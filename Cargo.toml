@@ -29,7 +29,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 
 # Async stream utilities
-futures-util = "0.3"
+futures-util = { version = "0.3", features = ["sink"] }
 
 [profile.dev]
 opt-level = 1
