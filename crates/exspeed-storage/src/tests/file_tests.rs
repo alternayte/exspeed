@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use exspeed_common::{Offset, PartitionId, StreamName};
+use exspeed_common::{Offset, StreamName};
 use exspeed_streams::{Record, StorageEngine};
 use tempfile::TempDir;
 
@@ -7,10 +7,6 @@ use crate::file::FileStorage;
 
 fn stream(name: &str) -> StreamName {
     StreamName::try_from(name).unwrap()
-}
-
-fn partition(id: u32) -> PartitionId {
-    PartitionId(id)
 }
 
 fn record(value: &[u8]) -> Record {
@@ -31,11 +27,11 @@ fn crash_recovery_replays_wal() {
     // Phase 1: write records, then drop to simulate crash.
     {
         let storage = FileStorage::new(dir.path()).unwrap();
-        storage.create_stream(&stream("crash"), 1).unwrap();
+        storage.create_stream(&stream("crash")).unwrap();
         for i in 0u64..10 {
             let val = format!("val-{}", i);
             let offset = storage
-                .append(&stream("crash"), partition(0), &record(val.as_bytes()))
+                .append(&stream("crash"), &record(val.as_bytes()))
                 .unwrap();
             assert_eq!(offset, Offset(i));
         }
@@ -46,7 +42,7 @@ fn crash_recovery_replays_wal() {
     {
         let storage = FileStorage::open(dir.path()).unwrap();
         let records = storage
-            .read(&stream("crash"), partition(0), Offset(0), 100)
+            .read(&stream("crash"), Offset(0), 100)
             .unwrap();
         assert_eq!(records.len(), 10);
         for i in 0u64..10 {
@@ -57,20 +53,17 @@ fn crash_recovery_replays_wal() {
     }
 }
 
-/// Create storage, create stream with 2 partitions, write 1 record to each,
-/// drop, reopen with FileStorage::open, read both, verify data.
+/// Create storage, create stream, write 1 record,
+/// drop, reopen with FileStorage::open, read back, verify data.
 #[test]
 fn data_persists_across_restart() {
     let dir = TempDir::new().unwrap();
 
     {
         let storage = FileStorage::new(dir.path()).unwrap();
-        storage.create_stream(&stream("persist"), 2).unwrap();
+        storage.create_stream(&stream("persist")).unwrap();
         storage
-            .append(&stream("persist"), partition(0), &record(b"p0-data"))
-            .unwrap();
-        storage
-            .append(&stream("persist"), partition(1), &record(b"p1-data"))
+            .append(&stream("persist"), &record(b"p0-data"))
             .unwrap();
     }
 
@@ -78,18 +71,11 @@ fn data_persists_across_restart() {
         let storage = FileStorage::open(dir.path()).unwrap();
 
         let p0 = storage
-            .read(&stream("persist"), partition(0), Offset(0), 10)
+            .read(&stream("persist"), Offset(0), 10)
             .unwrap();
         assert_eq!(p0.len(), 1);
         assert_eq!(p0[0].offset, Offset(0));
         assert_eq!(p0[0].value, Bytes::from_static(b"p0-data"));
-
-        let p1 = storage
-            .read(&stream("persist"), partition(1), Offset(0), 10)
-            .unwrap();
-        assert_eq!(p1.len(), 1);
-        assert_eq!(p1[0].offset, Offset(0));
-        assert_eq!(p1[0].value, Bytes::from_static(b"p1-data"));
     }
 }
 
@@ -99,18 +85,18 @@ fn data_persists_across_restart() {
 fn segment_rolling() {
     let dir = TempDir::new().unwrap();
     let storage = FileStorage::new(dir.path()).unwrap();
-    storage.create_stream(&stream("rolling"), 1).unwrap();
+    storage.create_stream(&stream("rolling")).unwrap();
 
     for i in 0u64..1000 {
         let val = format!("rec-{:04}", i);
         let offset = storage
-            .append(&stream("rolling"), partition(0), &record(val.as_bytes()))
+            .append(&stream("rolling"), &record(val.as_bytes()))
             .unwrap();
         assert_eq!(offset, Offset(i));
     }
 
     let records = storage
-        .read(&stream("rolling"), partition(0), Offset(0), 1000)
+        .read(&stream("rolling"), Offset(0), 1000)
         .unwrap();
     assert_eq!(records.len(), 1000);
     assert_eq!(records[0].offset, Offset(0));
@@ -127,12 +113,12 @@ fn milestone_10k_records_crash_recover() {
     // Phase 1: write 10,000 records then drop (crash).
     {
         let storage = FileStorage::new(dir.path()).unwrap();
-        storage.create_stream(&stream("milestone"), 1).unwrap();
+        storage.create_stream(&stream("milestone")).unwrap();
 
         for i in 0u64..10_000 {
             let val = format!("record-{:05}", i);
             let offset = storage
-                .append(&stream("milestone"), partition(0), &record(val.as_bytes()))
+                .append(&stream("milestone"), &record(val.as_bytes()))
                 .unwrap();
             assert_eq!(offset, Offset(i));
         }
@@ -142,7 +128,7 @@ fn milestone_10k_records_crash_recover() {
     {
         let storage = FileStorage::open(dir.path()).unwrap();
         let records = storage
-            .read(&stream("milestone"), partition(0), Offset(0), 10_000)
+            .read(&stream("milestone"), Offset(0), 10_000)
             .unwrap();
 
         assert_eq!(

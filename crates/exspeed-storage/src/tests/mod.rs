@@ -28,8 +28,8 @@ mod memory_tests {
     }
 
     #[test]
-    fn read_empty_partition() {
-        trait_tests::test_read_empty_partition(&MemoryStorage::new());
+    fn read_empty_stream() {
+        trait_tests::test_read_empty_stream(&MemoryStorage::new());
     }
 
     #[test]
@@ -43,18 +43,8 @@ mod memory_tests {
     }
 
     #[test]
-    fn partition_not_found() {
-        trait_tests::test_partition_not_found(&MemoryStorage::new());
-    }
-
-    #[test]
     fn stream_already_exists() {
         trait_tests::test_stream_already_exists(&MemoryStorage::new());
-    }
-
-    #[test]
-    fn multiple_partitions() {
-        trait_tests::test_multiple_partitions(&MemoryStorage::new());
     }
 
     #[test]
@@ -99,9 +89,9 @@ mod file_trait_tests {
     }
 
     #[test]
-    fn read_empty_partition() {
+    fn read_empty_stream() {
         let (s, _d) = make_storage();
-        trait_tests::test_read_empty_partition(&s);
+        trait_tests::test_read_empty_stream(&s);
     }
 
     #[test]
@@ -117,21 +107,9 @@ mod file_trait_tests {
     }
 
     #[test]
-    fn partition_not_found() {
-        let (s, _d) = make_storage();
-        trait_tests::test_partition_not_found(&s);
-    }
-
-    #[test]
     fn stream_already_exists() {
         let (s, _d) = make_storage();
         trait_tests::test_stream_already_exists(&s);
-    }
-
-    #[test]
-    fn multiple_partitions() {
-        let (s, _d) = make_storage();
-        trait_tests::test_multiple_partitions(&s);
     }
 
     #[test]

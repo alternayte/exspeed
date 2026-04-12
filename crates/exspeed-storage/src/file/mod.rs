@@ -9,7 +9,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
-use exspeed_common::{Offset, PartitionId, StreamName};
+use exspeed_common::{Offset, StreamName};
 use exspeed_streams::{Record, StorageEngine, StorageError, StoredRecord};
 
 use crate::file::partition::Partition;
@@ -17,7 +17,7 @@ use crate::file::partition::Partition;
 /// File-backed storage engine.
 ///
 /// Directory layout:
-///   `{data_dir}/streams/{stream}/partitions/{partition_id}/`
+///   `{data_dir}/streams/{stream}/partitions/0/`
 ///
 /// Each partition directory contains `.seg` segment files and a `wal.log`.
 pub struct FileStorage {
@@ -93,18 +93,16 @@ impl FileStorage {
 }
 
 impl StorageEngine for FileStorage {
-    fn create_stream(&self, stream: &StreamName, partition_count: u32) -> Result<(), StorageError> {
+    fn create_stream(&self, stream: &StreamName) -> Result<(), StorageError> {
         let mut map = self.partitions.write().unwrap();
         let key = (stream.as_str().to_string(), 0u32);
         if map.contains_key(&key) {
             return Err(StorageError::StreamAlreadyExists(stream.clone()));
         }
 
-        for p in 0..partition_count {
-            let dir = self.partition_dir(stream.as_str(), p);
-            let partition = Partition::create(&dir, stream.as_str(), p)?;
-            map.insert((stream.as_str().to_string(), p), partition);
-        }
+        let dir = self.partition_dir(stream.as_str(), 0);
+        let partition = Partition::create(&dir, stream.as_str(), 0)?;
+        map.insert(key, partition);
 
         Ok(())
     }
@@ -112,25 +110,15 @@ impl StorageEngine for FileStorage {
     fn append(
         &self,
         stream: &StreamName,
-        partition: PartitionId,
         record: &Record,
     ) -> Result<Offset, StorageError> {
         let mut map = self.partitions.write().unwrap();
-        let stream_str = stream.as_str().to_string();
-        let key = (stream_str.clone(), partition.0);
+        let key = (stream.as_str().to_string(), 0u32);
 
-        if !map.contains_key(&key) {
-            return if map.contains_key(&(stream_str, 0)) {
-                Err(StorageError::PartitionNotFound {
-                    stream: stream.clone(),
-                    partition,
-                })
-            } else {
-                Err(StorageError::StreamNotFound(stream.clone()))
-            };
-        }
+        let part = map.get_mut(&key).ok_or_else(|| {
+            StorageError::StreamNotFound(stream.clone())
+        })?;
 
-        let part = map.get_mut(&key).unwrap();
         let offset = part.append(record)?;
         Ok(offset)
     }
@@ -138,23 +126,14 @@ impl StorageEngine for FileStorage {
     fn read(
         &self,
         stream: &StreamName,
-        partition: PartitionId,
         from: Offset,
         max_records: usize,
     ) -> Result<Vec<StoredRecord>, StorageError> {
         let map = self.partitions.read().unwrap();
-        let stream_str = stream.as_str().to_string();
-        let key = (stream_str.clone(), partition.0);
+        let key = (stream.as_str().to_string(), 0u32);
 
         let part = map.get(&key).ok_or_else(|| {
-            if map.contains_key(&(stream_str, 0)) {
-                StorageError::PartitionNotFound {
-                    stream: stream.clone(),
-                    partition,
-                }
-            } else {
-                StorageError::StreamNotFound(stream.clone())
-            }
+            StorageError::StreamNotFound(stream.clone())
         })?;
 
         let records = part.read(from, max_records)?;
