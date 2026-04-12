@@ -14,6 +14,9 @@ path = "src/main.rs"
 [dependencies]
 exspeed-common = { path = "../exspeed-common" }
 exspeed-protocol = { path = "../exspeed-protocol" }
+exspeed-broker = { path = "../exspeed-broker" }
+exspeed-storage = { path = "../exspeed-storage" }
+exspeed-streams = { path = "../exspeed-streams" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 clap = { workspace = true }

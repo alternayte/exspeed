@@ -1,4 +1,6 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Args;
@@ -7,17 +9,27 @@ use tokio::net::TcpListener;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::{error, info, warn};
 
+use exspeed_broker::Broker;
 use exspeed_protocol::codec::ExspeedCodec;
 use exspeed_protocol::messages::{ClientMessage, ServerMessage};
+use exspeed_storage::file::FileStorage;
+use exspeed_streams::StorageEngine;
 
 #[derive(Args)]
 pub struct ServerArgs {
     /// Address to bind to
     #[arg(long, default_value = "0.0.0.0:5933")]
     pub bind: String,
+
+    /// Directory for persistent data
+    #[arg(long, default_value = "./exspeed-data")]
+    pub data_dir: PathBuf,
 }
 
 pub async fn run(args: ServerArgs) -> Result<()> {
+    let storage: Arc<dyn StorageEngine> = Arc::new(FileStorage::open(&args.data_dir)?);
+    let broker = Arc::new(Broker::new(storage));
+
     let addr: SocketAddr = args.bind.parse()?;
     let listener = TcpListener::bind(addr).await?;
 
@@ -27,8 +39,9 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         let (socket, peer) = listener.accept().await?;
         info!(%peer, "new connection");
 
+        let broker = broker.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(socket, peer).await {
+            if let Err(e) = handle_connection(socket, peer, broker).await {
                 error!(%peer, "connection error: {}", e);
             }
             info!(%peer, "connection closed");
@@ -36,7 +49,11 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     }
 }
 
-async fn handle_connection(socket: tokio::net::TcpStream, peer: SocketAddr) -> Result<()> {
+async fn handle_connection(
+    socket: tokio::net::TcpStream,
+    peer: SocketAddr,
+    broker: Arc<Broker>,
+) -> Result<()> {
     let (reader, writer) = socket.into_split();
     let mut framed_read = FramedRead::new(reader, ExspeedCodec::new());
     let mut framed_write = FramedWrite::new(writer, ExspeedCodec::new());
@@ -55,6 +72,14 @@ async fn handle_connection(socket: tokio::net::TcpStream, peer: SocketAddr) -> R
                     Ok(ClientMessage::Ping) => {
                         let response = ServerMessage::Pong.into_frame(correlation_id);
                         framed_write.send(response).await?;
+                    }
+                    Ok(msg) => {
+                        let broker = broker.clone();
+                        let response = tokio::task::spawn_blocking(move || {
+                            broker.handle_message(msg)
+                        })
+                        .await?;
+                        framed_write.send(response.into_frame(correlation_id)).await?;
                     }
                     Err(e) => {
                         warn!(%peer, "unhandled message: {}", e);
