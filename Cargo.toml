@@ -6,6 +6,7 @@ members = [
     "crates/exspeed-protocol",
     "crates/exspeed-streams",
     "crates/exspeed-storage",
+    "crates/exspeed-broker",
 ]
 
 [workspace.dependencies]

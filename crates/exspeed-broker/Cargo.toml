@@ -1,0 +1,14 @@
+[package]
+name = "exspeed-broker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+exspeed-common = { path = "../exspeed-common" }
+exspeed-streams = { path = "../exspeed-streams" }
+exspeed-protocol = { path = "../exspeed-protocol" }
+bytes = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+exspeed-storage = { path = "../exspeed-storage" }
