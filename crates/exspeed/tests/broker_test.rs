@@ -47,11 +47,7 @@ async fn connect_to(addr: &str) -> (FramedReader, FramedWriter) {
     )
 }
 
-async fn send_recv(
-    writer: &mut FramedWriter,
-    reader: &mut FramedReader,
-    frame: Frame,
-) -> Frame {
+async fn send_recv(writer: &mut FramedWriter, reader: &mut FramedReader, frame: Frame) -> Frame {
     writer.send(frame).await.unwrap();
     timeout(Duration::from_secs(5), reader.next())
         .await
@@ -93,7 +89,13 @@ fn publish_frame(stream: &str, subject: &str, value: &[u8], corr: u32) -> Frame 
     Frame::new(OpCode::Publish, corr, buf.freeze())
 }
 
-fn fetch_frame(stream: &str, offset: u64, max_records: u32, subject_filter: &str, corr: u32) -> Frame {
+fn fetch_frame(
+    stream: &str,
+    offset: u64,
+    max_records: u32,
+    subject_filter: &str,
+    corr: u32,
+) -> Frame {
     let req = FetchRequest {
         stream: stream.into(),
         offset,
@@ -144,7 +146,11 @@ async fn publish_and_fetch() {
         fetch_frame("orders", 0, 100, "", 20),
     )
     .await;
-    assert_eq!(resp.opcode, OpCode::RecordsBatch, "FETCH should return RecordsBatch");
+    assert_eq!(
+        resp.opcode,
+        OpCode::RecordsBatch,
+        "FETCH should return RecordsBatch"
+    );
     assert_eq!(resp.correlation_id, 20);
 
     // 5. Decode and verify
@@ -186,7 +192,12 @@ async fn fetch_with_subject_filter() {
             publish_frame("events", subject, value, 10 + i as u32),
         )
         .await;
-        assert_eq!(resp.opcode, OpCode::Ok, "PUBLISH '{}' should return Ok", subject);
+        assert_eq!(
+            resp.opcode,
+            OpCode::Ok,
+            "PUBLISH '{}' should return Ok",
+            subject
+        );
     }
 
     // Fetch with filter "order.eu.*" -> expect 2 records
@@ -207,8 +218,14 @@ async fn fetch_with_subject_filter() {
         batch.records.iter().map(|r| &r.subject).collect::<Vec<_>>()
     );
     let subjects: Vec<&str> = batch.records.iter().map(|r| r.subject.as_str()).collect();
-    assert!(subjects.contains(&"order.eu.created"), "should contain order.eu.created");
-    assert!(subjects.contains(&"order.eu.shipped"), "should contain order.eu.shipped");
+    assert!(
+        subjects.contains(&"order.eu.created"),
+        "should contain order.eu.created"
+    );
+    assert!(
+        subjects.contains(&"order.eu.shipped"),
+        "should contain order.eu.shipped"
+    );
 
     // Fetch with filter "order.>" -> expect 3 records (all order.* but not payment.*)
     let resp = send_recv(
@@ -231,5 +248,8 @@ async fn fetch_with_subject_filter() {
     assert!(subjects.contains(&"order.eu.created"));
     assert!(subjects.contains(&"order.us.created"));
     assert!(subjects.contains(&"order.eu.shipped"));
-    assert!(!subjects.contains(&"payment.captured"), "payment.captured should NOT match order.>");
+    assert!(
+        !subjects.contains(&"payment.captured"),
+        "payment.captured should NOT match order.>"
+    );
 }

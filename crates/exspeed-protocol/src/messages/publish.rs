@@ -67,9 +67,7 @@ impl PublishRequest {
         }
         let stream_len = src.get_u16_le() as usize;
         if src.remaining() < stream_len {
-            return Err(ProtocolError::Decode(
-                "PUBLISH truncated at stream".into(),
-            ));
+            return Err(ProtocolError::Decode("PUBLISH truncated at stream".into()));
         }
         let stream = String::from_utf8(src.split_to(stream_len).to_vec())
             .map_err(|e| ProtocolError::Decode(format!("invalid stream UTF-8: {e}")))?;
@@ -82,9 +80,7 @@ impl PublishRequest {
         }
         let subject_len = src.get_u16_le() as usize;
         if src.remaining() < subject_len {
-            return Err(ProtocolError::Decode(
-                "PUBLISH truncated at subject".into(),
-            ));
+            return Err(ProtocolError::Decode("PUBLISH truncated at subject".into()));
         }
         let subject = String::from_utf8(src.split_to(subject_len).to_vec())
             .map_err(|e| ProtocolError::Decode(format!("invalid subject UTF-8: {e}")))?;

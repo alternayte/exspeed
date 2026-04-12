@@ -1,7 +1,7 @@
-use std::sync::Arc;
+use crate::handlers;
 use exspeed_protocol::messages::{ClientMessage, ServerMessage};
 use exspeed_streams::StorageEngine;
-use crate::handlers;
+use std::sync::Arc;
 
 pub struct Broker {
     storage: Arc<dyn StorageEngine>,
@@ -17,12 +17,10 @@ impl Broker {
             ClientMessage::CreateStream(req) => handlers::handle_create_stream(&self.storage, req),
             ClientMessage::Publish(req) => handlers::handle_publish(&self.storage, req),
             ClientMessage::Fetch(req) => handlers::handle_fetch(&self.storage, req),
-            ClientMessage::Connect(_) | ClientMessage::Ping => {
-                ServerMessage::Error {
-                    code: 500,
-                    message: "message should be handled by connection layer".into(),
-                }
-            }
+            ClientMessage::Connect(_) | ClientMessage::Ping => ServerMessage::Error {
+                code: 500,
+                message: "message should be handled by connection layer".into(),
+            },
         }
     }
 }
@@ -49,12 +47,7 @@ mod tests {
         }))
     }
 
-    fn publish(
-        broker: &Broker,
-        stream: &str,
-        subject: &str,
-        value: &[u8],
-    ) -> ServerMessage {
+    fn publish(broker: &Broker, stream: &str, subject: &str, value: &[u8]) -> ServerMessage {
         broker.handle_message(ClientMessage::Publish(PublishRequest {
             stream: stream.into(),
             subject: subject.into(),
@@ -110,7 +103,11 @@ mod tests {
     fn create_stream_ok() {
         let broker = make_broker();
         let resp = create_stream(&broker, "events");
-        assert!(matches!(resp, ServerMessage::Ok), "expected Ok, got {:?}", resp);
+        assert!(
+            matches!(resp, ServerMessage::Ok),
+            "expected Ok, got {:?}",
+            resp
+        );
     }
 
     #[test]
@@ -189,7 +186,11 @@ mod tests {
             batch_eu.records.len(),
             2,
             "expected 2 records for order.eu.*, got {:?}",
-            batch_eu.records.iter().map(|r| &r.subject).collect::<Vec<_>>()
+            batch_eu
+                .records
+                .iter()
+                .map(|r| &r.subject)
+                .collect::<Vec<_>>()
         );
 
         // "order.>" should match all three order.* subjects → 3 records
@@ -198,7 +199,11 @@ mod tests {
             batch_order.records.len(),
             3,
             "expected 3 records for order.>, got {:?}",
-            batch_order.records.iter().map(|r| &r.subject).collect::<Vec<_>>()
+            batch_order
+                .records
+                .iter()
+                .map(|r| &r.subject)
+                .collect::<Vec<_>>()
         );
     }
 

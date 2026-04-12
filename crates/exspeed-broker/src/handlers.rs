@@ -87,8 +87,7 @@ pub fn handle_fetch(storage: &Arc<dyn StorageEngine>, req: FetchRequest) -> Serv
     let records: Vec<BatchRecord> = stored
         .into_iter()
         .filter(|r| {
-            req.subject_filter.is_empty()
-                || subject_matches(&r.subject, &req.subject_filter)
+            req.subject_filter.is_empty() || subject_matches(&r.subject, &req.subject_filter)
         })
         .take(max_records)
         .map(|r| BatchRecord {

@@ -41,16 +41,12 @@ impl StorageEngine for MemoryStorage {
         Ok(())
     }
 
-    fn append(
-        &self,
-        stream: &StreamName,
-        record: &Record,
-    ) -> Result<Offset, StorageError> {
+    fn append(&self, stream: &StreamName, record: &Record) -> Result<Offset, StorageError> {
         let mut map = self.streams.write().unwrap();
         let key = stream.as_str().to_string();
-        let records = map.get_mut(&key).ok_or_else(|| {
-            StorageError::StreamNotFound(stream.clone())
-        })?;
+        let records = map
+            .get_mut(&key)
+            .ok_or_else(|| StorageError::StreamNotFound(stream.clone()))?;
         let offset = Offset(records.len() as u64);
         let stored = StoredRecord {
             offset,
@@ -72,9 +68,9 @@ impl StorageEngine for MemoryStorage {
     ) -> Result<Vec<StoredRecord>, StorageError> {
         let map = self.streams.read().unwrap();
         let key = stream.as_str().to_string();
-        let records = map.get(&key).ok_or_else(|| {
-            StorageError::StreamNotFound(stream.clone())
-        })?;
+        let records = map
+            .get(&key)
+            .ok_or_else(|| StorageError::StreamNotFound(stream.clone()))?;
         let start = from.0 as usize;
         if start >= records.len() {
             return Ok(Vec::new());

@@ -266,9 +266,7 @@ mod tests {
 
     #[test]
     fn records_batch_roundtrip_empty() {
-        let batch = RecordsBatch {
-            records: vec![],
-        };
+        let batch = RecordsBatch { records: vec![] };
 
         let mut buf = BytesMut::new();
         batch.encode(&mut buf);

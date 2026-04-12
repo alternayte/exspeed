@@ -75,11 +75,11 @@ async fn handle_connection(
                     }
                     Ok(msg) => {
                         let broker = broker.clone();
-                        let response = tokio::task::spawn_blocking(move || {
-                            broker.handle_message(msg)
-                        })
-                        .await?;
-                        framed_write.send(response.into_frame(correlation_id)).await?;
+                        let response =
+                            tokio::task::spawn_blocking(move || broker.handle_message(msg)).await?;
+                        framed_write
+                            .send(response.into_frame(correlation_id))
+                            .await?;
                     }
                     Err(e) => {
                         warn!(%peer, "unhandled message: {}", e);

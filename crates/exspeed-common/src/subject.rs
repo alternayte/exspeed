@@ -27,10 +27,7 @@ pub fn subject_matches(subject: &str, pattern: &str) -> bool {
             return false;
         }
 
-        if pt == "*" {
-            si += 1;
-            pi += 1;
-        } else if pt == subject_tokens[si] {
+        if pt == "*" || pt == subject_tokens[si] {
             si += 1;
             pi += 1;
         } else {

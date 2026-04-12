@@ -33,9 +33,7 @@ fn record_with_key(subject: &str, key: &[u8], value: &[u8]) -> Record {
 pub fn test_create_and_append(engine: &impl StorageEngine) {
     let s = stream("test-create");
     engine.create_stream(&s).unwrap();
-    let offset = engine
-        .append(&s, &record("events", b"hello"))
-        .unwrap();
+    let offset = engine.append(&s, &record("events", b"hello")).unwrap();
     assert_eq!(offset, Offset(0));
 }
 
@@ -81,9 +79,7 @@ pub fn test_sequential_offsets(engine: &impl StorageEngine) {
     engine.create_stream(&s).unwrap();
 
     for i in 0u64..5 {
-        let offset = engine
-            .append(&s, &record("events", b"data"))
-            .unwrap();
+        let offset = engine.append(&s, &record("events", b"data")).unwrap();
         assert_eq!(offset, Offset(i), "expected offset {i} on append #{i}");
     }
 }
@@ -94,9 +90,7 @@ pub fn test_read_range(engine: &impl StorageEngine) {
     engine.create_stream(&s).unwrap();
 
     for i in 0u8..10 {
-        engine
-            .append(&s, &record("events", &[i]))
-            .unwrap();
+        engine.append(&s, &record("events", &[i])).unwrap();
     }
 
     let results = engine.read(&s, Offset(3), 4).unwrap();
@@ -120,9 +114,7 @@ pub fn test_read_empty_stream(engine: &impl StorageEngine) {
 pub fn test_read_past_end(engine: &impl StorageEngine) {
     let s = stream("test-past-end");
     engine.create_stream(&s).unwrap();
-    engine
-        .append(&s, &record("events", b"only"))
-        .unwrap();
+    engine.append(&s, &record("events", b"only")).unwrap();
 
     let results = engine.read(&s, Offset(999), 10).unwrap();
     assert!(results.is_empty());
@@ -131,9 +123,7 @@ pub fn test_read_past_end(engine: &impl StorageEngine) {
 /// Append to a nonexistent stream, get StreamNotFound error.
 pub fn test_stream_not_found(engine: &impl StorageEngine) {
     let s = stream("nonexistent");
-    let err = engine
-        .append(&s, &record("events", b"data"))
-        .unwrap_err();
+    let err = engine.append(&s, &record("events", b"data")).unwrap_err();
     assert!(
         matches!(err, StorageError::StreamNotFound(_)),
         "expected StreamNotFound, got {err:?}"
@@ -157,12 +147,8 @@ pub fn test_timestamps_increasing(engine: &impl StorageEngine) {
     let s = stream("test-timestamps");
     engine.create_stream(&s).unwrap();
 
-    engine
-        .append(&s, &record("events", b"first"))
-        .unwrap();
-    engine
-        .append(&s, &record("events", b"second"))
-        .unwrap();
+    engine.append(&s, &record("events", b"first")).unwrap();
+    engine.append(&s, &record("events", b"second")).unwrap();
 
     let results = engine.read(&s, Offset(0), 10).unwrap();
     assert_eq!(results.len(), 2);

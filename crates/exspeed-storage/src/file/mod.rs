@@ -107,17 +107,13 @@ impl StorageEngine for FileStorage {
         Ok(())
     }
 
-    fn append(
-        &self,
-        stream: &StreamName,
-        record: &Record,
-    ) -> Result<Offset, StorageError> {
+    fn append(&self, stream: &StreamName, record: &Record) -> Result<Offset, StorageError> {
         let mut map = self.partitions.write().unwrap();
         let key = (stream.as_str().to_string(), 0u32);
 
-        let part = map.get_mut(&key).ok_or_else(|| {
-            StorageError::StreamNotFound(stream.clone())
-        })?;
+        let part = map
+            .get_mut(&key)
+            .ok_or_else(|| StorageError::StreamNotFound(stream.clone()))?;
 
         let offset = part.append(record)?;
         Ok(offset)
@@ -132,9 +128,9 @@ impl StorageEngine for FileStorage {
         let map = self.partitions.read().unwrap();
         let key = (stream.as_str().to_string(), 0u32);
 
-        let part = map.get(&key).ok_or_else(|| {
-            StorageError::StreamNotFound(stream.clone())
-        })?;
+        let part = map
+            .get(&key)
+            .ok_or_else(|| StorageError::StreamNotFound(stream.clone()))?;
 
         let records = part.read(from, max_records)?;
         Ok(records)

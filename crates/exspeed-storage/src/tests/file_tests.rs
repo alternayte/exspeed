@@ -41,9 +41,7 @@ fn crash_recovery_replays_wal() {
     // Phase 2: reopen and verify all records survived.
     {
         let storage = FileStorage::open(dir.path()).unwrap();
-        let records = storage
-            .read(&stream("crash"), Offset(0), 100)
-            .unwrap();
+        let records = storage.read(&stream("crash"), Offset(0), 100).unwrap();
         assert_eq!(records.len(), 10);
         for i in 0u64..10 {
             assert_eq!(records[i as usize].offset, Offset(i));
@@ -70,9 +68,7 @@ fn data_persists_across_restart() {
     {
         let storage = FileStorage::open(dir.path()).unwrap();
 
-        let p0 = storage
-            .read(&stream("persist"), Offset(0), 10)
-            .unwrap();
+        let p0 = storage.read(&stream("persist"), Offset(0), 10).unwrap();
         assert_eq!(p0.len(), 1);
         assert_eq!(p0[0].offset, Offset(0));
         assert_eq!(p0[0].value, Bytes::from_static(b"p0-data"));
@@ -95,9 +91,7 @@ fn segment_rolling() {
         assert_eq!(offset, Offset(i));
     }
 
-    let records = storage
-        .read(&stream("rolling"), Offset(0), 1000)
-        .unwrap();
+    let records = storage.read(&stream("rolling"), Offset(0), 1000).unwrap();
     assert_eq!(records.len(), 1000);
     assert_eq!(records[0].offset, Offset(0));
     assert_eq!(records[0].value, Bytes::from(String::from("rec-0000")));
