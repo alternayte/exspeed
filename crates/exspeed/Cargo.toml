@@ -1,0 +1,20 @@
+[package]
+name = "exspeed"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "exspeed"
+path = "src/main.rs"
+
+[dependencies]
+exspeed-common = { path = "../exspeed-common" }
+exspeed-protocol = { path = "../exspeed-protocol" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
