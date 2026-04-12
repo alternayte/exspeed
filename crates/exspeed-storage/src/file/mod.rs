@@ -1,7 +1,7 @@
-pub mod segment_writer;
-pub mod segment_reader;
-pub mod wal;
 pub mod partition;
+pub mod segment_reader;
+pub mod segment_writer;
+pub mod wal;
 
 use std::collections::HashMap;
 use std::fs;
@@ -52,10 +52,7 @@ impl FileStorage {
                 if !stream_path.is_dir() {
                     continue;
                 }
-                let stream_name = stream_entry
-                    .file_name()
-                    .to_string_lossy()
-                    .into_owned();
+                let stream_name = stream_entry.file_name().to_string_lossy().into_owned();
 
                 let partitions_dir = stream_path.join("partitions");
                 if !partitions_dir.is_dir() {
@@ -68,17 +65,12 @@ impl FileStorage {
                     if !part_path.is_dir() {
                         continue;
                     }
-                    let part_id: u32 = match part_entry
-                        .file_name()
-                        .to_string_lossy()
-                        .parse()
-                    {
+                    let part_id: u32 = match part_entry.file_name().to_string_lossy().parse() {
                         Ok(id) => id,
                         Err(_) => continue, // skip non-numeric directories
                     };
 
-                    let partition =
-                        Partition::open(&part_path, &stream_name, part_id)?;
+                    let partition = Partition::open(&part_path, &stream_name, part_id)?;
                     partitions.insert((stream_name.clone(), part_id), partition);
                 }
             }
@@ -101,11 +93,7 @@ impl FileStorage {
 }
 
 impl StorageEngine for FileStorage {
-    fn create_stream(
-        &self,
-        stream: &StreamName,
-        partition_count: u32,
-    ) -> Result<(), StorageError> {
+    fn create_stream(&self, stream: &StreamName, partition_count: u32) -> Result<(), StorageError> {
         let mut map = self.partitions.write().unwrap();
         let key = (stream.as_str().to_string(), 0u32);
         if map.contains_key(&key) {

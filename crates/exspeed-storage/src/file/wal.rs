@@ -189,8 +189,8 @@ fn decode_wal_payload(data: &[u8]) -> Result<WalRecord, String> {
     let partition = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
     pos += 4;
 
-    let (stored, _) = decode_record(&data[pos..])
-        .map_err(|e| format!("record decode failed: {}", e))?;
+    let (stored, _) =
+        decode_record(&data[pos..]).map_err(|e| format!("record decode failed: {}", e))?;
 
     let record = stored_to_record(&stored);
     Ok(WalRecord {

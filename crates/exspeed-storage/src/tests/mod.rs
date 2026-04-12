@@ -1,11 +1,11 @@
 // Built in Task 4
 
-mod trait_tests;
 mod file_tests;
+mod trait_tests;
 
 mod memory_tests {
-    use crate::memory::MemoryStorage;
     use super::trait_tests;
+    use crate::memory::MemoryStorage;
 
     #[test]
     fn create_and_append() {
@@ -64,8 +64,8 @@ mod memory_tests {
 }
 
 mod file_trait_tests {
-    use crate::file::FileStorage;
     use super::trait_tests;
+    use crate::file::FileStorage;
     use tempfile::TempDir;
 
     fn make_storage() -> (FileStorage, TempDir) {

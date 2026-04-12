@@ -15,6 +15,7 @@ pub enum OpCode {
     Nack = 0x06,
     Fetch = 0x07,
     Seek = 0x08,
+    RebalanceAck = 0x09,
     CreateStream = 0x10,
     DeleteStream = 0x11,
     StreamInfo = 0x12,
@@ -48,6 +49,7 @@ impl OpCode {
                 | OpCode::Nack
                 | OpCode::Fetch
                 | OpCode::Seek
+                | OpCode::RebalanceAck
                 | OpCode::CreateStream
                 | OpCode::DeleteStream
                 | OpCode::StreamInfo
@@ -92,6 +94,7 @@ impl TryFrom<u8> for OpCode {
             0x06 => Ok(OpCode::Nack),
             0x07 => Ok(OpCode::Fetch),
             0x08 => Ok(OpCode::Seek),
+            0x09 => Ok(OpCode::RebalanceAck),
             0x10 => Ok(OpCode::CreateStream),
             0x11 => Ok(OpCode::DeleteStream),
             0x12 => Ok(OpCode::StreamInfo),

@@ -31,11 +31,7 @@ fn now_nanos() -> u64 {
 }
 
 impl StorageEngine for MemoryStorage {
-    fn create_stream(
-        &self,
-        stream: &StreamName,
-        partition_count: u32,
-    ) -> Result<(), StorageError> {
+    fn create_stream(&self, stream: &StreamName, partition_count: u32) -> Result<(), StorageError> {
         let mut map = self.partitions.write().unwrap();
         let key = (stream.as_str().to_string(), 0u32);
         if map.contains_key(&key) {
@@ -58,7 +54,10 @@ impl StorageEngine for MemoryStorage {
         let key = (stream_str.clone(), partition.0);
         if !map.contains_key(&key) {
             let err = if map.contains_key(&(stream_str, 0)) {
-                StorageError::PartitionNotFound { stream: stream.clone(), partition }
+                StorageError::PartitionNotFound {
+                    stream: stream.clone(),
+                    partition,
+                }
             } else {
                 StorageError::StreamNotFound(stream.clone())
             };
@@ -89,7 +88,10 @@ impl StorageEngine for MemoryStorage {
         let key = (stream.as_str().to_string(), partition.0);
         let records = map.get(&key).ok_or_else(|| {
             if map.contains_key(&(stream.as_str().to_string(), 0)) {
-                StorageError::PartitionNotFound { stream: stream.clone(), partition }
+                StorageError::PartitionNotFound {
+                    stream: stream.clone(),
+                    partition,
+                }
             } else {
                 StorageError::StreamNotFound(stream.clone())
             }

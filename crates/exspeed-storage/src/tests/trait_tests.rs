@@ -37,7 +37,9 @@ fn record_with_key(subject: &str, key: &[u8], value: &[u8]) -> Record {
 pub fn test_create_and_append(engine: &impl StorageEngine) {
     let s = stream("test-create");
     engine.create_stream(&s, 3).unwrap();
-    let offset = engine.append(&s, partition(0), &record("events", b"hello")).unwrap();
+    let offset = engine
+        .append(&s, partition(0), &record("events", b"hello"))
+        .unwrap();
     assert_eq!(offset, Offset(0));
 }
 
@@ -67,8 +69,14 @@ pub fn test_append_and_read_back(engine: &impl StorageEngine) {
     assert_eq!(stored.key, Some(Bytes::from_static(b"mykey")));
     assert_eq!(stored.value, Bytes::from_static(b"myvalue"));
     assert_eq!(stored.headers.len(), 2);
-    assert_eq!(stored.headers[0], ("content-type".to_string(), "application/json".to_string()));
-    assert_eq!(stored.headers[1], ("correlation-id".to_string(), "abc-123".to_string()));
+    assert_eq!(
+        stored.headers[0],
+        ("content-type".to_string(), "application/json".to_string())
+    );
+    assert_eq!(
+        stored.headers[1],
+        ("correlation-id".to_string(), "abc-123".to_string())
+    );
 }
 
 /// Append 5 records, verify offsets are 0, 1, 2, 3, 4.
@@ -77,7 +85,9 @@ pub fn test_sequential_offsets(engine: &impl StorageEngine) {
     engine.create_stream(&s, 1).unwrap();
 
     for i in 0u64..5 {
-        let offset = engine.append(&s, partition(0), &record("events", b"data")).unwrap();
+        let offset = engine
+            .append(&s, partition(0), &record("events", b"data"))
+            .unwrap();
         assert_eq!(offset, Offset(i), "expected offset {i} on append #{i}");
     }
 }
@@ -88,7 +98,9 @@ pub fn test_read_range(engine: &impl StorageEngine) {
     engine.create_stream(&s, 1).unwrap();
 
     for i in 0u8..10 {
-        engine.append(&s, partition(0), &record("events", &[i])).unwrap();
+        engine
+            .append(&s, partition(0), &record("events", &[i]))
+            .unwrap();
     }
 
     let results = engine.read(&s, partition(0), Offset(3), 4).unwrap();
@@ -112,7 +124,9 @@ pub fn test_read_empty_partition(engine: &impl StorageEngine) {
 pub fn test_read_past_end(engine: &impl StorageEngine) {
     let s = stream("test-past-end");
     engine.create_stream(&s, 1).unwrap();
-    engine.append(&s, partition(0), &record("events", b"only")).unwrap();
+    engine
+        .append(&s, partition(0), &record("events", b"only"))
+        .unwrap();
 
     let results = engine.read(&s, partition(0), Offset(999), 10).unwrap();
     assert!(results.is_empty());
@@ -121,7 +135,9 @@ pub fn test_read_past_end(engine: &impl StorageEngine) {
 /// Append to a nonexistent stream, get StreamNotFound error.
 pub fn test_stream_not_found(engine: &impl StorageEngine) {
     let s = stream("nonexistent");
-    let err = engine.append(&s, partition(0), &record("events", b"data")).unwrap_err();
+    let err = engine
+        .append(&s, partition(0), &record("events", b"data"))
+        .unwrap_err();
     assert!(
         matches!(err, StorageError::StreamNotFound(_)),
         "expected StreamNotFound, got {err:?}"
@@ -133,7 +149,9 @@ pub fn test_partition_not_found(engine: &impl StorageEngine) {
     let s = stream("test-partnotfound");
     engine.create_stream(&s, 2).unwrap();
 
-    let err = engine.append(&s, partition(99), &record("events", b"data")).unwrap_err();
+    let err = engine
+        .append(&s, partition(99), &record("events", b"data"))
+        .unwrap_err();
     assert!(
         matches!(err, StorageError::PartitionNotFound { .. }),
         "expected PartitionNotFound, got {err:?}"
@@ -158,14 +176,26 @@ pub fn test_multiple_partitions(engine: &impl StorageEngine) {
     engine.create_stream(&s, 3).unwrap();
 
     // Append different numbers of records to each partition.
-    engine.append(&s, partition(0), &record("p0", b"a")).unwrap();
-    engine.append(&s, partition(0), &record("p0", b"b")).unwrap();
+    engine
+        .append(&s, partition(0), &record("p0", b"a"))
+        .unwrap();
+    engine
+        .append(&s, partition(0), &record("p0", b"b"))
+        .unwrap();
 
-    engine.append(&s, partition(1), &record("p1", b"x")).unwrap();
+    engine
+        .append(&s, partition(1), &record("p1", b"x"))
+        .unwrap();
 
-    engine.append(&s, partition(2), &record("p2", b"m")).unwrap();
-    engine.append(&s, partition(2), &record("p2", b"n")).unwrap();
-    engine.append(&s, partition(2), &record("p2", b"o")).unwrap();
+    engine
+        .append(&s, partition(2), &record("p2", b"m"))
+        .unwrap();
+    engine
+        .append(&s, partition(2), &record("p2", b"n"))
+        .unwrap();
+    engine
+        .append(&s, partition(2), &record("p2", b"o"))
+        .unwrap();
 
     let p0 = engine.read(&s, partition(0), Offset(0), 10).unwrap();
     assert_eq!(p0.len(), 2);
@@ -193,8 +223,12 @@ pub fn test_timestamps_increasing(engine: &impl StorageEngine) {
     let s = stream("test-timestamps");
     engine.create_stream(&s, 1).unwrap();
 
-    engine.append(&s, partition(0), &record("events", b"first")).unwrap();
-    engine.append(&s, partition(0), &record("events", b"second")).unwrap();
+    engine
+        .append(&s, partition(0), &record("events", b"first"))
+        .unwrap();
+    engine
+        .append(&s, partition(0), &record("events", b"second"))
+        .unwrap();
 
     let results = engine.read(&s, partition(0), Offset(0), 10).unwrap();
     assert_eq!(results.len(), 2);

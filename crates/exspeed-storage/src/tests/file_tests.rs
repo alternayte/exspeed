@@ -145,7 +145,11 @@ fn milestone_10k_records_crash_recover() {
             .read(&stream("milestone"), partition(0), Offset(0), 10_000)
             .unwrap();
 
-        assert_eq!(records.len(), 10_000, "expected 10000 records after recovery");
+        assert_eq!(
+            records.len(),
+            10_000,
+            "expected 10000 records after recovery"
+        );
 
         // First record
         assert_eq!(records[0].offset, Offset(0));

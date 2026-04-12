@@ -168,8 +168,8 @@ impl SegmentReader {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use exspeed_streams::record::Record;
     use exspeed_common::Offset;
+    use exspeed_streams::record::Record;
     use tempfile::TempDir;
 
     use crate::file::segment_writer::SegmentWriter;
@@ -188,9 +188,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut writer = SegmentWriter::create(dir.path(), 0).unwrap();
 
-        writer.append(Offset(0), 1_000, &make_record(b"value-0")).unwrap();
-        writer.append(Offset(1), 2_000, &make_record(b"value-1")).unwrap();
-        writer.append(Offset(2), 3_000, &make_record(b"value-2")).unwrap();
+        writer
+            .append(Offset(0), 1_000, &make_record(b"value-0"))
+            .unwrap();
+        writer
+            .append(Offset(1), 2_000, &make_record(b"value-1"))
+            .unwrap();
+        writer
+            .append(Offset(2), 3_000, &make_record(b"value-2"))
+            .unwrap();
 
         let path = writer.path().to_path_buf();
         drop(writer);
@@ -234,8 +240,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut writer = SegmentWriter::create(dir.path(), 0).unwrap();
 
-        writer.append(Offset(0), 1_000, &make_record(b"first")).unwrap();
-        writer.append(Offset(1), 2_000, &make_record(b"second")).unwrap();
+        writer
+            .append(Offset(0), 1_000, &make_record(b"first"))
+            .unwrap();
+        writer
+            .append(Offset(1), 2_000, &make_record(b"second"))
+            .unwrap();
 
         let path = writer.path().to_path_buf();
         drop(writer);
@@ -263,7 +273,9 @@ mod tests {
     fn crc_corruption_detected() {
         let dir = TempDir::new().unwrap();
         let mut writer = SegmentWriter::create(dir.path(), 0).unwrap();
-        writer.append(Offset(0), 1_000, &make_record(b"integrity")).unwrap();
+        writer
+            .append(Offset(0), 1_000, &make_record(b"integrity"))
+            .unwrap();
         let path = writer.path().to_path_buf();
         drop(writer);
 
@@ -287,7 +299,11 @@ mod tests {
     fn invalid_magic_rejected() {
         let dir = TempDir::new().unwrap();
         let file_path = dir.path().join("bad.seg");
-        std::fs::write(&file_path, b"BADMAGIC this is not a valid segment file at all").unwrap();
+        std::fs::write(
+            &file_path,
+            b"BADMAGIC this is not a valid segment file at all",
+        )
+        .unwrap();
 
         let err = SegmentReader::open(&file_path).unwrap_err();
         let msg = err.to_string();

@@ -1,5 +1,5 @@
-use thiserror::Error;
 use exspeed_common::{PartitionId, StreamName};
+use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum StorageError {

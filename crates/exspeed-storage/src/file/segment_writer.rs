@@ -190,7 +190,9 @@ mod tests {
         let mut writer = SegmentWriter::create(dir.path(), 0).unwrap();
 
         let before = writer.bytes_written();
-        let written = writer.append(Offset(0), 1_700_000_000, &make_record()).unwrap();
+        let written = writer
+            .append(Offset(0), 1_700_000_000, &make_record())
+            .unwrap();
         let after = writer.bytes_written();
 
         assert!(written > 0, "append should report non-zero bytes written");
