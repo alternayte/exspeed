@@ -1,13 +1,13 @@
 use bytes::{Bytes, BytesMut};
+use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
 use tokio_util::codec::{FramedRead, FramedWrite};
-use futures_util::{SinkExt, StreamExt};
 
 use exspeed_protocol::codec::ExspeedCodec;
 use exspeed_protocol::frame::Frame;
-use exspeed_protocol::opcodes::OpCode;
 use exspeed_protocol::messages::connect::{AuthType, ConnectRequest};
+use exspeed_protocol::opcodes::OpCode;
 
 async fn start_server() -> String {
     let port = portpicker::pick_unused_port().unwrap();
@@ -15,11 +15,9 @@ async fn start_server() -> String {
     let bind = addr.clone();
 
     tokio::spawn(async move {
-        exspeed::cli::server::run(exspeed::cli::server::ServerArgs {
-            bind,
-        })
-        .await
-        .unwrap();
+        exspeed::cli::server::run(exspeed::cli::server::ServerArgs { bind })
+            .await
+            .unwrap();
     });
 
     tokio::time::sleep(Duration::from_millis(100)).await;

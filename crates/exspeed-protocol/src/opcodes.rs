@@ -7,33 +7,33 @@ use crate::error::ProtocolError;
 #[repr(u8)]
 pub enum OpCode {
     // Client -> Server
-    Connect       = 0x01,
-    Publish       = 0x02,
-    Subscribe     = 0x03,
-    Unsubscribe   = 0x04,
-    Ack           = 0x05,
-    Nack          = 0x06,
-    Fetch         = 0x07,
-    Seek          = 0x08,
-    CreateStream  = 0x10,
-    DeleteStream  = 0x11,
-    StreamInfo    = 0x12,
+    Connect = 0x01,
+    Publish = 0x02,
+    Subscribe = 0x03,
+    Unsubscribe = 0x04,
+    Ack = 0x05,
+    Nack = 0x06,
+    Fetch = 0x07,
+    Seek = 0x08,
+    CreateStream = 0x10,
+    DeleteStream = 0x11,
+    StreamInfo = 0x12,
     CreateConsumer = 0x13,
     DeleteConsumer = 0x14,
-    Query         = 0x20,
-    QueryCancel   = 0x21,
-    Ping          = 0xF0,
+    Query = 0x20,
+    QueryCancel = 0x21,
+    Ping = 0xF0,
 
     // Server -> Client
-    Ok            = 0x80,
-    Error         = 0x81,
-    Record        = 0x82,
-    RecordsBatch  = 0x83,
+    Ok = 0x80,
+    Error = 0x81,
+    Record = 0x82,
+    RecordsBatch = 0x83,
     StreamInfoResp = 0x84,
-    QueryResult   = 0x85,
-    Rebalance     = 0x86,
-    Drain         = 0x87,
-    Pong          = 0xF1,
+    QueryResult = 0x85,
+    Rebalance = 0x86,
+    Drain = 0x87,
+    Pong = 0xF1,
 }
 
 impl OpCode {
@@ -121,9 +121,14 @@ mod tests {
     #[test]
     fn opcode_roundtrip() {
         let codes = [
-            OpCode::Connect, OpCode::Publish, OpCode::Ping,
-            OpCode::Ok, OpCode::Error, OpCode::Pong,
-            OpCode::Rebalance, OpCode::Drain,
+            OpCode::Connect,
+            OpCode::Publish,
+            OpCode::Ping,
+            OpCode::Ok,
+            OpCode::Error,
+            OpCode::Pong,
+            OpCode::Rebalance,
+            OpCode::Drain,
         ];
         for code in codes {
             let byte = code.as_u8();

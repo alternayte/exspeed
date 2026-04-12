@@ -140,7 +140,10 @@ mod tests {
         buf.put_u32_le(0);
 
         let result = Frame::decode(&mut buf);
-        assert!(matches!(result, Err(ProtocolError::UnsupportedVersion(0xFF))));
+        assert!(matches!(
+            result,
+            Err(ProtocolError::UnsupportedVersion(0xFF))
+        ));
     }
 
     #[test]

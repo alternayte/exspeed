@@ -2,10 +2,10 @@ use std::net::SocketAddr;
 
 use anyhow::Result;
 use clap::Args;
+use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio_util::codec::{FramedRead, FramedWrite};
-use futures_util::{SinkExt, StreamExt};
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use exspeed_protocol::codec::ExspeedCodec;
 use exspeed_protocol::messages::{ClientMessage, ServerMessage};
@@ -36,10 +36,7 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     }
 }
 
-async fn handle_connection(
-    socket: tokio::net::TcpStream,
-    peer: SocketAddr,
-) -> Result<()> {
+async fn handle_connection(socket: tokio::net::TcpStream, peer: SocketAddr) -> Result<()> {
     let (reader, writer) = socket.into_split();
     let mut framed_read = FramedRead::new(reader, ExspeedCodec::new());
     let mut framed_write = FramedWrite::new(writer, ExspeedCodec::new());

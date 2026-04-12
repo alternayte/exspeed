@@ -28,7 +28,10 @@ impl TryFrom<String> for StreamName {
         if s.is_empty() {
             return Err(InvalidName("stream name cannot be empty".into()));
         }
-        if !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        if !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
             return Err(InvalidName(format!(
                 "stream name '{}' contains invalid characters (allowed: a-z, A-Z, 0-9, -, _)",
                 s

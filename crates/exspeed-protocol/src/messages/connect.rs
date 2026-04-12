@@ -5,10 +5,10 @@ use crate::error::ProtocolError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum AuthType {
-    None  = 0x00,
+    None = 0x00,
     Token = 0x01,
-    MTls  = 0x02,
-    Sasl  = 0x03,
+    MTls = 0x02,
+    Sasl = 0x03,
 }
 
 impl TryFrom<u8> for AuthType {
@@ -20,7 +20,9 @@ impl TryFrom<u8> for AuthType {
             0x01 => Ok(AuthType::Token),
             0x02 => Ok(AuthType::MTls),
             0x03 => Ok(AuthType::Sasl),
-            other => Err(ProtocolError::Decode(format!("unknown auth type: 0x{other:02x}"))),
+            other => Err(ProtocolError::Decode(format!(
+                "unknown auth type: 0x{other:02x}"
+            ))),
         }
     }
 }
@@ -50,7 +52,9 @@ impl ConnectRequest {
         let id_len = src.get_u16_le() as usize;
 
         if src.remaining() < id_len + 1 {
-            return Err(ProtocolError::Decode("CONNECT payload truncated at client_id".into()));
+            return Err(ProtocolError::Decode(
+                "CONNECT payload truncated at client_id".into(),
+            ));
         }
 
         let id_bytes = src.split_to(id_len);

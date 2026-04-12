@@ -96,7 +96,8 @@ mod tests {
         let frame = ServerMessage::Error {
             code: 404,
             message: "stream not found".into(),
-        }.into_frame(1);
+        }
+        .into_frame(1);
         assert_eq!(frame.opcode, OpCode::Error);
         assert!(frame.payload.len() > 2);
     }
