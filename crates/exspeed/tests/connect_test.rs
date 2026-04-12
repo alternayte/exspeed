@@ -13,9 +13,12 @@ async fn start_server() -> String {
     let port = portpicker::pick_unused_port().unwrap();
     let addr = format!("127.0.0.1:{}", port);
     let bind = addr.clone();
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().to_path_buf();
 
     tokio::spawn(async move {
-        exspeed::cli::server::run(exspeed::cli::server::ServerArgs { bind })
+        let _tmp = tmp; // keep tempdir alive
+        exspeed::cli::server::run(exspeed::cli::server::ServerArgs { bind, data_dir })
             .await
             .unwrap();
     });

@@ -28,3 +28,4 @@ futures-util = { workspace = true }
 
 [dev-dependencies]
 portpicker = "0.1"
+tempfile = "3"

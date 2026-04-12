@@ -163,14 +163,30 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "exspeed-broker",
  "exspeed-common",
  "exspeed-protocol",
+ "exspeed-storage",
+ "exspeed-streams",
  "futures-util",
  "portpicker",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "exspeed-broker"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "exspeed-common",
+ "exspeed-protocol",
+ "exspeed-storage",
+ "exspeed-streams",
+ "tracing",
 ]
 
 [[package]]
