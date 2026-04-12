@@ -3,6 +3,10 @@ name = "exspeed"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "exspeed"
+path = "src/lib.rs"
+
 [[bin]]
 name = "exspeed"
 path = "src/main.rs"
@@ -18,3 +22,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }
+
+[dev-dependencies]
+portpicker = "0.1"

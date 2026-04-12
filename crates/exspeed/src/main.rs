@@ -1,7 +1,7 @@
-pub mod cli;
-
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
+
+use exspeed::cli;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
