@@ -13,6 +13,8 @@ impl fmt::Display for InvalidName {
     }
 }
 
+impl std::error::Error for InvalidName {}
+
 impl StreamName {
     pub fn as_str(&self) -> &str {
         &self.0
