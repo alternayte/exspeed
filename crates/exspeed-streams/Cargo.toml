@@ -1,0 +1,9 @@
+[package]
+name = "exspeed-streams"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+exspeed-common = { path = "../exspeed-common" }
+bytes = { workspace = true }
+thiserror = { workspace = true }

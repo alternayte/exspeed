@@ -4,6 +4,8 @@ members = [
     "crates/exspeed",
     "crates/exspeed-common",
     "crates/exspeed-protocol",
+    "crates/exspeed-streams",
+    "crates/exspeed-storage",
 ]
 
 [workspace.dependencies]
@@ -30,6 +32,9 @@ clap = { version = "4", features = ["derive"] }
 
 # Async stream utilities
 futures-util = { version = "0.3", features = ["sink"] }
+
+# Checksums
+crc32c = "0.6"
 
 [profile.dev]
 opt-level = 1
