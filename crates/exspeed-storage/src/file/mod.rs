@@ -16,6 +16,7 @@ use exspeed_common::{Offset, StreamName};
 use exspeed_streams::{Record, StorageEngine, StorageError, StoredRecord};
 
 use crate::file::partition::Partition;
+use crate::file::stream_config::StreamConfig;
 
 /// File-backed storage engine.
 ///
@@ -96,7 +97,7 @@ impl FileStorage {
 }
 
 impl StorageEngine for FileStorage {
-    fn create_stream(&self, stream: &StreamName) -> Result<(), StorageError> {
+    fn create_stream(&self, stream: &StreamName, max_age_secs: u64, max_bytes: u64) -> Result<(), StorageError> {
         let mut map = self.partitions.write().unwrap();
         let key = (stream.as_str().to_string(), 0u32);
         if map.contains_key(&key) {
@@ -106,6 +107,11 @@ impl StorageEngine for FileStorage {
         let dir = self.partition_dir(stream.as_str(), 0);
         let partition = Partition::create(&dir, stream.as_str(), 0)?;
         map.insert(key, partition);
+
+        // Save stream config
+        let config = StreamConfig::from_request(max_age_secs, max_bytes);
+        let stream_dir = self.data_dir.join("streams").join(stream.as_str());
+        config.save(&stream_dir).map_err(StorageError::Io)?;
 
         Ok(())
     }

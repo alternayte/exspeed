@@ -188,6 +188,8 @@ mod tests {
     fn create_stream(broker: &Broker, name: &str) -> ServerMessage {
         broker.handle_message(ClientMessage::CreateStream(CreateStreamRequest {
             stream_name: name.into(),
+            max_age_secs: 0,
+            max_bytes: 0,
         }))
     }
 

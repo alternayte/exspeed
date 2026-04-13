@@ -91,6 +91,8 @@ fn connect_frame(corr: u32) -> Frame {
 fn create_stream_frame(stream_name: &str, corr: u32) -> Frame {
     let req = CreateStreamRequest {
         stream_name: stream_name.into(),
+        max_age_secs: 0,
+        max_bytes: 0,
     };
     let mut buf = BytesMut::new();
     req.encode(&mut buf);

@@ -186,6 +186,8 @@ mod tests {
     fn create_stream_frame_to_client_message() {
         let req = CreateStreamRequest {
             stream_name: "test-stream".into(),
+            max_age_secs: 0,
+            max_bytes: 0,
         };
         let mut payload = BytesMut::new();
         req.encode(&mut payload);

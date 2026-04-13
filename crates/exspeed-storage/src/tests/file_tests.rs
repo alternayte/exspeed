@@ -27,7 +27,7 @@ fn crash_recovery_replays_wal() {
     // Phase 1: write records, then drop to simulate crash.
     {
         let storage = FileStorage::new(dir.path()).unwrap();
-        storage.create_stream(&stream("crash")).unwrap();
+        storage.create_stream(&stream("crash"), 0, 0).unwrap();
         for i in 0u64..10 {
             let val = format!("val-{}", i);
             let offset = storage
@@ -59,7 +59,7 @@ fn data_persists_across_restart() {
 
     {
         let storage = FileStorage::new(dir.path()).unwrap();
-        storage.create_stream(&stream("persist")).unwrap();
+        storage.create_stream(&stream("persist"), 0, 0).unwrap();
         storage
             .append(&stream("persist"), &record(b"p0-data"))
             .unwrap();
@@ -81,7 +81,7 @@ fn data_persists_across_restart() {
 fn segment_rolling() {
     let dir = TempDir::new().unwrap();
     let storage = FileStorage::new(dir.path()).unwrap();
-    storage.create_stream(&stream("rolling")).unwrap();
+    storage.create_stream(&stream("rolling"), 0, 0).unwrap();
 
     for i in 0u64..1000 {
         let val = format!("rec-{:04}", i);
@@ -107,7 +107,7 @@ fn milestone_10k_records_crash_recover() {
     // Phase 1: write 10,000 records then drop (crash).
     {
         let storage = FileStorage::new(dir.path()).unwrap();
-        storage.create_stream(&stream("milestone")).unwrap();
+        storage.create_stream(&stream("milestone"), 0, 0).unwrap();
 
         for i in 0u64..10_000 {
             let val = format!("record-{:05}", i);

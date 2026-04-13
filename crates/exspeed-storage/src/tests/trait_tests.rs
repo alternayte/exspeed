@@ -32,7 +32,7 @@ fn record_with_key(subject: &str, key: &[u8], value: &[u8]) -> Record {
 /// Create a stream, append one record, assert offset is 0.
 pub fn test_create_and_append(engine: &impl StorageEngine) {
     let s = stream("test-create");
-    engine.create_stream(&s).unwrap();
+    engine.create_stream(&s, 0, 0).unwrap();
     let offset = engine.append(&s, &record("events", b"hello")).unwrap();
     assert_eq!(offset, Offset(0));
 }
@@ -40,7 +40,7 @@ pub fn test_create_and_append(engine: &impl StorageEngine) {
 /// Create a stream, append a record with key + headers, read back, verify all fields match.
 pub fn test_append_and_read_back(engine: &impl StorageEngine) {
     let s = stream("test-readback");
-    engine.create_stream(&s).unwrap();
+    engine.create_stream(&s, 0, 0).unwrap();
 
     let rec = Record {
         key: Some(Bytes::from_static(b"mykey")),
@@ -76,7 +76,7 @@ pub fn test_append_and_read_back(engine: &impl StorageEngine) {
 /// Append 5 records, verify offsets are 0, 1, 2, 3, 4.
 pub fn test_sequential_offsets(engine: &impl StorageEngine) {
     let s = stream("test-offsets");
-    engine.create_stream(&s).unwrap();
+    engine.create_stream(&s, 0, 0).unwrap();
 
     for i in 0u64..5 {
         let offset = engine.append(&s, &record("events", b"data")).unwrap();
@@ -87,7 +87,7 @@ pub fn test_sequential_offsets(engine: &impl StorageEngine) {
 /// Append 10 records, read from offset 3 with max 4, verify records 3, 4, 5, 6 are returned.
 pub fn test_read_range(engine: &impl StorageEngine) {
     let s = stream("test-range");
-    engine.create_stream(&s).unwrap();
+    engine.create_stream(&s, 0, 0).unwrap();
 
     for i in 0u8..10 {
         engine.append(&s, &record("events", &[i])).unwrap();
@@ -104,7 +104,7 @@ pub fn test_read_range(engine: &impl StorageEngine) {
 /// Create a stream, read from an empty stream, get an empty vec.
 pub fn test_read_empty_stream(engine: &impl StorageEngine) {
     let s = stream("test-empty");
-    engine.create_stream(&s).unwrap();
+    engine.create_stream(&s, 0, 0).unwrap();
 
     let results = engine.read(&s, Offset(0), 100).unwrap();
     assert!(results.is_empty());
@@ -113,7 +113,7 @@ pub fn test_read_empty_stream(engine: &impl StorageEngine) {
 /// Append 1 record, read from offset 999, get an empty vec.
 pub fn test_read_past_end(engine: &impl StorageEngine) {
     let s = stream("test-past-end");
-    engine.create_stream(&s).unwrap();
+    engine.create_stream(&s, 0, 0).unwrap();
     engine.append(&s, &record("events", b"only")).unwrap();
 
     let results = engine.read(&s, Offset(999), 10).unwrap();
@@ -133,9 +133,9 @@ pub fn test_stream_not_found(engine: &impl StorageEngine) {
 /// Create the same stream twice, get StreamAlreadyExists error.
 pub fn test_stream_already_exists(engine: &impl StorageEngine) {
     let s = stream("test-duplicate");
-    engine.create_stream(&s).unwrap();
+    engine.create_stream(&s, 0, 0).unwrap();
 
-    let err = engine.create_stream(&s).unwrap_err();
+    let err = engine.create_stream(&s, 0, 0).unwrap_err();
     assert!(
         matches!(err, StorageError::StreamAlreadyExists(_)),
         "expected StreamAlreadyExists, got {err:?}"
@@ -145,7 +145,7 @@ pub fn test_stream_already_exists(engine: &impl StorageEngine) {
 /// Seek by timestamp: timestamp 0 returns offset 0; far future returns end of stream.
 pub fn test_seek_by_time(engine: &impl StorageEngine) {
     let s = stream("test-seek");
-    engine.create_stream(&s).unwrap();
+    engine.create_stream(&s, 0, 0).unwrap();
 
     // Publish records -- we can't control timestamps in MemoryStorage (they use now()),
     // so just verify seek returns a valid offset
@@ -164,7 +164,7 @@ pub fn test_seek_by_time(engine: &impl StorageEngine) {
 /// Append 2 records, verify the second timestamp is >= the first.
 pub fn test_timestamps_increasing(engine: &impl StorageEngine) {
     let s = stream("test-timestamps");
-    engine.create_stream(&s).unwrap();
+    engine.create_stream(&s, 0, 0).unwrap();
 
     engine.append(&s, &record("events", b"first")).unwrap();
     engine.append(&s, &record("events", b"second")).unwrap();

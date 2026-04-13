@@ -21,7 +21,7 @@ pub fn handle_create_stream(broker: &Broker, req: CreateStreamRequest) -> Server
         }
     };
 
-    match broker.storage.create_stream(&stream_name) {
+    match broker.storage.create_stream(&stream_name, req.max_age_secs, req.max_bytes) {
         Ok(()) => ServerMessage::Ok,
         Err(e) => ServerMessage::Error {
             code: 409,
@@ -376,7 +376,7 @@ pub fn handle_nack(broker: &Broker, req: NackRequest) -> ServerMessage {
         };
 
         // Ignore StreamAlreadyExists error
-        match broker.storage.create_stream(&dlq_stream_name) {
+        match broker.storage.create_stream(&dlq_stream_name, 0, 0) {
             Ok(()) => {}
             Err(StorageError::StreamAlreadyExists(_)) => {}
             Err(e) => {

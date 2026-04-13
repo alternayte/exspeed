@@ -31,7 +31,7 @@ fn now_nanos() -> u64 {
 }
 
 impl StorageEngine for MemoryStorage {
-    fn create_stream(&self, stream: &StreamName) -> Result<(), StorageError> {
+    fn create_stream(&self, stream: &StreamName, _max_age_secs: u64, _max_bytes: u64) -> Result<(), StorageError> {
         let mut map = self.streams.write().unwrap();
         let key = stream.as_str().to_string();
         if map.contains_key(&key) {

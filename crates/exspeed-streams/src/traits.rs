@@ -3,7 +3,7 @@ use crate::record::{Record, StoredRecord};
 use exspeed_common::{Offset, StreamName};
 
 pub trait StorageEngine: Send + Sync {
-    fn create_stream(&self, stream: &StreamName) -> Result<(), StorageError>;
+    fn create_stream(&self, stream: &StreamName, max_age_secs: u64, max_bytes: u64) -> Result<(), StorageError>;
 
     fn append(&self, stream: &StreamName, record: &Record) -> Result<Offset, StorageError>;
 
