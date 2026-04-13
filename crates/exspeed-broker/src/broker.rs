@@ -13,10 +13,10 @@ use exspeed_protocol::messages::{ClientMessage, ServerMessage};
 use exspeed_streams::StorageEngine;
 
 pub struct Broker {
-    pub(crate) storage: Arc<dyn StorageEngine>,
-    pub(crate) consumers: RwLock<HashMap<String, ConsumerState>>,
+    pub storage: Arc<dyn StorageEngine>,
+    pub consumers: RwLock<HashMap<String, ConsumerState>>,
     pub(crate) groups: RwLock<HashMap<String, ConsumerGroup>>,
-    pub(crate) data_dir: PathBuf,
+    pub data_dir: PathBuf,
     pub(crate) max_delivery_attempts: u16,
     pub(crate) nack_attempts: RwLock<HashMap<(String, u64), u16>>,
 }
