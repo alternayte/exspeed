@@ -94,7 +94,8 @@ impl FileStorage {
     /// List all stream names.
     pub fn list_streams(&self) -> Vec<String> {
         let map = self.partitions.read().unwrap();
-        let mut streams: Vec<String> = map.keys()
+        let mut streams: Vec<String> = map
+            .keys()
             .map(|(name, _)| name.clone())
             .collect::<std::collections::HashSet<_>>()
             .into_iter()

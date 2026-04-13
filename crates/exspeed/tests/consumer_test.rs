@@ -29,9 +29,13 @@ async fn start_server() -> String {
 
     tokio::spawn(async move {
         let _tmp = tmp; // keep tempdir alive for the server's lifetime
-        exspeed::cli::server::run(exspeed::cli::server::ServerArgs { bind, api_bind: format!("127.0.0.1:{}", portpicker::pick_unused_port().unwrap()), data_dir })
-            .await
-            .unwrap();
+        exspeed::cli::server::run(exspeed::cli::server::ServerArgs {
+            bind,
+            api_bind: format!("127.0.0.1:{}", portpicker::pick_unused_port().unwrap()),
+            data_dir,
+        })
+        .await
+        .unwrap();
     });
 
     tokio::time::sleep(Duration::from_millis(200)).await;

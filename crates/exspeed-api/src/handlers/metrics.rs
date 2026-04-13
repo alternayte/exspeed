@@ -15,10 +15,7 @@ pub async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl Into
 
     // 2. Update storage bytes per stream.
     for stream in state.storage.list_streams() {
-        let bytes = state
-            .storage
-            .stream_storage_bytes(&stream)
-            .unwrap_or(0) as i64;
+        let bytes = state.storage.stream_storage_bytes(&stream).unwrap_or(0) as i64;
         state.metrics.set_storage_bytes(&stream, bytes);
     }
 

@@ -28,9 +28,7 @@ impl Metrics {
             .build()
             .expect("prometheus exporter should build");
 
-        let provider = SdkMeterProvider::builder()
-            .with_reader(exporter)
-            .build();
+        let provider = SdkMeterProvider::builder().with_reader(exporter).build();
 
         let meter = provider.meter("exspeed");
 

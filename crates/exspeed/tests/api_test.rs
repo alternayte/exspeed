@@ -35,7 +35,11 @@ async fn healthz_returns_ok() {
     let (_tcp, http) = start_server().await;
     let client = reqwest::Client::new();
 
-    let resp = client.get(format!("{}/healthz", http)).send().await.unwrap();
+    let resp = client
+        .get(format!("{}/healthz", http))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
 
     let body: Value = resp.json().await.unwrap();
@@ -120,7 +124,11 @@ async fn metrics_endpoint_returns_prometheus_text() {
     let (_tcp, http) = start_server().await;
     let client = reqwest::Client::new();
 
-    let resp = client.get(format!("{}/metrics", http)).send().await.unwrap();
+    let resp = client
+        .get(format!("{}/metrics", http))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
 
     let body = resp.text().await.unwrap();
