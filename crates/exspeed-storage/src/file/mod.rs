@@ -1,6 +1,7 @@
 pub mod partition;
 pub mod segment_reader;
 pub mod segment_writer;
+pub mod stream_config;
 pub mod wal;
 
 use std::collections::HashMap;
