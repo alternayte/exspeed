@@ -24,35 +24,62 @@ pub struct ServerArgs {
     #[arg(long, default_value = "0.0.0.0:5933")]
     pub bind: String,
 
+    /// Address for the HTTP API
+    #[arg(long, default_value = "0.0.0.0:8080")]
+    pub api_bind: String,
+
     /// Directory for persistent data
     #[arg(long, default_value = "./exspeed-data")]
     pub data_dir: PathBuf,
 }
 
 pub async fn run(args: ServerArgs) -> Result<()> {
-    // Create storage (keep Arc<FileStorage> separately for retention task)
+    // Create storage
     let file_storage = Arc::new(FileStorage::open(&args.data_dir)?);
     let storage: Arc<dyn StorageEngine> = file_storage.clone();
+
+    // Create metrics
+    let (metrics, prometheus_registry) = exspeed_common::Metrics::new();
+    let metrics = Arc::new(metrics);
+
+    // Create broker
     let broker = Arc::new(Broker::new(storage, args.data_dir.clone()));
     broker.load_consumers()?;
 
-    // Spawn retention background task
+    // Create shared AppState
+    let state = Arc::new(exspeed_api::AppState {
+        broker: broker.clone(),
+        storage: file_storage.clone(),
+        metrics: metrics.clone(),
+        start_time: std::time::Instant::now(),
+        prometheus_registry,
+    });
+
+    // Spawn retention task
     exspeed_broker::retention_task::spawn_retention_task(file_storage);
 
-    let addr: SocketAddr = args.bind.parse()?;
-    let listener = TcpListener::bind(addr).await?;
+    // Spawn HTTP API server
+    let api_addr: SocketAddr = args.api_bind.parse()?;
+    tokio::spawn(exspeed_api::serve(state, api_addr));
 
-    info!("exspeed server listening on {}", addr);
+    // TCP server
+    let tcp_addr: SocketAddr = args.bind.parse()?;
+    let listener = TcpListener::bind(tcp_addr).await?;
+    info!("exspeed TCP listening on {}", tcp_addr);
+    info!("exspeed HTTP API listening on {}", api_addr);
 
     loop {
         let (socket, peer) = listener.accept().await?;
         info!(%peer, "new connection");
+        metrics.connection_opened();
 
         let broker = broker.clone();
+        let metrics_clone = metrics.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_connection(socket, peer, broker).await {
                 error!(%peer, "connection error: {}", e);
             }
+            metrics_clone.connection_closed();
             info!(%peer, "connection closed");
         });
     }
