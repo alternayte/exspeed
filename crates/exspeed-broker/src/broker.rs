@@ -21,6 +21,15 @@ impl Broker {
                 code: 500,
                 message: "message should be handled by connection layer".into(),
             },
+            ClientMessage::CreateConsumer(_)
+            | ClientMessage::DeleteConsumer(_)
+            | ClientMessage::Subscribe(_)
+            | ClientMessage::Unsubscribe(_)
+            | ClientMessage::Ack(_)
+            | ClientMessage::Nack(_) => ServerMessage::Error {
+                code: 501,
+                message: "not implemented yet".into(),
+            },
         }
     }
 }

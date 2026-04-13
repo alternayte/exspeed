@@ -1,14 +1,22 @@
+pub mod ack;
 pub mod connect;
+pub mod consumer;
 pub mod fetch;
 pub mod ping;
 pub mod publish;
+pub mod record_delivery;
 pub mod records_batch;
 pub mod stream_mgmt;
 
+pub use ack::{AckRequest, NackRequest};
 pub use connect::{AuthType, ConnectRequest};
+pub use consumer::{
+    CreateConsumerRequest, DeleteConsumerRequest, StartFrom, SubscribeRequest, UnsubscribeRequest,
+};
 pub use fetch::FetchRequest;
 pub use ping::{Ping, Pong};
 pub use publish::PublishRequest;
+pub use record_delivery::RecordDelivery;
 pub use records_batch::{BatchRecord, RecordsBatch};
 pub use stream_mgmt::CreateStreamRequest;
 
@@ -26,6 +34,12 @@ pub enum ClientMessage {
     CreateStream(CreateStreamRequest),
     Publish(PublishRequest),
     Fetch(FetchRequest),
+    CreateConsumer(CreateConsumerRequest),
+    DeleteConsumer(DeleteConsumerRequest),
+    Subscribe(SubscribeRequest),
+    Unsubscribe(UnsubscribeRequest),
+    Ack(AckRequest),
+    Nack(NackRequest),
 }
 
 impl ClientMessage {
@@ -48,6 +62,20 @@ impl ClientMessage {
                 let req = FetchRequest::decode(frame.payload)?;
                 Ok(ClientMessage::Fetch(req))
             }
+            OpCode::CreateConsumer => {
+                Ok(Self::CreateConsumer(CreateConsumerRequest::decode(frame.payload)?))
+            }
+            OpCode::DeleteConsumer => {
+                Ok(Self::DeleteConsumer(DeleteConsumerRequest::decode(frame.payload)?))
+            }
+            OpCode::Subscribe => {
+                Ok(Self::Subscribe(SubscribeRequest::decode(frame.payload)?))
+            }
+            OpCode::Unsubscribe => {
+                Ok(Self::Unsubscribe(UnsubscribeRequest::decode(frame.payload)?))
+            }
+            OpCode::Ack => Ok(Self::Ack(AckRequest::decode(frame.payload)?)),
+            OpCode::Nack => Ok(Self::Nack(NackRequest::decode(frame.payload)?)),
             other => Err(ProtocolError::Decode(format!(
                 "unhandled client opcode: {:?}",
                 other
@@ -64,6 +92,7 @@ pub enum ServerMessage {
     Pong,
     PublishOk { offset: u64 },
     RecordsBatch(RecordsBatch),
+    Record(RecordDelivery),
 }
 
 impl ServerMessage {
@@ -86,6 +115,11 @@ impl ServerMessage {
                 let mut payload = BytesMut::new();
                 batch.encode(&mut payload);
                 Frame::new(OpCode::RecordsBatch, correlation_id, payload.freeze())
+            }
+            ServerMessage::Record(delivery) => {
+                let mut payload = BytesMut::new();
+                delivery.encode(&mut payload);
+                Frame::new(OpCode::Record, 0, payload.freeze()) // correlation_id=0 for push
             }
         }
     }
@@ -243,5 +277,150 @@ mod tests {
         assert_eq!(decoded.records.len(), 1);
         assert_eq!(decoded.records[0].offset, 0);
         assert_eq!(decoded.records[0].subject, "test.sub");
+    }
+
+    // --- Phase 2b: consumer message frame tests ---
+
+    #[test]
+    fn create_consumer_frame_to_client_message() {
+        let req = CreateConsumerRequest {
+            name: "my-consumer".into(),
+            stream: "orders".into(),
+            group: "workers".into(),
+            subject_filter: "orders.created".into(),
+            start_from: StartFrom::Earliest,
+            start_offset: 0,
+        };
+        let mut payload = BytesMut::new();
+        req.encode(&mut payload);
+
+        let frame = Frame::new(OpCode::CreateConsumer, 100, payload.freeze());
+        let msg = ClientMessage::from_frame(frame).unwrap();
+        match msg {
+            ClientMessage::CreateConsumer(r) => {
+                assert_eq!(r.name, "my-consumer");
+                assert_eq!(r.stream, "orders");
+                assert_eq!(r.group, "workers");
+                assert_eq!(r.subject_filter, "orders.created");
+                assert_eq!(r.start_from, StartFrom::Earliest);
+                assert_eq!(r.start_offset, 0);
+            }
+            other => panic!("expected CreateConsumer, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn delete_consumer_frame_to_client_message() {
+        let req = DeleteConsumerRequest {
+            name: "old-consumer".into(),
+        };
+        let mut payload = BytesMut::new();
+        req.encode(&mut payload);
+
+        let frame = Frame::new(OpCode::DeleteConsumer, 101, payload.freeze());
+        let msg = ClientMessage::from_frame(frame).unwrap();
+        match msg {
+            ClientMessage::DeleteConsumer(r) => assert_eq!(r.name, "old-consumer"),
+            other => panic!("expected DeleteConsumer, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn subscribe_frame_to_client_message() {
+        let req = SubscribeRequest {
+            consumer_name: "my-consumer".into(),
+        };
+        let mut payload = BytesMut::new();
+        req.encode(&mut payload);
+
+        let frame = Frame::new(OpCode::Subscribe, 102, payload.freeze());
+        let msg = ClientMessage::from_frame(frame).unwrap();
+        match msg {
+            ClientMessage::Subscribe(r) => assert_eq!(r.consumer_name, "my-consumer"),
+            other => panic!("expected Subscribe, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unsubscribe_frame_to_client_message() {
+        let req = UnsubscribeRequest {
+            consumer_name: "my-consumer".into(),
+        };
+        let mut payload = BytesMut::new();
+        req.encode(&mut payload);
+
+        let frame = Frame::new(OpCode::Unsubscribe, 103, payload.freeze());
+        let msg = ClientMessage::from_frame(frame).unwrap();
+        match msg {
+            ClientMessage::Unsubscribe(r) => assert_eq!(r.consumer_name, "my-consumer"),
+            other => panic!("expected Unsubscribe, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ack_frame_to_client_message() {
+        let req = AckRequest {
+            consumer_name: "acker".into(),
+            offset: 555,
+        };
+        let mut payload = BytesMut::new();
+        req.encode(&mut payload);
+
+        let frame = Frame::new(OpCode::Ack, 104, payload.freeze());
+        let msg = ClientMessage::from_frame(frame).unwrap();
+        match msg {
+            ClientMessage::Ack(r) => {
+                assert_eq!(r.consumer_name, "acker");
+                assert_eq!(r.offset, 555);
+            }
+            other => panic!("expected Ack, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn nack_frame_to_client_message() {
+        let req = NackRequest {
+            consumer_name: "nacker".into(),
+            offset: 777,
+        };
+        let mut payload = BytesMut::new();
+        req.encode(&mut payload);
+
+        let frame = Frame::new(OpCode::Nack, 105, payload.freeze());
+        let msg = ClientMessage::from_frame(frame).unwrap();
+        match msg {
+            ClientMessage::Nack(r) => {
+                assert_eq!(r.consumer_name, "nacker");
+                assert_eq!(r.offset, 777);
+            }
+            other => panic!("expected Nack, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn record_delivery_to_frame() {
+        let delivery = RecordDelivery {
+            consumer_name: "my-consumer".into(),
+            offset: 42,
+            timestamp: 1_700_000_000,
+            subject: "orders.created".into(),
+            delivery_attempt: 1,
+            key: Some(Bytes::from_static(b"key-1")),
+            value: Bytes::from_static(b"payload-data"),
+            headers: vec![("trace".into(), "t1".into())],
+        };
+        let frame = ServerMessage::Record(delivery).into_frame(0);
+        assert_eq!(frame.opcode, OpCode::Record);
+        assert_eq!(frame.correlation_id, 0);
+
+        let decoded = RecordDelivery::decode(frame.payload).unwrap();
+        assert_eq!(decoded.consumer_name, "my-consumer");
+        assert_eq!(decoded.offset, 42);
+        assert_eq!(decoded.timestamp, 1_700_000_000);
+        assert_eq!(decoded.subject, "orders.created");
+        assert_eq!(decoded.delivery_attempt, 1);
+        assert_eq!(decoded.key, Some(Bytes::from_static(b"key-1")));
+        assert_eq!(decoded.value, Bytes::from_static(b"payload-data"));
+        assert_eq!(decoded.headers, vec![("trace".into(), "t1".into())]);
     }
 }
