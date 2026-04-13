@@ -1,4 +1,4 @@
-// Built in Task 8
+// Built in Task 8, updated in Task 4 (Phase 3)
 
 use std::fs;
 use std::io;
@@ -9,8 +9,10 @@ use exspeed_common::Offset;
 use exspeed_streams::record::{Record, StoredRecord};
 use tracing::info;
 
+use crate::file::offset_index::OffsetIndex;
 use crate::file::segment_reader::SegmentReader;
 use crate::file::segment_writer::SegmentWriter;
+use crate::file::time_index::{self, TimeIndex};
 use crate::file::wal::{replay_wal, WalWriter};
 
 /// Default maximum segment size before rolling: 256 MiB.
@@ -210,14 +212,18 @@ impl Partition {
         Ok(result)
     }
 
-    /// Roll the active segment: seal it, open a reader for it, and create
-    /// a new active segment starting at `next_offset`.
+    /// Roll the active segment: seal it, build indexes, open a reader for it,
+    /// and create a new active segment starting at `next_offset`.
     fn roll_segment(&mut self) -> io::Result<()> {
         // Sync the current active writer.
         self.active_writer.sync()?;
 
-        // Open the current segment as a sealed reader.
-        let sealed = SegmentReader::open(self.active_writer.path())?;
+        // Build indexes for the sealed segment.
+        let seg_path = self.active_writer.path().to_path_buf();
+        self.build_indexes(&seg_path)?;
+
+        // Open the current segment as a sealed reader (will load the new index files).
+        let sealed = SegmentReader::open(&seg_path)?;
         self.sealed_readers.push(sealed);
 
         // Create a new segment.
@@ -225,6 +231,38 @@ impl Partition {
 
         // Truncate the WAL — all records prior to this point are in sealed segments.
         self.wal.truncate()?;
+
+        Ok(())
+    }
+
+    /// Scan the segment at `seg_path` and build companion `.idx` and `.tix`
+    /// index files alongside it.
+    fn build_indexes(&self, seg_path: &Path) -> io::Result<()> {
+        // Open a temporary reader to scan the data. Indexes don't exist yet,
+        // so offset_index and time_index will be None — that's fine, we only
+        // need sequential scanning here.
+        let reader = SegmentReader::open(seg_path)?;
+        let index_data = reader.scan_for_index_data()?;
+
+        if index_data.is_empty() {
+            return Ok(());
+        }
+
+        // Build offset index (.idx).
+        let offset_entries: Vec<(u64, u32)> = index_data
+            .iter()
+            .map(|&(offset, file_pos, _)| (offset, file_pos))
+            .collect();
+        let idx_path = seg_path.with_extension("idx");
+        OffsetIndex::build(&idx_path, &offset_entries)?;
+
+        // Build timestamp index (.tix).
+        let time_entries: Vec<(u64, u64)> = index_data
+            .iter()
+            .map(|&(offset, _, timestamp)| (timestamp, offset))
+            .collect();
+        let tix_path = seg_path.with_extension("tix");
+        TimeIndex::build(&tix_path, &time_entries, time_index::DEFAULT_INTERVAL)?;
 
         Ok(())
     }

@@ -1,4 +1,4 @@
-// Built in Task 6
+// Built in Task 6, updated in Task 4 (Phase 3)
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -7,18 +7,25 @@ use std::path::{Path, PathBuf};
 use exspeed_streams::record::StoredRecord;
 
 use crate::encoding::{decode_record, unwrap_crc};
+use crate::file::offset_index::OffsetIndex;
 use crate::file::segment_writer::{SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION};
+use crate::file::time_index::TimeIndex;
 
 /// Read-only accessor for a sealed segment file.
 ///
 /// A new `File` handle is opened for each read operation so the reader
 /// can be used safely across threads without holding a persistent handle.
+///
+/// When companion index files (`.idx`, `.tix`) exist alongside the segment,
+/// they are loaded automatically and used to accelerate lookups. Segments
+/// without index files fall back to sequential scanning.
 #[derive(Debug)]
 pub struct SegmentReader {
     path: PathBuf,
     base_offset: u64,
-    #[allow(dead_code)]
     file_size: u64,
+    offset_index: Option<OffsetIndex>,
+    time_index: Option<TimeIndex>,
 }
 
 impl SegmentReader {
@@ -26,6 +33,10 @@ impl SegmentReader {
     ///
     /// Returns an error if the file cannot be opened, if the magic bytes do not
     /// match `SEGMENT_MAGIC`, or if the version byte is not `SEGMENT_VERSION`.
+    ///
+    /// Companion index files are loaded on a best-effort basis:
+    /// - `.idx` (offset index) — enables O(1) offset lookups
+    /// - `.tix` (time index)   — enables seek-by-timestamp
     pub fn open(path: &Path) -> io::Result<Self> {
         let mut file = File::open(path)?;
         let file_size = file.metadata()?.len();
@@ -60,16 +71,40 @@ impl SegmentReader {
         // Read base_offset from bytes 5-12 (u64 LE).
         let base_offset = u64::from_le_bytes(header[5..13].try_into().unwrap());
 
+        // Try to load companion index files (graceful fallback to None).
+        let idx_path = path.with_extension("idx");
+        let offset_index = OffsetIndex::load(&idx_path).ok();
+
+        let tix_path = path.with_extension("tix");
+        let time_index = TimeIndex::load(&tix_path).ok();
+
         Ok(Self {
             path: path.to_path_buf(),
             base_offset,
             file_size,
+            offset_index,
+            time_index,
         })
     }
 
     /// The base offset this segment was created with.
     pub fn base_offset(&self) -> u64 {
         self.base_offset
+    }
+
+    /// Get the file size of this segment.
+    pub fn file_size(&self) -> u64 {
+        self.file_size
+    }
+
+    /// Seek by timestamp using the time index. Returns approximate offset.
+    pub fn seek_by_time(&self, timestamp: u64) -> Option<u64> {
+        self.time_index.as_ref()?.seek_by_time(timestamp)
+    }
+
+    /// Get the last timestamp from the time index.
+    pub fn last_timestamp(&self) -> Option<u64> {
+        self.time_index.as_ref()?.last_timestamp()
     }
 
     /// Read all records from the segment file sequentially.
@@ -99,7 +134,18 @@ impl SegmentReader {
 
     /// Read records from `from_offset` (inclusive), returning at most
     /// `max_records` results.
+    ///
+    /// When an offset index is available, seeks directly to the target offset's
+    /// file position instead of scanning the entire segment.
     pub fn read_from(&self, from_offset: u64, max_records: usize) -> io::Result<Vec<StoredRecord>> {
+        if let Some(ref idx) = self.offset_index {
+            if let Some(file_pos) = idx.lookup(from_offset) {
+                // Fast path: jump directly to the record's file position.
+                return self.read_from_file_position(file_pos as u64, from_offset, max_records);
+            }
+        }
+
+        // Fallback: sequential scan + filter.
         let all = self.read_all()?;
         let filtered: Vec<StoredRecord> = all
             .into_iter()
@@ -116,7 +162,64 @@ impl SegmentReader {
         Ok(records.last().map(|r| r.offset.0))
     }
 
+    /// Scan a segment sequentially, collecting data needed for index building.
+    /// Returns Vec of (offset, file_position, timestamp) for each record.
+    pub fn scan_for_index_data(&self) -> io::Result<Vec<(u64, u32, u64)>> {
+        let mut file = File::open(&self.path)?;
+        file.seek(SeekFrom::Start(SEGMENT_HEADER_SIZE as u64))?;
+
+        let mut entries = Vec::new();
+        let mut pos = SEGMENT_HEADER_SIZE as u64;
+
+        loop {
+            let file_pos = pos as u32;
+            match self.read_one_record(&mut file, pos) {
+                Ok((record, consumed)) => {
+                    entries.push((record.offset.0, file_pos, record.timestamp));
+                    pos += consumed as u64;
+                }
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(entries)
+    }
+
     // ── Private helpers ──────────────────────────────────────────────────────
+
+    /// Read records starting from `file_pos` in the segment file, collecting
+    /// only those with offset >= `from_offset`, up to `max_records`.
+    fn read_from_file_position(
+        &self,
+        file_pos: u64,
+        from_offset: u64,
+        max_records: usize,
+    ) -> io::Result<Vec<StoredRecord>> {
+        let mut file = File::open(&self.path)?;
+        file.seek(SeekFrom::Start(file_pos))?;
+
+        let mut records = Vec::new();
+        let mut pos = file_pos;
+
+        loop {
+            if records.len() >= max_records {
+                break;
+            }
+            match self.read_one_record(&mut file, pos) {
+                Ok((record, consumed)) => {
+                    pos += consumed as u64;
+                    if record.offset.0 >= from_offset {
+                        records.push(record);
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(records)
+    }
 
     /// Read a single framed record from `file` starting at byte position `pos`.
     ///

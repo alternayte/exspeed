@@ -222,6 +222,8 @@ dependencies = [
  "crc32c",
  "exspeed-common",
  "exspeed-streams",
+ "serde",
+ "serde_json",
  "tempfile",
  "tracing",
 ]

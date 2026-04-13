@@ -26,6 +26,7 @@ pub struct TimeIndexEntry {
 /// Covers one segment file. Every `interval`-th record is sampled, plus the
 /// first and last records are always included. Entries are stored in ascending
 /// timestamp order, enabling binary search for seek-by-time.
+#[derive(Debug)]
 pub struct TimeIndex {
     path: PathBuf,
     entries: Vec<TimeIndexEntry>,
