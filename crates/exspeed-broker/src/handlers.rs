@@ -21,7 +21,10 @@ pub fn handle_create_stream(broker: &Broker, req: CreateStreamRequest) -> Server
         }
     };
 
-    match broker.storage.create_stream(&stream_name, req.max_age_secs, req.max_bytes) {
+    match broker
+        .storage
+        .create_stream(&stream_name, req.max_age_secs, req.max_bytes)
+    {
         Ok(()) => ServerMessage::Ok,
         Err(e) => ServerMessage::Error {
             code: 409,

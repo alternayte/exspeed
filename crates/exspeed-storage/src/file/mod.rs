@@ -121,7 +121,12 @@ impl FileStorage {
 }
 
 impl StorageEngine for FileStorage {
-    fn create_stream(&self, stream: &StreamName, max_age_secs: u64, max_bytes: u64) -> Result<(), StorageError> {
+    fn create_stream(
+        &self,
+        stream: &StreamName,
+        max_age_secs: u64,
+        max_bytes: u64,
+    ) -> Result<(), StorageError> {
         let mut map = self.partitions.write().unwrap();
         let key = (stream.as_str().to_string(), 0u32);
         if map.contains_key(&key) {

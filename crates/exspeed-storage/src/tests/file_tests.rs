@@ -176,10 +176,7 @@ fn retention_deletes_old_segments_by_age() {
 
     // At this point there should be at least 1 sealed segment.
     let total_before = partition.total_bytes();
-    assert!(
-        total_before > 0,
-        "partition should have some bytes written"
-    );
+    assert!(total_before > 0, "partition should have some bytes written");
 
     // Wait just over 1 second so the sealed segments age out.
     thread::sleep(Duration::from_millis(1500));
@@ -190,10 +187,7 @@ fn retention_deletes_old_segments_by_age() {
         stats.segments_deleted > 0,
         "expected at least one sealed segment to be deleted by age retention"
     );
-    assert!(
-        stats.bytes_reclaimed > 0,
-        "expected bytes to be reclaimed"
-    );
+    assert!(stats.bytes_reclaimed > 0, "expected bytes to be reclaimed");
 
     // Total bytes should have decreased.
     let total_after = partition.total_bytes();

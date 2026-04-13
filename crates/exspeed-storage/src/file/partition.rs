@@ -248,7 +248,11 @@ impl Partition {
 
     /// Enforce retention: delete old sealed segments based on age and size limits.
     /// Never deletes the active segment.
-    pub fn enforce_retention(&mut self, max_age_secs: u64, max_bytes: u64) -> io::Result<RetentionStats> {
+    pub fn enforce_retention(
+        &mut self,
+        max_age_secs: u64,
+        max_bytes: u64,
+    ) -> io::Result<RetentionStats> {
         let mut stats = RetentionStats::default();
         let now = now_nanos();
         let age_cutoff_nanos = now.saturating_sub(max_age_secs * 1_000_000_000);

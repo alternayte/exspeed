@@ -1,5 +1,5 @@
-use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crate::error::ProtocolError;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 #[derive(Debug, Clone)]
 pub struct SeekRequest {
@@ -26,7 +26,10 @@ impl SeekRequest {
         let consumer_name = String::from_utf8(src.split_to(name_len).to_vec())
             .map_err(|e| ProtocolError::Decode(format!("SEEK name UTF-8: {e}")))?;
         let timestamp = src.get_u64_le();
-        Ok(Self { consumer_name, timestamp })
+        Ok(Self {
+            consumer_name,
+            timestamp,
+        })
     }
 }
 

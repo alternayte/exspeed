@@ -44,8 +44,7 @@ impl StreamConfig {
     pub fn save(&self, stream_dir: &Path) -> io::Result<()> {
         fs::create_dir_all(stream_dir)?;
         let path = stream_dir.join("stream.json");
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let json = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
         let mut file = File::create(&path)?;
         file.write_all(json.as_bytes())?;
         file.flush()?;

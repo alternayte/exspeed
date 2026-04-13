@@ -16,10 +16,8 @@ pub fn spawn_retention_task(storage: Arc<FileStorage>) {
             interval.tick().await;
 
             let storage_clone = storage.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                storage_clone.enforce_all_retention()
-            })
-            .await;
+            let result =
+                tokio::task::spawn_blocking(move || storage_clone.enforce_all_retention()).await;
 
             match result {
                 Ok(Ok(())) => {}

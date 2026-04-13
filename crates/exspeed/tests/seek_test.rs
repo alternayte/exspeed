@@ -274,12 +274,7 @@ async fn seek_repositions_consumer() {
     assert!(seek_timestamp > 0, "timestamp should be non-zero");
 
     // 6. Unsubscribe
-    let resp = send_recv(
-        &mut writer,
-        &mut reader,
-        unsubscribe_frame("seeker", 202),
-    )
-    .await;
+    let resp = send_recv(&mut writer, &mut reader, unsubscribe_frame("seeker", 202)).await;
     assert_eq!(resp.opcode, OpCode::Ok, "UNSUBSCRIBE should return Ok");
 
     // Brief sleep to let the delivery task stop
@@ -296,7 +291,10 @@ async fn seek_repositions_consumer() {
 
     // The payload contains the new offset (u64 LE)
     let mut payload = resp.payload;
-    assert!(payload.remaining() >= 8, "SEEK response should contain offset");
+    assert!(
+        payload.remaining() >= 8,
+        "SEEK response should contain offset"
+    );
     let seek_offset = payload.get_u64_le();
     // The seek offset should be at or before offset 2 (due to sparse index rounding)
     assert!(
@@ -368,13 +366,12 @@ async fn seek_to_beginning_returns_offset_zero() {
     assert_eq!(resp.opcode, OpCode::Ok);
 
     // SEEK with timestamp=0 should return offset 0
-    let resp = send_recv(
-        &mut writer,
-        &mut reader,
-        seek_frame("log-reader", 0, 201),
-    )
-    .await;
-    assert_eq!(resp.opcode, OpCode::Ok, "SEEK to timestamp=0 should return Ok");
+    let resp = send_recv(&mut writer, &mut reader, seek_frame("log-reader", 0, 201)).await;
+    assert_eq!(
+        resp.opcode,
+        OpCode::Ok,
+        "SEEK to timestamp=0 should return Ok"
+    );
 
     let mut payload = resp.payload;
     assert!(payload.remaining() >= 8);

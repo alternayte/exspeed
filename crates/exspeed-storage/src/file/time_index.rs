@@ -28,8 +28,10 @@ pub struct TimeIndexEntry {
 /// timestamp order, enabling binary search for seek-by-time.
 #[derive(Debug)]
 pub struct TimeIndex {
+    #[allow(dead_code)]
     path: PathBuf,
     entries: Vec<TimeIndexEntry>,
+    #[allow(dead_code)]
     interval: u32,
 }
 
@@ -39,11 +41,7 @@ impl TimeIndex {
     /// `all_records` is a slice of `(timestamp, offset)` pairs for every record
     /// in the segment, in order. Every `interval`-th record is sampled; the
     /// first and last records are always included regardless of interval.
-    pub fn build(
-        tix_path: &Path,
-        all_records: &[(u64, u64)],
-        interval: u32,
-    ) -> io::Result<Self> {
+    pub fn build(tix_path: &Path, all_records: &[(u64, u64)], interval: u32) -> io::Result<Self> {
         let mut sampled: Vec<TimeIndexEntry> = Vec::new();
 
         if !all_records.is_empty() {
@@ -54,7 +52,10 @@ impl TimeIndex {
                 let is_sampled = i % interval_usize == 0;
                 if is_first || is_last || is_sampled {
                     // Avoid duplicates when first/last overlap with sampled
-                    if sampled.last().map_or(true, |e: &TimeIndexEntry| e.offset != offset) {
+                    if sampled
+                        .last()
+                        .is_none_or(|e: &TimeIndexEntry| e.offset != offset)
+                    {
                         sampled.push(TimeIndexEntry { timestamp, offset });
                     }
                 }
