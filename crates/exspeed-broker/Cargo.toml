@@ -9,6 +9,10 @@ exspeed-streams = { path = "../exspeed-streams" }
 exspeed-protocol = { path = "../exspeed-protocol" }
 bytes = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 exspeed-storage = { path = "../exspeed-storage" }
+tempfile = "3"

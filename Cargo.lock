@@ -186,6 +186,10 @@ dependencies = [
  "exspeed-protocol",
  "exspeed-storage",
  "exspeed-streams",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
  "tracing",
 ]
 
