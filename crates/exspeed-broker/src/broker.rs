@@ -1,34 +1,80 @@
+use std::collections::HashMap;
+use std::io;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
+
+use crate::consumer_state::{ConsumerGroup, ConsumerState};
 use crate::handlers;
+use crate::persistence;
 use exspeed_protocol::messages::{ClientMessage, ServerMessage};
 use exspeed_streams::StorageEngine;
-use std::sync::Arc;
 
 pub struct Broker {
-    storage: Arc<dyn StorageEngine>,
+    pub(crate) storage: Arc<dyn StorageEngine>,
+    pub(crate) consumers: RwLock<HashMap<String, ConsumerState>>,
+    pub(crate) groups: RwLock<HashMap<String, ConsumerGroup>>,
+    pub(crate) data_dir: PathBuf,
+    pub(crate) max_delivery_attempts: u16,
+    pub(crate) nack_attempts: RwLock<HashMap<(String, u64), u16>>,
 }
 
 impl Broker {
-    pub fn new(storage: Arc<dyn StorageEngine>) -> Self {
-        Self { storage }
+    pub fn new(storage: Arc<dyn StorageEngine>, data_dir: PathBuf) -> Self {
+        Self {
+            storage,
+            consumers: RwLock::new(HashMap::new()),
+            groups: RwLock::new(HashMap::new()),
+            data_dir,
+            max_delivery_attempts: 5,
+            nack_attempts: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Load all persisted consumers from disk and rebuild in-memory state.
+    pub fn load_consumers(&self) -> io::Result<()> {
+        let configs = persistence::load_all_consumers(&self.data_dir)?;
+        let mut consumers = self.consumers.write().unwrap();
+        let mut groups = self.groups.write().unwrap();
+
+        for config in configs {
+            let group_name = config.group.clone();
+            let consumer_name = config.name.clone();
+
+            consumers.insert(
+                consumer_name.clone(),
+                ConsumerState {
+                    config,
+                    delivery_tx: None,
+                },
+            );
+
+            if !group_name.is_empty() {
+                groups
+                    .entry(group_name.clone())
+                    .or_insert_with(|| ConsumerGroup::new(&group_name))
+                    .add_member(&consumer_name);
+            }
+        }
+
+        Ok(())
     }
 
     pub fn handle_message(&self, msg: ClientMessage) -> ServerMessage {
         match msg {
-            ClientMessage::CreateStream(req) => handlers::handle_create_stream(&self.storage, req),
-            ClientMessage::Publish(req) => handlers::handle_publish(&self.storage, req),
-            ClientMessage::Fetch(req) => handlers::handle_fetch(&self.storage, req),
+            ClientMessage::CreateStream(req) => handlers::handle_create_stream(self, req),
+            ClientMessage::Publish(req) => handlers::handle_publish(self, req),
+            ClientMessage::Fetch(req) => handlers::handle_fetch(self, req),
+            ClientMessage::CreateConsumer(req) => handlers::handle_create_consumer(self, req),
+            ClientMessage::DeleteConsumer(req) => handlers::handle_delete_consumer(self, req),
+            ClientMessage::Ack(req) => handlers::handle_ack(self, req),
+            ClientMessage::Nack(req) => handlers::handle_nack(self, req),
             ClientMessage::Connect(_) | ClientMessage::Ping => ServerMessage::Error {
                 code: 500,
                 message: "message should be handled by connection layer".into(),
             },
-            ClientMessage::CreateConsumer(_)
-            | ClientMessage::DeleteConsumer(_)
-            | ClientMessage::Subscribe(_)
-            | ClientMessage::Unsubscribe(_)
-            | ClientMessage::Ack(_)
-            | ClientMessage::Nack(_) => ServerMessage::Error {
-                code: 501,
-                message: "not implemented yet".into(),
+            ClientMessage::Subscribe(_) | ClientMessage::Unsubscribe(_) => ServerMessage::Error {
+                code: 500,
+                message: "subscribe/unsubscribe handled by connection layer".into(),
             },
         }
     }
@@ -39,15 +85,19 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use exspeed_protocol::messages::{
-        CreateStreamRequest, FetchRequest, PublishRequest, RecordsBatch, ServerMessage,
+        AckRequest, CreateConsumerRequest, CreateStreamRequest, DeleteConsumerRequest,
+        FetchRequest, NackRequest, PublishRequest, RecordsBatch, ServerMessage, StartFrom,
     };
     use exspeed_storage::memory::MemoryStorage;
+    use tempfile::TempDir;
 
     // --- Helpers ---
 
-    fn make_broker() -> Broker {
+    fn make_broker() -> (Broker, TempDir) {
+        let dir = TempDir::new().unwrap();
         let storage = Arc::new(MemoryStorage::new());
-        Broker::new(storage)
+        let broker = Broker::new(storage, dir.path().to_path_buf());
+        (broker, dir)
     }
 
     fn create_stream(broker: &Broker, name: &str) -> ServerMessage {
@@ -110,7 +160,7 @@ mod tests {
 
     #[test]
     fn create_stream_ok() {
-        let broker = make_broker();
+        let (broker, _dir) = make_broker();
         let resp = create_stream(&broker, "events");
         assert!(
             matches!(resp, ServerMessage::Ok),
@@ -121,7 +171,7 @@ mod tests {
 
     #[test]
     fn create_duplicate_stream_error() {
-        let broker = make_broker();
+        let (broker, _dir) = make_broker();
         create_stream(&broker, "events");
         let resp = create_stream(&broker, "events");
         assert!(
@@ -133,7 +183,7 @@ mod tests {
 
     #[test]
     fn publish_returns_offset() {
-        let broker = make_broker();
+        let (broker, _dir) = make_broker();
         create_stream(&broker, "events");
         let offset = unwrap_publish_offset(publish(&broker, "events", "events.created", b"data"));
         assert_eq!(offset, 0);
@@ -141,7 +191,7 @@ mod tests {
 
     #[test]
     fn publish_sequential_offsets() {
-        let broker = make_broker();
+        let (broker, _dir) = make_broker();
         create_stream(&broker, "orders");
         let o0 = unwrap_publish_offset(publish(&broker, "orders", "orders.created", b"a"));
         let o1 = unwrap_publish_offset(publish(&broker, "orders", "orders.created", b"b"));
@@ -153,7 +203,7 @@ mod tests {
 
     #[test]
     fn publish_to_nonexistent_stream_error() {
-        let broker = make_broker();
+        let (broker, _dir) = make_broker();
         let resp = publish(&broker, "ghost", "ghost.event", b"data");
         assert!(
             matches!(resp, ServerMessage::Error { .. }),
@@ -164,7 +214,7 @@ mod tests {
 
     #[test]
     fn fetch_after_publish() {
-        let broker = make_broker();
+        let (broker, _dir) = make_broker();
         create_stream(&broker, "logs");
         publish(&broker, "logs", "logs.info", b"msg1");
         publish(&broker, "logs", "logs.warn", b"msg2");
@@ -182,7 +232,7 @@ mod tests {
 
     #[test]
     fn fetch_with_subject_filter() {
-        let broker = make_broker();
+        let (broker, _dir) = make_broker();
         create_stream(&broker, "orders");
         publish(&broker, "orders", "order.eu.created", b"1");
         publish(&broker, "orders", "order.us.created", b"2");
@@ -218,7 +268,7 @@ mod tests {
 
     #[test]
     fn fetch_empty_stream() {
-        let broker = make_broker();
+        let (broker, _dir) = make_broker();
         create_stream(&broker, "empty");
         let batch = unwrap_batch(fetch(&broker, "empty", 0, 10, ""));
         assert!(batch.records.is_empty(), "expected empty batch");
@@ -226,7 +276,7 @@ mod tests {
 
     #[test]
     fn fetch_nonexistent_stream_error() {
-        let broker = make_broker();
+        let (broker, _dir) = make_broker();
         let resp = fetch(&broker, "ghost", 0, 10, "");
         assert!(
             matches!(resp, ServerMessage::Error { .. }),
@@ -237,7 +287,7 @@ mod tests {
 
     #[test]
     fn publish_with_key_and_headers() {
-        let broker = make_broker();
+        let (broker, _dir) = make_broker();
         create_stream(&broker, "events");
 
         let key = Bytes::from_static(b"user-42");
@@ -261,5 +311,238 @@ mod tests {
         assert_eq!(record.key, Some(key), "key should be preserved");
         assert_eq!(record.headers, headers, "headers should be preserved");
         assert_eq!(record.value, Bytes::from_static(b"{\"id\":42}"));
+    }
+
+    // --- Consumer CRUD tests ---
+
+    #[test]
+    fn create_consumer_ok() {
+        let (broker, _dir) = make_broker();
+        create_stream(&broker, "events");
+
+        let resp = broker.handle_message(ClientMessage::CreateConsumer(CreateConsumerRequest {
+            name: "my-consumer".into(),
+            stream: "events".into(),
+            group: String::new(),
+            subject_filter: String::new(),
+            start_from: StartFrom::Earliest,
+            start_offset: 0,
+        }));
+        assert!(
+            matches!(resp, ServerMessage::Ok),
+            "expected Ok, got {:?}",
+            resp
+        );
+
+        // Verify consumer is in state
+        let consumers = broker.consumers.read().unwrap();
+        assert!(consumers.contains_key("my-consumer"));
+    }
+
+    #[test]
+    fn create_consumer_nonexistent_stream() {
+        let (broker, _dir) = make_broker();
+
+        let resp = broker.handle_message(ClientMessage::CreateConsumer(CreateConsumerRequest {
+            name: "orphan".into(),
+            stream: "ghost".into(),
+            group: String::new(),
+            subject_filter: String::new(),
+            start_from: StartFrom::Earliest,
+            start_offset: 0,
+        }));
+        assert!(
+            matches!(resp, ServerMessage::Error { .. }),
+            "expected Error for non-existent stream, got {:?}",
+            resp
+        );
+    }
+
+    #[test]
+    fn create_duplicate_consumer() {
+        let (broker, _dir) = make_broker();
+        create_stream(&broker, "events");
+
+        let req = CreateConsumerRequest {
+            name: "dup".into(),
+            stream: "events".into(),
+            group: String::new(),
+            subject_filter: String::new(),
+            start_from: StartFrom::Earliest,
+            start_offset: 0,
+        };
+        let resp1 = broker.handle_message(ClientMessage::CreateConsumer(req.clone()));
+        assert!(matches!(resp1, ServerMessage::Ok));
+
+        let resp2 = broker.handle_message(ClientMessage::CreateConsumer(req));
+        assert!(
+            matches!(resp2, ServerMessage::Error { .. }),
+            "expected Error on duplicate consumer, got {:?}",
+            resp2
+        );
+    }
+
+    #[test]
+    fn delete_consumer_ok() {
+        let (broker, _dir) = make_broker();
+        create_stream(&broker, "events");
+
+        broker.handle_message(ClientMessage::CreateConsumer(CreateConsumerRequest {
+            name: "doomed".into(),
+            stream: "events".into(),
+            group: String::new(),
+            subject_filter: String::new(),
+            start_from: StartFrom::Earliest,
+            start_offset: 0,
+        }));
+
+        let resp = broker.handle_message(ClientMessage::DeleteConsumer(DeleteConsumerRequest {
+            name: "doomed".into(),
+        }));
+        assert!(
+            matches!(resp, ServerMessage::Ok),
+            "expected Ok, got {:?}",
+            resp
+        );
+
+        let consumers = broker.consumers.read().unwrap();
+        assert!(!consumers.contains_key("doomed"));
+    }
+
+    #[test]
+    fn delete_nonexistent_consumer() {
+        let (broker, _dir) = make_broker();
+
+        let resp = broker.handle_message(ClientMessage::DeleteConsumer(DeleteConsumerRequest {
+            name: "ghost".into(),
+        }));
+        assert!(
+            matches!(resp, ServerMessage::Error { .. }),
+            "expected Error deleting non-existent consumer, got {:?}",
+            resp
+        );
+    }
+
+    #[test]
+    fn ack_advances_offset() {
+        let (broker, _dir) = make_broker();
+        create_stream(&broker, "events");
+
+        // Publish some records
+        for i in 0..5 {
+            publish(&broker, "events", "events.tick", format!("msg-{i}").as_bytes());
+        }
+
+        // Create consumer
+        broker.handle_message(ClientMessage::CreateConsumer(CreateConsumerRequest {
+            name: "acker".into(),
+            stream: "events".into(),
+            group: String::new(),
+            subject_filter: String::new(),
+            start_from: StartFrom::Earliest,
+            start_offset: 0,
+        }));
+
+        // ACK offset 3
+        let resp = broker.handle_message(ClientMessage::Ack(AckRequest {
+            consumer_name: "acker".into(),
+            offset: 3,
+        }));
+        assert!(matches!(resp, ServerMessage::Ok));
+
+        // Verify offset advanced
+        let consumers = broker.consumers.read().unwrap();
+        let state = consumers.get("acker").unwrap();
+        assert_eq!(state.config.offset, 3);
+    }
+
+    #[test]
+    fn nack_increments_attempts() {
+        let (broker, _dir) = make_broker();
+        create_stream(&broker, "events");
+        publish(&broker, "events", "events.fail", b"bad-record");
+
+        broker.handle_message(ClientMessage::CreateConsumer(CreateConsumerRequest {
+            name: "nacker".into(),
+            stream: "events".into(),
+            group: String::new(),
+            subject_filter: String::new(),
+            start_from: StartFrom::Earliest,
+            start_offset: 0,
+        }));
+
+        // NACK once — should not create DLQ yet
+        let resp = broker.handle_message(ClientMessage::Nack(NackRequest {
+            consumer_name: "nacker".into(),
+            offset: 0,
+        }));
+        assert!(matches!(resp, ServerMessage::Ok));
+
+        // Verify attempts incremented
+        let nack_attempts = broker.nack_attempts.read().unwrap();
+        assert_eq!(
+            *nack_attempts.get(&("nacker".into(), 0u64)).unwrap(),
+            1
+        );
+
+        // DLQ stream should NOT exist yet (only 1 attempt < max_delivery_attempts=5)
+        let dlq_resp = fetch(&broker, "events-dlq", 0, 10, "");
+        assert!(
+            matches!(dlq_resp, ServerMessage::Error { .. }),
+            "DLQ should not exist yet"
+        );
+    }
+
+    #[test]
+    fn nack_max_attempts_sends_to_dlq() {
+        let (broker, _dir) = make_broker();
+        create_stream(&broker, "events");
+        publish(&broker, "events", "events.fail", b"poison-pill");
+
+        broker.handle_message(ClientMessage::CreateConsumer(CreateConsumerRequest {
+            name: "nacker".into(),
+            stream: "events".into(),
+            group: String::new(),
+            subject_filter: String::new(),
+            start_from: StartFrom::Earliest,
+            start_offset: 0,
+        }));
+
+        // NACK 5 times (max_delivery_attempts = 5)
+        for _ in 0..5 {
+            let resp = broker.handle_message(ClientMessage::Nack(NackRequest {
+                consumer_name: "nacker".into(),
+                offset: 0,
+            }));
+            assert!(matches!(resp, ServerMessage::Ok));
+        }
+
+        // DLQ stream should now exist and contain the record
+        let dlq_batch = unwrap_batch(fetch(&broker, "events-dlq", 0, 10, ""));
+        assert_eq!(dlq_batch.records.len(), 1, "DLQ should have 1 record");
+        assert_eq!(dlq_batch.records[0].value, Bytes::from_static(b"poison-pill"));
+
+        // DLQ record should have diagnostic headers
+        let headers = &dlq_batch.records[0].headers;
+        let header_map: HashMap<&str, &str> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(header_map.get("x-exspeed-original-stream"), Some(&"events"));
+        assert_eq!(header_map.get("x-exspeed-original-offset"), Some(&"0"));
+        assert_eq!(header_map.get("x-exspeed-consumer"), Some(&"nacker"));
+        assert_eq!(header_map.get("x-exspeed-failure-count"), Some(&"5"));
+
+        // Consumer offset should have advanced past the NACKed record
+        let consumers = broker.consumers.read().unwrap();
+        let state = consumers.get("nacker").unwrap();
+        assert_eq!(state.config.offset, 1, "consumer offset should advance past DLQ'd record");
+
+        // nack_attempts entry should be cleaned up
+        let nack_attempts = broker.nack_attempts.read().unwrap();
+        assert!(
+            !nack_attempts.contains_key(&("nacker".into(), 0u64)),
+            "nack_attempts should be cleaned up after DLQ"
+        );
     }
 }

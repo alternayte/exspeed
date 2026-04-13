@@ -28,7 +28,7 @@ pub struct ServerArgs {
 
 pub async fn run(args: ServerArgs) -> Result<()> {
     let storage: Arc<dyn StorageEngine> = Arc::new(FileStorage::open(&args.data_dir)?);
-    let broker = Arc::new(Broker::new(storage));
+    let broker = Arc::new(Broker::new(storage, args.data_dir.clone()));
 
     let addr: SocketAddr = args.bind.parse()?;
     let listener = TcpListener::bind(addr).await?;
