@@ -1,3 +1,4 @@
+pub mod offset_index;
 pub mod partition;
 pub mod segment_reader;
 pub mod segment_writer;
