@@ -311,6 +311,11 @@ impl Partition {
         Ok(stats)
     }
 
+    /// Return the next offset to be assigned.
+    pub fn next_offset(&self) -> u64 {
+        self.next_offset
+    }
+
     /// Total bytes across all segments (sealed + active).
     pub fn total_bytes(&self) -> u64 {
         let sealed: u64 = self.sealed_readers.iter().map(|r| r.file_size()).sum();

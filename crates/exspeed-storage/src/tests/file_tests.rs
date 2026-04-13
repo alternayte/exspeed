@@ -251,6 +251,35 @@ fn retention_deletes_oldest_segments_by_size() {
     );
 }
 
+#[test]
+fn list_streams() {
+    let dir = TempDir::new().unwrap();
+    let storage = FileStorage::new(dir.path()).unwrap();
+    storage.create_stream(&stream("alpha"), 0, 0).unwrap();
+    storage.create_stream(&stream("beta"), 0, 0).unwrap();
+    let names = storage.list_streams();
+    assert_eq!(names, vec!["alpha", "beta"]);
+}
+
+#[test]
+fn stream_storage_bytes_and_head_offset() {
+    let dir = TempDir::new().unwrap();
+    let storage = FileStorage::new(dir.path()).unwrap();
+    storage.create_stream(&stream("metrics-test"), 0, 0).unwrap();
+    assert_eq!(storage.stream_head_offset("metrics-test"), Some(0));
+    storage.append(&stream("metrics-test"), &record(b"data")).unwrap();
+    assert_eq!(storage.stream_head_offset("metrics-test"), Some(1));
+    assert!(storage.stream_storage_bytes("metrics-test").unwrap() > 0);
+}
+
+#[test]
+fn nonexistent_stream_query_returns_none() {
+    let dir = TempDir::new().unwrap();
+    let storage = FileStorage::new(dir.path()).unwrap();
+    assert!(storage.stream_storage_bytes("nope").is_none());
+    assert!(storage.stream_head_offset("nope").is_none());
+}
+
 /// Test that retention never deletes the active segment.
 #[test]
 fn retention_never_deletes_active_segment() {

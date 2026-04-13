@@ -86,6 +86,37 @@ impl FileStorage {
         })
     }
 
+    /// Return the root data directory for this storage engine.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// List all stream names.
+    pub fn list_streams(&self) -> Vec<String> {
+        let map = self.partitions.read().unwrap();
+        let mut streams: Vec<String> = map.keys()
+            .map(|(name, _)| name.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        streams.sort();
+        streams
+    }
+
+    /// Get total storage bytes for a stream.
+    pub fn stream_storage_bytes(&self, stream: &str) -> Option<u64> {
+        let map = self.partitions.read().unwrap();
+        let key = (stream.to_string(), 0u32);
+        map.get(&key).map(|p| p.total_bytes())
+    }
+
+    /// Get the head offset (next offset to be assigned) for a stream.
+    pub fn stream_head_offset(&self, stream: &str) -> Option<u64> {
+        let map = self.partitions.read().unwrap();
+        let key = (stream.to_string(), 0u32);
+        map.get(&key).map(|p| p.next_offset())
+    }
+
     /// Return the directory path for a given stream + partition.
     pub fn partition_dir(&self, stream: &str, partition: u32) -> PathBuf {
         self.data_dir
