@@ -33,9 +33,7 @@ impl AckRequest {
             .map_err(|e| ProtocolError::Decode(format!("ACK invalid consumer_name UTF-8: {e}")))?;
 
         if src.remaining() < 8 {
-            return Err(ProtocolError::Decode(
-                "ACK truncated before offset".into(),
-            ));
+            return Err(ProtocolError::Decode("ACK truncated before offset".into()));
         }
         let offset = src.get_u64_le();
 
@@ -73,14 +71,11 @@ impl NackRequest {
                 "NACK truncated at consumer_name".into(),
             ));
         }
-        let consumer_name = String::from_utf8(src.split_to(name_len).to_vec()).map_err(|e| {
-            ProtocolError::Decode(format!("NACK invalid consumer_name UTF-8: {e}"))
-        })?;
+        let consumer_name = String::from_utf8(src.split_to(name_len).to_vec())
+            .map_err(|e| ProtocolError::Decode(format!("NACK invalid consumer_name UTF-8: {e}")))?;
 
         if src.remaining() < 8 {
-            return Err(ProtocolError::Decode(
-                "NACK truncated before offset".into(),
-            ));
+            return Err(ProtocolError::Decode("NACK truncated before offset".into()));
         }
         let offset = src.get_u64_le();
 

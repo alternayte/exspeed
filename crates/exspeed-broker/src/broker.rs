@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::consumer_state::{ConsumerGroup, ConsumerState, DeliveryRecord};
-use crate::delivery::{DeliveryConfig, run_delivery};
+use crate::delivery::{run_delivery, DeliveryConfig};
 use crate::handlers;
 use crate::persistence;
 use exspeed_protocol::messages::{ClientMessage, ServerMessage};
@@ -76,7 +76,10 @@ impl Broker {
 
         // 2. Must not already be subscribed.
         if consumer.delivery_tx.is_some() {
-            return Err(format!("consumer '{}' is already subscribed", consumer_name));
+            return Err(format!(
+                "consumer '{}' is already subscribed",
+                consumer_name
+            ));
         }
 
         // 3. Create mpsc channel for delivery records.
@@ -511,7 +514,12 @@ mod tests {
 
         // Publish some records
         for i in 0..5 {
-            publish(&broker, "events", "events.tick", format!("msg-{i}").as_bytes());
+            publish(
+                &broker,
+                "events",
+                "events.tick",
+                format!("msg-{i}").as_bytes(),
+            );
         }
 
         // Create consumer
@@ -561,10 +569,7 @@ mod tests {
 
         // Verify attempts incremented
         let nack_attempts = broker.nack_attempts.read().unwrap();
-        assert_eq!(
-            *nack_attempts.get(&("nacker".into(), 0u64)).unwrap(),
-            1
-        );
+        assert_eq!(*nack_attempts.get(&("nacker".into(), 0u64)).unwrap(), 1);
 
         // DLQ stream should NOT exist yet (only 1 attempt < max_delivery_attempts=5)
         let dlq_resp = fetch(&broker, "events-dlq", 0, 10, "");
@@ -601,7 +606,10 @@ mod tests {
         // DLQ stream should now exist and contain the record
         let dlq_batch = unwrap_batch(fetch(&broker, "events-dlq", 0, 10, ""));
         assert_eq!(dlq_batch.records.len(), 1, "DLQ should have 1 record");
-        assert_eq!(dlq_batch.records[0].value, Bytes::from_static(b"poison-pill"));
+        assert_eq!(
+            dlq_batch.records[0].value,
+            Bytes::from_static(b"poison-pill")
+        );
 
         // DLQ record should have diagnostic headers
         let headers = &dlq_batch.records[0].headers;
@@ -617,7 +625,10 @@ mod tests {
         // Consumer offset should have advanced past the NACKed record
         let consumers = broker.consumers.read().unwrap();
         let state = consumers.get("nacker").unwrap();
-        assert_eq!(state.config.offset, 1, "consumer offset should advance past DLQ'd record");
+        assert_eq!(
+            state.config.offset, 1,
+            "consumer offset should advance past DLQ'd record"
+        );
 
         // nack_attempts entry should be cleaned up
         let nack_attempts = broker.nack_attempts.read().unwrap();

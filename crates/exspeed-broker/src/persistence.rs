@@ -21,8 +21,7 @@ pub fn save_consumer(data_dir: &Path, config: &ConsumerConfig) -> std::io::Resul
     fs::create_dir_all(&dir)?;
 
     let path = consumer_path(data_dir, &config.name);
-    let json = serde_json::to_string_pretty(config)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let json = serde_json::to_string_pretty(config).map_err(std::io::Error::other)?;
 
     let mut file = fs::File::create(&path)?;
     file.write_all(json.as_bytes())?;

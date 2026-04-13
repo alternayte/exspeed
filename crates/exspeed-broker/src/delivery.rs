@@ -54,15 +54,13 @@ pub async fn run_delivery(
         let offset = Offset(current_offset);
         let bs = batch_size;
 
-        let read_result = tokio::task::spawn_blocking(move || {
-            storage_clone.read(&sn, offset, bs)
-        })
-        .await;
+        let read_result =
+            tokio::task::spawn_blocking(move || storage_clone.read(&sn, offset, bs)).await;
 
         let records = match read_result {
             Ok(Ok(recs)) => recs,
-            Ok(Err(_)) => break,   // storage error — stop delivery
-            Err(_) => break,       // join error — stop delivery
+            Ok(Err(_)) => break, // storage error — stop delivery
+            Err(_) => break,     // join error — stop delivery
         };
 
         // (c) If empty, sleep and continue.
@@ -85,11 +83,8 @@ pub async fn run_delivery(
             if let Some(ref members_rx) = group_members {
                 let members = members_rx.borrow();
                 if !members.is_empty() {
-                    let target = route_to_member(
-                        &members,
-                        record.key.as_deref(),
-                        round_robin_counter,
-                    );
+                    let target =
+                        route_to_member(&members, record.key.as_deref(), round_robin_counter);
                     if target != config.consumer_name {
                         current_offset = record.offset.0 + 1;
                         round_robin_counter += 1;

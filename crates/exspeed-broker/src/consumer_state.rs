@@ -158,9 +158,7 @@ mod tests {
         g.add_member("b");
         g.add_member("c");
 
-        let targets: Vec<&str> = (0..6)
-            .map(|i| g.route_record(None, i))
-            .collect();
+        let targets: Vec<&str> = (0..6).map(|i| g.route_record(None, i)).collect();
 
         // With 3 members, round-robin should cycle: a, b, c, a, b, c
         assert_eq!(targets, vec!["a", "b", "c", "a", "b", "c"]);

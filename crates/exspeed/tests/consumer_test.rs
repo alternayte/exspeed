@@ -8,7 +8,9 @@ use exspeed_protocol::codec::ExspeedCodec;
 use exspeed_protocol::frame::Frame;
 use exspeed_protocol::messages::ack::{AckRequest, NackRequest};
 use exspeed_protocol::messages::connect::{AuthType, ConnectRequest};
-use exspeed_protocol::messages::consumer::{CreateConsumerRequest, StartFrom, SubscribeRequest, UnsubscribeRequest};
+use exspeed_protocol::messages::consumer::{
+    CreateConsumerRequest, StartFrom, SubscribeRequest, UnsubscribeRequest,
+};
 use exspeed_protocol::messages::publish::PublishRequest;
 use exspeed_protocol::messages::record_delivery::RecordDelivery;
 use exspeed_protocol::messages::stream_mgmt::CreateStreamRequest;
@@ -235,7 +237,12 @@ async fn subscribe_and_receive() {
     assert_eq!(resp.opcode, OpCode::Ok, "CREATE_CONSUMER should return Ok");
 
     // 3. Subscribe
-    let resp = send_recv(&mut writer, &mut reader, subscribe_frame("my-consumer", 201)).await;
+    let resp = send_recv(
+        &mut writer,
+        &mut reader,
+        subscribe_frame("my-consumer", 201),
+    )
+    .await;
     assert_eq!(resp.opcode, OpCode::Ok, "SUBSCRIBE should return Ok");
 
     // 4. Receive 3 RECORD frames
@@ -303,7 +310,12 @@ async fn resume_after_disconnect() {
         assert_eq!(resp.opcode, OpCode::Ok, "ACK should return Ok");
 
         // Unsubscribe before disconnecting so the consumer state is cleared
-        let resp = send_recv(&mut writer, &mut reader, unsubscribe_frame("resumable", 203)).await;
+        let resp = send_recv(
+            &mut writer,
+            &mut reader,
+            unsubscribe_frame("resumable", 203),
+        )
+        .await;
         assert_eq!(resp.opcode, OpCode::Ok, "UNSUBSCRIBE should return Ok");
 
         // Give a moment for the state to settle
@@ -360,7 +372,15 @@ async fn subject_filter_delivery() {
     let resp = send_recv(
         &mut writer,
         &mut reader,
-        create_consumer_frame("eu-only", "events", "", "order.eu.*", StartFrom::Earliest, 0, 200),
+        create_consumer_frame(
+            "eu-only",
+            "events",
+            "",
+            "order.eu.*",
+            StartFrom::Earliest,
+            0,
+            200,
+        ),
     )
     .await;
     assert_eq!(resp.opcode, OpCode::Ok, "CREATE_CONSUMER should return Ok");

@@ -75,7 +75,10 @@ pub fn handle_fetch(broker: &Broker, req: FetchRequest) -> ServerMessage {
         max_records * 4
     };
 
-    let stored = match broker.storage.read(&stream_name, Offset(req.offset), fetch_count) {
+    let stored = match broker
+        .storage
+        .read(&stream_name, Offset(req.offset), fetch_count)
+    {
         Ok(records) => records,
         Err(e) => {
             return ServerMessage::Error {
@@ -279,9 +282,8 @@ pub fn handle_ack(broker: &Broker, req: AckRequest) -> ServerMessage {
     // Clean up nack_attempts entries for this consumer where offset <= req.offset
     {
         let mut nack_attempts = broker.nack_attempts.write().unwrap();
-        nack_attempts.retain(|(name, offset), _| {
-            !(name == &req.consumer_name && *offset <= req.offset)
-        });
+        nack_attempts
+            .retain(|(name, offset), _| !(name == &req.consumer_name && *offset <= req.offset));
     }
 
     ServerMessage::Ok
@@ -349,10 +351,7 @@ pub fn handle_nack(broker: &Broker, req: NackRequest) -> ServerMessage {
 
         // Build DLQ headers
         let mut dlq_headers = record.headers.clone();
-        dlq_headers.push((
-            "x-exspeed-original-stream".to_string(),
-            stream.clone(),
-        ));
+        dlq_headers.push(("x-exspeed-original-stream".to_string(), stream.clone()));
         dlq_headers.push((
             "x-exspeed-original-offset".to_string(),
             req.offset.to_string(),
@@ -361,14 +360,8 @@ pub fn handle_nack(broker: &Broker, req: NackRequest) -> ServerMessage {
             "x-exspeed-original-subject".to_string(),
             record.subject.clone(),
         ));
-        dlq_headers.push((
-            "x-exspeed-failure-count".to_string(),
-            attempts.to_string(),
-        ));
-        dlq_headers.push((
-            "x-exspeed-consumer".to_string(),
-            req.consumer_name.clone(),
-        ));
+        dlq_headers.push(("x-exspeed-failure-count".to_string(), attempts.to_string()));
+        dlq_headers.push(("x-exspeed-consumer".to_string(), req.consumer_name.clone()));
 
         // Create/ensure DLQ stream exists
         let dlq_stream_str = format!("{stream}-dlq");

@@ -103,9 +103,7 @@ impl RecordDelivery {
         }
         let subject_len = src.get_u16_le() as usize;
         if src.remaining() < subject_len {
-            return Err(ProtocolError::Decode(
-                "RECORD truncated at subject".into(),
-            ));
+            return Err(ProtocolError::Decode("RECORD truncated at subject".into()));
         }
         let subject = String::from_utf8(src.split_to(subject_len).to_vec())
             .map_err(|e| ProtocolError::Decode(format!("RECORD invalid subject UTF-8: {e}")))?;

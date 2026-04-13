@@ -62,18 +62,16 @@ impl ClientMessage {
                 let req = FetchRequest::decode(frame.payload)?;
                 Ok(ClientMessage::Fetch(req))
             }
-            OpCode::CreateConsumer => {
-                Ok(Self::CreateConsumer(CreateConsumerRequest::decode(frame.payload)?))
-            }
-            OpCode::DeleteConsumer => {
-                Ok(Self::DeleteConsumer(DeleteConsumerRequest::decode(frame.payload)?))
-            }
-            OpCode::Subscribe => {
-                Ok(Self::Subscribe(SubscribeRequest::decode(frame.payload)?))
-            }
-            OpCode::Unsubscribe => {
-                Ok(Self::Unsubscribe(UnsubscribeRequest::decode(frame.payload)?))
-            }
+            OpCode::CreateConsumer => Ok(Self::CreateConsumer(CreateConsumerRequest::decode(
+                frame.payload,
+            )?)),
+            OpCode::DeleteConsumer => Ok(Self::DeleteConsumer(DeleteConsumerRequest::decode(
+                frame.payload,
+            )?)),
+            OpCode::Subscribe => Ok(Self::Subscribe(SubscribeRequest::decode(frame.payload)?)),
+            OpCode::Unsubscribe => Ok(Self::Unsubscribe(UnsubscribeRequest::decode(
+                frame.payload,
+            )?)),
             OpCode::Ack => Ok(Self::Ack(AckRequest::decode(frame.payload)?)),
             OpCode::Nack => Ok(Self::Nack(NackRequest::decode(frame.payload)?)),
             other => Err(ProtocolError::Decode(format!(
