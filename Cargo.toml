@@ -7,6 +7,7 @@ members = [
     "crates/exspeed-streams",
     "crates/exspeed-storage",
     "crates/exspeed-broker",
+    "crates/exspeed-api",
 ]
 
 [workspace.dependencies]
@@ -37,6 +38,9 @@ futures-util = { version = "0.3", features = ["sink"] }
 
 # Checksums
 crc32c = "0.6"
+
+# HTTP
+axum = "0.8"
 
 # Observability / Metrics
 opentelemetry = "0.28"

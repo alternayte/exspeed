@@ -1,0 +1,16 @@
+[package]
+name = "exspeed-api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+exspeed-common = { path = "../exspeed-common" }
+exspeed-broker = { path = "../exspeed-broker" }
+exspeed-storage = { path = "../exspeed-storage" }
+exspeed-streams = { path = "../exspeed-streams" }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+prometheus = { workspace = true }
+tracing = { workspace = true }
