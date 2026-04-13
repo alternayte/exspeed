@@ -30,3 +30,5 @@ futures-util = { workspace = true }
 [dev-dependencies]
 portpicker = "0.1"
 tempfile = "3"
+reqwest = { version = "0.12", features = ["json"] }
+serde_json = { workspace = true }
