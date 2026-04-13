@@ -3,7 +3,10 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use crate::consumer_state::{ConsumerGroup, ConsumerState};
+use tokio::sync::{mpsc, oneshot, watch};
+
+use crate::consumer_state::{ConsumerGroup, ConsumerState, DeliveryRecord};
+use crate::delivery::{DeliveryConfig, run_delivery};
 use crate::handlers;
 use crate::persistence;
 use exspeed_protocol::messages::{ClientMessage, ServerMessage};
@@ -56,6 +59,84 @@ impl Broker {
             }
         }
 
+        Ok(())
+    }
+
+    /// Subscribe a consumer: start the delivery task, return the channel receiver.
+    /// Called by the connection handler (not by handle_message — needs async context).
+    pub fn subscribe(
+        &self,
+        consumer_name: &str,
+    ) -> Result<(mpsc::Receiver<DeliveryRecord>, oneshot::Sender<()>), String> {
+        // 1. Look up the consumer.
+        let mut consumers = self.consumers.write().unwrap();
+        let consumer = consumers
+            .get_mut(consumer_name)
+            .ok_or_else(|| format!("consumer '{}' not found", consumer_name))?;
+
+        // 2. Must not already be subscribed.
+        if consumer.delivery_tx.is_some() {
+            return Err(format!("consumer '{}' is already subscribed", consumer_name));
+        }
+
+        // 3. Create mpsc channel for delivery records.
+        let (tx, rx) = mpsc::channel::<DeliveryRecord>(1000);
+
+        // 4. Create oneshot for cancellation.
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+
+        // 5. Store tx clone in consumer state.
+        consumer.delivery_tx = Some(tx.clone());
+
+        // 6. Build DeliveryConfig from consumer config.
+        let delivery_config = DeliveryConfig {
+            consumer_name: consumer.config.name.clone(),
+            stream_name: consumer.config.stream.clone(),
+            subject_filter: consumer.config.subject_filter.clone(),
+            start_offset: consumer.config.offset,
+            group_name: if consumer.config.group.is_empty() {
+                None
+            } else {
+                Some(consumer.config.group.clone())
+            },
+        };
+
+        // 7. Build group_members watch channel if consumer is in a group.
+        let group_members = if let Some(ref group_name) = delivery_config.group_name {
+            let groups = self.groups.read().unwrap();
+            let members = groups
+                .get(group_name)
+                .map(|g| g.members.clone())
+                .unwrap_or_default();
+            let (watch_tx, watch_rx) = watch::channel(members);
+            // Leak the sender so the receiver stays valid.
+            // Proper rebalance would store it for later broadcasts.
+            std::mem::forget(watch_tx);
+            Some(watch_rx)
+        } else {
+            None
+        };
+
+        let storage = Arc::clone(&self.storage);
+
+        // 8. Spawn the delivery task.
+        tokio::spawn(async move {
+            run_delivery(delivery_config, storage, tx, cancel_rx, group_members).await;
+        });
+
+        // 9. Return the receiver and cancel sender.
+        Ok((rx, cancel_tx))
+    }
+
+    /// Unsubscribe a consumer: stop the delivery task.
+    pub fn unsubscribe(&self, consumer_name: &str) -> Result<(), String> {
+        let mut consumers = self.consumers.write().unwrap();
+        let consumer = consumers
+            .get_mut(consumer_name)
+            .ok_or_else(|| format!("consumer '{}' not found", consumer_name))?;
+
+        // Dropping the sender signals the delivery task to stop.
+        consumer.delivery_tx = None;
         Ok(())
     }
 
