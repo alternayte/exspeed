@@ -51,6 +51,11 @@ mod memory_tests {
     fn timestamps_increasing() {
         trait_tests::test_timestamps_increasing(&MemoryStorage::new());
     }
+
+    #[test]
+    fn seek_by_time() {
+        trait_tests::test_seek_by_time(&MemoryStorage::new());
+    }
 }
 
 mod file_trait_tests {
@@ -116,5 +121,11 @@ mod file_trait_tests {
     fn timestamps_increasing() {
         let (s, _d) = make_storage();
         trait_tests::test_timestamps_increasing(&s);
+    }
+
+    #[test]
+    fn seek_by_time() {
+        let (s, _d) = make_storage();
+        trait_tests::test_seek_by_time(&s);
     }
 }

@@ -78,4 +78,18 @@ impl StorageEngine for MemoryStorage {
         let end = (start + max_records).min(records.len());
         Ok(records[start..end].to_vec())
     }
+
+    fn seek_by_time(&self, stream: &StreamName, timestamp: u64) -> Result<Offset, StorageError> {
+        let map = self.streams.read().unwrap();
+        let name = stream.as_str().to_string();
+        let records = map
+            .get(&name)
+            .ok_or_else(|| StorageError::StreamNotFound(stream.clone()))?;
+        for record in records {
+            if record.timestamp >= timestamp {
+                return Ok(record.offset);
+            }
+        }
+        Ok(Offset(records.len() as u64))
+    }
 }

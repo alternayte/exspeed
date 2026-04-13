@@ -142,6 +142,25 @@ pub fn test_stream_already_exists(engine: &impl StorageEngine) {
     );
 }
 
+/// Seek by timestamp: timestamp 0 returns offset 0; far future returns end of stream.
+pub fn test_seek_by_time(engine: &impl StorageEngine) {
+    let s = stream("test-seek");
+    engine.create_stream(&s).unwrap();
+
+    // Publish records -- we can't control timestamps in MemoryStorage (they use now()),
+    // so just verify seek returns a valid offset
+    engine.append(&s, &record("events", b"first")).unwrap();
+    engine.append(&s, &record("events", b"second")).unwrap();
+
+    // Seek to timestamp 0 (before all records) should return offset 0
+    let offset = engine.seek_by_time(&s, 0).unwrap();
+    assert_eq!(offset, Offset(0));
+
+    // Seek to far future should return end of stream
+    let offset = engine.seek_by_time(&s, u64::MAX).unwrap();
+    assert!(offset.0 >= 2); // at or past the end
+}
+
 /// Append 2 records, verify the second timestamp is >= the first.
 pub fn test_timestamps_increasing(engine: &impl StorageEngine) {
     let s = stream("test-timestamps");

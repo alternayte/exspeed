@@ -6,6 +6,7 @@ pub mod ping;
 pub mod publish;
 pub mod record_delivery;
 pub mod records_batch;
+pub mod seek;
 pub mod stream_mgmt;
 
 pub use ack::{AckRequest, NackRequest};
@@ -18,6 +19,7 @@ pub use ping::{Ping, Pong};
 pub use publish::PublishRequest;
 pub use record_delivery::RecordDelivery;
 pub use records_batch::{BatchRecord, RecordsBatch};
+pub use seek::SeekRequest;
 pub use stream_mgmt::CreateStreamRequest;
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -40,6 +42,7 @@ pub enum ClientMessage {
     Unsubscribe(UnsubscribeRequest),
     Ack(AckRequest),
     Nack(NackRequest),
+    Seek(SeekRequest),
 }
 
 impl ClientMessage {
@@ -74,6 +77,7 @@ impl ClientMessage {
             )?)),
             OpCode::Ack => Ok(Self::Ack(AckRequest::decode(frame.payload)?)),
             OpCode::Nack => Ok(Self::Nack(NackRequest::decode(frame.payload)?)),
+            OpCode::Seek => Ok(Self::Seek(SeekRequest::decode(frame.payload)?)),
             other => Err(ProtocolError::Decode(format!(
                 "unhandled client opcode: {:?}",
                 other

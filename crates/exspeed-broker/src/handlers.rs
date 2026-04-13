@@ -1,7 +1,7 @@
 use exspeed_common::{subject_matches, Offset, StreamName};
 use exspeed_protocol::messages::{
     AckRequest, BatchRecord, CreateConsumerRequest, CreateStreamRequest, DeleteConsumerRequest,
-    FetchRequest, NackRequest, PublishRequest, RecordsBatch, ServerMessage, StartFrom,
+    FetchRequest, NackRequest, PublishRequest, RecordsBatch, SeekRequest, ServerMessage, StartFrom,
 };
 use exspeed_streams::record::Record;
 use exspeed_streams::StorageError;
@@ -422,4 +422,46 @@ pub fn handle_nack(broker: &Broker, req: NackRequest) -> ServerMessage {
     }
 
     ServerMessage::Ok
+}
+
+pub fn handle_seek(broker: &Broker, req: SeekRequest) -> ServerMessage {
+    let consumer_name = req.consumer_name;
+    let mut consumers = broker.consumers.write().unwrap();
+    let consumer = match consumers.get_mut(&consumer_name) {
+        Some(c) => c,
+        None => {
+            return ServerMessage::Error {
+                code: 404,
+                message: format!("consumer not found: {consumer_name}"),
+            }
+        }
+    };
+
+    let stream_name = match StreamName::try_from(consumer.config.stream.as_str()) {
+        Ok(n) => n,
+        Err(e) => {
+            return ServerMessage::Error {
+                code: 400,
+                message: e.to_string(),
+            }
+        }
+    };
+
+    match broker.storage.seek_by_time(&stream_name, req.timestamp) {
+        Ok(offset) => {
+            consumer.config.offset = offset.0;
+            // Persist
+            if let Err(e) = persistence::save_consumer(&broker.data_dir, &consumer.config) {
+                return ServerMessage::Error {
+                    code: 500,
+                    message: format!("persist failed: {e}"),
+                };
+            }
+            ServerMessage::PublishOk { offset: offset.0 } // reuse PublishOk for offset response
+        }
+        Err(e) => ServerMessage::Error {
+            code: 500,
+            message: format!("seek failed: {e}"),
+        },
+    }
 }

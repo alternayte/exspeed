@@ -212,6 +212,33 @@ impl Partition {
         Ok(result)
     }
 
+    /// Find the offset of the first record at or after the given timestamp.
+    ///
+    /// Checks sealed segments (which have time indexes) in reverse order,
+    /// then falls back to scanning the active segment.
+    pub fn seek_by_time(&self, timestamp: u64) -> io::Result<Offset> {
+        // Check sealed segments (they have time indexes)
+        for reader in self.sealed_readers.iter().rev() {
+            if let Some(first_ts) = reader.first_timestamp() {
+                if timestamp >= first_ts {
+                    if let Some(offset) = reader.seek_by_time(timestamp) {
+                        return Ok(Offset(offset));
+                    }
+                }
+            }
+        }
+        // Fall back: scan active segment
+        self.active_writer.sync()?;
+        let active_reader = SegmentReader::open(self.active_writer.path())?;
+        let records = active_reader.read_all()?;
+        for record in &records {
+            if record.timestamp >= timestamp {
+                return Ok(record.offset);
+            }
+        }
+        Ok(Offset(self.next_offset))
+    }
+
     /// Roll the active segment: seal it, build indexes, open a reader for it,
     /// and create a new active segment starting at `next_offset`.
     fn roll_segment(&mut self) -> io::Result<()> {

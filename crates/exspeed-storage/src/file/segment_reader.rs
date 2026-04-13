@@ -102,6 +102,11 @@ impl SegmentReader {
         self.time_index.as_ref()?.seek_by_time(timestamp)
     }
 
+    /// Get the first timestamp from the time index.
+    pub fn first_timestamp(&self) -> Option<u64> {
+        self.time_index.as_ref()?.first_timestamp()
+    }
+
     /// Get the last timestamp from the time index.
     pub fn last_timestamp(&self) -> Option<u64> {
         self.time_index.as_ref()?.last_timestamp()

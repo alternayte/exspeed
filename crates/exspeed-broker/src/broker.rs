@@ -152,6 +152,7 @@ impl Broker {
             ClientMessage::DeleteConsumer(req) => handlers::handle_delete_consumer(self, req),
             ClientMessage::Ack(req) => handlers::handle_ack(self, req),
             ClientMessage::Nack(req) => handlers::handle_nack(self, req),
+            ClientMessage::Seek(req) => handlers::handle_seek(self, req),
             ClientMessage::Connect(_) | ClientMessage::Ping => ServerMessage::Error {
                 code: 500,
                 message: "message should be handled by connection layer".into(),

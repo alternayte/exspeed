@@ -138,4 +138,14 @@ impl StorageEngine for FileStorage {
         let records = part.read(from, max_records)?;
         Ok(records)
     }
+
+    fn seek_by_time(&self, stream: &StreamName, timestamp: u64) -> Result<Offset, StorageError> {
+        let map = self.partitions.read().unwrap();
+        let key = (stream.as_str().to_string(), 0u32);
+        let part = map
+            .get(&key)
+            .ok_or_else(|| StorageError::StreamNotFound(stream.clone()))?;
+        let offset = part.seek_by_time(timestamp)?;
+        Ok(offset)
+    }
 }
