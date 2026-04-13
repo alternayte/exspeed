@@ -18,6 +18,13 @@ use crate::file::wal::{replay_wal, WalWriter};
 /// Default maximum segment size before rolling: 256 MiB.
 const DEFAULT_SEGMENT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Stats from retention enforcement.
+#[derive(Debug, Default)]
+pub struct RetentionStats {
+    pub segments_deleted: u32,
+    pub bytes_reclaimed: u64,
+}
+
 fn now_nanos() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -237,6 +244,79 @@ impl Partition {
             }
         }
         Ok(Offset(self.next_offset))
+    }
+
+    /// Enforce retention: delete old sealed segments based on age and size limits.
+    /// Never deletes the active segment.
+    pub fn enforce_retention(&mut self, max_age_secs: u64, max_bytes: u64) -> io::Result<RetentionStats> {
+        let mut stats = RetentionStats::default();
+        let now = now_nanos();
+        let age_cutoff_nanos = now.saturating_sub(max_age_secs * 1_000_000_000);
+
+        // Age-based deletion: remove sealed segments where all records are older than cutoff
+        let mut indices_to_remove: Vec<usize> = Vec::new();
+        for (i, reader) in self.sealed_readers.iter().enumerate() {
+            let is_old = match reader.last_timestamp() {
+                Some(ts) => ts < age_cutoff_nanos,
+                None => {
+                    // No time index -- try reading last record
+                    match reader.last_offset() {
+                        Ok(Some(_)) => false, // has records but no timestamp info -- keep it safe
+                        _ => true,            // empty segment, ok to delete
+                    }
+                }
+            };
+            if is_old {
+                indices_to_remove.push(i);
+            }
+        }
+
+        // Remove in reverse order so indices stay valid
+        for &i in indices_to_remove.iter().rev() {
+            let reader = self.sealed_readers.remove(i);
+            let seg_path = reader.path().to_path_buf();
+            let size = reader.file_size();
+
+            // Delete segment + index files
+            let _ = fs::remove_file(&seg_path);
+            let _ = fs::remove_file(seg_path.with_extension("idx"));
+            let _ = fs::remove_file(seg_path.with_extension("tix"));
+
+            stats.segments_deleted += 1;
+            stats.bytes_reclaimed += size;
+        }
+
+        // Size-based deletion: remove oldest sealed segments until under limit
+        loop {
+            let total_size = self.total_bytes();
+            if total_size <= max_bytes || self.sealed_readers.is_empty() {
+                break;
+            }
+            let reader = self.sealed_readers.remove(0); // remove oldest
+            let seg_path = reader.path().to_path_buf();
+            let size = reader.file_size();
+
+            let _ = fs::remove_file(&seg_path);
+            let _ = fs::remove_file(seg_path.with_extension("idx"));
+            let _ = fs::remove_file(seg_path.with_extension("tix"));
+
+            stats.segments_deleted += 1;
+            stats.bytes_reclaimed += size;
+        }
+
+        Ok(stats)
+    }
+
+    /// Total bytes across all segments (sealed + active).
+    pub fn total_bytes(&self) -> u64 {
+        let sealed: u64 = self.sealed_readers.iter().map(|r| r.file_size()).sum();
+        sealed + self.active_writer.bytes_written()
+    }
+
+    /// Override the segment max bytes threshold (for testing).
+    #[cfg(test)]
+    pub(crate) fn set_segment_max_bytes(&mut self, max: u64) {
+        self.segment_max_bytes = max;
     }
 
     /// Roll the active segment: seal it, build indexes, open a reader for it,

@@ -112,6 +112,11 @@ impl SegmentReader {
         self.time_index.as_ref()?.last_timestamp()
     }
 
+    /// The filesystem path of this segment file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Read all records from the segment file sequentially.
     ///
     /// Stops cleanly on EOF. Returns an error on CRC mismatch or decode

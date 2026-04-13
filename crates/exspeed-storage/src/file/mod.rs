@@ -96,6 +96,30 @@ impl FileStorage {
     }
 }
 
+impl FileStorage {
+    /// Enforce retention for all streams.
+    pub fn enforce_all_retention(&self) -> io::Result<()> {
+        let mut map = self.partitions.write().unwrap();
+
+        for ((stream_name, _), partition) in map.iter_mut() {
+            let stream_dir = self.data_dir.join("streams").join(stream_name);
+            let config = StreamConfig::load(&stream_dir)?;
+
+            let stats = partition.enforce_retention(config.max_age_secs, config.max_bytes)?;
+            if stats.segments_deleted > 0 {
+                tracing::info!(
+                    stream = stream_name.as_str(),
+                    segments_deleted = stats.segments_deleted,
+                    bytes_reclaimed = stats.bytes_reclaimed,
+                    "retention enforced"
+                );
+            }
+        }
+
+        Ok(())
+    }
+}
+
 impl StorageEngine for FileStorage {
     fn create_stream(&self, stream: &StreamName, max_age_secs: u64, max_bytes: u64) -> Result<(), StorageError> {
         let mut map = self.partitions.write().unwrap();

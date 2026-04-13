@@ -30,9 +30,14 @@ pub struct ServerArgs {
 }
 
 pub async fn run(args: ServerArgs) -> Result<()> {
-    let storage: Arc<dyn StorageEngine> = Arc::new(FileStorage::open(&args.data_dir)?);
+    // Create storage (keep Arc<FileStorage> separately for retention task)
+    let file_storage = Arc::new(FileStorage::open(&args.data_dir)?);
+    let storage: Arc<dyn StorageEngine> = file_storage.clone();
     let broker = Arc::new(Broker::new(storage, args.data_dir.clone()));
     broker.load_consumers()?;
+
+    // Spawn retention background task
+    exspeed_broker::retention_task::spawn_retention_task(file_storage);
 
     let addr: SocketAddr = args.bind.parse()?;
     let listener = TcpListener::bind(addr).await?;
