@@ -55,8 +55,7 @@ pub async fn get_view(
         // Single-row lookup
         match state.exql.mv_registry.get_row(&name, &key) {
             Some(row) => {
-                let values: Vec<serde_json::Value> =
-                    row.values.iter().map(value_to_json).collect();
+                let values: Vec<serde_json::Value> = row.values.iter().map(value_to_json).collect();
                 (
                     StatusCode::OK,
                     Json(json!({

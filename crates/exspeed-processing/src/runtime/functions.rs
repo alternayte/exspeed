@@ -35,7 +35,7 @@ pub fn call_function(name: &str, args: &[Value]) -> Value {
 
         // ── Windowing ───────────────────────────────────────────────────
         "TUMBLING" => {
-            let ts = args.get(0).and_then(|v| match v {
+            let ts = args.first().and_then(|v| match v {
                 Value::Timestamp(t) => Some(*t),
                 Value::Int(n) => Some(*n as u64),
                 _ => None,
@@ -70,7 +70,7 @@ pub fn parse_interval_nanos(interval: &str) -> u64 {
     }
     let amount: u64 = parts[0].parse().unwrap_or(0);
     let unit = parts[1].to_lowercase();
-    let multiplier = match unit.trim_end_matches('s').as_ref() {
+    let multiplier = match unit.trim_end_matches('s') {
         "second" => 1_000_000_000u64,
         "minute" => 60_000_000_000,
         "hour" => 3_600_000_000_000,
@@ -414,10 +414,7 @@ mod tests {
         let ts: u64 = 1_704_067_200_000_000_000 + 1_800_000_000_000; // + 30 min
         let result = call_function(
             "TUMBLING",
-            &[
-                Value::Timestamp(ts),
-                Value::Text("1 hour".into()),
-            ],
+            &[Value::Timestamp(ts), Value::Text("1 hour".into())],
         );
         let expected_start = (ts / hour_nanos) * hour_nanos;
         assert_eq!(result, Value::Timestamp(expected_start));
@@ -431,8 +428,14 @@ mod tests {
         let ts1 = base + 600_000_000_000; // + 10 min
         let ts2 = base + 1_800_000_000_000; // + 30 min
 
-        let r1 = call_function("TUMBLING", &[Value::Timestamp(ts1), Value::Text("1 hour".into())]);
-        let r2 = call_function("TUMBLING", &[Value::Timestamp(ts2), Value::Text("1 hour".into())]);
+        let r1 = call_function(
+            "TUMBLING",
+            &[Value::Timestamp(ts1), Value::Text("1 hour".into())],
+        );
+        let r2 = call_function(
+            "TUMBLING",
+            &[Value::Timestamp(ts2), Value::Text("1 hour".into())],
+        );
 
         assert_eq!(r1, r2);
         assert_eq!(r1, Value::Timestamp((ts1 / hour_nanos) * hour_nanos));
@@ -442,11 +445,17 @@ mod tests {
     #[test]
     fn tumbling_different_windows() {
         let base: u64 = 1_704_067_200_000_000_000; // 2024-01-01 00:00:00 UTC
-        let ts1 = base + 600_000_000_000;           // 00:10 — hour 0
-        let ts2 = base + 3_660_000_000_000;         // 01:01 — hour 1
+        let ts1 = base + 600_000_000_000; // 00:10 — hour 0
+        let ts2 = base + 3_660_000_000_000; // 01:01 — hour 1
 
-        let r1 = call_function("TUMBLING", &[Value::Timestamp(ts1), Value::Text("1 hour".into())]);
-        let r2 = call_function("TUMBLING", &[Value::Timestamp(ts2), Value::Text("1 hour".into())]);
+        let r1 = call_function(
+            "TUMBLING",
+            &[Value::Timestamp(ts1), Value::Text("1 hour".into())],
+        );
+        let r2 = call_function(
+            "TUMBLING",
+            &[Value::Timestamp(ts2), Value::Text("1 hour".into())],
+        );
 
         assert_ne!(r1, r2);
     }

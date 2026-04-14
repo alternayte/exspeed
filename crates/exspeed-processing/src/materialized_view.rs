@@ -121,21 +121,11 @@ mod tests {
     #[test]
     fn register_and_get_rows_roundtrip() {
         let registry = MaterializedViewRegistry::new();
-        let state = registry.register(
-            "mv_test",
-            vec!["key".into(), "val".into()],
-            "q-001",
-        );
+        let state = registry.register("mv_test", vec!["key".into(), "val".into()], "q-001");
 
         // Write two rows via the returned state handle.
-        state
-            .write()
-            .unwrap()
-            .insert("a".into(), make_row("a", 1));
-        state
-            .write()
-            .unwrap()
-            .insert("b".into(), make_row("b", 2));
+        state.write().unwrap().insert("a".into(), make_row("a", 1));
+        state.write().unwrap().insert("b".into(), make_row("b", 2));
 
         let (cols, rows) = registry.get_rows("mv_test").expect("view should exist");
         assert_eq!(cols, vec!["key", "val"]);
@@ -145,18 +135,16 @@ mod tests {
     #[test]
     fn register_and_get_row_by_key() {
         let registry = MaterializedViewRegistry::new();
-        let state = registry.register(
-            "mv_key",
-            vec!["key".into(), "val".into()],
-            "q-002",
-        );
+        let state = registry.register("mv_key", vec!["key".into(), "val".into()], "q-002");
 
         state
             .write()
             .unwrap()
             .insert("hello".into(), make_row("hello", 42));
 
-        let row = registry.get_row("mv_key", "hello").expect("row should exist");
+        let row = registry
+            .get_row("mv_key", "hello")
+            .expect("row should exist");
         assert_eq!(row.get("val"), Some(&Value::Int(42)));
 
         assert!(registry.get_row("mv_key", "missing").is_none());

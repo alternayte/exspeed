@@ -531,7 +531,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.rows.len(), 1);
-        assert_eq!(result.rows[0].get("region"), Some(&Value::Text("eu".into())));
+        assert_eq!(
+            result.rows[0].get("region"),
+            Some(&Value::Text("eu".into()))
+        );
     }
 
     #[test]

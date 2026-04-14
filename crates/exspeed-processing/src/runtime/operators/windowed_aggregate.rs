@@ -67,10 +67,13 @@ impl WindowedAggregateState {
         // Check if this record is a late arrival for an already-closed window.
         // A window is considered closed when the latest observed event time
         // has moved past the window's close deadline (window_end + grace).
-        let max_observed_end = self.windows.values().map(|w| w.window_end).max().unwrap_or(0);
-        if max_observed_end > 0
-            && window_end + self.grace_period_nanos <= max_observed_end
-        {
+        let max_observed_end = self
+            .windows
+            .values()
+            .map(|w| w.window_end)
+            .max()
+            .unwrap_or(0);
+        if max_observed_end > 0 && window_end + self.grace_period_nanos <= max_observed_end {
             return Vec::new();
         }
 
@@ -105,54 +108,58 @@ impl WindowedAggregateState {
 
         // Get or create the WindowState and update the accumulator.
         {
-            let ws = self.windows.entry(window_start).or_insert_with(|| WindowState {
-                groups: HashMap::new(),
-                window_end,
-            });
+            let ws = self
+                .windows
+                .entry(window_start)
+                .or_insert_with(|| WindowState {
+                    groups: HashMap::new(),
+                    window_end,
+                });
 
-            let acc = ws.groups.entry(group_key.clone()).or_insert_with(|| GroupAccumulator {
-                group_values: group_values.clone(),
-                count: 0,
-                sum: 0.0,
-                min: None,
-                max: None,
-            });
+            let acc = ws
+                .groups
+                .entry(group_key.clone())
+                .or_insert_with(|| GroupAccumulator {
+                    group_values: group_values.clone(),
+                    count: 0,
+                    sum: 0.0,
+                    min: None,
+                    max: None,
+                });
 
-            for input in &agg_inputs {
-                if let Some((func, val)) = input {
-                    match func {
-                        AggregateFunc::Count => {
-                            acc.count += 1;
+            for (func, val) in agg_inputs.iter().flatten() {
+                match func {
+                    AggregateFunc::Count => {
+                        acc.count += 1;
+                    }
+                    AggregateFunc::Sum | AggregateFunc::Avg => {
+                        if let Some(f) = val.to_f64() {
+                            acc.sum += f;
                         }
-                        AggregateFunc::Sum | AggregateFunc::Avg => {
-                            if let Some(f) = val.to_f64() {
-                                acc.sum += f;
-                            }
-                        }
-                        AggregateFunc::Min => {
-                            if !val.is_null() {
-                                match &acc.min {
-                                    None => acc.min = Some(val.clone()),
-                                    Some(current) => {
-                                        if compare_values(val, current)
-                                            == Some(std::cmp::Ordering::Less)
-                                        {
-                                            acc.min = Some(val.clone());
-                                        }
+                    }
+                    AggregateFunc::Min => {
+                        if !val.is_null() {
+                            match &acc.min {
+                                None => acc.min = Some(val.clone()),
+                                Some(current) => {
+                                    if compare_values(val, current)
+                                        == Some(std::cmp::Ordering::Less)
+                                    {
+                                        acc.min = Some(val.clone());
                                     }
                                 }
                             }
                         }
-                        AggregateFunc::Max => {
-                            if !val.is_null() {
-                                match &acc.max {
-                                    None => acc.max = Some(val.clone()),
-                                    Some(current) => {
-                                        if compare_values(val, current)
-                                            == Some(std::cmp::Ordering::Greater)
-                                        {
-                                            acc.max = Some(val.clone());
-                                        }
+                    }
+                    AggregateFunc::Max => {
+                        if !val.is_null() {
+                            match &acc.max {
+                                None => acc.max = Some(val.clone()),
+                                Some(current) => {
+                                    if compare_values(val, current)
+                                        == Some(std::cmp::Ordering::Greater)
+                                    {
+                                        acc.max = Some(val.clone());
                                     }
                                 }
                             }
@@ -209,12 +216,7 @@ impl WindowedAggregateState {
     }
 
     /// Build an output row from the window start, group key, and accumulator.
-    fn build_output_row(
-        &self,
-        window_start: u64,
-        _group_key: &str,
-        acc: &GroupAccumulator,
-    ) -> Row {
+    fn build_output_row(&self, window_start: u64, _group_key: &str, acc: &GroupAccumulator) -> Row {
         let mut columns = Vec::new();
         let mut values = Vec::new();
 
@@ -229,12 +231,7 @@ impl WindowedAggregateState {
                 _ => format!("group_{i}"),
             };
             columns.push(col_name);
-            values.push(
-                acc.group_values
-                    .get(i)
-                    .cloned()
-                    .unwrap_or(Value::Null),
-            );
+            values.push(acc.group_values.get(i).cloned().unwrap_or(Value::Null));
         }
 
         // Add aggregate result columns.
@@ -461,7 +458,10 @@ mod tests {
 
         // Not closed yet — within grace period.
         let not_yet = state.check_closed_windows(base + TEN_SEC_NANOS + GRACE_NANOS);
-        assert!(not_yet.is_empty(), "window should not close at exactly end + grace");
+        assert!(
+            not_yet.is_empty(),
+            "window should not close at exactly end + grace"
+        );
 
         // Now close.
         let closed = state.check_closed_windows(base + TEN_SEC_NANOS + GRACE_NANOS + 1);
@@ -489,7 +489,8 @@ mod tests {
 
         let amounts = [10, 20, 30, 40, 50];
         for (i, &amt) in amounts.iter().enumerate() {
-            let result = state.process_record(&make_row("any", amt), base + (i as u64) * 1_000_000_000);
+            let result =
+                state.process_record(&make_row("any", amt), base + (i as u64) * 1_000_000_000);
             assert_eq!(result.len(), 1);
 
             let expected_count = (i + 1) as i64;

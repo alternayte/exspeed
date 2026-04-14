@@ -267,11 +267,7 @@ async fn materialized_view_creation_and_query() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        resp.status(),
-        201,
-        "create MV should return 201"
-    );
+    assert_eq!(resp.status(), 201, "create MV should return 201");
 
     let mv_body: Value = resp.json().await.unwrap();
     assert!(

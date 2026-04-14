@@ -57,7 +57,9 @@ fn extract_emit_mode(sql: &str) -> (String, Option<EmitMode>) {
     // Case-insensitive check for trailing EMIT FINAL or EMIT CHANGES
     let upper = trimmed.to_uppercase();
     if upper.ends_with("EMIT FINAL") {
-        let cleaned = trimmed[..trimmed.len() - "EMIT FINAL".len()].trim().to_string();
+        let cleaned = trimmed[..trimmed.len() - "EMIT FINAL".len()]
+            .trim()
+            .to_string();
         (cleaned, Some(EmitMode::Final))
     } else if upper.ends_with("EMIT CHANGES") {
         let cleaned = trimmed[..trimmed.len() - "EMIT CHANGES".len()]
@@ -90,10 +92,8 @@ fn extract_within_clauses(sql: &str) -> (String, Vec<String>) {
 
                     // Calculate the full span to remove: from WITHIN to closing quote
                     let after_within_start = within_pos + 6;
-                    let trimmed_offset =
-                        result[after_within_start..].len() - after_within.len();
-                    let value_end =
-                        after_within_start + trimmed_offset + 1 + end_quote + 1;
+                    let trimmed_offset = result[after_within_start..].len() - after_within.len();
+                    let value_end = after_within_start + trimmed_offset + 1 + end_quote + 1;
                     result = format!(
                         "{}{}",
                         &result[..within_pos].trim_end(),
@@ -477,10 +477,7 @@ mod tests {
 
     #[test]
     fn parse_emit_changes_explicit() {
-        let stmt = parse(
-            r#"CREATE VIEW output AS SELECT * FROM "orders" EMIT CHANGES"#,
-        )
-        .unwrap();
+        let stmt = parse(r#"CREATE VIEW output AS SELECT * FROM "orders" EMIT CHANGES"#).unwrap();
         match stmt {
             ExqlStatement::CreateStream { name, emit, .. } => {
                 assert_eq!(name, "output");
@@ -495,10 +492,7 @@ mod tests {
         // WITHIN parsing is supported via pre-processing: the WITHIN clause
         // is extracted from the SQL before passing to sqlparser, then applied
         // to the corresponding JoinClause in the AST.
-        let stmt = parse(
-            r#"SELECT * FROM "a" JOIN "b" ON a.key = b.key WITHIN '1 hour'"#,
-        )
-        .unwrap();
+        let stmt = parse(r#"SELECT * FROM "a" JOIN "b" ON a.key = b.key WITHIN '1 hour'"#).unwrap();
         match stmt {
             ExqlStatement::Query(q) => {
                 assert_eq!(q.joins.len(), 1);

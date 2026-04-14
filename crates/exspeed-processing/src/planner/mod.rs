@@ -119,7 +119,11 @@ fn build_logical(query: &QueryExpr, emit_mode: EmitMode) -> Result<LogicalPlan, 
 }
 
 /// Convert a FROM clause into a logical scan node, expanding CTEs inline.
-fn from_to_logical(from: &FromClause, ctes: &[Cte], emit_mode: EmitMode) -> Result<LogicalPlan, ParseError> {
+fn from_to_logical(
+    from: &FromClause,
+    ctes: &[Cte],
+    emit_mode: EmitMode,
+) -> Result<LogicalPlan, ParseError> {
     match from {
         FromClause::Stream { name, alias } => {
             // Check if this name matches a CTE — expand inline.

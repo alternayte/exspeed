@@ -124,18 +124,16 @@ impl ExqlEngine {
             .select
             .iter()
             .map(|item| {
-                item.alias.clone().unwrap_or_else(|| {
-                    match &item.expr {
-                        crate::parser::ast::Expr::Column { name, .. } => name.clone(),
-                        crate::parser::ast::Expr::Aggregate { func, .. } => match func {
-                            crate::parser::ast::AggregateFunc::Count => "count".into(),
-                            crate::parser::ast::AggregateFunc::Sum => "sum".into(),
-                            crate::parser::ast::AggregateFunc::Avg => "avg".into(),
-                            crate::parser::ast::AggregateFunc::Min => "min".into(),
-                            crate::parser::ast::AggregateFunc::Max => "max".into(),
-                        },
-                        _ => "?".into(),
-                    }
+                item.alias.clone().unwrap_or_else(|| match &item.expr {
+                    crate::parser::ast::Expr::Column { name, .. } => name.clone(),
+                    crate::parser::ast::Expr::Aggregate { func, .. } => match func {
+                        crate::parser::ast::AggregateFunc::Count => "count".into(),
+                        crate::parser::ast::AggregateFunc::Sum => "sum".into(),
+                        crate::parser::ast::AggregateFunc::Avg => "avg".into(),
+                        crate::parser::ast::AggregateFunc::Min => "min".into(),
+                        crate::parser::ast::AggregateFunc::Max => "max".into(),
+                    },
+                    _ => "?".into(),
                 })
             })
             .collect();

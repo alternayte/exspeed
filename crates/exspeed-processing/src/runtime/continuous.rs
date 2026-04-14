@@ -241,8 +241,7 @@ async fn run_inner(
                 let last_offset = batch.last().unwrap().offset.0;
 
                 for record in &batch {
-                    let mut row =
-                        stored_record_to_row(record, pipeline.source_alias.as_deref());
+                    let mut row = stored_record_to_row(record, pipeline.source_alias.as_deref());
 
                     if let Some((ref lookup, ref join_info)) = join_lookup {
                         let left_key = eval_expr(&join_info.left_key_expr, &row).to_string();
@@ -272,10 +271,7 @@ async fn run_inner(
                                 if matches!(join_info.join_type, JoinType::Left) {
                                     let null_right = Row {
                                         columns: join_info.right_columns.clone(),
-                                        values: vec![
-                                            Value::Null;
-                                            join_info.right_columns.len()
-                                        ],
+                                        values: vec![Value::Null; join_info.right_columns.len()],
                                     };
                                     row = combine_rows(&row, &null_right);
                                 } else {
@@ -374,8 +370,7 @@ async fn run_inner(
                 let last_offset = batch.last().unwrap().offset.0;
 
                 for record in &batch {
-                    let row =
-                        stored_record_to_row(record, pipeline.source_alias.as_deref());
+                    let row = stored_record_to_row(record, pipeline.source_alias.as_deref());
                     let emitted = windowed_state.process_record(&row, record.timestamp);
                     for output_row in &emitted {
                         emit_row(
@@ -451,8 +446,7 @@ async fn run_inner(
                     .map_err(|e| format!("read left error: {e}"))?;
 
                 for record in &left_batch {
-                    let row =
-                        stored_record_to_row(record, pipeline.source_alias.as_deref());
+                    let row = stored_record_to_row(record, pipeline.source_alias.as_deref());
                     let matched = join_state.process_left(row, record.timestamp);
                     for joined_row in matched {
                         let output = apply_filter_and_project(
@@ -1169,9 +1163,7 @@ mod tests {
             let amount = (i + 1) * 10;
             let record = Record {
                 key: Some(Bytes::from(format!("evt-{i}"))),
-                value: Bytes::from(format!(
-                    r#"{{"amount": {amount}, "region": "us"}}"#
-                )),
+                value: Bytes::from(format!(r#"{{"amount": {amount}, "region": "us"}}"#)),
                 subject: "event.created".into(),
                 headers: vec![],
             };
@@ -1192,7 +1184,10 @@ mod tests {
             select: vec![
                 SelectItem {
                     expr: Expr::JsonAccess {
-                        expr: Box::new(Expr::Column { table: None, name: "payload".into() }),
+                        expr: Box::new(Expr::Column {
+                            table: None,
+                            name: "payload".into(),
+                        }),
                         field: "region".into(),
                         as_text: true,
                     },
@@ -1210,7 +1205,10 @@ mod tests {
                     expr: Expr::Aggregate {
                         func: AggregateFunc::Sum,
                         expr: Box::new(Expr::JsonAccess {
-                            expr: Box::new(Expr::Column { table: None, name: "payload".into() }),
+                            expr: Box::new(Expr::Column {
+                                table: None,
+                                name: "payload".into(),
+                            }),
                             field: "amount".into(),
                             as_text: true,
                         }),
@@ -1229,12 +1227,18 @@ mod tests {
                 Expr::Function {
                     name: "tumbling".into(),
                     args: vec![
-                        Expr::Column { table: None, name: "timestamp".into() },
+                        Expr::Column {
+                            table: None,
+                            name: "timestamp".into(),
+                        },
                         Expr::Literal(LiteralValue::String("1 hour".into())),
                     ],
                 },
                 Expr::JsonAccess {
-                    expr: Box::new(Expr::Column { table: None, name: "payload".into() }),
+                    expr: Box::new(Expr::Column {
+                        table: None,
+                        name: "payload".into(),
+                    }),
                     field: "region".into(),
                     as_text: true,
                 },
@@ -1261,9 +1265,7 @@ mod tests {
 
         // Manually run the windowed aggregate loop for 1 batch
         let source_name = StreamName::try_from("events").unwrap();
-        let batch = storage
-            .read(&source_name, Offset(0), 1000)
-            .unwrap();
+        let batch = storage.read(&source_name, Offset(0), 1000).unwrap();
         assert_eq!(batch.len(), 4);
 
         // Extract windowed params
@@ -1333,8 +1335,7 @@ mod tests {
         registry.set_running(&query_id, cancel_tx).unwrap();
 
         // Create the MV state
-        let mv_state: Arc<RwLock<HashMap<String, Row>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let mv_state: Arc<RwLock<HashMap<String, Row>>> = Arc::new(RwLock::new(HashMap::new()));
 
         let storage_clone = storage.clone();
         let registry_clone = registry.clone();
@@ -1363,15 +1364,17 @@ mod tests {
         // Actually, since there's no GROUP BY, every row will write to __global__
         // and only the last one will survive.  That's correct for a simple non-aggregate MV.
         let state = mv_state.read().unwrap();
-        assert!(
-            !state.is_empty(),
-            "MV state should have at least one entry"
-        );
+        assert!(!state.is_empty(), "MV state should have at least one entry");
 
         // The __global__ key should exist with the last record's data
-        let row = state.get("__global__").expect("expected __global__ key in MV");
+        let row = state
+            .get("__global__")
+            .expect("expected __global__ key in MV");
         assert!(row.get("key").is_some(), "expected 'key' column in MV row");
-        assert!(row.get("total").is_some(), "expected 'total' column in MV row");
+        assert!(
+            row.get("total").is_some(),
+            "expected 'total' column in MV row"
+        );
     }
 
     // ── Stream-stream join test ──────────────────────────────────────────
