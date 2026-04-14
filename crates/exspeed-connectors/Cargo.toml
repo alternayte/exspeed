@@ -17,6 +17,9 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 reqwest = { workspace = true }
 tokio-postgres = { workspace = true }
+sqlx = { workspace = true }
+lapin = { workspace = true }
+rust-s3 = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
