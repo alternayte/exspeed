@@ -1,4 +1,6 @@
+pub mod client;
 pub mod connector;
+pub mod format;
 pub mod server;
 
 use clap::Parser;
