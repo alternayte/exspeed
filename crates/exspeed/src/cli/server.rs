@@ -54,6 +54,20 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         metrics.clone(),
     ));
 
+    // Ensure connectors.d directory exists
+    let _ = std::fs::create_dir_all(args.data_dir.join("connectors.d"));
+
+    // Load persisted + TOML connector configs on startup
+    if let Err(e) = connector_manager.load_all().await {
+        warn!("failed to load connector configs: {}", e);
+    }
+
+    // Spawn TOML file watcher for hot-reload of connectors.d/
+    exspeed_connectors::file_watcher::spawn_file_watcher(
+        connector_manager.clone(),
+        args.data_dir.join("connectors.d"),
+    );
+
     // Create shared AppState
     let state = Arc::new(exspeed_api::AppState {
         broker: broker.clone(),
