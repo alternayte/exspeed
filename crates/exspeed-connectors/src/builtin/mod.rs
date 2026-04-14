@@ -1,3 +1,4 @@
+pub mod http_poll;
 pub mod http_sink;
 pub mod http_webhook;
 pub mod jdbc_sink;
@@ -20,6 +21,7 @@ pub fn create_source(
         )?)),
         "postgres_cdc" => Ok(Box::new(postgres_cdc::PostgresCdcSource::new(config)?)),
         "rabbitmq" => Ok(Box::new(rabbitmq_source::RabbitmqSource::new(config)?)),
+        "http_poll" => Ok(Box::new(http_poll::HttpPollSource::new(config)?)),
         other => Err(ConnectorError::Config(format!(
             "unknown source plugin: {other}"
         ))),
