@@ -6,6 +6,7 @@ use exspeed_streams::{StorageEngine, StoredRecord};
 
 use crate::error::ExqlError;
 use crate::external::connections::ConnectionRegistry;
+use crate::materialized_view::MaterializedViewRegistry;
 use crate::parser::ast::ExqlStatement;
 use crate::planner::physical::PhysicalPlan;
 use crate::runtime::operators::aggregate::AggregateOperator;
@@ -23,7 +24,7 @@ pub fn execute_bounded(
     sql: &str,
     storage: &Arc<dyn StorageEngine>,
 ) -> Result<ResultSet, ExqlError> {
-    execute_bounded_with_connections(sql, storage, None)
+    execute_bounded_with_mv(sql, storage, None, None)
 }
 
 /// Execute a bounded (batch) SQL query with optional external connection support.
@@ -31,6 +32,16 @@ pub fn execute_bounded_with_connections(
     sql: &str,
     storage: &Arc<dyn StorageEngine>,
     connections: Option<&ConnectionRegistry>,
+) -> Result<ResultSet, ExqlError> {
+    execute_bounded_with_mv(sql, storage, connections, None)
+}
+
+/// Execute a bounded (batch) SQL query with optional connection and MV registry support.
+pub fn execute_bounded_with_mv(
+    sql: &str,
+    storage: &Arc<dyn StorageEngine>,
+    connections: Option<&ConnectionRegistry>,
+    mv_registry: Option<&MaterializedViewRegistry>,
 ) -> Result<ResultSet, ExqlError> {
     let start = Instant::now();
 
@@ -51,7 +62,7 @@ pub fn execute_bounded_with_connections(
     let plan = crate::planner::plan(&query, crate::parser::ast::EmitMode::Changes)?;
 
     // 4. Build operator tree
-    let mut root = build_operator(&plan, storage, connections)?;
+    let mut root = build_operator(&plan, storage, connections, mv_registry)?;
 
     // 5. Pull all rows from the root operator
     let columns = root.columns();
@@ -74,9 +85,17 @@ fn build_operator(
     plan: &PhysicalPlan,
     storage: &Arc<dyn StorageEngine>,
     connections: Option<&ConnectionRegistry>,
+    mv_registry: Option<&MaterializedViewRegistry>,
 ) -> Result<Box<dyn Operator>, ExqlError> {
     match plan {
         PhysicalPlan::SeqScan { stream, alias } => {
+            // Check materialized views first
+            if let Some(mv_reg) = mv_registry {
+                if let Some((_columns, rows)) = mv_reg.get_rows(stream) {
+                    return Ok(Box::new(ScanOperator::new(rows)));
+                }
+            }
+
             let stream_name = StreamName::try_from(stream.as_str()).map_err(|e| {
                 ExqlError::Storage(format!("invalid stream name '{}': {}", stream, e))
             })?;
@@ -125,12 +144,12 @@ fn build_operator(
         }
 
         PhysicalPlan::Filter { input, predicate } => {
-            let child = build_operator(input, storage, connections)?;
+            let child = build_operator(input, storage, connections, mv_registry)?;
             Ok(Box::new(FilterOperator::new(child, predicate.clone())))
         }
 
         PhysicalPlan::Project { input, items } => {
-            let child = build_operator(input, storage, connections)?;
+            let child = build_operator(input, storage, connections, mv_registry)?;
             Ok(Box::new(ProjectOperator::new(child, items.clone())))
         }
 
@@ -140,8 +159,8 @@ fn build_operator(
             on,
             join_type,
         } => {
-            let left_op = build_operator(left, storage, connections)?;
-            let right_op = build_operator(right, storage, connections)?;
+            let left_op = build_operator(left, storage, connections, mv_registry)?;
+            let right_op = build_operator(right, storage, connections, mv_registry)?;
             Ok(Box::new(HashJoinOperator::new(
                 left_op,
                 right_op,
@@ -155,7 +174,7 @@ fn build_operator(
             group_by,
             select_items,
         } => {
-            let child = build_operator(input, storage, connections)?;
+            let child = build_operator(input, storage, connections, mv_registry)?;
             Ok(Box::new(AggregateOperator::new(
                 child,
                 group_by.clone(),
@@ -164,7 +183,7 @@ fn build_operator(
         }
 
         PhysicalPlan::Sort { input, order_by } => {
-            let child = build_operator(input, storage, connections)?;
+            let child = build_operator(input, storage, connections, mv_registry)?;
             Ok(Box::new(SortOperator::new(child, order_by.clone())))
         }
 
@@ -173,7 +192,7 @@ fn build_operator(
             limit,
             offset,
         } => {
-            let child = build_operator(input, storage, connections)?;
+            let child = build_operator(input, storage, connections, mv_registry)?;
             Ok(Box::new(LimitOperator::new(
                 child,
                 *limit,
@@ -407,5 +426,148 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn select_from_materialized_view() {
+        use crate::materialized_view::MaterializedViewRegistry;
+
+        let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+        let mv_registry = MaterializedViewRegistry::new();
+
+        // Register an MV with two pre-populated rows.
+        let state = mv_registry.register(
+            "mv_orders",
+            vec!["region".into(), "total".into()],
+            "q-test-01",
+        );
+
+        {
+            let mut map = state.write().unwrap();
+            map.insert(
+                "eu".into(),
+                Row {
+                    columns: vec!["region".into(), "total".into()],
+                    values: vec![Value::Text("eu".into()), Value::Int(300)],
+                },
+            );
+            map.insert(
+                "us".into(),
+                Row {
+                    columns: vec!["region".into(), "total".into()],
+                    values: vec![Value::Text("us".into()), Value::Int(200)],
+                },
+            );
+        }
+
+        let result = execute_bounded_with_mv(
+            "SELECT * FROM \"mv_orders\"",
+            &storage,
+            None,
+            Some(&mv_registry),
+        )
+        .unwrap();
+
+        assert_eq!(result.rows.len(), 2);
+
+        // Verify both expected regions are present.
+        let regions: Vec<String> = result
+            .rows
+            .iter()
+            .filter_map(|r| r.get("region"))
+            .map(|v| match v {
+                Value::Text(s) => s.clone(),
+                _ => panic!("expected text value for region"),
+            })
+            .collect();
+        assert!(regions.contains(&"eu".to_string()));
+        assert!(regions.contains(&"us".to_string()));
+    }
+
+    #[test]
+    fn select_from_mv_with_where() {
+        use crate::materialized_view::MaterializedViewRegistry;
+
+        let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+        let mv_registry = MaterializedViewRegistry::new();
+
+        let state = mv_registry.register(
+            "mv_sales",
+            vec!["region".into(), "total".into()],
+            "q-test-02",
+        );
+
+        {
+            let mut map = state.write().unwrap();
+            map.insert(
+                "eu".into(),
+                Row {
+                    columns: vec!["region".into(), "total".into()],
+                    values: vec![Value::Text("eu".into()), Value::Int(300)],
+                },
+            );
+            map.insert(
+                "us".into(),
+                Row {
+                    columns: vec!["region".into(), "total".into()],
+                    values: vec![Value::Text("us".into()), Value::Int(200)],
+                },
+            );
+            map.insert(
+                "apac".into(),
+                Row {
+                    columns: vec!["region".into(), "total".into()],
+                    values: vec![Value::Text("apac".into()), Value::Int(500)],
+                },
+            );
+        }
+
+        let result = execute_bounded_with_mv(
+            "SELECT * FROM \"mv_sales\" WHERE region = 'eu'",
+            &storage,
+            None,
+            Some(&mv_registry),
+        )
+        .unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].get("region"), Some(&Value::Text("eu".into())));
+    }
+
+    #[test]
+    fn select_from_mv_with_limit() {
+        use crate::materialized_view::MaterializedViewRegistry;
+
+        let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+        let mv_registry = MaterializedViewRegistry::new();
+
+        let state = mv_registry.register(
+            "mv_limit_test",
+            vec!["id".into(), "val".into()],
+            "q-test-03",
+        );
+
+        {
+            let mut map = state.write().unwrap();
+            for i in 0..10i64 {
+                map.insert(
+                    i.to_string(),
+                    Row {
+                        columns: vec!["id".into(), "val".into()],
+                        values: vec![Value::Int(i), Value::Int(i * 10)],
+                    },
+                );
+            }
+        }
+
+        let result = execute_bounded_with_mv(
+            "SELECT * FROM \"mv_limit_test\" LIMIT 3",
+            &storage,
+            None,
+            Some(&mv_registry),
+        )
+        .unwrap();
+
+        assert_eq!(result.rows.len(), 3);
     }
 }
