@@ -9,6 +9,7 @@ members = [
     "crates/exspeed-broker",
     "crates/exspeed-api",
     "crates/exspeed-connectors",
+    "crates/exspeed-processing",
 ]
 
 [workspace.dependencies]
@@ -49,6 +50,9 @@ toml = "0.8"
 # HTTP
 axum = "0.8"
 reqwest = { version = "0.12", features = ["json"] }
+
+# SQL parsing
+sqlparser = "0.61"
 
 # Database
 tokio-postgres = "0.7"
