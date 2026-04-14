@@ -65,11 +65,7 @@ fn transform_query(query: sp::Query) -> Result<QueryExpr, ParseError> {
 
     // Extract LIMIT / OFFSET
     let (limit, offset) = match query.limit_clause {
-        Some(sp::LimitClause::LimitOffset {
-            limit,
-            offset,
-            ..
-        }) => {
+        Some(sp::LimitClause::LimitOffset { limit, offset, .. }) => {
             let l = limit.map(expr_to_u64).transpose()?;
             let o = offset.map(|o| expr_to_u64(o.value)).transpose()?;
             (l, o)
@@ -108,9 +104,7 @@ fn transform_query(query: sp::Query) -> Result<QueryExpr, ParseError> {
             }
             Ok(result)
         }
-        other => Err(ParseError::Unsupported(format!(
-            "query body type: {other}"
-        ))),
+        other => Err(ParseError::Unsupported(format!("query body type: {other}"))),
     }
 }
 
@@ -147,7 +141,7 @@ fn transform_select(
         // Additional FROM items become implicit CROSS JOINs — unsupported for now,
         // but we can support them later. For simplicity, treat additional FROM items
         // as an error if they have joins, or merge them.
-        for extra in from_iter {
+        if let Some(extra) = from_iter.next() {
             return Err(ParseError::Unsupported(format!(
                 "multiple FROM items (implicit cross join): {extra}"
             )));
@@ -157,10 +151,7 @@ fn transform_select(
     };
 
     // WHERE
-    let filter = select
-        .selection
-        .map(transform_expr)
-        .transpose()?;
+    let filter = select.selection.map(transform_expr).transpose()?;
 
     // GROUP BY
     let group_by = match select.group_by {
@@ -229,9 +220,7 @@ fn transform_select_item(item: sp::SelectItem) -> Result<SelectItem, ParseError>
                     Some(object_name_to_string(&name))
                 }
                 sp::SelectItemQualifiedWildcardKind::Expr(_) => {
-                    return Err(ParseError::Unsupported(
-                        "expression wildcard".into(),
-                    ));
+                    return Err(ParseError::Unsupported("expression wildcard".into()));
                 }
             };
             Ok(SelectItem {
@@ -246,9 +235,7 @@ fn transform_select_item(item: sp::SelectItem) -> Result<SelectItem, ParseError>
 // FROM clause
 // ---------------------------------------------------------------------------
 
-fn transform_from(
-    twj: sp::TableWithJoins,
-) -> Result<(FromClause, Vec<JoinClause>), ParseError> {
+fn transform_from(twj: sp::TableWithJoins) -> Result<(FromClause, Vec<JoinClause>), ParseError> {
     let from = transform_table_factor(twj.relation)?;
     let joins = twj
         .joins
@@ -261,10 +248,7 @@ fn transform_from(
 fn transform_table_factor(tf: sp::TableFactor) -> Result<FromClause, ParseError> {
     match tf {
         sp::TableFactor::Table {
-            name,
-            alias,
-            args,
-            ..
+            name, alias, args, ..
         } => {
             // Check if this is a table-valued function (e.g., external(), postgres(), mssql())
             if let Some(table_fn_args) = args {
@@ -295,10 +279,7 @@ fn transform_table_factor(tf: sp::TableFactor) -> Result<FromClause, ParseError>
             transform_table_function_expr(expr, alias)
         }
         sp::TableFactor::Function {
-            name,
-            args,
-            alias,
-            ..
+            name, args, alias, ..
         } => {
             // LATERAL FLATTEN or similar — try to map as external
             let fn_name = object_name_to_string(&name).to_lowercase();
@@ -422,9 +403,7 @@ fn transform_join(join: sp::Join) -> Result<JoinClause, ParseError> {
         sp::JoinOperator::Left(c) => (JoinType::Left, c),
         sp::JoinOperator::LeftOuter(c) => (JoinType::Left, c),
         other => {
-            return Err(ParseError::Unsupported(format!(
-                "join type: {other:?}"
-            )));
+            return Err(ParseError::Unsupported(format!("join type: {other:?}")));
         }
     };
 
@@ -437,9 +416,7 @@ fn transform_join(join: sp::Join) -> Result<JoinClause, ParseError> {
             return Err(ParseError::Unsupported("NATURAL JOIN".into()));
         }
         sp::JoinConstraint::None => {
-            return Err(ParseError::Transform(
-                "JOIN without ON clause".into(),
-            ));
+            return Err(ParseError::Transform("JOIN without ON clause".into()));
         }
     };
 
@@ -456,9 +433,7 @@ fn transform_join(join: sp::Join) -> Result<JoinClause, ParseError> {
 // ORDER BY
 // ---------------------------------------------------------------------------
 
-fn transform_order_by_expr(
-    obe: sp::OrderByExpr,
-) -> Result<OrderByItem, ParseError> {
+fn transform_order_by_expr(obe: sp::OrderByExpr) -> Result<OrderByItem, ParseError> {
     let expr = transform_expr(obe.expr)?;
     let descending = match obe.options.asc {
         Some(true) => false,
@@ -726,9 +701,7 @@ fn transform_expr(expr: sp::Expr) -> Result<Expr, ParseError> {
         }
 
         // Anything else
-        other => Err(ParseError::Unsupported(format!(
-            "expression type: {other}"
-        ))),
+        other => Err(ParseError::Unsupported(format!("expression type: {other}"))),
     }
 }
 
@@ -778,9 +751,7 @@ fn transform_function(func: sp::Function) -> Result<Expr, ParseError> {
 // Binary / Unary operator mapping
 // ---------------------------------------------------------------------------
 
-fn transform_binary_op(
-    op: sp::BinaryOperator,
-) -> Result<BinaryOperator, ParseError> {
+fn transform_binary_op(op: sp::BinaryOperator) -> Result<BinaryOperator, ParseError> {
     match op {
         sp::BinaryOperator::Eq => Ok(BinaryOperator::Eq),
         sp::BinaryOperator::NotEq => Ok(BinaryOperator::Neq),
@@ -795,21 +766,15 @@ fn transform_binary_op(
         sp::BinaryOperator::Multiply => Ok(BinaryOperator::Mul),
         sp::BinaryOperator::Divide => Ok(BinaryOperator::Div),
         sp::BinaryOperator::Modulo => Ok(BinaryOperator::Mod),
-        other => Err(ParseError::Unsupported(format!(
-            "binary operator: {other}"
-        ))),
+        other => Err(ParseError::Unsupported(format!("binary operator: {other}"))),
     }
 }
 
-fn transform_unary_op(
-    op: sp::UnaryOperator,
-) -> Result<UnaryOperator, ParseError> {
+fn transform_unary_op(op: sp::UnaryOperator) -> Result<UnaryOperator, ParseError> {
     match op {
         sp::UnaryOperator::Not => Ok(UnaryOperator::Not),
         sp::UnaryOperator::Minus => Ok(UnaryOperator::Neg),
-        other => Err(ParseError::Unsupported(format!(
-            "unary operator: {other}"
-        ))),
+        other => Err(ParseError::Unsupported(format!("unary operator: {other}"))),
     }
 }
 
@@ -832,17 +797,11 @@ fn transform_value(val: sp::Value) -> Result<Expr, ParseError> {
                 )))
             }
         }
-        sp::Value::SingleQuotedString(s) => {
-            Ok(Expr::Literal(LiteralValue::String(s)))
-        }
-        sp::Value::DoubleQuotedString(s) => {
-            Ok(Expr::Literal(LiteralValue::String(s)))
-        }
+        sp::Value::SingleQuotedString(s) => Ok(Expr::Literal(LiteralValue::String(s))),
+        sp::Value::DoubleQuotedString(s) => Ok(Expr::Literal(LiteralValue::String(s))),
         sp::Value::Boolean(b) => Ok(Expr::Literal(LiteralValue::Bool(b))),
         sp::Value::Null => Ok(Expr::Literal(LiteralValue::Null)),
-        other => Err(ParseError::Unsupported(format!(
-            "value type: {other}"
-        ))),
+        other => Err(ParseError::Unsupported(format!("value type: {other}"))),
     }
 }
 
@@ -854,9 +813,9 @@ fn transform_value(val: sp::Value) -> Result<Expr, ParseError> {
 fn object_name_to_string(name: &sp::ObjectName) -> String {
     name.0
         .iter()
-        .filter_map(|part| match part {
-            sp::ObjectNamePart::Identifier(ident) => Some(ident.value.clone()),
-            sp::ObjectNamePart::Function(f) => Some(f.name.value.clone()),
+        .map(|part| match part {
+            sp::ObjectNamePart::Identifier(ident) => ident.value.clone(),
+            sp::ObjectNamePart::Function(f) => f.name.value.clone(),
         })
         .collect::<Vec<_>>()
         .join(".")
@@ -931,15 +890,9 @@ fn extract_function_call_args_with_distinct(
                 .args
                 .into_iter()
                 .map(|arg| match arg {
-                    sp::FunctionArg::Unnamed(fae) => {
-                        transform_function_arg_expr(fae)
-                    }
-                    sp::FunctionArg::Named { arg, .. } => {
-                        transform_function_arg_expr(arg)
-                    }
-                    sp::FunctionArg::ExprNamed { arg, .. } => {
-                        transform_function_arg_expr(arg)
-                    }
+                    sp::FunctionArg::Unnamed(fae) => transform_function_arg_expr(fae),
+                    sp::FunctionArg::Named { arg, .. } => transform_function_arg_expr(arg),
+                    sp::FunctionArg::ExprNamed { arg, .. } => transform_function_arg_expr(arg),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok((exprs, distinct))
@@ -948,21 +901,15 @@ fn extract_function_call_args_with_distinct(
 }
 
 /// Extract function arguments without distinct flag.
-fn extract_function_call_args(
-    args: sp::FunctionArguments,
-) -> Result<Vec<Expr>, ParseError> {
+fn extract_function_call_args(args: sp::FunctionArguments) -> Result<Vec<Expr>, ParseError> {
     let (exprs, _) = extract_function_call_args_with_distinct(args)?;
     Ok(exprs)
 }
 
-fn transform_function_arg_expr(
-    fae: sp::FunctionArgExpr,
-) -> Result<Expr, ParseError> {
+fn transform_function_arg_expr(fae: sp::FunctionArgExpr) -> Result<Expr, ParseError> {
     match fae {
         sp::FunctionArgExpr::Expr(e) => transform_expr(e),
-        sp::FunctionArgExpr::Wildcard => {
-            Ok(Expr::Wildcard { table: None })
-        }
+        sp::FunctionArgExpr::Wildcard => Ok(Expr::Wildcard { table: None }),
         sp::FunctionArgExpr::QualifiedWildcard(name) => Ok(Expr::Wildcard {
             table: Some(object_name_to_string(&name)),
         }),
@@ -970,36 +917,24 @@ fn transform_function_arg_expr(
 }
 
 /// Extract ExQL Exprs from TableFunctionArgs.
-fn extract_fn_args_from_table_fn_args(
-    tfa: sp::TableFunctionArgs,
-) -> Result<Vec<Expr>, ParseError> {
+fn extract_fn_args_from_table_fn_args(tfa: sp::TableFunctionArgs) -> Result<Vec<Expr>, ParseError> {
     tfa.args
         .into_iter()
         .map(|arg| match arg {
             sp::FunctionArg::Unnamed(fae) => transform_function_arg_expr(fae),
-            sp::FunctionArg::Named { arg, .. } => {
-                transform_function_arg_expr(arg)
-            }
-            sp::FunctionArg::ExprNamed { arg, .. } => {
-                transform_function_arg_expr(arg)
-            }
+            sp::FunctionArg::Named { arg, .. } => transform_function_arg_expr(arg),
+            sp::FunctionArg::ExprNamed { arg, .. } => transform_function_arg_expr(arg),
         })
         .collect()
 }
 
 /// Extract ExQL Exprs from a Vec<FunctionArg> (used in TableFactor::Function).
-fn extract_fn_args_from_vec(
-    args: Vec<sp::FunctionArg>,
-) -> Result<Vec<Expr>, ParseError> {
+fn extract_fn_args_from_vec(args: Vec<sp::FunctionArg>) -> Result<Vec<Expr>, ParseError> {
     args.into_iter()
         .map(|arg| match arg {
             sp::FunctionArg::Unnamed(fae) => transform_function_arg_expr(fae),
-            sp::FunctionArg::Named { arg, .. } => {
-                transform_function_arg_expr(arg)
-            }
-            sp::FunctionArg::ExprNamed { arg, .. } => {
-                transform_function_arg_expr(arg)
-            }
+            sp::FunctionArg::Named { arg, .. } => transform_function_arg_expr(arg),
+            sp::FunctionArg::ExprNamed { arg, .. } => transform_function_arg_expr(arg),
         })
         .collect()
 }

@@ -126,19 +126,11 @@ mod tests {
         vec![
             Row {
                 columns: vec!["id".into(), "name".into(), "score".into()],
-                values: vec![
-                    Value::Int(1),
-                    Value::Text("Alice".into()),
-                    Value::Int(95),
-                ],
+                values: vec![Value::Int(1), Value::Text("Alice".into()), Value::Int(95)],
             },
             Row {
                 columns: vec!["id".into(), "name".into(), "score".into()],
-                values: vec![
-                    Value::Int(2),
-                    Value::Text("Bob".into()),
-                    Value::Int(80),
-                ],
+                values: vec![Value::Int(2), Value::Text("Bob".into()), Value::Int(80)],
             },
         ]
     }

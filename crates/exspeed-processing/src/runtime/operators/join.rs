@@ -103,11 +103,7 @@ impl Operator for HashJoinOperator {
             match self.left.next() {
                 Some(left_row) => {
                     let key = eval_expr(&self.left_key_expr, &left_row).to_string();
-                    self.current_matches = self
-                        .right_lookup
-                        .get(&key)
-                        .cloned()
-                        .unwrap_or_default();
+                    self.current_matches = self.right_lookup.get(&key).cloned().unwrap_or_default();
                     self.match_idx = 0;
                     self.current_left = Some(left_row);
                     self.left_had_match = false;
@@ -131,9 +127,11 @@ impl Operator for HashJoinOperator {
 /// expression as both the left and right key if it is not a simple equality.
 fn decompose_on_expr(expr: &Expr) -> (Expr, Expr) {
     match expr {
-        Expr::BinaryOp { left, op: crate::parser::ast::BinaryOperator::Eq, right } => {
-            (*left.clone(), *right.clone())
-        }
+        Expr::BinaryOp {
+            left,
+            op: crate::parser::ast::BinaryOperator::Eq,
+            right,
+        } => (*left.clone(), *right.clone()),
         _ => (expr.clone(), expr.clone()),
     }
 }
@@ -203,10 +201,7 @@ mod tests {
         let right = Box::new(ScanOperator::new(right_rows()));
         let mut join = HashJoinOperator::new(left, right, JoinType::Inner, on_expr());
 
-        assert_eq!(
-            join.columns(),
-            vec!["user_id", "order", "id", "name"]
-        );
+        assert_eq!(join.columns(), vec!["user_id", "order", "id", "name"]);
 
         let r1 = join.next().unwrap();
         assert_eq!(r1.get("user_id"), Some(&Value::Int(1)));

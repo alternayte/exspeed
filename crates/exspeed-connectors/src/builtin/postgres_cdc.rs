@@ -178,10 +178,10 @@ impl SourceConnector for PostgresCdcSource {
                 }
 
                 let value_json = serde_json::Value::Object(map);
-                let value_bytes =
-                    Bytes::from(serde_json::to_vec(&value_json).map_err(|e| {
-                        ConnectorError::Data(format!("json serialization: {e}"))
-                    })?);
+                let value_bytes = Bytes::from(
+                    serde_json::to_vec(&value_json)
+                        .map_err(|e| ConnectorError::Data(format!("json serialization: {e}")))?,
+                );
 
                 // Subject: use template if set, otherwise derive from table name.
                 let subject = if !self.subject_template.is_empty() {
@@ -204,10 +204,7 @@ impl SourceConnector for PostgresCdcSource {
                     value: value_bytes,
                     subject,
                     headers: vec![
-                        (
-                            "x-exspeed-source".to_string(),
-                            "postgres_cdc".to_string(),
-                        ),
+                        ("x-exspeed-source".to_string(), "postgres_cdc".to_string()),
                         ("x-table".to_string(), table.clone()),
                     ],
                 };
@@ -271,10 +268,7 @@ mod tests {
 
     #[test]
     fn rejects_missing_connection() {
-        let config = make_config(HashMap::from([(
-            "tables".into(),
-            "public.orders".into(),
-        )]));
+        let config = make_config(HashMap::from([("tables".into(), "public.orders".into())]));
         let err = PostgresCdcSource::new(&config).unwrap_err();
         assert!(
             err.to_string().contains("connection"),
@@ -316,10 +310,7 @@ mod tests {
             ("timestamp_column".into(), "modified_at".into()),
         ]));
         let src = PostgresCdcSource::new(&config).unwrap();
-        assert_eq!(
-            src.tables,
-            vec!["public.orders", "public.customers"]
-        );
+        assert_eq!(src.tables, vec!["public.orders", "public.customers"]);
         assert_eq!(src.timestamp_column, "modified_at");
     }
 
@@ -335,7 +326,10 @@ mod tests {
 
     #[test]
     fn split_table_name_qualified() {
-        assert_eq!(split_table_name("myschema.mytable"), ("myschema", "mytable"));
+        assert_eq!(
+            split_table_name("myschema.mytable"),
+            ("myschema", "mytable")
+        );
     }
 
     #[test]

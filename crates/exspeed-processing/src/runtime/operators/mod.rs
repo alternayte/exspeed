@@ -1,10 +1,10 @@
-pub mod scan;
-pub mod filter;
-pub mod project;
-pub mod join;
 pub mod aggregate;
-pub mod sort;
+pub mod filter;
+pub mod join;
 pub mod limit;
+pub mod project;
+pub mod scan;
+pub mod sort;
 
 use crate::types::Row;
 

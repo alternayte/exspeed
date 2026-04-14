@@ -36,10 +36,7 @@ pub async fn create_connection(
             StatusCode::CREATED,
             Json(json!({"name": body.name, "driver": body.driver, "status": "created"})),
         ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e})),
-        ),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))),
     }
 }
 
@@ -70,9 +67,6 @@ pub async fn delete_connection(
             StatusCode::OK,
             Json(json!({"status": "removed", "name": name})),
         ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e})),
-        ),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))),
     }
 }

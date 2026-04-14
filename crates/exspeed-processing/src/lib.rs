@@ -1,10 +1,10 @@
 pub mod error;
-pub mod types;
+pub mod external;
 pub mod parser;
 pub mod planner;
-pub mod runtime;
-pub mod external;
 pub mod query_registry;
+pub mod runtime;
+pub mod types;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -73,12 +73,12 @@ impl ExqlEngine {
 
         self.query_registry
             .register(&id, sql, &target_stream)
-            .map_err(|e| ExqlError::Execution(e))?;
+            .map_err(ExqlError::Execution)?;
 
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
         self.query_registry
             .set_running(&id, cancel_tx)
-            .map_err(|e| ExqlError::Execution(e))?;
+            .map_err(ExqlError::Execution)?;
 
         // Spawn the continuous query task
         let storage = self.storage.clone();
@@ -89,12 +89,7 @@ impl ExqlEngine {
 
         tokio::spawn(async move {
             runtime::continuous::run_continuous_query(
-                query_id,
-                sql_owned,
-                target,
-                storage,
-                registry,
-                cancel_rx,
+                query_id, sql_owned, target, storage, registry, cancel_rx,
             )
             .await;
         });
@@ -104,16 +99,12 @@ impl ExqlEngine {
 
     /// Stop a running continuous query.
     pub fn stop_query(&self, id: &str) -> Result<(), ExqlError> {
-        self.query_registry
-            .stop(id)
-            .map_err(|e| ExqlError::Execution(e))
+        self.query_registry.stop(id).map_err(ExqlError::Execution)
     }
 
     /// Remove a continuous query (stop if running, delete from disk).
     pub fn remove_query(&self, id: &str) -> Result<(), ExqlError> {
-        self.query_registry
-            .remove(id)
-            .map_err(|e| ExqlError::Execution(e))
+        self.query_registry.remove(id).map_err(ExqlError::Execution)
     }
 
     /// List all registered continuous queries.
@@ -132,11 +123,7 @@ impl ExqlEngine {
             // Retrieve the SQL so we can re-launch
             if let Some(sql) = self.query_registry.get_sql(&snap.id) {
                 let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-                if self
-                    .query_registry
-                    .set_running(&snap.id, cancel_tx)
-                    .is_ok()
-                {
+                if self.query_registry.set_running(&snap.id, cancel_tx).is_ok() {
                     let storage = self.storage.clone();
                     let registry = self.query_registry.clone();
                     let query_id = snap.id.clone();
@@ -144,12 +131,7 @@ impl ExqlEngine {
 
                     tokio::spawn(async move {
                         runtime::continuous::run_continuous_query(
-                            query_id,
-                            sql,
-                            target,
-                            storage,
-                            registry,
-                            cancel_rx,
+                            query_id, sql, target, storage, registry, cancel_rx,
                         )
                         .await;
                     });

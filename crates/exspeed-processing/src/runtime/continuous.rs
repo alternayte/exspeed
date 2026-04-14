@@ -191,11 +191,8 @@ async fn run_inner(
             }
 
             // Apply filter and project
-            let output = apply_filter_and_project(
-                row,
-                pipeline.filter.as_ref(),
-                &pipeline.project_items,
-            );
+            let output =
+                apply_filter_and_project(row, pipeline.filter.as_ref(), &pipeline.project_items);
             if let Some(out_row) = output {
                 let rec = row_to_record(&out_row, target_stream);
                 storage
@@ -279,7 +276,10 @@ fn decompose_plan(plan: &PhysicalPlan) -> Result<ContinuousPipeline, String> {
                 let (left_key, right_key) = decompose_on_expr(on);
 
                 // Build placeholder right columns (standard virtual columns)
-                let right_prefix = right_alias.as_deref().map(|a| format!("{a}.")).unwrap_or_default();
+                let right_prefix = right_alias
+                    .as_deref()
+                    .map(|a| format!("{a}."))
+                    .unwrap_or_default();
                 let right_columns: Vec<String> = vec![
                     format!("{right_prefix}offset"),
                     format!("{right_prefix}timestamp"),
@@ -395,10 +395,9 @@ fn build_join_lookup(
 /// Convert a StoredRecord into a Row with virtual columns.
 /// (Same logic as bounded.rs but pub for continuous use.)
 fn stored_record_to_row(record: &StoredRecord, alias: Option<&str>) -> Row {
-    let payload_json = serde_json::from_slice::<serde_json::Value>(&record.value)
-        .unwrap_or(serde_json::Value::String(
-            String::from_utf8_lossy(&record.value).into(),
-        ));
+    let payload_json = serde_json::from_slice::<serde_json::Value>(&record.value).unwrap_or(
+        serde_json::Value::String(String::from_utf8_lossy(&record.value).into()),
+    );
 
     let headers_json = serde_json::Value::Object(
         record
@@ -437,9 +436,16 @@ fn stored_record_to_row(record: &StoredRecord, alias: Option<&str>) -> Row {
 
     if alias.is_some() {
         columns.extend(
-            ["offset", "timestamp", "key", "subject", "payload", "headers"]
-                .iter()
-                .map(|s| s.to_string()),
+            [
+                "offset",
+                "timestamp",
+                "key",
+                "subject",
+                "payload",
+                "headers",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
         );
         values.extend(base_values);
     }
@@ -480,7 +486,10 @@ fn apply_filter_and_project(
                 }
             }
             expr => {
-                let name = item.alias.clone().unwrap_or_else(|| derive_column_name(expr));
+                let name = item
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| derive_column_name(expr));
                 let val = eval_expr(expr, &row);
                 columns.push(name);
                 values.push(val);
@@ -573,10 +582,7 @@ mod tests {
                     (i + 1) * 100,
                     if i % 2 == 0 { "eu" } else { "us" }
                 )),
-                subject: format!(
-                    "order.{}.created",
-                    if i % 2 == 0 { "eu" } else { "us" }
-                ),
+                subject: format!("order.{}.created", if i % 2 == 0 { "eu" } else { "us" }),
                 headers: vec![],
             };
             storage
@@ -594,7 +600,9 @@ mod tests {
         let registry = Arc::new(QueryRegistry::new(dir.path().to_path_buf()));
 
         let query_id = "q_test_filter".to_string();
-        let sql = r#"CREATE VIEW eu_orders AS SELECT * FROM "orders" WHERE payload->>'region' = 'eu'"#.to_string();
+        let sql =
+            r#"CREATE VIEW eu_orders AS SELECT * FROM "orders" WHERE payload->>'region' = 'eu'"#
+                .to_string();
         let target = "eu_orders".to_string();
 
         registry.register(&query_id, &sql, &target).unwrap();
@@ -633,7 +641,12 @@ mod tests {
         let results = storage.read(&target_name, Offset(0), 100).unwrap();
 
         // 10 records, half are "eu" region (indices 0,2,4,6,8)
-        assert_eq!(results.len(), 5, "expected 5 eu records, got {}", results.len());
+        assert_eq!(
+            results.len(),
+            5,
+            "expected 5 eu records, got {}",
+            results.len()
+        );
 
         // Verify each record has region=eu in the payload
         for r in &results {
@@ -653,7 +666,9 @@ mod tests {
         let registry = Arc::new(QueryRegistry::new(dir.path().to_path_buf()));
 
         let query_id = "q_test_project".to_string();
-        let sql = r#"CREATE VIEW order_totals AS SELECT key, payload->>'total' AS total FROM "orders""#.to_string();
+        let sql =
+            r#"CREATE VIEW order_totals AS SELECT key, payload->>'total' AS total FROM "orders""#
+                .to_string();
         let target = "order_totals".to_string();
 
         registry.register(&query_id, &sql, &target).unwrap();
@@ -691,8 +706,14 @@ mod tests {
 
         // Verify first record has key and total columns
         let first: serde_json::Value = serde_json::from_slice(&results[0].value).unwrap();
-        assert!(first.get("key").is_some(), "expected 'key' column in output");
-        assert!(first.get("total").is_some(), "expected 'total' column in output");
+        assert!(
+            first.get("key").is_some(),
+            "expected 'key' column in output"
+        );
+        assert!(
+            first.get("total").is_some(),
+            "expected 'total' column in output"
+        );
     }
 
     #[tokio::test]

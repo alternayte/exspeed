@@ -19,9 +19,7 @@ pub fn create_source(
             config,
         )?)),
         "postgres_cdc" => Ok(Box::new(postgres_cdc::PostgresCdcSource::new(config)?)),
-        "rabbitmq" => Ok(Box::new(
-            rabbitmq_source::RabbitmqSource::new(config)?,
-        )),
+        "rabbitmq" => Ok(Box::new(rabbitmq_source::RabbitmqSource::new(config)?)),
         other => Err(ConnectorError::Config(format!(
             "unknown source plugin: {other}"
         ))),

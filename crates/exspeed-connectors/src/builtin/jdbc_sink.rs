@@ -2,9 +2,7 @@ use async_trait::async_trait;
 use tracing::{info, warn};
 
 use crate::config::ConnectorConfig;
-use crate::traits::{
-    ConnectorError, HealthStatus, SinkBatch, SinkConnector, WriteResult,
-};
+use crate::traits::{ConnectorError, HealthStatus, SinkBatch, SinkConnector, WriteResult};
 
 pub struct JdbcSinkConnector {
     connection_string: String,
@@ -63,7 +61,9 @@ impl SinkConnector for JdbcSinkConnector {
 
         let pool = sqlx::AnyPool::connect(&self.connection_string)
             .await
-            .map_err(|e| ConnectorError::Connection(format!("JDBC sink: failed to connect: {e}")))?;
+            .map_err(|e| {
+                ConnectorError::Connection(format!("JDBC sink: failed to connect: {e}"))
+            })?;
 
         info!(
             connection = %self.connection_string,
@@ -93,20 +93,19 @@ impl SinkConnector for JdbcSinkConnector {
 
         'records: for record in &batch.records {
             // Parse value as JSON object.
-            let json: serde_json::Value =
-                match serde_json::from_slice(&record.value) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!(
-                            offset = record.offset,
-                            "JDBC sink: skipping non-JSON record: {e}"
-                        );
-                        // Treat parse failures as "advanced past" (poisoned data).
-                        last_successful_offset = Some(record.offset);
-                        any_success = true;
-                        continue 'records;
-                    }
-                };
+            let json: serde_json::Value = match serde_json::from_slice(&record.value) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        offset = record.offset,
+                        "JDBC sink: skipping non-JSON record: {e}"
+                    );
+                    // Treat parse failures as "advanced past" (poisoned data).
+                    last_successful_offset = Some(record.offset);
+                    any_success = true;
+                    continue 'records;
+                }
+            };
 
             let obj = match json.as_object() {
                 Some(o) => o,

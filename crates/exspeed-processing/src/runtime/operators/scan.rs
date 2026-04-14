@@ -10,10 +10,7 @@ pub struct ScanOperator {
 
 impl ScanOperator {
     pub fn new(rows: Vec<Row>) -> Self {
-        let column_names = rows
-            .first()
-            .map(|r| r.columns.clone())
-            .unwrap_or_default();
+        let column_names = rows.first().map(|r| r.columns.clone()).unwrap_or_default();
         Self {
             rows,
             position: 0,

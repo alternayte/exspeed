@@ -12,15 +12,13 @@ use sqlparser::parser::Parser;
 /// Parse a SQL string into an ExQL AST statement.
 pub fn parse(sql: &str) -> Result<ExqlStatement, ParseError> {
     let dialect = ExspeedDialect;
-    let statements = Parser::parse_sql(&dialect, sql)
-        .map_err(|e| ParseError::Sql(e.to_string()))?;
+    let statements =
+        Parser::parse_sql(&dialect, sql).map_err(|e| ParseError::Sql(e.to_string()))?;
     if statements.is_empty() {
         return Err(ParseError::Sql("empty SQL".into()));
     }
     if statements.len() > 1 {
-        return Err(ParseError::Unsupported(
-            "multiple statements".into(),
-        ));
+        return Err(ParseError::Unsupported("multiple statements".into()));
     }
     transform::transform_statement(statements.into_iter().next().unwrap())
 }
@@ -56,9 +54,7 @@ mod tests {
 
     #[test]
     fn parse_select_with_where() {
-        let stmt =
-            parse(r#"SELECT key FROM "orders" WHERE timestamp > 1000"#)
-                .unwrap();
+        let stmt = parse(r#"SELECT key FROM "orders" WHERE timestamp > 1000"#).unwrap();
         match stmt {
             ExqlStatement::Query(q) => {
                 assert_eq!(q.select.len(), 1);
@@ -94,8 +90,7 @@ mod tests {
 
     #[test]
     fn parse_select_with_json() {
-        let stmt =
-            parse(r#"SELECT payload->>'name' FROM "orders""#).unwrap();
+        let stmt = parse(r#"SELECT payload->>'name' FROM "orders""#).unwrap();
         match stmt {
             ExqlStatement::Query(q) => {
                 assert_eq!(q.select.len(), 1);
@@ -105,7 +100,9 @@ mod tests {
                         field,
                         as_text,
                     } => {
-                        assert!(matches!(expr.as_ref(), Expr::Column { name, .. } if name == "payload"));
+                        assert!(
+                            matches!(expr.as_ref(), Expr::Column { name, .. } if name == "payload")
+                        );
                         assert_eq!(field, "name");
                         assert!(*as_text);
                     }
@@ -118,10 +115,7 @@ mod tests {
 
     #[test]
     fn parse_aggregate() {
-        let stmt = parse(
-            r#"SELECT COUNT(*) FROM "orders" GROUP BY key"#,
-        )
-        .unwrap();
+        let stmt = parse(r#"SELECT COUNT(*) FROM "orders" GROUP BY key"#).unwrap();
         match stmt {
             ExqlStatement::Query(q) => {
                 assert_eq!(q.select.len(), 1);
@@ -152,10 +146,7 @@ mod tests {
 
     #[test]
     fn parse_join() {
-        let stmt = parse(
-            r#"SELECT * FROM "a" JOIN "b" ON a.key = b.key"#,
-        )
-        .unwrap();
+        let stmt = parse(r#"SELECT * FROM "a" JOIN "b" ON a.key = b.key"#).unwrap();
         match stmt {
             ExqlStatement::Query(q) => {
                 match &q.from {
@@ -201,10 +192,7 @@ mod tests {
 
     #[test]
     fn parse_order_limit() {
-        let stmt = parse(
-            r#"SELECT * FROM "orders" ORDER BY timestamp DESC LIMIT 10"#,
-        )
-        .unwrap();
+        let stmt = parse(r#"SELECT * FROM "orders" ORDER BY timestamp DESC LIMIT 10"#).unwrap();
         match stmt {
             ExqlStatement::Query(q) => {
                 assert_eq!(q.order_by.len(), 1);
@@ -224,16 +212,10 @@ mod tests {
 
     #[test]
     fn parse_create_stream() {
-        let stmt = parse(
-            r#"CREATE VIEW high_value AS SELECT * FROM "orders" WHERE key = 'x'"#,
-        )
-        .unwrap();
+        let stmt =
+            parse(r#"CREATE VIEW high_value AS SELECT * FROM "orders" WHERE key = 'x'"#).unwrap();
         match stmt {
-            ExqlStatement::CreateStream {
-                name,
-                query,
-                emit,
-            } => {
+            ExqlStatement::CreateStream { name, query, emit } => {
                 assert_eq!(name, "high_value");
                 assert!(matches!(emit, EmitMode::Changes));
                 assert!(query.filter.is_some());
@@ -252,14 +234,15 @@ mod tests {
 
     #[test]
     fn parse_cast_expression() {
-        let stmt =
-            parse(r#"SELECT key::int FROM "orders""#).unwrap();
+        let stmt = parse(r#"SELECT key::int FROM "orders""#).unwrap();
         match stmt {
             ExqlStatement::Query(q) => {
                 assert_eq!(q.select.len(), 1);
                 match &q.select[0].expr {
                     Expr::Cast { expr, to_type } => {
-                        assert!(matches!(expr.as_ref(), Expr::Column { name, .. } if name == "key"));
+                        assert!(
+                            matches!(expr.as_ref(), Expr::Column { name, .. } if name == "key")
+                        );
                         assert!(to_type.to_lowercase().contains("int"));
                     }
                     other => panic!("expected Cast, got {other:?}"),
@@ -271,30 +254,24 @@ mod tests {
 
     #[test]
     fn parse_subquery_in_from() {
-        let stmt = parse(
-            r#"SELECT x FROM (SELECT key AS x FROM "orders") AS sub"#,
-        )
-        .unwrap();
+        let stmt = parse(r#"SELECT x FROM (SELECT key AS x FROM "orders") AS sub"#).unwrap();
         match stmt {
-            ExqlStatement::Query(q) => {
-                match &q.from {
-                    FromClause::Subquery { query, alias } => {
-                        assert_eq!(alias, "sub");
-                        assert_eq!(query.select.len(), 1);
-                    }
-                    other => panic!("expected Subquery, got {other:?}"),
+            ExqlStatement::Query(q) => match &q.from {
+                FromClause::Subquery { query, alias } => {
+                    assert_eq!(alias, "sub");
+                    assert_eq!(query.select.len(), 1);
                 }
-            }
+                other => panic!("expected Subquery, got {other:?}"),
+            },
             other => panic!("expected Query, got {other:?}"),
         }
     }
 
     #[test]
     fn parse_cte() {
-        let stmt = parse(
-            r#"WITH recent AS (SELECT * FROM "orders" LIMIT 100) SELECT * FROM recent"#,
-        )
-        .unwrap();
+        let stmt =
+            parse(r#"WITH recent AS (SELECT * FROM "orders" LIMIT 100) SELECT * FROM recent"#)
+                .unwrap();
         match stmt {
             ExqlStatement::Query(q) => {
                 assert_eq!(q.ctes.len(), 1);
@@ -307,43 +284,33 @@ mod tests {
 
     #[test]
     fn parse_case_when() {
-        let stmt = parse(
-            r#"SELECT CASE WHEN key = 'a' THEN 1 ELSE 0 END FROM "orders""#,
-        )
-        .unwrap();
+        let stmt = parse(r#"SELECT CASE WHEN key = 'a' THEN 1 ELSE 0 END FROM "orders""#).unwrap();
         match stmt {
-            ExqlStatement::Query(q) => {
-                match &q.select[0].expr {
-                    Expr::Case {
-                        conditions,
-                        else_val,
-                    } => {
-                        assert_eq!(conditions.len(), 1);
-                        assert!(else_val.is_some());
-                    }
-                    other => panic!("expected Case, got {other:?}"),
+            ExqlStatement::Query(q) => match &q.select[0].expr {
+                Expr::Case {
+                    conditions,
+                    else_val,
+                } => {
+                    assert_eq!(conditions.len(), 1);
+                    assert!(else_val.is_some());
                 }
-            }
+                other => panic!("expected Case, got {other:?}"),
+            },
             other => panic!("expected Query, got {other:?}"),
         }
     }
 
     #[test]
     fn parse_is_null() {
-        let stmt = parse(
-            r#"SELECT * FROM "orders" WHERE key IS NOT NULL"#,
-        )
-        .unwrap();
+        let stmt = parse(r#"SELECT * FROM "orders" WHERE key IS NOT NULL"#).unwrap();
         match stmt {
-            ExqlStatement::Query(q) => {
-                match &q.filter.unwrap() {
-                    Expr::IsNull { expr, negated } => {
-                        assert!(*negated);
-                        assert!(matches!(expr.as_ref(), Expr::Column { name, .. } if name == "key"));
-                    }
-                    other => panic!("expected IsNull, got {other:?}"),
+            ExqlStatement::Query(q) => match &q.filter.unwrap() {
+                Expr::IsNull { expr, negated } => {
+                    assert!(*negated);
+                    assert!(matches!(expr.as_ref(), Expr::Column { name, .. } if name == "key"));
                 }
-            }
+                other => panic!("expected IsNull, got {other:?}"),
+            },
             other => panic!("expected Query, got {other:?}"),
         }
     }

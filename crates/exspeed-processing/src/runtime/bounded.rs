@@ -115,11 +115,8 @@ fn build_operator(
             driver,
         } => {
             // Resolve the driver and URL for this external scan.
-            let (resolved_driver, url) = resolve_external_connection(
-                connection,
-                driver.as_deref(),
-                connections,
-            )?;
+            let (resolved_driver, url) =
+                resolve_external_connection(connection, driver.as_deref(), connections)?;
 
             // Run the async query synchronously. We use block_in_place so the
             // tokio runtime can still make progress on other tasks while we wait.
@@ -200,9 +197,9 @@ fn resolve_external_connection(
         // Inline connection: connection field *is* the URL.
         Ok((drv.to_string(), connection.to_string()))
     } else if let Some(reg) = registry {
-        let cfg = reg.get(connection).ok_or_else(|| {
-            ExqlError::Execution(format!("unknown connection '{connection}'"))
-        })?;
+        let cfg = reg
+            .get(connection)
+            .ok_or_else(|| ExqlError::Execution(format!("unknown connection '{connection}'")))?;
         Ok((cfg.driver.clone(), cfg.url.clone()))
     } else {
         Err(ExqlError::Execution(format!(
@@ -294,9 +291,16 @@ fn stored_record_to_row(record: &StoredRecord, alias: Option<&str>) -> Row {
     // `alias.key` and `key` resolve correctly.
     if alias.is_some() {
         columns.extend(
-            ["offset", "timestamp", "key", "subject", "payload", "headers"]
-                .iter()
-                .map(|s| s.to_string()),
+            [
+                "offset",
+                "timestamp",
+                "key",
+                "subject",
+                "payload",
+                "headers",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
         );
         values.extend(base_values);
     }
@@ -329,10 +333,7 @@ mod tests {
                     (i + 1) * 100,
                     if i % 2 == 0 { "eu" } else { "us" }
                 )),
-                subject: format!(
-                    "order.{}.created",
-                    if i % 2 == 0 { "eu" } else { "us" }
-                ),
+                subject: format!("order.{}.created", if i % 2 == 0 { "eu" } else { "us" }),
                 headers: vec![],
             };
             storage
@@ -383,11 +384,7 @@ mod tests {
     #[test]
     fn select_with_aggregate() {
         let storage = setup_test_data();
-        let result = execute_bounded(
-            "SELECT COUNT(*) AS cnt FROM \"orders\"",
-            &storage,
-        )
-        .unwrap();
+        let result = execute_bounded("SELECT COUNT(*) AS cnt FROM \"orders\"", &storage).unwrap();
         assert_eq!(result.rows.len(), 1);
         // count should be 5
         assert_eq!(result.rows[0].get("cnt"), Some(&Value::Int(5)));

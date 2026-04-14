@@ -131,9 +131,6 @@ pub async fn delete_query(
             StatusCode::OK,
             Json(json!({"status": "removed", "query_id": id})),
         ),
-        Err(e) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": e.to_string()})),
-        ),
+        Err(e) => (StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))),
     }
 }

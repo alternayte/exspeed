@@ -85,12 +85,7 @@ fn publish_frame(stream: &str, subject: &str, value: &[u8], corr: u32) -> Frame 
 /// Create a stream via HTTP, then publish `records` via TCP.
 ///
 /// Each record is a `(subject, json_payload)` pair.
-async fn setup_stream(
-    stream_name: &str,
-    records: &[(&str, &str)],
-    tcp_addr: &str,
-    http_url: &str,
-) {
+async fn setup_stream(stream_name: &str, records: &[(&str, &str)], tcp_addr: &str, http_url: &str) {
     let client = reqwest::Client::new();
 
     // Create stream via HTTP
@@ -137,12 +132,7 @@ async fn query(http_url: &str, sql: &str) -> Value {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        resp.status(),
-        200,
-        "query failed for SQL: {}",
-        sql
-    );
+    assert_eq!(resp.status(), 200, "query failed for SQL: {}", sql);
     resp.json().await.unwrap()
 }
 
@@ -234,11 +224,7 @@ async fn bounded_aggregate() {
     ];
     setup_stream("exql-agg-test", &records, &tcp, &http).await;
 
-    let body = query(
-        &http,
-        r#"SELECT COUNT(*) AS cnt FROM "exql-agg-test""#,
-    )
-    .await;
+    let body = query(&http, r#"SELECT COUNT(*) AS cnt FROM "exql-agg-test""#).await;
 
     assert_eq!(
         body["row_count"], 1,
@@ -270,11 +256,7 @@ async fn bounded_select_with_limit() {
     ];
     setup_stream("exql-limit-test", &records, &tcp, &http).await;
 
-    let body = query(
-        &http,
-        r#"SELECT * FROM "exql-limit-test" LIMIT 2"#,
-    )
-    .await;
+    let body = query(&http, r#"SELECT * FROM "exql-limit-test" LIMIT 2"#).await;
 
     assert_eq!(
         body["row_count"], 2,

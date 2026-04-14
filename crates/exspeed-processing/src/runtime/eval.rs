@@ -127,8 +127,13 @@ pub fn eval_expr(expr: &Expr, row: &Row) -> Value {
             let v = eval_expr(expr, row);
             let lo = eval_expr(low, row);
             let hi = eval_expr(high, row);
-            let in_range = matches!(compare_values(&v, &lo), Some(Ordering::Equal | Ordering::Greater))
-                && matches!(compare_values(&v, &hi), Some(Ordering::Equal | Ordering::Less));
+            let in_range = matches!(
+                compare_values(&v, &lo),
+                Some(Ordering::Equal | Ordering::Greater)
+            ) && matches!(
+                compare_values(&v, &hi),
+                Some(Ordering::Equal | Ordering::Less)
+            );
             Value::Bool(if *negated { !in_range } else { in_range })
         }
 
@@ -190,18 +195,14 @@ fn eval_binary_op(left: &Value, op: &BinaryOperator, right: &Value) -> Value {
         BinaryOperator::Neq => Value::Bool(compare_values(left, right) != Some(Ordering::Equal)),
         BinaryOperator::Lt => Value::Bool(compare_values(left, right) == Some(Ordering::Less)),
         BinaryOperator::Gt => Value::Bool(compare_values(left, right) == Some(Ordering::Greater)),
-        BinaryOperator::Lte => {
-            Value::Bool(matches!(
-                compare_values(left, right),
-                Some(Ordering::Less | Ordering::Equal)
-            ))
-        }
-        BinaryOperator::Gte => {
-            Value::Bool(matches!(
-                compare_values(left, right),
-                Some(Ordering::Greater | Ordering::Equal)
-            ))
-        }
+        BinaryOperator::Lte => Value::Bool(matches!(
+            compare_values(left, right),
+            Some(Ordering::Less | Ordering::Equal)
+        )),
+        BinaryOperator::Gte => Value::Bool(matches!(
+            compare_values(left, right),
+            Some(Ordering::Greater | Ordering::Equal)
+        )),
 
         // ── LIKE ────────────────────────────────────────────────────────
         BinaryOperator::Like => {
@@ -389,7 +390,7 @@ fn like_match_recursive(text: &[u8], pattern: &[u8]) -> bool {
         }
         c => {
             !text.is_empty()
-                && text[0].to_ascii_lowercase() == c.to_ascii_lowercase()
+                && text[0].eq_ignore_ascii_case(&c)
                 && like_match_recursive(&text[1..], &pattern[1..])
         }
     }
@@ -746,10 +747,7 @@ mod tests {
         let expr = Expr::Interval {
             value: "30 minutes".into(),
         };
-        assert_eq!(
-            eval_expr(&expr, &row),
-            Value::Int(30 * 60 * 1_000_000_000)
-        );
+        assert_eq!(eval_expr(&expr, &row), Value::Int(30 * 60 * 1_000_000_000));
 
         let expr = Expr::Interval {
             value: "7 days".into(),

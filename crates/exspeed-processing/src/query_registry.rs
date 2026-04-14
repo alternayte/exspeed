@@ -77,8 +77,7 @@ impl QueryRegistry {
     /// Register a new continuous query, persisting `query.json` to disk.
     pub fn register(&self, id: &str, sql: &str, target_stream: &str) -> Result<(), String> {
         let query_dir = self.data_dir.join("queries").join(id);
-        fs::create_dir_all(&query_dir)
-            .map_err(|e| format!("failed to create query dir: {e}"))?;
+        fs::create_dir_all(&query_dir).map_err(|e| format!("failed to create query dir: {e}"))?;
 
         let json = QueryJson {
             id: id.to_string(),
@@ -87,8 +86,7 @@ impl QueryRegistry {
             status: "stopped".to_string(),
         };
 
-        let content = serde_json::to_string_pretty(&json)
-            .map_err(|e| format!("serialize: {e}"))?;
+        let content = serde_json::to_string_pretty(&json).map_err(|e| format!("serialize: {e}"))?;
         fs::write(query_dir.join("query.json"), content)
             .map_err(|e| format!("write query.json: {e}"))?;
 
@@ -113,8 +111,7 @@ impl QueryRegistry {
             return Ok(());
         }
 
-        let entries = fs::read_dir(&queries_dir)
-            .map_err(|e| format!("read queries dir: {e}"))?;
+        let entries = fs::read_dir(&queries_dir).map_err(|e| format!("read queries dir: {e}"))?;
 
         let mut map = self.queries.write().unwrap();
         for entry in entries.flatten() {
@@ -151,7 +148,9 @@ impl QueryRegistry {
     /// Mark a query as running and store the cancel channel.
     pub fn set_running(&self, id: &str, cancel_tx: oneshot::Sender<()>) -> Result<(), String> {
         let mut map = self.queries.write().unwrap();
-        let info = map.get_mut(id).ok_or_else(|| format!("query '{id}' not found"))?;
+        let info = map
+            .get_mut(id)
+            .ok_or_else(|| format!("query '{id}' not found"))?;
         info.status = QueryStatus::Running;
         info.cancel_tx = Some(cancel_tx);
 
@@ -173,7 +172,9 @@ impl QueryRegistry {
     /// Stop a running query by sending the cancel signal.
     pub fn stop(&self, id: &str) -> Result<(), String> {
         let mut map = self.queries.write().unwrap();
-        let info = map.get_mut(id).ok_or_else(|| format!("query '{id}' not found"))?;
+        let info = map
+            .get_mut(id)
+            .ok_or_else(|| format!("query '{id}' not found"))?;
 
         if let Some(tx) = info.cancel_tx.take() {
             let _ = tx.send(());
@@ -194,8 +195,7 @@ impl QueryRegistry {
 
         let query_dir = self.data_dir.join("queries").join(id);
         if query_dir.is_dir() {
-            fs::remove_dir_all(&query_dir)
-                .map_err(|e| format!("remove query dir: {e}"))?;
+            fs::remove_dir_all(&query_dir).map_err(|e| format!("remove query dir: {e}"))?;
         }
 
         Ok(())
@@ -238,7 +238,11 @@ impl QueryRegistry {
 
     /// Load the last checkpoint for a query, if any.
     pub fn load_checkpoint(&self, id: &str) -> Option<HashMap<String, u64>> {
-        let path = self.data_dir.join("queries").join(id).join("checkpoint.json");
+        let path = self
+            .data_dir
+            .join("queries")
+            .join(id)
+            .join("checkpoint.json");
         let content = fs::read_to_string(&path).ok()?;
         let ckpt: CheckpointJson = serde_json::from_str(&content).ok()?;
         Some(ckpt.source_offsets)
@@ -246,16 +250,20 @@ impl QueryRegistry {
 
     /// Get a snapshot of a single registered query by ID.
     pub fn get_snapshot(&self, id: &str) -> Option<QueryInfoSnapshot> {
-        self.queries.read().unwrap().get(id).map(|info| QueryInfoSnapshot {
-            id: info.id.clone(),
-            sql: info.sql.clone(),
-            target_stream: info.target_stream.clone(),
-            status: match &info.status {
-                QueryStatus::Running => "running".to_string(),
-                QueryStatus::Stopped => "stopped".to_string(),
-                QueryStatus::Failed(reason) => format!("failed: {reason}"),
-            },
-        })
+        self.queries
+            .read()
+            .unwrap()
+            .get(id)
+            .map(|info| QueryInfoSnapshot {
+                id: info.id.clone(),
+                sql: info.sql.clone(),
+                target_stream: info.target_stream.clone(),
+                status: match &info.status {
+                    QueryStatus::Running => "running".to_string(),
+                    QueryStatus::Stopped => "stopped".to_string(),
+                    QueryStatus::Failed(reason) => format!("failed: {reason}"),
+                },
+            })
     }
 
     /// Get the SQL for a registered query.
@@ -272,15 +280,14 @@ impl QueryRegistry {
         if !json_path.exists() {
             return Ok(());
         }
-        let content = fs::read_to_string(&json_path)
-            .map_err(|e| format!("read query.json: {e}"))?;
-        let mut parsed: QueryJson = serde_json::from_str(&content)
-            .map_err(|e| format!("parse query.json: {e}"))?;
+        let content =
+            fs::read_to_string(&json_path).map_err(|e| format!("read query.json: {e}"))?;
+        let mut parsed: QueryJson =
+            serde_json::from_str(&content).map_err(|e| format!("parse query.json: {e}"))?;
         parsed.status = status.to_string();
         let updated = serde_json::to_string_pretty(&parsed)
             .map_err(|e| format!("serialize query.json: {e}"))?;
-        fs::write(&json_path, updated)
-            .map_err(|e| format!("write query.json: {e}"))?;
+        fs::write(&json_path, updated).map_err(|e| format!("write query.json: {e}"))?;
         Ok(())
     }
 }

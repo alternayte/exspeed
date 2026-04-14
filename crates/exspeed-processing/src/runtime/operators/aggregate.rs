@@ -82,9 +82,10 @@ impl AggregateOperator {
             let mut values = Vec::new();
 
             for (i, item) in self.select_items.iter().enumerate() {
-                let col_name = item.alias.clone().unwrap_or_else(|| {
-                    derive_agg_column_name(&item.expr)
-                });
+                let col_name = item
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| derive_agg_column_name(&item.expr));
                 columns.push(col_name);
 
                 if let Some(desc) = &agg_descs[i] {
@@ -113,13 +114,17 @@ impl AggregateOperator {
         // Handle the case where there are no groups but there are aggregate
         // functions (e.g., `SELECT COUNT(*) FROM empty_table` should return
         // a single row with count = 0).
-        if self.result_rows.is_empty() && self.group_by.is_empty() && has_any_aggregate(&self.select_items) {
+        if self.result_rows.is_empty()
+            && self.group_by.is_empty()
+            && has_any_aggregate(&self.select_items)
+        {
             let mut columns = Vec::new();
             let mut values = Vec::new();
             for (i, item) in self.select_items.iter().enumerate() {
-                let col_name = item.alias.clone().unwrap_or_else(|| {
-                    derive_agg_column_name(&item.expr)
-                });
+                let col_name = item
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| derive_agg_column_name(&item.expr));
                 columns.push(col_name);
                 if let Some(desc) = &agg_descs[i] {
                     let acc = AggAccum::new();
@@ -287,7 +292,9 @@ fn extract_agg_desc(expr: &Expr) -> Option<AggDesc> {
 
 /// Check if any select item contains an aggregate.
 fn has_any_aggregate(items: &[SelectItem]) -> bool {
-    items.iter().any(|item| matches!(item.expr, Expr::Aggregate { .. }))
+    items
+        .iter()
+        .any(|item| matches!(item.expr, Expr::Aggregate { .. }))
 }
 
 /// Derive a column name for an aggregate or other expression.

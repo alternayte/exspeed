@@ -138,8 +138,7 @@ impl ConnectionRegistry {
             .map_err(|e| format!("failed to create connections dir: {e}"))?;
 
         let file_path = json_dir.join(format!("{}.json", config.name));
-        let json =
-            serde_json::to_string_pretty(&config).map_err(|e| format!("serialize: {e}"))?;
+        let json = serde_json::to_string_pretty(&config).map_err(|e| format!("serialize: {e}"))?;
         fs::write(&file_path, json).map_err(|e| format!("write {}: {e}", file_path.display()))?;
 
         self.connections
@@ -153,7 +152,10 @@ impl ConnectionRegistry {
     pub fn remove(&self, name: &str) -> Result<(), String> {
         self.connections.write().unwrap().remove(name);
 
-        let file_path = self.data_dir.join("connections").join(format!("{name}.json"));
+        let file_path = self
+            .data_dir
+            .join("connections")
+            .join(format!("{name}.json"));
         if file_path.exists() {
             fs::remove_file(&file_path)
                 .map_err(|e| format!("delete {}: {e}", file_path.display()))?;
@@ -178,11 +180,7 @@ impl ConnectionRegistry {
 fn resolve_env_vars(input: &str) -> String {
     let mut result = input.to_string();
     // Simple approach: repeatedly find ${...} and replace.
-    loop {
-        let start = match result.find("${") {
-            Some(i) => i,
-            None => break,
-        };
+    while let Some(start) = result.find("${") {
         let end = match result[start..].find('}') {
             Some(i) => start + i,
             None => break,
@@ -358,7 +356,9 @@ url = "postgresql://toml-host/db"
         let registry = ConnectionRegistry::new(dir.path().to_path_buf());
         registry.load_all();
 
-        let cfg = registry.get("override-db").expect("should find override-db");
+        let cfg = registry
+            .get("override-db")
+            .expect("should find override-db");
         // env var should win
         assert_eq!(cfg.url, "postgresql://env-host/db");
 

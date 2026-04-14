@@ -108,9 +108,7 @@ fn from_to_logical(from: &FromClause, ctes: &[Cte]) -> Result<LogicalPlan, Parse
 fn expr_has_aggregate(expr: &Expr) -> bool {
     match expr {
         Expr::Aggregate { .. } => true,
-        Expr::BinaryOp { left, right, .. } => {
-            expr_has_aggregate(left) || expr_has_aggregate(right)
-        }
+        Expr::BinaryOp { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
         Expr::UnaryOp { expr, .. } => expr_has_aggregate(expr),
         Expr::Function { args, .. } => args.iter().any(expr_has_aggregate),
         Expr::JsonAccess { expr, .. } => expr_has_aggregate(expr),
@@ -122,7 +120,7 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
             conditions
                 .iter()
                 .any(|(c, v)| expr_has_aggregate(c) || expr_has_aggregate(v))
-                || else_val.as_ref().map_or(false, |e| expr_has_aggregate(e))
+                || else_val.as_ref().is_some_and(|e| expr_has_aggregate(e))
         }
         Expr::IsNull { expr, .. } => expr_has_aggregate(expr),
         Expr::InList { expr, list, .. } => {
@@ -221,7 +219,9 @@ mod tests {
                     PhysicalPlan::Project { input, items } => {
                         assert_eq!(items.len(), 1);
                         assert!(matches!(items[0].expr, Expr::Wildcard { .. }));
-                        assert!(matches!(*input, PhysicalPlan::SeqScan { ref stream, .. } if stream == "orders"));
+                        assert!(
+                            matches!(*input, PhysicalPlan::SeqScan { ref stream, .. } if stream == "orders")
+                        );
                     }
                     other => panic!("expected Project, got {other:?}"),
                 }
@@ -232,22 +232,24 @@ mod tests {
 
     #[test]
     fn plan_with_filter() {
-        let stmt =
-            crate::parser::parse(r#"SELECT * FROM "orders" WHERE key = 'a'"#).unwrap();
+        let stmt = crate::parser::parse(r#"SELECT * FROM "orders" WHERE key = 'a'"#).unwrap();
         match stmt {
             ExqlStatement::Query(q) => {
                 let p = plan(&q).unwrap();
                 // Project → Filter → SeqScan
                 match p {
-                    PhysicalPlan::Project { input, .. } => {
-                        match *input {
-                            PhysicalPlan::Filter { input: inner, predicate } => {
-                                assert!(matches!(predicate, Expr::BinaryOp { .. }));
-                                assert!(matches!(*inner, PhysicalPlan::SeqScan { ref stream, .. } if stream == "orders"));
-                            }
-                            other => panic!("expected Filter, got {other:?}"),
+                    PhysicalPlan::Project { input, .. } => match *input {
+                        PhysicalPlan::Filter {
+                            input: inner,
+                            predicate,
+                        } => {
+                            assert!(matches!(predicate, Expr::BinaryOp { .. }));
+                            assert!(
+                                matches!(*inner, PhysicalPlan::SeqScan { ref stream, .. } if stream == "orders")
+                            );
                         }
-                    }
+                        other => panic!("expected Filter, got {other:?}"),
+                    },
                     other => panic!("expected Project, got {other:?}"),
                 }
             }
@@ -257,30 +259,29 @@ mod tests {
 
     #[test]
     fn plan_with_join() {
-        let stmt = crate::parser::parse(
-            r#"SELECT * FROM "a" JOIN "b" ON a.key = b.key"#,
-        )
-        .unwrap();
+        let stmt = crate::parser::parse(r#"SELECT * FROM "a" JOIN "b" ON a.key = b.key"#).unwrap();
         match stmt {
             ExqlStatement::Query(q) => {
                 let p = plan(&q).unwrap();
                 // Project → HashJoin(SeqScan, SeqScan)
                 match p {
-                    PhysicalPlan::Project { input, .. } => {
-                        match *input {
-                            PhysicalPlan::HashJoin {
-                                ref left,
-                                ref right,
-                                ref join_type,
-                                ..
-                            } => {
-                                assert!(matches!(join_type, JoinType::Inner));
-                                assert!(matches!(left.as_ref(), PhysicalPlan::SeqScan { ref stream, .. } if stream == "a"));
-                                assert!(matches!(right.as_ref(), PhysicalPlan::SeqScan { ref stream, .. } if stream == "b"));
-                            }
-                            other => panic!("expected HashJoin, got {other:?}"),
+                    PhysicalPlan::Project { input, .. } => match *input {
+                        PhysicalPlan::HashJoin {
+                            ref left,
+                            ref right,
+                            ref join_type,
+                            ..
+                        } => {
+                            assert!(matches!(join_type, JoinType::Inner));
+                            assert!(
+                                matches!(left.as_ref(), PhysicalPlan::SeqScan { ref stream, .. } if stream == "a")
+                            );
+                            assert!(
+                                matches!(right.as_ref(), PhysicalPlan::SeqScan { ref stream, .. } if stream == "b")
+                            );
                         }
-                    }
+                        other => panic!("expected HashJoin, got {other:?}"),
+                    },
                     other => panic!("expected Project, got {other:?}"),
                 }
             }
@@ -290,28 +291,25 @@ mod tests {
 
     #[test]
     fn plan_with_aggregate() {
-        let stmt = crate::parser::parse(
-            r#"SELECT COUNT(*) FROM "orders" GROUP BY key"#,
-        )
-        .unwrap();
+        let stmt = crate::parser::parse(r#"SELECT COUNT(*) FROM "orders" GROUP BY key"#).unwrap();
         match stmt {
             ExqlStatement::Query(q) => {
                 let p = plan(&q).unwrap();
                 // Project → HashAggregate → SeqScan
                 match p {
-                    PhysicalPlan::Project { input, .. } => {
-                        match *input {
-                            PhysicalPlan::HashAggregate {
-                                ref input,
-                                ref group_by,
-                                ..
-                            } => {
-                                assert_eq!(group_by.len(), 1);
-                                assert!(matches!(input.as_ref(), PhysicalPlan::SeqScan { ref stream, .. } if stream == "orders"));
-                            }
-                            other => panic!("expected HashAggregate, got {other:?}"),
+                    PhysicalPlan::Project { input, .. } => match *input {
+                        PhysicalPlan::HashAggregate {
+                            ref input,
+                            ref group_by,
+                            ..
+                        } => {
+                            assert_eq!(group_by.len(), 1);
+                            assert!(
+                                matches!(input.as_ref(), PhysicalPlan::SeqScan { ref stream, .. } if stream == "orders")
+                            );
                         }
-                    }
+                        other => panic!("expected HashAggregate, got {other:?}"),
+                    },
                     other => panic!("expected Project, got {other:?}"),
                 }
             }
@@ -321,10 +319,9 @@ mod tests {
 
     #[test]
     fn plan_with_sort_limit() {
-        let stmt = crate::parser::parse(
-            r#"SELECT * FROM "orders" ORDER BY timestamp DESC LIMIT 10"#,
-        )
-        .unwrap();
+        let stmt =
+            crate::parser::parse(r#"SELECT * FROM "orders" ORDER BY timestamp DESC LIMIT 10"#)
+                .unwrap();
         match stmt {
             ExqlStatement::Query(q) => {
                 let p = plan(&q).unwrap();

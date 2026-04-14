@@ -135,12 +135,7 @@ fn fn_substring(args: &[Value]) -> Value {
 
 fn substring_helper(s: &str, args: &[Value]) -> String {
     // SQL SUBSTRING is 1-based.
-    let start = args
-        .get(1)
-        .and_then(|v| v.to_i64())
-        .unwrap_or(1)
-        .max(1) as usize
-        - 1;
+    let start = args.get(1).and_then(|v| v.to_i64()).unwrap_or(1).max(1) as usize - 1;
 
     let len = args.get(2).and_then(|v| v.to_i64());
 
@@ -271,7 +266,11 @@ mod tests {
     fn test_concat_with_null() {
         let result = call_function(
             "CONCAT",
-            &[Value::Text("a".into()), Value::Null, Value::Text("b".into())],
+            &[
+                Value::Text("a".into()),
+                Value::Null,
+                Value::Text("b".into()),
+            ],
         );
         assert_eq!(result, Value::Text("ab".into()));
     }
@@ -280,7 +279,11 @@ mod tests {
     fn test_substring() {
         let result = call_function(
             "SUBSTRING",
-            &[Value::Text("hello world".into()), Value::Int(7), Value::Int(5)],
+            &[
+                Value::Text("hello world".into()),
+                Value::Int(7),
+                Value::Int(5),
+            ],
         );
         assert_eq!(result, Value::Text("world".into()));
     }
@@ -294,7 +297,10 @@ mod tests {
     #[test]
     fn test_abs() {
         assert_eq!(call_function("ABS", &[Value::Int(-5)]), Value::Int(5));
-        assert_eq!(call_function("ABS", &[Value::Float(-3.14)]), Value::Float(3.14));
+        assert_eq!(
+            call_function("ABS", &[Value::Float(-3.14)]),
+            Value::Float(3.14)
+        );
     }
 
     #[test]
