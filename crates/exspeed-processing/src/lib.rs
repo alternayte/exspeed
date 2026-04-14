@@ -1,5 +1,6 @@
 pub mod error;
 pub mod external;
+pub mod materialized_view;
 pub mod parser;
 pub mod planner;
 pub mod query_registry;
@@ -14,6 +15,7 @@ use tokio::sync::oneshot;
 
 use crate::error::ExqlError;
 use crate::external::ConnectionRegistry;
+use crate::materialized_view::MaterializedViewRegistry;
 use crate::parser::ast::ExqlStatement;
 use crate::query_registry::{generate_query_id, QueryInfoSnapshot, QueryRegistry};
 use crate::types::ResultSet;
@@ -24,6 +26,7 @@ pub struct ExqlEngine {
     pub storage: Arc<dyn StorageEngine>,
     pub connection_registry: Arc<ConnectionRegistry>,
     pub query_registry: Arc<QueryRegistry>,
+    pub mv_registry: Arc<MaterializedViewRegistry>,
 }
 
 impl ExqlEngine {
@@ -31,10 +34,12 @@ impl ExqlEngine {
     pub fn new(storage: Arc<dyn StorageEngine>, data_dir: PathBuf) -> Self {
         let connection_registry = Arc::new(ConnectionRegistry::new(data_dir.clone()));
         let query_registry = Arc::new(QueryRegistry::new(data_dir));
+        let mv_registry = Arc::new(MaterializedViewRegistry::new());
         Self {
             storage,
             connection_registry,
             query_registry,
+            mv_registry,
         }
     }
 
