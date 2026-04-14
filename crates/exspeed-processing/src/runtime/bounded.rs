@@ -5,6 +5,7 @@ use exspeed_common::{Offset, StreamName};
 use exspeed_streams::{StorageEngine, StoredRecord};
 
 use crate::error::ExqlError;
+use crate::external::connections::ConnectionRegistry;
 use crate::parser::ast::ExqlStatement;
 use crate::planner::physical::PhysicalPlan;
 use crate::runtime::operators::aggregate::AggregateOperator;
@@ -21,6 +22,15 @@ use crate::types::{ResultSet, Row, Value};
 pub fn execute_bounded(
     sql: &str,
     storage: &Arc<dyn StorageEngine>,
+) -> Result<ResultSet, ExqlError> {
+    execute_bounded_with_connections(sql, storage, None)
+}
+
+/// Execute a bounded (batch) SQL query with optional external connection support.
+pub fn execute_bounded_with_connections(
+    sql: &str,
+    storage: &Arc<dyn StorageEngine>,
+    connections: Option<&ConnectionRegistry>,
 ) -> Result<ResultSet, ExqlError> {
     let start = Instant::now();
 
@@ -41,7 +51,7 @@ pub fn execute_bounded(
     let plan = crate::planner::plan(&query)?;
 
     // 4. Build operator tree
-    let mut root = build_operator(&plan, storage)?;
+    let mut root = build_operator(&plan, storage, connections)?;
 
     // 5. Pull all rows from the root operator
     let columns = root.columns();
@@ -63,6 +73,7 @@ pub fn execute_bounded(
 fn build_operator(
     plan: &PhysicalPlan,
     storage: &Arc<dyn StorageEngine>,
+    connections: Option<&ConnectionRegistry>,
 ) -> Result<Box<dyn Operator>, ExqlError> {
     match plan {
         PhysicalPlan::SeqScan { stream, alias } => {
@@ -97,18 +108,32 @@ fn build_operator(
             Ok(Box::new(ScanOperator::new(rows)))
         }
 
-        PhysicalPlan::ExternalScan { .. } => {
-            // External sources are implemented in Task 8. Return empty scan.
-            Ok(Box::new(ScanOperator::new(vec![])))
+        PhysicalPlan::ExternalScan {
+            connection,
+            table,
+            alias: _,
+            driver,
+        } => {
+            // Resolve the driver and URL for this external scan.
+            let (resolved_driver, url) = resolve_external_connection(
+                connection,
+                driver.as_deref(),
+                connections,
+            )?;
+
+            // Run the async query synchronously. We use block_in_place so the
+            // tokio runtime can still make progress on other tasks while we wait.
+            let rows = run_external_query(&resolved_driver, &url, table)?;
+            Ok(Box::new(ScanOperator::new(rows)))
         }
 
         PhysicalPlan::Filter { input, predicate } => {
-            let child = build_operator(input, storage)?;
+            let child = build_operator(input, storage, connections)?;
             Ok(Box::new(FilterOperator::new(child, predicate.clone())))
         }
 
         PhysicalPlan::Project { input, items } => {
-            let child = build_operator(input, storage)?;
+            let child = build_operator(input, storage, connections)?;
             Ok(Box::new(ProjectOperator::new(child, items.clone())))
         }
 
@@ -118,8 +143,8 @@ fn build_operator(
             on,
             join_type,
         } => {
-            let left_op = build_operator(left, storage)?;
-            let right_op = build_operator(right, storage)?;
+            let left_op = build_operator(left, storage, connections)?;
+            let right_op = build_operator(right, storage, connections)?;
             Ok(Box::new(HashJoinOperator::new(
                 left_op,
                 right_op,
@@ -133,7 +158,7 @@ fn build_operator(
             group_by,
             select_items,
         } => {
-            let child = build_operator(input, storage)?;
+            let child = build_operator(input, storage, connections)?;
             Ok(Box::new(AggregateOperator::new(
                 child,
                 group_by.clone(),
@@ -142,7 +167,7 @@ fn build_operator(
         }
 
         PhysicalPlan::Sort { input, order_by } => {
-            let child = build_operator(input, storage)?;
+            let child = build_operator(input, storage, connections)?;
             Ok(Box::new(SortOperator::new(child, order_by.clone())))
         }
 
@@ -151,13 +176,76 @@ fn build_operator(
             limit,
             offset,
         } => {
-            let child = build_operator(input, storage)?;
+            let child = build_operator(input, storage, connections)?;
             Ok(Box::new(LimitOperator::new(
                 child,
                 *limit,
                 offset.unwrap_or(0),
             )))
         }
+    }
+}
+
+/// Resolve the driver and URL for an external scan.
+///
+/// If the `driver` field is provided on the plan node, it is used as an inline
+/// connection specification (the `connection` field is treated as the URL).
+/// Otherwise, the connection name is looked up in the registry.
+fn resolve_external_connection(
+    connection: &str,
+    driver: Option<&str>,
+    registry: Option<&ConnectionRegistry>,
+) -> Result<(String, String), ExqlError> {
+    if let Some(drv) = driver {
+        // Inline connection: connection field *is* the URL.
+        Ok((drv.to_string(), connection.to_string()))
+    } else if let Some(reg) = registry {
+        let cfg = reg.get(connection).ok_or_else(|| {
+            ExqlError::Execution(format!("unknown connection '{connection}'"))
+        })?;
+        Ok((cfg.driver.clone(), cfg.url.clone()))
+    } else {
+        Err(ExqlError::Execution(format!(
+            "connection '{connection}' referenced but no connection registry available"
+        )))
+    }
+}
+
+/// Bridge async external queries into the sync operator pipeline.
+///
+/// Uses `tokio::task::block_in_place` + `Handle::current().block_on` to run the
+/// async query without blocking the tokio runtime. This works because the bounded
+/// executor runs inside a multi-threaded tokio runtime.
+fn run_external_query(driver: &str, url: &str, table: &str) -> Result<Vec<Row>, ExqlError> {
+    // If we are inside a tokio runtime, use block_in_place to bridge.
+    // Otherwise (e.g., tests without a runtime), create a temporary runtime.
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle.block_on(dispatch_external_query(driver, url, table))
+        }),
+        Err(_) => {
+            // No runtime — build a temporary one (useful for testing).
+            let rt = tokio::runtime::Runtime::new().map_err(|e| {
+                ExqlError::Execution(format!("failed to create tokio runtime: {e}"))
+            })?;
+            rt.block_on(dispatch_external_query(driver, url, table))
+        }
+    }
+}
+
+async fn dispatch_external_query(
+    driver: &str,
+    url: &str,
+    table: &str,
+) -> Result<Vec<Row>, ExqlError> {
+    use crate::external::{mssql, postgres};
+
+    match driver {
+        "postgres" | "postgresql" => postgres::query_postgres(url, table).await,
+        "mssql" | "sqlserver" => mssql::query_mssql(url, table).await,
+        other => Err(ExqlError::Execution(format!(
+            "unsupported external driver '{other}'"
+        ))),
     }
 }
 
