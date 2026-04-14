@@ -56,16 +56,16 @@ async fn run_inner(
     registry: &Arc<QueryRegistry>,
     cancel_rx: &mut oneshot::Receiver<()>,
 ) -> Result<(), String> {
-    // 1. Parse SQL, extract QueryExpr from CreateStream
+    // 1. Parse SQL, extract QueryExpr and EmitMode from CreateStream
     let stmt = crate::parser::parse(sql).map_err(|e| format!("parse error: {e}"))?;
-    let query = match stmt {
-        ExqlStatement::CreateStream { query, .. } => query,
-        ExqlStatement::Query(q) => q,
+    let (query, emit_mode) = match stmt {
+        ExqlStatement::CreateStream { query, emit, .. } => (query, emit),
+        ExqlStatement::Query(q) => (q, EmitMode::Changes),
         _ => return Err("continuous queries require CREATE VIEW or SELECT statement".into()),
     };
 
     // 2. Plan the query
-    let plan = crate::planner::plan(&query).map_err(|e| format!("plan error: {e}"))?;
+    let plan = crate::planner::plan(&query, emit_mode).map_err(|e| format!("plan error: {e}"))?;
 
     // 3. Extract plan components
     let pipeline = decompose_plan(&plan)?;

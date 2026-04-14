@@ -31,6 +31,20 @@ pub enum LogicalPlan {
         group_by: Vec<Expr>,
         select_items: Vec<SelectItem>,
     },
+    WindowedAggregate {
+        input: Box<LogicalPlan>,
+        window_size: String,
+        group_by: Vec<Expr>,
+        select_items: Vec<SelectItem>,
+        emit_mode: EmitMode,
+    },
+    StreamStreamJoin {
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+        on: Expr,
+        within: String,
+        join_type: JoinType,
+    },
     Sort {
         input: Box<LogicalPlan>,
         order_by: Vec<OrderByItem>,

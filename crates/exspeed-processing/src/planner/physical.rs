@@ -31,6 +31,20 @@ pub enum PhysicalPlan {
         group_by: Vec<Expr>,
         select_items: Vec<SelectItem>,
     },
+    WindowedAggregate {
+        input: Box<PhysicalPlan>,
+        window_size: String,
+        group_by: Vec<Expr>,
+        select_items: Vec<SelectItem>,
+        emit_mode: EmitMode,
+    },
+    StreamStreamJoin {
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+        on: Expr,
+        within: String,
+        join_type: JoinType,
+    },
     Sort {
         input: Box<PhysicalPlan>,
         order_by: Vec<OrderByItem>,

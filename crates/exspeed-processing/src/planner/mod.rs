@@ -7,8 +7,8 @@ use logical::LogicalPlan;
 use physical::PhysicalPlan;
 
 /// Convert an ExQL query AST into a physical execution plan.
-pub fn plan(query: &QueryExpr) -> Result<PhysicalPlan, ParseError> {
-    let logical = build_logical(query)?;
+pub fn plan(query: &QueryExpr, emit_mode: EmitMode) -> Result<PhysicalPlan, ParseError> {
+    let logical = build_logical(query, emit_mode)?;
     let physical = to_physical(logical);
     Ok(physical)
 }
@@ -17,19 +17,29 @@ pub fn plan(query: &QueryExpr) -> Result<PhysicalPlan, ParseError> {
 // Logical plan construction
 // ---------------------------------------------------------------------------
 
-fn build_logical(query: &QueryExpr) -> Result<LogicalPlan, ParseError> {
+fn build_logical(query: &QueryExpr, emit_mode: EmitMode) -> Result<LogicalPlan, ParseError> {
     // 1. FROM → base scan (with CTE expansion)
-    let mut plan = from_to_logical(&query.from, &query.ctes)?;
+    let mut plan = from_to_logical(&query.from, &query.ctes, emit_mode.clone())?;
 
     // 2. JOINs
     for join in &query.joins {
-        let right = from_to_logical(&join.source, &query.ctes)?;
-        plan = LogicalPlan::Join {
-            left: Box::new(plan),
-            right: Box::new(right),
-            on: join.on.clone(),
-            join_type: join.join_type.clone(),
-        };
+        let right = from_to_logical(&join.source, &query.ctes, emit_mode.clone())?;
+        if let Some(ref within) = join.within {
+            plan = LogicalPlan::StreamStreamJoin {
+                left: Box::new(plan),
+                right: Box::new(right),
+                on: join.on.clone(),
+                within: within.clone(),
+                join_type: join.join_type.clone(),
+            };
+        } else {
+            plan = LogicalPlan::Join {
+                left: Box::new(plan),
+                right: Box::new(right),
+                on: join.on.clone(),
+                join_type: join.join_type.clone(),
+            };
+        }
     }
 
     // 3. WHERE
@@ -40,14 +50,46 @@ fn build_logical(query: &QueryExpr) -> Result<LogicalPlan, ParseError> {
         };
     }
 
-    // 4. GROUP BY / aggregates
+    // 4. GROUP BY / aggregates — detect tumbling() window function
     let has_aggregates = query.select.iter().any(|si| expr_has_aggregate(&si.expr));
     if has_aggregates || !query.group_by.is_empty() {
-        plan = LogicalPlan::Aggregate {
-            input: Box::new(plan),
-            group_by: query.group_by.clone(),
-            select_items: query.select.clone(),
-        };
+        // Look for tumbling() in GROUP BY
+        let tumbling_info = query.group_by.iter().find_map(|expr| {
+            if let Expr::Function { name, args } = expr {
+                if name.to_uppercase() == "TUMBLING" && args.len() >= 2 {
+                    if let Expr::Literal(LiteralValue::String(ref size)) = args[1] {
+                        return Some(size.clone());
+                    }
+                }
+            }
+            None
+        });
+
+        if let Some(window_size) = tumbling_info {
+            // Remove the tumbling() call from group_by — remaining exprs are real keys
+            let real_group_by: Vec<Expr> = query
+                .group_by
+                .iter()
+                .filter(|expr| {
+                    !matches!(expr, Expr::Function { name, .. } if name.to_uppercase() == "TUMBLING")
+                })
+                .cloned()
+                .collect();
+
+            plan = LogicalPlan::WindowedAggregate {
+                input: Box::new(plan),
+                window_size,
+                group_by: real_group_by,
+                select_items: query.select.clone(),
+                emit_mode,
+            };
+        } else {
+            plan = LogicalPlan::Aggregate {
+                input: Box::new(plan),
+                group_by: query.group_by.clone(),
+                select_items: query.select.clone(),
+            };
+        }
     }
 
     // 5. SELECT (project)
@@ -77,19 +119,19 @@ fn build_logical(query: &QueryExpr) -> Result<LogicalPlan, ParseError> {
 }
 
 /// Convert a FROM clause into a logical scan node, expanding CTEs inline.
-fn from_to_logical(from: &FromClause, ctes: &[Cte]) -> Result<LogicalPlan, ParseError> {
+fn from_to_logical(from: &FromClause, ctes: &[Cte], emit_mode: EmitMode) -> Result<LogicalPlan, ParseError> {
     match from {
         FromClause::Stream { name, alias } => {
             // Check if this name matches a CTE — expand inline.
             if let Some(cte) = ctes.iter().find(|c| c.name == *name) {
-                return build_logical(&cte.query);
+                return build_logical(&cte.query, emit_mode);
             }
             Ok(LogicalPlan::Scan {
                 stream: name.clone(),
                 alias: alias.clone(),
             })
         }
-        FromClause::Subquery { query, alias: _ } => build_logical(query),
+        FromClause::Subquery { query, alias: _ } => build_logical(query, emit_mode),
         FromClause::External {
             connection,
             table,
@@ -184,6 +226,32 @@ fn to_physical(logical: LogicalPlan) -> PhysicalPlan {
             group_by,
             select_items,
         },
+        LogicalPlan::WindowedAggregate {
+            input,
+            window_size,
+            group_by,
+            select_items,
+            emit_mode,
+        } => PhysicalPlan::WindowedAggregate {
+            input: Box::new(to_physical(*input)),
+            window_size,
+            group_by,
+            select_items,
+            emit_mode,
+        },
+        LogicalPlan::StreamStreamJoin {
+            left,
+            right,
+            on,
+            within,
+            join_type,
+        } => PhysicalPlan::StreamStreamJoin {
+            left: Box::new(to_physical(*left)),
+            right: Box::new(to_physical(*right)),
+            on,
+            within,
+            join_type,
+        },
         LogicalPlan::Sort { input, order_by } => PhysicalPlan::Sort {
             input: Box::new(to_physical(*input)),
             order_by,
@@ -213,7 +281,7 @@ mod tests {
         let stmt = crate::parser::parse(r#"SELECT * FROM "orders""#).unwrap();
         match stmt {
             ExqlStatement::Query(q) => {
-                let p = plan(&q).unwrap();
+                let p = plan(&q, EmitMode::Changes).unwrap();
                 // Outermost should be Project wrapping a SeqScan.
                 match p {
                     PhysicalPlan::Project { input, items } => {
@@ -235,7 +303,7 @@ mod tests {
         let stmt = crate::parser::parse(r#"SELECT * FROM "orders" WHERE key = 'a'"#).unwrap();
         match stmt {
             ExqlStatement::Query(q) => {
-                let p = plan(&q).unwrap();
+                let p = plan(&q, EmitMode::Changes).unwrap();
                 // Project → Filter → SeqScan
                 match p {
                     PhysicalPlan::Project { input, .. } => match *input {
@@ -262,7 +330,7 @@ mod tests {
         let stmt = crate::parser::parse(r#"SELECT * FROM "a" JOIN "b" ON a.key = b.key"#).unwrap();
         match stmt {
             ExqlStatement::Query(q) => {
-                let p = plan(&q).unwrap();
+                let p = plan(&q, EmitMode::Changes).unwrap();
                 // Project → HashJoin(SeqScan, SeqScan)
                 match p {
                     PhysicalPlan::Project { input, .. } => match *input {
@@ -294,7 +362,7 @@ mod tests {
         let stmt = crate::parser::parse(r#"SELECT COUNT(*) FROM "orders" GROUP BY key"#).unwrap();
         match stmt {
             ExqlStatement::Query(q) => {
-                let p = plan(&q).unwrap();
+                let p = plan(&q, EmitMode::Changes).unwrap();
                 // Project → HashAggregate → SeqScan
                 match p {
                     PhysicalPlan::Project { input, .. } => match *input {
@@ -324,7 +392,7 @@ mod tests {
                 .unwrap();
         match stmt {
             ExqlStatement::Query(q) => {
-                let p = plan(&q).unwrap();
+                let p = plan(&q, EmitMode::Changes).unwrap();
                 // Limit → Sort → Project → SeqScan
                 match p {
                     PhysicalPlan::Limit {
@@ -350,6 +418,240 @@ mod tests {
                 }
             }
             _ => panic!("expected Query"),
+        }
+    }
+
+    #[test]
+    fn plan_with_tumbling_window() {
+        // Build a query with tumbling() in GROUP BY directly via AST,
+        // since the parser may not yet handle tumbling() in GROUP BY.
+        let query = QueryExpr {
+            ctes: vec![],
+            select: vec![
+                SelectItem {
+                    expr: Expr::Column {
+                        table: None,
+                        name: "region".into(),
+                    },
+                    alias: None,
+                },
+                SelectItem {
+                    expr: Expr::Aggregate {
+                        func: AggregateFunc::Count,
+                        expr: Box::new(Expr::Wildcard { table: None }),
+                        distinct: false,
+                    },
+                    alias: Some("cnt".into()),
+                },
+            ],
+            from: FromClause::Stream {
+                name: "orders".into(),
+                alias: None,
+            },
+            joins: vec![],
+            filter: None,
+            group_by: vec![
+                Expr::Function {
+                    name: "tumbling".into(),
+                    args: vec![
+                        Expr::Column {
+                            table: None,
+                            name: "timestamp".into(),
+                        },
+                        Expr::Literal(LiteralValue::String("1 hour".into())),
+                    ],
+                },
+                Expr::Column {
+                    table: None,
+                    name: "region".into(),
+                },
+            ],
+            order_by: vec![],
+            limit: None,
+            offset: None,
+        };
+
+        let p = plan(&query, EmitMode::Final).unwrap();
+        // Project → WindowedAggregate → SeqScan
+        match p {
+            PhysicalPlan::Project { input, .. } => match *input {
+                PhysicalPlan::WindowedAggregate {
+                    ref window_size,
+                    ref group_by,
+                    ref emit_mode,
+                    ref input,
+                    ..
+                } => {
+                    assert_eq!(window_size, "1 hour");
+                    // tumbling() removed; only "region" remains
+                    assert_eq!(group_by.len(), 1);
+                    assert!(matches!(&group_by[0], Expr::Column { name, .. } if name == "region"));
+                    assert_eq!(*emit_mode, EmitMode::Final);
+                    assert!(
+                        matches!(input.as_ref(), PhysicalPlan::SeqScan { ref stream, .. } if stream == "orders")
+                    );
+                }
+                other => panic!("expected WindowedAggregate, got {other:?}"),
+            },
+            other => panic!("expected Project, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_without_tumbling_gives_hash_aggregate() {
+        // Regular GROUP BY without tumbling → HashAggregate
+        let query = QueryExpr {
+            ctes: vec![],
+            select: vec![SelectItem {
+                expr: Expr::Aggregate {
+                    func: AggregateFunc::Count,
+                    expr: Box::new(Expr::Wildcard { table: None }),
+                    distinct: false,
+                },
+                alias: Some("cnt".into()),
+            }],
+            from: FromClause::Stream {
+                name: "orders".into(),
+                alias: None,
+            },
+            joins: vec![],
+            filter: None,
+            group_by: vec![Expr::Column {
+                table: None,
+                name: "key".into(),
+            }],
+            order_by: vec![],
+            limit: None,
+            offset: None,
+        };
+
+        let p = plan(&query, EmitMode::Changes).unwrap();
+        match p {
+            PhysicalPlan::Project { input, .. } => {
+                assert!(
+                    matches!(*input, PhysicalPlan::HashAggregate { .. }),
+                    "expected HashAggregate, got {:?}",
+                    *input
+                );
+            }
+            other => panic!("expected Project, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_join_with_within() {
+        // Build a query with JOIN ... WITHIN via AST
+        let query = QueryExpr {
+            ctes: vec![],
+            select: vec![SelectItem {
+                expr: Expr::Wildcard { table: None },
+                alias: None,
+            }],
+            from: FromClause::Stream {
+                name: "clicks".into(),
+                alias: None,
+            },
+            joins: vec![JoinClause {
+                join_type: JoinType::Inner,
+                source: FromClause::Stream {
+                    name: "purchases".into(),
+                    alias: None,
+                },
+                on: Expr::BinaryOp {
+                    left: Box::new(Expr::Column {
+                        table: Some("clicks".into()),
+                        name: "user_id".into(),
+                    }),
+                    op: BinaryOperator::Eq,
+                    right: Box::new(Expr::Column {
+                        table: Some("purchases".into()),
+                        name: "user_id".into(),
+                    }),
+                },
+                within: Some("1 hour".into()),
+            }],
+            filter: None,
+            group_by: vec![],
+            order_by: vec![],
+            limit: None,
+            offset: None,
+        };
+
+        let p = plan(&query, EmitMode::Changes).unwrap();
+        // Project → StreamStreamJoin(SeqScan, SeqScan)
+        match p {
+            PhysicalPlan::Project { input, .. } => match *input {
+                PhysicalPlan::StreamStreamJoin {
+                    ref left,
+                    ref right,
+                    ref within,
+                    ref join_type,
+                    ..
+                } => {
+                    assert_eq!(within, "1 hour");
+                    assert!(matches!(join_type, JoinType::Inner));
+                    assert!(
+                        matches!(left.as_ref(), PhysicalPlan::SeqScan { ref stream, .. } if stream == "clicks")
+                    );
+                    assert!(
+                        matches!(right.as_ref(), PhysicalPlan::SeqScan { ref stream, .. } if stream == "purchases")
+                    );
+                }
+                other => panic!("expected StreamStreamJoin, got {other:?}"),
+            },
+            other => panic!("expected Project, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_join_without_within() {
+        // JOIN without WITHIN → regular HashJoin
+        let query = QueryExpr {
+            ctes: vec![],
+            select: vec![SelectItem {
+                expr: Expr::Wildcard { table: None },
+                alias: None,
+            }],
+            from: FromClause::Stream {
+                name: "a".into(),
+                alias: None,
+            },
+            joins: vec![JoinClause {
+                join_type: JoinType::Inner,
+                source: FromClause::Stream {
+                    name: "b".into(),
+                    alias: None,
+                },
+                on: Expr::BinaryOp {
+                    left: Box::new(Expr::Column {
+                        table: Some("a".into()),
+                        name: "key".into(),
+                    }),
+                    op: BinaryOperator::Eq,
+                    right: Box::new(Expr::Column {
+                        table: Some("b".into()),
+                        name: "key".into(),
+                    }),
+                },
+                within: None,
+            }],
+            filter: None,
+            group_by: vec![],
+            order_by: vec![],
+            limit: None,
+            offset: None,
+        };
+
+        let p = plan(&query, EmitMode::Changes).unwrap();
+        match p {
+            PhysicalPlan::Project { input, .. } => {
+                assert!(
+                    matches!(*input, PhysicalPlan::HashJoin { .. }),
+                    "expected HashJoin, got {:?}",
+                    *input
+                );
+            }
+            other => panic!("expected Project, got {other:?}"),
         }
     }
 }

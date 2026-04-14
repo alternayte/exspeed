@@ -48,7 +48,7 @@ pub fn execute_bounded_with_connections(
     };
 
     // 3. Plan → PhysicalPlan
-    let plan = crate::planner::plan(&query)?;
+    let plan = crate::planner::plan(&query, crate::parser::ast::EmitMode::Changes)?;
 
     // 4. Build operator tree
     let mut root = build_operator(&plan, storage, connections)?;
@@ -180,6 +180,14 @@ fn build_operator(
                 offset.unwrap_or(0),
             )))
         }
+
+        PhysicalPlan::WindowedAggregate { .. } => Err(ExqlError::Execution(
+            "WindowedAggregate is not supported in bounded execution".into(),
+        )),
+
+        PhysicalPlan::StreamStreamJoin { .. } => Err(ExqlError::Execution(
+            "StreamStreamJoin is not supported in bounded execution".into(),
+        )),
     }
 }
 
