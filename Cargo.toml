@@ -8,6 +8,7 @@ members = [
     "crates/exspeed-storage",
     "crates/exspeed-broker",
     "crates/exspeed-api",
+    "crates/exspeed-connectors",
 ]
 
 [workspace.dependencies]
@@ -39,8 +40,18 @@ futures-util = { version = "0.3", features = ["sink"] }
 # Checksums
 crc32c = "0.6"
 
+# Async traits
+async-trait = "0.1"
+
+# Config
+toml = "0.8"
+
 # HTTP
 axum = "0.8"
+reqwest = { version = "0.12", features = ["json"] }
+
+# Database
+tokio-postgres = "0.7"
 
 # Observability / Metrics
 opentelemetry = "0.28"
