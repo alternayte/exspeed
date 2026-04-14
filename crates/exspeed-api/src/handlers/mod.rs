@@ -1,11 +1,13 @@
+pub mod connectors;
 pub mod consumers;
 pub mod health;
 pub mod metrics;
 pub mod streams;
+pub mod webhooks;
 
 use std::sync::Arc;
 
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 
 use crate::state::AppState;
@@ -24,6 +26,19 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/v1/consumers/{name}",
             get(consumers::get_consumer).delete(consumers::delete_consumer),
         )
+        .route(
+            "/api/v1/connectors",
+            get(connectors::list_connectors).post(connectors::create_connector),
+        )
+        .route(
+            "/api/v1/connectors/{name}",
+            get(connectors::get_connector).delete(connectors::delete_connector),
+        )
+        .route(
+            "/api/v1/connectors/{name}/restart",
+            post(connectors::restart_connector),
+        )
+        .route("/webhooks/{*path}", post(webhooks::handle_webhook))
         .route("/metrics", get(metrics::prometheus_metrics))
         .with_state(state)
 }

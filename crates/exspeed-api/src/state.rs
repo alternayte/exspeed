@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use exspeed_broker::Broker;
 use exspeed_common::Metrics;
+use exspeed_connectors::ConnectorManager;
 use exspeed_storage::file::FileStorage;
 use prometheus::Registry;
 
@@ -12,4 +13,5 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     pub start_time: Instant,
     pub prometheus_registry: Registry,
+    pub connector_manager: Arc<ConnectorManager>,
 }

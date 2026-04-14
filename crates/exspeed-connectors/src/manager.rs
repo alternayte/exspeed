@@ -38,7 +38,7 @@ impl std::fmt::Display for ConnectorStatus {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ConnectorInfo {
     pub name: String,
     pub connector_type: String,

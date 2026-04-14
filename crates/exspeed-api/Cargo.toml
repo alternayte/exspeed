@@ -9,7 +9,9 @@ exspeed-broker = { path = "../exspeed-broker" }
 exspeed-protocol = { path = "../exspeed-protocol" }
 exspeed-storage = { path = "../exspeed-storage" }
 exspeed-streams = { path = "../exspeed-streams" }
+exspeed-connectors = { path = "../exspeed-connectors" }
 axum = { workspace = true }
+bytes = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

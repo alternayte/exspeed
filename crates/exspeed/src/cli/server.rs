@@ -15,6 +15,7 @@ use exspeed_broker::Broker;
 use exspeed_protocol::codec::ExspeedCodec;
 use exspeed_protocol::messages::record_delivery::RecordDelivery;
 use exspeed_protocol::messages::{ClientMessage, ServerMessage};
+use exspeed_connectors::ConnectorManager;
 use exspeed_storage::file::FileStorage;
 use exspeed_streams::StorageEngine;
 
@@ -43,8 +44,15 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     let metrics = Arc::new(metrics);
 
     // Create broker
-    let broker = Arc::new(Broker::new(storage, args.data_dir.clone()));
+    let broker = Arc::new(Broker::new(storage.clone(), args.data_dir.clone()));
     broker.load_consumers()?;
+
+    // Create connector manager
+    let connector_manager = Arc::new(ConnectorManager::new(
+        storage,
+        args.data_dir.clone(),
+        metrics.clone(),
+    ));
 
     // Create shared AppState
     let state = Arc::new(exspeed_api::AppState {
@@ -53,6 +61,7 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         metrics: metrics.clone(),
         start_time: std::time::Instant::now(),
         prometheus_registry,
+        connector_manager,
     });
 
     // Spawn retention task
