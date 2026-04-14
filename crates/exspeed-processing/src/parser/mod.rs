@@ -1,6 +1,7 @@
-// Implemented in Task 3
-
-pub mod dialect;
 pub mod ast;
-pub mod transform;
+pub mod dialect;
 pub mod error;
+pub mod transform;
+
+pub use ast::ExqlStatement;
+pub use error::ParseError;
