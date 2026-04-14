@@ -5,6 +5,7 @@ pub mod limit;
 pub mod project;
 pub mod scan;
 pub mod sort;
+pub mod stream_join;
 pub mod windowed_aggregate;
 
 use crate::types::Row;
