@@ -28,6 +28,8 @@ pub struct ConnectorConfig {
     pub dedup_key: String,
     #[serde(default = "default_dedup_window")]
     pub dedup_window_secs: u64,
+    #[serde(default)]
+    pub transform_sql: String,
 }
 
 fn default_batch_size() -> u32 {
@@ -101,6 +103,13 @@ struct TomlConnector {
     connector: TomlConnectorSection,
     #[serde(default)]
     settings: HashMap<String, String>,
+    #[serde(default)]
+    transform: Option<TomlTransform>,
+}
+
+#[derive(Deserialize)]
+struct TomlTransform {
+    sql: String,
 }
 
 #[derive(Deserialize)]
@@ -141,6 +150,7 @@ impl TomlConnector {
             dedup_enabled: self.connector.dedup_enabled,
             dedup_key: self.connector.dedup_key,
             dedup_window_secs: self.connector.dedup_window_secs,
+            transform_sql: self.transform.map(|t| t.sql).unwrap_or_default(),
         }
     }
 }
@@ -198,6 +208,7 @@ mod tests {
             dedup_enabled: true,
             dedup_key: String::new(),
             dedup_window_secs: 86400,
+            transform_sql: String::new(),
         };
 
         config.save_json(&path).unwrap();
@@ -253,6 +264,7 @@ outbox_table = "outbox_events"
             dedup_enabled: true,
             dedup_key: String::new(),
             dedup_window_secs: 86400,
+            transform_sql: String::new(),
         };
         config.resolve_env_vars();
         assert_eq!(config.settings.get("secret").unwrap(), "my-secret-value");
@@ -274,6 +286,7 @@ outbox_table = "outbox_events"
             dedup_enabled: true,
             dedup_key: String::new(),
             dedup_window_secs: 86400,
+            transform_sql: String::new(),
         };
         config.resolve_env_vars();
         assert_eq!(
@@ -297,6 +310,7 @@ outbox_table = "outbox_events"
             dedup_enabled: true,
             dedup_key: String::new(),
             dedup_window_secs: 86400,
+            transform_sql: String::new(),
         };
         assert_eq!(config.setting("url").unwrap(), "http://example.com");
         assert!(config.setting("missing").is_err());

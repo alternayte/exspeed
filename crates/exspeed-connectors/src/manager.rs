@@ -370,6 +370,7 @@ impl ConnectorManager {
         let dedup_enabled = config.dedup_enabled;
         let dedup_window_secs = config.dedup_window_secs;
         let dedup_key_header = config.dedup_key.clone();
+        let transform_sql = config.transform_sql.clone();
         let task_name = name.clone();
 
         // Insert into map before spawning
@@ -417,6 +418,19 @@ impl ConnectorManager {
                 None
             };
             let mut dedup_counter = 0u64;
+
+            // Compile transform once before the loop
+            let transform = if !transform_sql.is_empty() {
+                match crate::transform::Transform::compile(&transform_sql) {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        error!(connector = task_name.as_str(), "transform compile failed: {e}");
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
 
             let mut cancel_rx = cancel_rx;
 
@@ -472,6 +486,16 @@ impl ConnectorManager {
                             cache.cleanup();
                         }
                     }
+
+                    // Apply transform (filter + projection)
+                    let record = if let Some(ref t) = transform {
+                        match t.apply(record) {
+                            Some(r) => r,
+                            None => continue, // filtered out
+                        }
+                    } else {
+                        record.clone()
+                    };
 
                     let storage_record = Record {
                         key: record.key.clone(),

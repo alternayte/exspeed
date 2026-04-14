@@ -1096,6 +1096,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "exspeed-common",
+ "exspeed-processing",
  "exspeed-storage",
  "exspeed-streams",
  "futures-util",

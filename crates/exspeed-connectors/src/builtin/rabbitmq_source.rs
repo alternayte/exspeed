@@ -278,6 +278,7 @@ mod tests {
             dedup_enabled: true,
             dedup_key: String::new(),
             dedup_window_secs: 86400,
+            transform_sql: String::new(),
         }
     }
 

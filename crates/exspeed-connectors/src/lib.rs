@@ -5,6 +5,7 @@ pub mod file_watcher;
 pub mod manager;
 pub mod offset;
 pub mod traits;
+pub mod transform;
 
 pub use config::ConnectorConfig;
 pub use manager::ConnectorManager;
