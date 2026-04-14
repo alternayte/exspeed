@@ -120,4 +120,41 @@ impl ExqlEngine {
     pub fn list_queries(&self) -> Vec<QueryInfoSnapshot> {
         self.query_registry.list()
     }
+
+    /// Resume all continuous queries that were previously running.
+    ///
+    /// On startup, all queries are loaded with status `Stopped`. This method
+    /// iterates through them and re-spawns any that the user had previously
+    /// created (all loaded queries are candidates for resumption).
+    pub fn resume_all(&self) {
+        let snapshots = self.query_registry.list();
+        for snap in snapshots {
+            // Retrieve the SQL so we can re-launch
+            if let Some(sql) = self.query_registry.get_sql(&snap.id) {
+                let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+                if self
+                    .query_registry
+                    .set_running(&snap.id, cancel_tx)
+                    .is_ok()
+                {
+                    let storage = self.storage.clone();
+                    let registry = self.query_registry.clone();
+                    let query_id = snap.id.clone();
+                    let target = snap.target_stream.clone();
+
+                    tokio::spawn(async move {
+                        runtime::continuous::run_continuous_query(
+                            query_id,
+                            sql,
+                            target,
+                            storage,
+                            registry,
+                            cancel_rx,
+                        )
+                        .await;
+                    });
+                }
+            }
+        }
+    }
 }

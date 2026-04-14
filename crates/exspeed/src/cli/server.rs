@@ -13,6 +13,7 @@ use tracing::{error, info, warn};
 use exspeed_broker::consumer_state::DeliveryRecord;
 use exspeed_broker::Broker;
 use exspeed_connectors::ConnectorManager;
+use exspeed_processing::ExqlEngine;
 use exspeed_protocol::codec::ExspeedCodec;
 use exspeed_protocol::messages::record_delivery::RecordDelivery;
 use exspeed_protocol::messages::{ClientMessage, ServerMessage};
@@ -68,6 +69,12 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         args.data_dir.join("connectors.d"),
     );
 
+    // Create ExQL engine (use file_storage as the StorageEngine trait object)
+    let exql_storage: Arc<dyn StorageEngine> = file_storage.clone();
+    let exql = Arc::new(ExqlEngine::new(exql_storage, args.data_dir.clone()));
+    exql.load().unwrap_or_else(|e| warn!("ExQL load: {e}"));
+    exql.resume_all();
+
     // Create shared AppState
     let state = Arc::new(exspeed_api::AppState {
         broker: broker.clone(),
@@ -76,6 +83,7 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         start_time: std::time::Instant::now(),
         prometheus_registry,
         connector_manager,
+        exql,
     });
 
     // Spawn retention task

@@ -244,6 +244,20 @@ impl QueryRegistry {
         Some(ckpt.source_offsets)
     }
 
+    /// Get a snapshot of a single registered query by ID.
+    pub fn get_snapshot(&self, id: &str) -> Option<QueryInfoSnapshot> {
+        self.queries.read().unwrap().get(id).map(|info| QueryInfoSnapshot {
+            id: info.id.clone(),
+            sql: info.sql.clone(),
+            target_stream: info.target_stream.clone(),
+            status: match &info.status {
+                QueryStatus::Running => "running".to_string(),
+                QueryStatus::Stopped => "stopped".to_string(),
+                QueryStatus::Failed(reason) => format!("failed: {reason}"),
+            },
+        })
+    }
+
     /// Get the SQL for a registered query.
     pub fn get_sql(&self, id: &str) -> Option<String> {
         self.queries.read().unwrap().get(id).map(|q| q.sql.clone())

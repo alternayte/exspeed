@@ -19,6 +19,7 @@ exspeed-storage = { path = "../exspeed-storage" }
 exspeed-streams = { path = "../exspeed-streams" }
 exspeed-api = { path = "../exspeed-api" }
 exspeed-connectors = { path = "../exspeed-connectors" }
+exspeed-processing = { path = "../exspeed-processing" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 clap = { workspace = true }
