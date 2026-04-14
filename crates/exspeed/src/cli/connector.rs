@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 
@@ -40,10 +40,10 @@ pub async fn run(cmd: ConnectorCommand) -> Result<()> {
     }
 }
 
-async fn validate(path: &PathBuf) -> Result<()> {
+async fn validate(path: &Path) -> Result<()> {
     // Step 1: Load TOML
-    let mut config = ConnectorConfig::load_toml(path)
-        .map_err(|e| anyhow!("failed to load config: {e}"))?;
+    let mut config =
+        ConnectorConfig::load_toml(path).map_err(|e| anyhow!("failed to load config: {e}"))?;
     println!("✓ Config syntax valid");
 
     // Step 2: Resolve env vars
@@ -64,8 +64,7 @@ async fn validate(path: &PathBuf) -> Result<()> {
 
     // Step 4: Validate stream name
     let stream = config.stream.clone();
-    StreamName::try_from(stream.as_str())
-        .map_err(|e| anyhow!("invalid stream name: {e}"))?;
+    StreamName::try_from(stream.as_str()).map_err(|e| anyhow!("invalid stream name: {e}"))?;
     println!("✓ Stream name valid");
 
     // Step 5: Validate transform SQL if non-empty
@@ -79,13 +78,13 @@ async fn validate(path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn dry_run(path: &PathBuf) -> Result<()> {
+async fn dry_run(path: &Path) -> Result<()> {
     // Step 1: Run validate first
     validate(path).await?;
 
     // Reload config (validate already checked it's loadable)
-    let mut config = ConnectorConfig::load_toml(path)
-        .map_err(|e| anyhow!("failed to load config: {e}"))?;
+    let mut config =
+        ConnectorConfig::load_toml(path).map_err(|e| anyhow!("failed to load config: {e}"))?;
     config.resolve_env_vars();
 
     let plugin = config.plugin.clone();

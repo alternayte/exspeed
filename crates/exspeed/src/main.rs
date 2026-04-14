@@ -13,5 +13,6 @@ async fn main() -> anyhow::Result<()> {
 
     match cli::Cli::parse() {
         cli::Cli::Server(args) => cli::server::run(args).await,
+        cli::Cli::Connector(cmd) => cli::connector::run(cmd).await,
     }
 }

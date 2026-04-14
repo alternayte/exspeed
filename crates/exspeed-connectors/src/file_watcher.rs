@@ -113,8 +113,8 @@ pub fn spawn_file_watcher(manager: Arc<ConnectorManager>, connectors_dir: PathBu
     let tx_notify = tx.clone();
     let watch_dir = connectors_dir.clone();
 
-    let watcher_result = notify::recommended_watcher(
-        move |res: notify::Result<notify::Event>| match res {
+    let watcher_result =
+        notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
             Ok(event) => {
                 let relevant = matches!(
                     event.kind,
@@ -128,8 +128,7 @@ pub fn spawn_file_watcher(manager: Arc<ConnectorManager>, connectors_dir: PathBu
             Err(e) => {
                 warn!(error = %e, "file_watcher: notify error");
             }
-        },
-    );
+        });
 
     match watcher_result {
         Ok(mut watcher) => {
@@ -196,8 +195,8 @@ async fn event_loop(
         let debounce = Duration::from_millis(500);
         loop {
             match tokio::time::timeout(debounce, rx.recv()).await {
-                Ok(Some(())) => {} // more events — keep draining
-                Ok(None) => return, // channel closed
+                Ok(Some(())) => {}      // more events — keep draining
+                Ok(None) => return,     // channel closed
                 Err(_elapsed) => break, // debounce window passed
             }
         }

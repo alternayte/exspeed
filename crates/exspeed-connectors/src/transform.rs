@@ -24,11 +24,7 @@ impl Transform {
         let upper = sql.to_uppercase();
         let full_sql = if let Some(pos) = find_top_level_where(&upper) {
             // Insert FROM "__transform__" before WHERE
-            format!(
-                "{} FROM \"__transform__\" {}",
-                &sql[..pos],
-                &sql[pos..]
-            )
+            format!("{} FROM \"__transform__\" {}", &sql[..pos], &sql[pos..])
         } else {
             // No WHERE clause — append FROM
             format!("{sql} FROM \"__transform__\"")
@@ -63,9 +59,10 @@ impl Transform {
         }
 
         // Check if all select items are wildcards
-        let all_wildcard = self.select_items.iter().all(|item| {
-            matches!(item.expr, Expr::Wildcard { .. })
-        });
+        let all_wildcard = self
+            .select_items
+            .iter()
+            .all(|item| matches!(item.expr, Expr::Wildcard { .. }));
 
         if all_wildcard {
             return Some(record.clone());
@@ -82,8 +79,7 @@ impl Transform {
             output.insert(col_name, value_to_json(&val));
         }
 
-        let new_value = serde_json::to_vec(&serde_json::Value::Object(output))
-            .unwrap_or_default();
+        let new_value = serde_json::to_vec(&serde_json::Value::Object(output)).unwrap_or_default();
 
         Some(SourceRecord {
             key: record.key.clone(),
@@ -165,10 +161,8 @@ fn find_top_level_where(upper: &str) -> Option<usize> {
             b'W' if depth == 0 => {
                 if upper[i..].starts_with("WHERE") {
                     // Make sure it's a word boundary (not part of ELSEWHERE etc.)
-                    let before_ok =
-                        i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
-                    let after_ok = i + 5 >= bytes.len()
-                        || !bytes[i + 5].is_ascii_alphanumeric();
+                    let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+                    let after_ok = i + 5 >= bytes.len() || !bytes[i + 5].is_ascii_alphanumeric();
                     if before_ok && after_ok {
                         return Some(i);
                     }
@@ -197,14 +191,9 @@ mod tests {
 
     #[test]
     fn filter_passes_matching_record() {
-        let transform =
-            Transform::compile("SELECT * WHERE subject = 'orders.created'").unwrap();
+        let transform = Transform::compile("SELECT * WHERE subject = 'orders.created'").unwrap();
 
-        let record = make_record(
-            Some("k1"),
-            r#"{"amount": 100}"#,
-            "orders.created",
-        );
+        let record = make_record(Some("k1"), r#"{"amount": 100}"#, "orders.created");
 
         let result = transform.apply(&record);
         assert!(result.is_some(), "matching record should pass filter");
@@ -215,25 +204,22 @@ mod tests {
 
     #[test]
     fn filter_rejects_non_matching_record() {
-        let transform =
-            Transform::compile("SELECT * WHERE subject = 'orders.created'").unwrap();
+        let transform = Transform::compile("SELECT * WHERE subject = 'orders.created'").unwrap();
 
-        let record = make_record(
-            Some("k2"),
-            r#"{"amount": 50}"#,
-            "orders.cancelled",
-        );
+        let record = make_record(Some("k2"), r#"{"amount": 50}"#, "orders.cancelled");
 
         let result = transform.apply(&record);
-        assert!(result.is_none(), "non-matching record should be filtered out");
+        assert!(
+            result.is_none(),
+            "non-matching record should be filtered out"
+        );
     }
 
     #[test]
     fn projection_transforms_columns() {
-        let transform = Transform::compile(
-            "SELECT payload->>'name' AS customer_name, subject AS topic",
-        )
-        .unwrap();
+        let transform =
+            Transform::compile("SELECT payload->>'name' AS customer_name, subject AS topic")
+                .unwrap();
 
         let record = make_record(
             Some("k3"),
@@ -257,11 +243,7 @@ mod tests {
     fn passthrough_with_select_star() {
         let transform = Transform::compile("SELECT *").unwrap();
 
-        let record = make_record(
-            Some("k4"),
-            r#"{"data": true}"#,
-            "events.test",
-        );
+        let record = make_record(Some("k4"), r#"{"data": true}"#, "events.test");
 
         let result = transform.apply(&record);
         assert!(result.is_some());

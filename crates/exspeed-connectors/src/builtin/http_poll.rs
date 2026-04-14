@@ -56,10 +56,7 @@ impl HttpPollSource {
         };
 
         let auth_type = config.setting_or("auth_type", "none");
-        let auth_token = config
-            .settings
-            .get("auth_token")
-            .cloned();
+        let auth_token = config.settings.get("auth_token").cloned();
 
         let items_path = config.settings.get("items_path").cloned().and_then(|s| {
             if s.is_empty() {
@@ -161,8 +158,9 @@ impl SourceConnector for HttpPollSource {
         }
 
         // Build request
-        let method = reqwest::Method::from_bytes(self.method.as_bytes())
-            .map_err(|e| ConnectorError::Config(format!("invalid HTTP method '{}': {e}", self.method)))?;
+        let method = reqwest::Method::from_bytes(self.method.as_bytes()).map_err(|e| {
+            ConnectorError::Config(format!("invalid HTTP method '{}': {e}", self.method))
+        })?;
 
         let mut req = self.client.request(method, &self.url);
 
@@ -211,7 +209,7 @@ impl SourceConnector for HttpPollSource {
             });
         }
 
-        if status < 200 || status >= 300 {
+        if !(200..300).contains(&status) {
             let body = response
                 .text()
                 .await

@@ -424,7 +424,10 @@ impl ConnectorManager {
                 match crate::transform::Transform::compile(&transform_sql) {
                     Ok(t) => Some(t),
                     Err(e) => {
-                        error!(connector = task_name.as_str(), "transform compile failed: {e}");
+                        error!(
+                            connector = task_name.as_str(),
+                            "transform compile failed: {e}"
+                        );
                         return;
                     }
                 }
@@ -465,16 +468,19 @@ impl ConnectorManager {
                     if let Some(ref mut cache) = dedup_cache {
                         let key = if !dedup_key_header.is_empty() {
                             // Look up named header
-                            record.headers.iter()
+                            record
+                                .headers
+                                .iter()
                                 .find(|(k, _)| k == &dedup_key_header)
                                 .map(|(_, v)| v.clone())
-                        } else if let Some(ref k) = record.key {
-                            // Use record key
-                            Some(String::from_utf8_lossy(k).to_string())
                         } else {
-                            // Content hash fallback
-                            None
-                        }.unwrap_or_else(|| crate::dedup::DedupCache::content_hash(&record.value));
+                            // Use record key, or content hash fallback
+                            record
+                                .key
+                                .as_ref()
+                                .map(|k| String::from_utf8_lossy(k).to_string())
+                        }
+                        .unwrap_or_else(|| crate::dedup::DedupCache::content_hash(&record.value));
 
                         if !cache.check_and_insert(&key) {
                             continue; // skip duplicate
@@ -482,7 +488,7 @@ impl ConnectorManager {
 
                         // Periodic cleanup
                         dedup_counter += 1;
-                        if dedup_counter % 1000 == 0 {
+                        if dedup_counter.is_multiple_of(1000) {
                             cache.cleanup();
                         }
                     }
