@@ -315,11 +315,10 @@ impl ConnectorManager {
         // Try reading from the stream. If it fails with StreamNotFound, create it.
         match self.storage.read(stream, Offset(0), 0) {
             Ok(_) => Ok(()),
-            Err(StorageError::StreamNotFound(_)) => {
-                self.storage
-                    .create_stream(stream, 0, 0)
-                    .map_err(|e| format!("failed to create stream: {e}"))
-            }
+            Err(StorageError::StreamNotFound(_)) => self
+                .storage
+                .create_stream(stream, 0, 0)
+                .map_err(|e| format!("failed to create stream: {e}")),
             Err(e) => Err(format!("failed to check stream: {e}")),
         }
     }
@@ -349,7 +348,10 @@ impl ConnectorManager {
                     started_at: Instant::now(),
                 },
             );
-            info!(connector = name.as_str(), "registered http_webhook source (no task loop)");
+            info!(
+                connector = name.as_str(),
+                "registered http_webhook source (no task loop)"
+            );
             return Ok(());
         }
 
@@ -444,8 +446,8 @@ impl ConnectorManager {
 
                     let st = storage.clone();
                     let sn = stream_name.clone();
-                    let result = tokio::task::spawn_blocking(move || st.append(&sn, &storage_record))
-                        .await;
+                    let result =
+                        tokio::task::spawn_blocking(move || st.append(&sn, &storage_record)).await;
 
                     match result {
                         Ok(Ok(_offset)) => {

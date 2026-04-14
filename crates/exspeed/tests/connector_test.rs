@@ -157,16 +157,17 @@ async fn list_and_delete_connectors() {
 
     let body: Value = resp.json().await.unwrap();
     let list = body.as_array().expect("expected JSON array");
-    assert_eq!(
-        list.len(),
-        2,
-        "should have 2 connectors, got: {:?}",
-        list
-    );
+    assert_eq!(list.len(), 2, "should have 2 connectors, got: {:?}", list);
 
     let names: Vec<&str> = list.iter().filter_map(|c| c["name"].as_str()).collect();
-    assert!(names.contains(&"webhook-alpha"), "should contain webhook-alpha");
-    assert!(names.contains(&"webhook-beta"), "should contain webhook-beta");
+    assert!(
+        names.contains(&"webhook-alpha"),
+        "should contain webhook-alpha"
+    );
+    assert!(
+        names.contains(&"webhook-beta"),
+        "should contain webhook-beta"
+    );
 
     // 5. Delete first connector
     let resp = client

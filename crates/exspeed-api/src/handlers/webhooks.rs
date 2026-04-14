@@ -51,24 +51,15 @@ pub async fn handle_webhook(
     // Drop the read lock before doing work
     drop(connectors);
 
-    let auth_header = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok());
+    let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
 
     let storage = state.connector_manager.storage.clone();
 
     match handle_webhook_post(&storage, &config, body, auth_header) {
-        Ok(offset) => (
-            StatusCode::OK,
-            Json(json!({"offset": offset})),
-        ),
-        Err(e) if e.contains("unauthorized") => (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": e})),
-        ),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": e})),
-        ),
+        Ok(offset) => (StatusCode::OK, Json(json!({"offset": offset}))),
+        Err(e) if e.contains("unauthorized") => {
+            (StatusCode::UNAUTHORIZED, Json(json!({"error": e})))
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))),
     }
 }

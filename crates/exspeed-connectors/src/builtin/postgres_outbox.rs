@@ -22,7 +22,7 @@ impl PostgresOutboxSource {
     pub fn new(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
         let connection_string = config
             .setting("connection")
-            .map_err(|e| ConnectorError::Config(e))?
+            .map_err(ConnectorError::Config)?
             .to_string();
 
         let outbox_table = config.setting_or("outbox_table", "outbox_events");
@@ -67,11 +67,7 @@ impl SourceConnector for PostgresOutboxSource {
     async fn poll(&mut self, max_batch: usize) -> Result<SourceBatch, ConnectorError> {
         let client = match &self.client {
             Some(c) => c,
-            None => {
-                return Err(ConnectorError::Connection(
-                    "not connected".to_string(),
-                ))
-            }
+            None => return Err(ConnectorError::Connection("not connected".to_string())),
         };
 
         let query = format!(
@@ -115,10 +111,7 @@ impl SourceConnector for PostgresOutboxSource {
             let payload_bytes: Bytes = row
                 .try_get::<_, String>(3)
                 .map(|s| Bytes::from(s.into_bytes()))
-                .or_else(|_| {
-                    row.try_get::<_, Vec<u8>>(3)
-                        .map(Bytes::from)
-                })
+                .or_else(|_| row.try_get::<_, Vec<u8>>(3).map(Bytes::from))
                 .map_err(|e| ConnectorError::Data(format!("payload column: {e}")))?;
 
             // key (column 4)

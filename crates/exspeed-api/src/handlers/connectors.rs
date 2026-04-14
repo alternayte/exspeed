@@ -15,18 +15,9 @@ pub async fn create_connector(
     Json(config): Json<ConnectorConfig>,
 ) -> impl IntoResponse {
     match state.connector_manager.create(config).await {
-        Ok(()) => (
-            StatusCode::CREATED,
-            Json(json!({"status": "created"})),
-        ),
-        Err(e) if e.contains("already exists") => (
-            StatusCode::CONFLICT,
-            Json(json!({"error": e})),
-        ),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": e})),
-        ),
+        Ok(()) => (StatusCode::CREATED, Json(json!({"status": "created"}))),
+        Err(e) if e.contains("already exists") => (StatusCode::CONFLICT, Json(json!({"error": e}))),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))),
     }
 }
 
@@ -54,14 +45,8 @@ pub async fn delete_connector(
 ) -> impl IntoResponse {
     match state.connector_manager.delete(&name).await {
         Ok(()) => (StatusCode::OK, Json(json!({"deleted": name}))),
-        Err(e) if e.contains("not found") => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": e})),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e})),
-        ),
+        Err(e) if e.contains("not found") => (StatusCode::NOT_FOUND, Json(json!({"error": e}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))),
     }
 }
 
@@ -71,13 +56,7 @@ pub async fn restart_connector(
 ) -> impl IntoResponse {
     match state.connector_manager.restart(&name).await {
         Ok(()) => (StatusCode::OK, Json(json!({"restarted": name}))),
-        Err(e) if e.contains("not found") => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": e})),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e})),
-        ),
+        Err(e) if e.contains("not found") => (StatusCode::NOT_FOUND, Json(json!({"error": e}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))),
     }
 }

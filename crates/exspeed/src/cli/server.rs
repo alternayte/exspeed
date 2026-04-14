@@ -12,10 +12,10 @@ use tracing::{error, info, warn};
 
 use exspeed_broker::consumer_state::DeliveryRecord;
 use exspeed_broker::Broker;
+use exspeed_connectors::ConnectorManager;
 use exspeed_protocol::codec::ExspeedCodec;
 use exspeed_protocol::messages::record_delivery::RecordDelivery;
 use exspeed_protocol::messages::{ClientMessage, ServerMessage};
-use exspeed_connectors::ConnectorManager;
 use exspeed_storage::file::FileStorage;
 use exspeed_streams::StorageEngine;
 

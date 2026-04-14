@@ -9,13 +9,13 @@ use serde::{Deserialize, Serialize};
 pub struct ConnectorConfig {
     pub name: String,
     #[serde(rename = "type")]
-    pub connector_type: String,      // "source" or "sink"
-    pub plugin: String,               // "http_webhook", "http_sink", "postgres_outbox"
-    pub stream: String,               // target stream (source publishes to, sink reads from)
+    pub connector_type: String, // "source" or "sink"
+    pub plugin: String, // "http_webhook", "http_sink", "postgres_outbox"
+    pub stream: String, // target stream (source publishes to, sink reads from)
     #[serde(default)]
-    pub subject_template: String,     // sources: derive subject from record
+    pub subject_template: String, // sources: derive subject from record
     #[serde(default)]
-    pub subject_filter: String,       // sinks: filter records by subject
+    pub subject_filter: String, // sinks: filter records by subject
     #[serde(default)]
     pub settings: HashMap<String, String>,
     #[serde(default = "default_batch_size")]
@@ -24,8 +24,12 @@ pub struct ConnectorConfig {
     pub poll_interval_ms: u64,
 }
 
-fn default_batch_size() -> u32 { 100 }
-fn default_poll_interval() -> u64 { 50 }
+fn default_batch_size() -> u32 {
+    100
+}
+fn default_poll_interval() -> u64 {
+    50
+}
 
 impl ConnectorConfig {
     /// Load from a JSON file.
@@ -38,8 +42,7 @@ impl ConnectorConfig {
 
     /// Save as JSON.
     pub fn save_json(&self, path: &Path) -> io::Result<()> {
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let json = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
         fs::write(path, json)?;
         fs::File::open(path)?.sync_all()?;
         Ok(())
@@ -50,8 +53,8 @@ impl ConnectorConfig {
     /// TOML format uses `[connector]` table for top-level fields and `[settings]` for plugin config.
     pub fn load_toml(path: &Path) -> io::Result<Self> {
         let text = fs::read_to_string(path)?;
-        let toml_val: TomlConnector = toml::from_str(&text)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let toml_val: TomlConnector =
+            toml::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         Ok(toml_val.into_config())
     }
 
@@ -65,14 +68,16 @@ impl ConnectorConfig {
 
     /// Get a setting value, or return an error.
     pub fn setting(&self, key: &str) -> Result<&str, String> {
-        self.settings.get(key)
+        self.settings
+            .get(key)
             .map(|v| v.as_str())
             .ok_or_else(|| format!("missing required setting: {key}"))
     }
 
     /// Get a setting value with a default.
     pub fn setting_or(&self, key: &str, default: &str) -> String {
-        self.settings.get(key)
+        self.settings
+            .get(key)
             .cloned()
             .unwrap_or_else(|| default.to_string())
     }
@@ -129,7 +134,12 @@ fn resolve_env(input: &str) -> String {
             let var_name = &result[start + 2..start + end_rel];
             match std::env::var(var_name) {
                 Ok(val) => {
-                    result = format!("{}{}{}", &result[..start], val, &result[start + end_rel + 1..]);
+                    result = format!(
+                        "{}{}{}",
+                        &result[..start],
+                        val,
+                        &result[start + end_rel + 1..]
+                    );
                     search_from = start + val.len();
                 }
                 Err(_) => {
@@ -197,7 +207,10 @@ outbox_table = "outbox_events"
         assert_eq!(config.name, "pg-outbox");
         assert_eq!(config.connector_type, "source");
         assert_eq!(config.plugin, "postgres_outbox");
-        assert_eq!(config.settings.get("connection").unwrap(), "postgres://user:pass@host/db");
+        assert_eq!(
+            config.settings.get("connection").unwrap(),
+            "postgres://user:pass@host/db"
+        );
     }
 
     #[test]
@@ -233,7 +246,10 @@ outbox_table = "outbox_events"
             poll_interval_ms: 50,
         };
         config.resolve_env_vars();
-        assert_eq!(config.settings.get("val").unwrap(), "${NONEXISTENT_VAR_ABC}");
+        assert_eq!(
+            config.settings.get("val").unwrap(),
+            "${NONEXISTENT_VAR_ABC}"
+        );
     }
 
     #[test]

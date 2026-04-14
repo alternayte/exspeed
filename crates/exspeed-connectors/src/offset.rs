@@ -11,9 +11,10 @@ pub struct ConnectorOffset {
 
 /// Save a connector's position to disk.
 pub fn save_offset(path: &Path, position: &str) -> io::Result<()> {
-    let offset = ConnectorOffset { position: position.to_string() };
-    let json = serde_json::to_string_pretty(&offset)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let offset = ConnectorOffset {
+        position: position.to_string(),
+    };
+    let json = serde_json::to_string_pretty(&offset).map_err(io::Error::other)?;
     fs::write(path, json)?;
     fs::File::open(path)?.sync_all()?;
     Ok(())
@@ -25,8 +26,8 @@ pub fn load_offset(path: &Path) -> io::Result<Option<String>> {
         return Ok(None);
     }
     let json = fs::read_to_string(path)?;
-    let offset: ConnectorOffset = serde_json::from_str(&json)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let offset: ConnectorOffset =
+        serde_json::from_str(&json).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(Some(offset.position))
 }
 
@@ -46,8 +47,7 @@ pub struct SinkOffset {
 
 pub fn save_sink_offset(path: &Path, offset: u64) -> io::Result<()> {
     let data = SinkOffset { offset };
-    let json = serde_json::to_string_pretty(&data)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let json = serde_json::to_string_pretty(&data).map_err(io::Error::other)?;
     fs::write(path, json)?;
     fs::File::open(path)?.sync_all()?;
     Ok(())
@@ -58,8 +58,8 @@ pub fn load_sink_offset(path: &Path) -> io::Result<u64> {
         return Ok(0);
     }
     let json = fs::read_to_string(path)?;
-    let data: SinkOffset = serde_json::from_str(&json)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let data: SinkOffset =
+        serde_json::from_str(&json).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(data.offset)
 }
 

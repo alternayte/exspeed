@@ -7,9 +7,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::config::ConnectorConfig;
+use exspeed_common::StreamName;
 use exspeed_streams::record::Record;
 use exspeed_streams::traits::StorageEngine;
-use exspeed_common::StreamName;
 
 /// Handle an incoming HTTP webhook POST request.
 ///
@@ -98,7 +98,7 @@ fn extract_subject(template: &str, body: &Bytes) -> String {
         if let Some(rel_end) = result[start..].find('}') {
             let end = start + rel_end;
             let placeholder = result[start..=end].to_string(); // e.g. "{$.type}"
-            let field_name = &result[start + 3..end];          // e.g. "type"
+            let field_name = &result[start + 3..end]; // e.g. "type"
             let value = obj
                 .get(field_name)
                 .and_then(|v| v.as_str())

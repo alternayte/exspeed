@@ -10,7 +10,9 @@ pub fn create_source(
     config: &ConnectorConfig,
 ) -> Result<Box<dyn SourceConnector>, ConnectorError> {
     match plugin {
-        "postgres_outbox" => Ok(Box::new(postgres_outbox::PostgresOutboxSource::new(config)?)),
+        "postgres_outbox" => Ok(Box::new(postgres_outbox::PostgresOutboxSource::new(
+            config,
+        )?)),
         other => Err(ConnectorError::Config(format!(
             "unknown source plugin: {other}"
         ))),

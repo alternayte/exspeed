@@ -21,7 +21,7 @@ impl HttpSinkConnector {
     pub fn new(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
         let url = config
             .setting("url")
-            .map_err(|e| ConnectorError::Config(e))?
+            .map_err(ConnectorError::Config)?
             .to_string();
 
         let method = config.setting_or("method", "POST");
@@ -64,9 +64,8 @@ impl HttpSinkConnector {
     }
 
     async fn send_one(&self, record: &SinkRecord) -> Result<(), (u16, String)> {
-        let method = reqwest::Method::from_bytes(self.method.as_bytes()).map_err(|e| {
-            (0u16, format!("invalid HTTP method '{}': {e}", self.method))
-        })?;
+        let method = reqwest::Method::from_bytes(self.method.as_bytes())
+            .map_err(|e| (0u16, format!("invalid HTTP method '{}': {e}", self.method)))?;
 
         let mut req = self
             .client
@@ -85,7 +84,7 @@ impl HttpSinkConnector {
 
         let status = response.status().as_u16();
 
-        if status >= 200 && status < 300 {
+        if (200..300).contains(&status) {
             Ok(())
         } else {
             let body = response
@@ -118,7 +117,7 @@ impl SinkConnector for HttpSinkConnector {
                         any_success = true;
                         continue 'records;
                     }
-                    Err((status, body)) if status >= 400 && status < 500 => {
+                    Err((status, body)) if (400..500).contains(&status) => {
                         // 4xx: bad data, skip and treat as "advanced past".
                         warn!(
                             offset = record.offset,
@@ -164,9 +163,7 @@ impl SinkConnector for HttpSinkConnector {
                     last_successful_offset: offset,
                 })
             } else {
-                Ok(WriteResult::AllFailed(
-                    first_hard_fail.unwrap_or_default(),
-                ))
+                Ok(WriteResult::AllFailed(first_hard_fail.unwrap_or_default()))
             }
         } else if any_success || batch.records.is_empty() {
             Ok(WriteResult::AllSuccess)
