@@ -33,8 +33,51 @@ pub fn call_function(name: &str, args: &[Value]) -> Value {
         // ── Header access (placeholder — headers resolved via row) ─────
         "HEADER" => Value::Null,
 
+        // ── Windowing ───────────────────────────────────────────────────
+        "TUMBLING" => {
+            let ts = args.get(0).and_then(|v| match v {
+                Value::Timestamp(t) => Some(*t),
+                Value::Int(n) => Some(*n as u64),
+                _ => None,
+            });
+            let interval = args.get(1).and_then(|v| v.as_text());
+            match (ts, interval) {
+                (Some(ts), Some(interval)) => {
+                    let window_nanos = parse_interval_nanos(interval);
+                    if window_nanos == 0 {
+                        Value::Null
+                    } else {
+                        let window_start = (ts / window_nanos) * window_nanos;
+                        Value::Timestamp(window_start)
+                    }
+                }
+                _ => Value::Null,
+            }
+        }
+
         _ => Value::Null,
     }
+}
+
+/// Parse an interval string like "1 hour", "30 minutes", "15 seconds" into nanoseconds.
+///
+/// Supports seconds, minutes, hours, days (singular and plural).
+/// Returns 0 for unrecognised or malformed input.
+pub fn parse_interval_nanos(interval: &str) -> u64 {
+    let parts: Vec<&str> = interval.trim().splitn(2, ' ').collect();
+    if parts.len() != 2 {
+        return 0;
+    }
+    let amount: u64 = parts[0].parse().unwrap_or(0);
+    let unit = parts[1].to_lowercase();
+    let multiplier = match unit.trim_end_matches('s').as_ref() {
+        "second" => 1_000_000_000u64,
+        "minute" => 60_000_000_000,
+        "hour" => 3_600_000_000_000,
+        "day" => 86_400_000_000_000,
+        _ => 0,
+    };
+    amount * multiplier
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -358,5 +401,80 @@ mod tests {
             ],
         );
         assert_eq!(result, Value::Bool(true));
+    }
+
+    // ── tumbling() tests ─────────────────────────────────────────────────
+
+    /// A timestamp in the middle of an hour should floor to the start of that hour.
+    #[test]
+    fn tumbling_floors_to_hour() {
+        // 2024-01-01 00:30:00 UTC in nanoseconds
+        // 00:30:00 = 1800 seconds into the hour
+        let hour_nanos: u64 = 3_600_000_000_000;
+        let ts: u64 = 1_704_067_200_000_000_000 + 1_800_000_000_000; // + 30 min
+        let result = call_function(
+            "TUMBLING",
+            &[
+                Value::Timestamp(ts),
+                Value::Text("1 hour".into()),
+            ],
+        );
+        let expected_start = (ts / hour_nanos) * hour_nanos;
+        assert_eq!(result, Value::Timestamp(expected_start));
+    }
+
+    /// Two timestamps 30 minutes apart within the same hour should land in the same window.
+    #[test]
+    fn tumbling_same_window() {
+        let hour_nanos: u64 = 3_600_000_000_000;
+        let base: u64 = 1_704_067_200_000_000_000; // 2024-01-01 00:00:00 UTC
+        let ts1 = base + 600_000_000_000; // + 10 min
+        let ts2 = base + 1_800_000_000_000; // + 30 min
+
+        let r1 = call_function("TUMBLING", &[Value::Timestamp(ts1), Value::Text("1 hour".into())]);
+        let r2 = call_function("TUMBLING", &[Value::Timestamp(ts2), Value::Text("1 hour".into())]);
+
+        assert_eq!(r1, r2);
+        assert_eq!(r1, Value::Timestamp((ts1 / hour_nanos) * hour_nanos));
+    }
+
+    /// Timestamps in different hours should produce different window starts.
+    #[test]
+    fn tumbling_different_windows() {
+        let base: u64 = 1_704_067_200_000_000_000; // 2024-01-01 00:00:00 UTC
+        let ts1 = base + 600_000_000_000;           // 00:10 — hour 0
+        let ts2 = base + 3_660_000_000_000;         // 01:01 — hour 1
+
+        let r1 = call_function("TUMBLING", &[Value::Timestamp(ts1), Value::Text("1 hour".into())]);
+        let r2 = call_function("TUMBLING", &[Value::Timestamp(ts2), Value::Text("1 hour".into())]);
+
+        assert_ne!(r1, r2);
+    }
+
+    /// 5-minute tumbling windows should floor correctly.
+    #[test]
+    fn tumbling_five_minutes() {
+        let five_min_nanos: u64 = 300_000_000_000;
+        let base: u64 = 1_704_067_200_000_000_000; // 2024-01-01 00:00:00 UTC
+        let ts = base + 7 * 60 * 1_000_000_000; // 00:07 → should land in [00:05, 00:10) window
+
+        let result = call_function(
+            "TUMBLING",
+            &[Value::Timestamp(ts), Value::Text("5 minutes".into())],
+        );
+        let expected = (ts / five_min_nanos) * five_min_nanos;
+        assert_eq!(result, Value::Timestamp(expected));
+        // Sanity: window start is 00:05
+        assert_eq!(expected, base + 5 * 60 * 1_000_000_000);
+    }
+
+    /// parse_interval_nanos handles a variety of unit spellings.
+    #[test]
+    fn parse_interval_various() {
+        assert_eq!(parse_interval_nanos("1 hour"), 3_600_000_000_000);
+        assert_eq!(parse_interval_nanos("30 minutes"), 30 * 60_000_000_000);
+        assert_eq!(parse_interval_nanos("1 day"), 86_400_000_000_000);
+        assert_eq!(parse_interval_nanos("15 seconds"), 15 * 1_000_000_000);
+        assert_eq!(parse_interval_nanos("5 hours"), 5 * 3_600_000_000_000);
     }
 }
