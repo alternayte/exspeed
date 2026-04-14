@@ -94,7 +94,78 @@ impl ExqlEngine {
 
         tokio::spawn(async move {
             runtime::continuous::run_continuous_query(
-                query_id, sql_owned, target, storage, registry, cancel_rx,
+                query_id, sql_owned, target, storage, registry, cancel_rx, None,
+            )
+            .await;
+        });
+
+        Ok(id)
+    }
+
+    /// Create and start a materialized view from a CREATE MATERIALIZED VIEW
+    /// statement.
+    ///
+    /// The continuous executor writes output rows into the MV state HashMap
+    /// rather than an output stream. Returns the generated query ID.
+    pub fn create_materialized_view(&self, sql: &str) -> Result<String, ExqlError> {
+        let stmt = crate::parser::parse(sql)?;
+        let (name, query) = match stmt {
+            ExqlStatement::CreateMaterializedView { name, query } => (name, query),
+            _ => {
+                return Err(ExqlError::Execution(
+                    "expected CREATE MATERIALIZED VIEW".into(),
+                ));
+            }
+        };
+
+        // Determine columns from SELECT items
+        let columns: Vec<String> = query
+            .select
+            .iter()
+            .map(|item| {
+                item.alias.clone().unwrap_or_else(|| {
+                    match &item.expr {
+                        crate::parser::ast::Expr::Column { name, .. } => name.clone(),
+                        crate::parser::ast::Expr::Aggregate { func, .. } => match func {
+                            crate::parser::ast::AggregateFunc::Count => "count".into(),
+                            crate::parser::ast::AggregateFunc::Sum => "sum".into(),
+                            crate::parser::ast::AggregateFunc::Avg => "avg".into(),
+                            crate::parser::ast::AggregateFunc::Min => "min".into(),
+                            crate::parser::ast::AggregateFunc::Max => "max".into(),
+                        },
+                        _ => "?".into(),
+                    }
+                })
+            })
+            .collect();
+
+        let id = generate_query_id();
+        let mv_state = self.mv_registry.register(&name, columns, &id);
+
+        self.query_registry
+            .register(&id, sql, &name)
+            .map_err(ExqlError::Execution)?;
+
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        self.query_registry
+            .set_running(&id, cancel_tx)
+            .map_err(ExqlError::Execution)?;
+
+        let storage = self.storage.clone();
+        let registry = self.query_registry.clone();
+        let query_id = id.clone();
+        let sql_owned = sql.to_string();
+        let mv_name = name.clone();
+
+        tokio::spawn(async move {
+            runtime::continuous::run_continuous_query(
+                query_id,
+                sql_owned,
+                mv_name,
+                storage,
+                registry,
+                cancel_rx,
+                Some(mv_state),
             )
             .await;
         });
@@ -122,6 +193,8 @@ impl ExqlEngine {
     /// On startup, all queries are loaded with status `Stopped`. This method
     /// iterates through them and re-spawns any that the user had previously
     /// created (all loaded queries are candidates for resumption).
+    ///
+    /// Note: MV resume is deferred — MVs need to be re-registered separately.
     pub fn resume_all(&self) {
         let snapshots = self.query_registry.list();
         for snap in snapshots {
@@ -136,7 +209,7 @@ impl ExqlEngine {
 
                     tokio::spawn(async move {
                         runtime::continuous::run_continuous_query(
-                            query_id, sql, target, storage, registry, cancel_rx,
+                            query_id, sql, target, storage, registry, cancel_rx, None,
                         )
                         .await;
                     });
