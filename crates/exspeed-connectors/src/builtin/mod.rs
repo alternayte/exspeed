@@ -1,5 +1,6 @@
 pub mod http_sink;
 pub mod http_webhook;
+pub mod postgres_cdc;
 pub mod postgres_outbox;
 
 use crate::config::ConnectorConfig;
@@ -13,6 +14,7 @@ pub fn create_source(
         "postgres_outbox" => Ok(Box::new(postgres_outbox::PostgresOutboxSource::new(
             config,
         )?)),
+        "postgres_cdc" => Ok(Box::new(postgres_cdc::PostgresCdcSource::new(config)?)),
         other => Err(ConnectorError::Config(format!(
             "unknown source plugin: {other}"
         ))),
