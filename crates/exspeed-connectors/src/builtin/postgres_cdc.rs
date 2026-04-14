@@ -263,6 +263,9 @@ mod tests {
             settings,
             batch_size: 100,
             poll_interval_ms: 50,
+            dedup_enabled: true,
+            dedup_key: String::new(),
+            dedup_window_secs: 86400,
         }
     }
 

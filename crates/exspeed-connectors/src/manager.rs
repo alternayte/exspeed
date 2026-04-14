@@ -367,6 +367,9 @@ impl ConnectorManager {
         let stream_str = config.stream.clone();
         let batch_size = config.batch_size as usize;
         let poll_interval = std::time::Duration::from_millis(config.poll_interval_ms);
+        let dedup_enabled = config.dedup_enabled;
+        let dedup_window_secs = config.dedup_window_secs;
+        let dedup_key_header = config.dedup_key.clone();
         let task_name = name.clone();
 
         // Insert into map before spawning
@@ -408,6 +411,13 @@ impl ConnectorManager {
                 }
             };
 
+            let mut dedup_cache = if dedup_enabled {
+                Some(crate::dedup::DedupCache::new(dedup_window_secs))
+            } else {
+                None
+            };
+            let mut dedup_counter = 0u64;
+
             let mut cancel_rx = cancel_rx;
 
             loop {
@@ -437,6 +447,32 @@ impl ConnectorManager {
 
                 // Append each record to storage
                 for record in &batch.records {
+                    // Dedup check
+                    if let Some(ref mut cache) = dedup_cache {
+                        let key = if !dedup_key_header.is_empty() {
+                            // Look up named header
+                            record.headers.iter()
+                                .find(|(k, _)| k == &dedup_key_header)
+                                .map(|(_, v)| v.clone())
+                        } else if let Some(ref k) = record.key {
+                            // Use record key
+                            Some(String::from_utf8_lossy(k).to_string())
+                        } else {
+                            // Content hash fallback
+                            None
+                        }.unwrap_or_else(|| crate::dedup::DedupCache::content_hash(&record.value));
+
+                        if !cache.check_and_insert(&key) {
+                            continue; // skip duplicate
+                        }
+
+                        // Periodic cleanup
+                        dedup_counter += 1;
+                        if dedup_counter % 1000 == 0 {
+                            cache.cleanup();
+                        }
+                    }
+
                     let storage_record = Record {
                         key: record.key.clone(),
                         value: record.value.clone(),

@@ -22,6 +22,12 @@ pub struct ConnectorConfig {
     pub batch_size: u32,
     #[serde(default = "default_poll_interval")]
     pub poll_interval_ms: u64,
+    #[serde(default = "default_dedup_enabled")]
+    pub dedup_enabled: bool,
+    #[serde(default)]
+    pub dedup_key: String,
+    #[serde(default = "default_dedup_window")]
+    pub dedup_window_secs: u64,
 }
 
 fn default_batch_size() -> u32 {
@@ -29,6 +35,12 @@ fn default_batch_size() -> u32 {
 }
 fn default_poll_interval() -> u64 {
     50
+}
+fn default_dedup_enabled() -> bool {
+    true
+}
+fn default_dedup_window() -> u64 {
+    86400
 }
 
 impl ConnectorConfig {
@@ -106,6 +118,12 @@ struct TomlConnectorSection {
     batch_size: u32,
     #[serde(default = "default_poll_interval")]
     poll_interval_ms: u64,
+    #[serde(default = "default_dedup_enabled")]
+    dedup_enabled: bool,
+    #[serde(default)]
+    dedup_key: String,
+    #[serde(default = "default_dedup_window")]
+    dedup_window_secs: u64,
 }
 
 impl TomlConnector {
@@ -120,6 +138,9 @@ impl TomlConnector {
             settings: self.settings,
             batch_size: self.connector.batch_size,
             poll_interval_ms: self.connector.poll_interval_ms,
+            dedup_enabled: self.connector.dedup_enabled,
+            dedup_key: self.connector.dedup_key,
+            dedup_window_secs: self.connector.dedup_window_secs,
         }
     }
 }
@@ -174,6 +195,9 @@ mod tests {
             settings: HashMap::from([("path".into(), "/webhooks/test".into())]),
             batch_size: 100,
             poll_interval_ms: 50,
+            dedup_enabled: true,
+            dedup_key: String::new(),
+            dedup_window_secs: 86400,
         };
 
         config.save_json(&path).unwrap();
@@ -226,6 +250,9 @@ outbox_table = "outbox_events"
             settings: HashMap::from([("secret".into(), "${TEST_SECRET_XYZ}".into())]),
             batch_size: 100,
             poll_interval_ms: 50,
+            dedup_enabled: true,
+            dedup_key: String::new(),
+            dedup_window_secs: 86400,
         };
         config.resolve_env_vars();
         assert_eq!(config.settings.get("secret").unwrap(), "my-secret-value");
@@ -244,6 +271,9 @@ outbox_table = "outbox_events"
             settings: HashMap::from([("val".into(), "${NONEXISTENT_VAR_ABC}".into())]),
             batch_size: 100,
             poll_interval_ms: 50,
+            dedup_enabled: true,
+            dedup_key: String::new(),
+            dedup_window_secs: 86400,
         };
         config.resolve_env_vars();
         assert_eq!(
@@ -264,6 +294,9 @@ outbox_table = "outbox_events"
             settings: HashMap::from([("url".into(), "http://example.com".into())]),
             batch_size: 100,
             poll_interval_ms: 50,
+            dedup_enabled: true,
+            dedup_key: String::new(),
+            dedup_window_secs: 86400,
         };
         assert_eq!(config.setting("url").unwrap(), "http://example.com");
         assert!(config.setting("missing").is_err());
