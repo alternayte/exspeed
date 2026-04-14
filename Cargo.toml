@@ -64,6 +64,9 @@ lapin = "2"
 # Object storage
 rust-s3 = "0.37"
 
+# Filesystem watching
+notify = "7"
+
 # Observability / Metrics
 opentelemetry = "0.28"
 opentelemetry_sdk = { version = "0.28", features = ["metrics"] }
