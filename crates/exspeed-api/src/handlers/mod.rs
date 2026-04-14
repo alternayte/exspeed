@@ -5,6 +5,7 @@ pub mod health;
 pub mod metrics;
 pub mod queries;
 pub mod streams;
+pub mod views;
 pub mod webhooks;
 
 use std::sync::Arc;
@@ -40,6 +41,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/v1/connectors/{name}/restart",
             post(connectors::restart_connector),
         )
+        .route(
+            "/api/v1/views",
+            get(views::list_views).post(views::create_view),
+        )
+        .route("/api/v1/views/{name}", get(views::get_view))
         .route(
             "/api/v1/queries",
             get(queries::list_queries).post(queries::execute_query),
