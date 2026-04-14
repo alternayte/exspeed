@@ -1,5 +1,6 @@
 pub mod http_sink;
 pub mod http_webhook;
+pub mod jdbc_sink;
 pub mod postgres_cdc;
 pub mod postgres_outbox;
 
@@ -27,6 +28,7 @@ pub fn create_sink(
 ) -> Result<Box<dyn SinkConnector>, ConnectorError> {
     match plugin {
         "http_sink" => Ok(Box::new(http_sink::HttpSinkConnector::new(config)?)),
+        "jdbc" => Ok(Box::new(jdbc_sink::JdbcSinkConnector::new(config)?)),
         other => Err(ConnectorError::Config(format!(
             "unknown sink plugin: {other}"
         ))),
