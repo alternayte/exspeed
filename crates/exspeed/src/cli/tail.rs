@@ -1,6 +1,6 @@
-use anyhow::Result;
 use crate::cli::client::CliClient;
 use crate::cli::format;
+use anyhow::Result;
 
 pub async fn run(
     client: &CliClient,
@@ -13,7 +13,10 @@ pub async fn run(
 ) -> Result<()> {
     // Get current head offset
     let info = client.get(&format!("/api/v1/streams/{stream}")).await?;
-    let head = info.get("head_offset").and_then(|v| v.as_i64()).unwrap_or(0);
+    let head = info
+        .get("head_offset")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
 
     let mut current_offset: i64 = if from_beginning {
         0
@@ -38,7 +41,10 @@ pub async fn run(
         let (status, result) = client.post("/api/v1/queries", &body).await?;
 
         if status != 200 {
-            let msg = result.get("error").and_then(|e| e.as_str()).unwrap_or("query failed");
+            let msg = result
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("query failed");
             anyhow::bail!("Tail error: {}", msg);
         }
 

@@ -15,7 +15,12 @@ use clap::{Parser, Subcommand};
 #[command(name = "exspeed", about = "Lightweight stream processing platform")]
 pub struct Cli {
     /// URL of the exspeed server
-    #[arg(long, global = true, env = "EXSPEED_URL", default_value = "http://localhost:8080")]
+    #[arg(
+        long,
+        global = true,
+        env = "EXSPEED_URL",
+        default_value = "http://localhost:8080"
+    )]
     pub server: String,
 
     /// Output as JSON

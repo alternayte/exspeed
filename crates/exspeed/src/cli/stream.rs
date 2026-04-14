@@ -8,12 +8,7 @@ use crate::cli::format;
 ///
 /// `retention` is a human duration like "7d", "24h", "30m".
 /// `max_size` is a human size like "10gb", "256mb".
-pub async fn create(
-    client: &CliClient,
-    name: &str,
-    retention: &str,
-    max_size: &str,
-) -> Result<()> {
+pub async fn create(client: &CliClient, name: &str, retention: &str, max_size: &str) -> Result<()> {
     let retention_secs = parse_duration_secs(retention)?;
     let max_bytes = parse_size_bytes(max_size)?;
 

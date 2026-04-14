@@ -32,9 +32,7 @@ async fn main() -> anyhow::Result<()> {
             data,
             subject,
             key,
-        } => {
-            cli::publish::run(&client, &stream, &data, subject.as_deref(), key.as_deref()).await
-        }
+        } => cli::publish::run(&client, &stream, &data, subject.as_deref(), key.as_deref()).await,
         cli::Command::Tail {
             stream,
             last,
@@ -54,9 +52,7 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         cli::Command::Consumers => cli::consumer_cmd::list(&client, json).await,
-        cli::Command::ConsumerInfo { name } => {
-            cli::consumer_cmd::info(&client, &name, json).await
-        }
+        cli::Command::ConsumerInfo { name } => cli::consumer_cmd::info(&client, &name, json).await,
         cli::Command::Query { sql, continuous } => {
             cli::query::run(&client, &sql, continuous, json).await
         }

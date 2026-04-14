@@ -158,10 +158,7 @@ pub async fn publish_to_stream(
     };
 
     match state.storage.append(&stream_name, &record) {
-        Ok(offset) => (
-            StatusCode::CREATED,
-            Json(json!({"offset": offset.0})),
-        ),
+        Ok(offset) => (StatusCode::CREATED, Json(json!({"offset": offset.0}))),
         Err(exspeed_streams::StorageError::StreamNotFound(_)) => (
             StatusCode::NOT_FOUND,
             Json(json!({"error": format!("stream '{}' not found", name)})),

@@ -62,7 +62,11 @@ pub fn format_table(columns: &[String], rows: &[Vec<String>], execution_time_ms:
     for row in rows {
         out.push('│');
         for (i, cell) in row.iter().enumerate() {
-            let w = if i < widths.len() { widths[i] } else { cell.len() };
+            let w = if i < widths.len() {
+                widths[i]
+            } else {
+                cell.len()
+            };
             out.push(' ');
             out.push_str(&format!("{:<width$}", cell, width = w));
             out.push(' ');
@@ -117,9 +121,7 @@ pub fn format_tail_line(record: &Value) -> String {
         payload
     };
 
-    format!(
-        "[{secs}.{millis:03}] {subject} key={key} {truncated_payload}"
-    )
+    format!("[{secs}.{millis:03}] {subject} key={key} {truncated_payload}")
 }
 
 /// Extract columns and rows from a query result JSON value.
@@ -128,18 +130,16 @@ pub fn format_tail_line(record: &Value) -> String {
 /// Converts each cell to a display string (null -> "NULL", etc.).
 pub fn extract_table_data(result: &Value) -> (Vec<String>, Vec<Vec<String>>) {
     let columns: Vec<String> = match result["columns"].as_array() {
-        Some(arr) => arr.iter().map(|v| value_to_display(v)).collect(),
+        Some(arr) => arr.iter().map(value_to_display).collect(),
         None => return (vec![], vec![]),
     };
 
     let rows: Vec<Vec<String>> = match result["rows"].as_array() {
         Some(arr) => arr
             .iter()
-            .map(|row| {
-                match row.as_array() {
-                    Some(cells) => cells.iter().map(|v| value_to_display(v)).collect(),
-                    None => vec![],
-                }
+            .map(|row| match row.as_array() {
+                Some(cells) => cells.iter().map(value_to_display).collect(),
+                None => vec![],
             })
             .collect(),
         None => vec![],
@@ -207,6 +207,9 @@ mod tests {
         });
 
         let line = format_tail_line(&record);
-        assert_eq!(line, "[1700000000.123] orders.created key=order-42 hello world");
+        assert_eq!(
+            line,
+            "[1700000000.123] orders.created key=order-42 hello world"
+        );
     }
 }

@@ -8,12 +8,7 @@ use crate::cli::format;
 ///
 /// - `continuous`: POST to /api/v1/queries/continuous and print the query_id.
 /// - bounded: POST to /api/v1/queries, extract columns/rows, print table or JSON.
-pub async fn run(
-    client: &CliClient,
-    sql: &str,
-    continuous: bool,
-    json_output: bool,
-) -> Result<()> {
+pub async fn run(client: &CliClient, sql: &str, continuous: bool, json_output: bool) -> Result<()> {
     let body = json!({ "sql": sql });
 
     if continuous {
