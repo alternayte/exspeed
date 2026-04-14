@@ -15,6 +15,7 @@ use tracing::{error, warn};
 use crate::config::ConnectorConfig;
 use crate::traits::{ConnectorError, HealthStatus, SourceBatch, SourceConnector, SourceRecord};
 
+#[derive(Debug)]
 pub struct RabbitmqSource {
     url: String,
     queue: String,
@@ -163,8 +164,7 @@ impl SourceConnector for RabbitmqSource {
 
                         let mut headers: Vec<(String, String)> = Vec::new();
                         if let Some(ct) = delivery.properties.content_type() {
-                            headers
-                                .push(("content-type".to_string(), ct.as_str().to_string()));
+                            headers.push(("content-type".to_string(), ct.as_str().to_string()));
                         }
                         if let Some(corr_id) = delivery.properties.correlation_id() {
                             headers.push((
@@ -173,10 +173,7 @@ impl SourceConnector for RabbitmqSource {
                             ));
                         }
                         if let Some(msg_id) = delivery.properties.message_id() {
-                            headers.push((
-                                "x-message-id".to_string(),
-                                msg_id.as_str().to_string(),
-                            ));
+                            headers.push(("x-message-id".to_string(), msg_id.as_str().to_string()));
                         }
 
                         last_delivery_tag = Some(delivery.delivery_tag);
@@ -204,18 +201,11 @@ impl SourceConnector for RabbitmqSource {
 
         let channel = match self.channel.as_ref() {
             Some(ch) => ch,
-            None => {
-                return Err(ConnectorError::Connection(
-                    "channel not open".to_string(),
-                ))
-            }
+            None => return Err(ConnectorError::Connection("channel not open".to_string())),
         };
 
         channel
-            .basic_ack(
-                delivery_tag,
-                BasicAckOptions { multiple: true },
-            )
+            .basic_ack(delivery_tag, BasicAckOptions { multiple: true })
             .await
             .map_err(|e| ConnectorError::Connection(format!("basic_ack error: {e}")))?;
 
@@ -336,10 +326,7 @@ mod tests {
 
     #[test]
     fn initial_health_is_unhealthy() {
-        let config = make_config(vec![
-            ("url", "amqp://localhost"),
-            ("queue", "q"),
-        ]);
+        let config = make_config(vec![("url", "amqp://localhost"), ("queue", "q")]);
         let source = RabbitmqSource::new(&config).expect("should parse");
         // Before start(), connection is None
         assert!(source.connection.is_none());

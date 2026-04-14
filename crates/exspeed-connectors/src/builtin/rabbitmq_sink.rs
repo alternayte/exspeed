@@ -7,10 +7,9 @@ use lapin::{
 use tracing::warn;
 
 use crate::config::ConnectorConfig;
-use crate::traits::{
-    ConnectorError, HealthStatus, SinkBatch, SinkConnector, WriteResult,
-};
+use crate::traits::{ConnectorError, HealthStatus, SinkBatch, SinkConnector, WriteResult};
 
+#[derive(Debug)]
 pub struct RabbitmqSink {
     url: String,
     exchange: String,
@@ -87,9 +86,7 @@ impl SinkConnector for RabbitmqSink {
             channel
                 .confirm_select(ConfirmSelectOptions::default())
                 .await
-                .map_err(|e| {
-                    ConnectorError::Connection(format!("confirm_select error: {e}"))
-                })?;
+                .map_err(|e| ConnectorError::Connection(format!("confirm_select error: {e}")))?;
         }
 
         channel
@@ -113,11 +110,7 @@ impl SinkConnector for RabbitmqSink {
     async fn write(&mut self, batch: SinkBatch) -> Result<WriteResult, ConnectorError> {
         let channel = match self.channel.as_ref() {
             Some(ch) => ch,
-            None => {
-                return Err(ConnectorError::Connection(
-                    "channel not open".to_string(),
-                ))
-            }
+            None => return Err(ConnectorError::Connection("channel not open".to_string())),
         };
 
         let mut last_successful_offset: Option<u64> = None;
@@ -293,10 +286,7 @@ mod tests {
 
     #[test]
     fn initial_health_is_unhealthy() {
-        let config = make_config(vec![
-            ("url", "amqp://localhost"),
-            ("exchange", "ex"),
-        ]);
+        let config = make_config(vec![("url", "amqp://localhost"), ("exchange", "ex")]);
         let sink = RabbitmqSink::new(&config).expect("should parse");
         assert!(sink.connection.is_none());
     }

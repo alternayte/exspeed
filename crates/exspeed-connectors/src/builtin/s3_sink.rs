@@ -114,9 +114,18 @@ impl S3SinkConnector {
             .collect();
 
         let mut obj = serde_json::Map::new();
-        obj.insert("offset".into(), serde_json::Value::Number(record.offset.into()));
-        obj.insert("timestamp".into(), serde_json::Value::Number(record.timestamp.into()));
-        obj.insert("subject".into(), serde_json::Value::String(record.subject.clone()));
+        obj.insert(
+            "offset".into(),
+            serde_json::Value::Number(record.offset.into()),
+        );
+        obj.insert(
+            "timestamp".into(),
+            serde_json::Value::Number(record.timestamp.into()),
+        );
+        obj.insert(
+            "subject".into(),
+            serde_json::Value::String(record.subject.clone()),
+        );
         obj.insert("key".into(), key_str);
         obj.insert("value".into(), value_str);
         obj.insert("headers".into(), serde_json::Value::Object(headers_obj));
@@ -195,23 +204,28 @@ impl S3SinkConnector {
 #[async_trait]
 impl SinkConnector for S3SinkConnector {
     async fn start(&mut self) -> Result<(), ConnectorError> {
-        let credentials =
-            s3::creds::Credentials::new(Some(&self.access_key), Some(&self.secret_key), None, None, None)
-                .map_err(|e| ConnectorError::Config(format!("S3 sink: invalid credentials: {e}")))?;
+        let credentials = s3::creds::Credentials::new(
+            Some(&self.access_key),
+            Some(&self.secret_key),
+            None,
+            None,
+            None,
+        )
+        .map_err(|e| ConnectorError::Config(format!("S3 sink: invalid credentials: {e}")))?;
 
         let region: s3::Region = match &self.endpoint {
             Some(ep) => s3::Region::Custom {
                 region: self.region.clone(),
                 endpoint: ep.clone(),
             },
-            None => self
-                .region
-                .parse()
-                .map_err(|e| ConnectorError::Config(format!("S3 sink: invalid region '{}': {e}", self.region)))?,
+            None => self.region.parse().map_err(|e| {
+                ConnectorError::Config(format!("S3 sink: invalid region '{}': {e}", self.region))
+            })?,
         };
 
-        let mut bucket = s3::Bucket::new(&self.bucket_name, region, credentials)
-            .map_err(|e| ConnectorError::Connection(format!("S3 sink: failed to create bucket handle: {e}")))?;
+        let mut bucket = s3::Bucket::new(&self.bucket_name, region, credentials).map_err(|e| {
+            ConnectorError::Connection(format!("S3 sink: failed to create bucket handle: {e}"))
+        })?;
 
         if self.path_style {
             bucket = bucket.with_path_style();
@@ -276,7 +290,7 @@ impl SinkConnector for S3SinkConnector {
 /// rolled encoding that is well-tested and produces standard output.
 fn base64_encode(data: &[u8]) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     let mut chunks = data.chunks_exact(3);
     for chunk in chunks.by_ref() {
         let n = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | (chunk[2] as u32);
@@ -323,10 +337,10 @@ fn utc_parts() -> (u32, u32, u32, u32) {
     // Using the civil-date algorithm from Howard Hinnant (public domain).
     let z = days as i64 + 719_468;
     let era: i64 = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;                                  // day of era
+    let doe = z - era * 146_097; // day of era
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
     let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);           // day of year
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
@@ -403,7 +417,10 @@ mod tests {
         let path = connector.generate_path(12345);
 
         assert!(path.starts_with("data/"), "path prefix: {path}");
-        assert!(path.ends_with("/part-00000000000000012345.ndjson"), "path suffix: {path}");
+        assert!(
+            path.ends_with("/part-00000000000000012345.ndjson"),
+            "path suffix: {path}"
+        );
 
         let parts: Vec<&str> = path.split('/').collect();
         // parts: ["data", "YYYY", "MM", "DD", "HH", "part-....ndjson"]
