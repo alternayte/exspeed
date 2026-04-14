@@ -1,3 +1,4 @@
+pub mod connector;
 pub mod server;
 
 use clap::Parser;
@@ -7,4 +8,6 @@ use clap::Parser;
 pub enum Cli {
     /// Start the exspeed server
     Server(server::ServerArgs),
+    /// Manage and validate connector configs
+    Connector(connector::ConnectorCommand),
 }
