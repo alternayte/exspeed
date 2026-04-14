@@ -18,3 +18,4 @@ async-trait = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+bytes = { workspace = true }

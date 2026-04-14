@@ -1,7 +1,7 @@
 use super::Operator;
 use crate::parser::ast::{AggregateFunc, Expr, SelectItem};
 use crate::runtime::eval::eval_expr;
-use crate::types::Row;
+use crate::types::{Row, Value};
 
 /// Evaluates SELECT expressions against each input row to produce output columns.
 pub struct ProjectOperator {
@@ -43,11 +43,23 @@ impl Operator for ProjectOperator {
                     }
                 }
                 expr => {
-                    let val = eval_expr(expr, &input_row);
                     let name = item
                         .alias
                         .clone()
                         .unwrap_or_else(|| derive_column_name(expr));
+                    // For aggregate expressions, the value has already been
+                    // computed by an upstream AggregateOperator and stored
+                    // in the row under the column name (alias or derived).
+                    // Look it up directly instead of re-evaluating.
+                    let val = if matches!(expr, Expr::Aggregate { .. }) {
+                        input_row.get(&name).cloned().unwrap_or_else(|| {
+                            // Fallback: try the default aggregate column name
+                            let default_name = derive_column_name(expr);
+                            input_row.get(&default_name).cloned().unwrap_or(Value::Null)
+                        })
+                    } else {
+                        eval_expr(expr, &input_row)
+                    };
                     columns.push(name);
                     values.push(val);
                 }
