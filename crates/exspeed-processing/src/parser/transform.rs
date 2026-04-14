@@ -21,11 +21,15 @@ pub fn transform_statement(stmt: sp::Statement) -> Result<ExqlStatement, ParseEr
         sp::Statement::CreateView(cv) => {
             let name = object_name_to_string(&cv.name);
             let query = transform_query(*cv.query)?;
-            Ok(ExqlStatement::CreateStream {
-                name,
-                query,
-                emit: EmitMode::Changes,
-            })
+            if cv.materialized {
+                Ok(ExqlStatement::CreateMaterializedView { name, query })
+            } else {
+                Ok(ExqlStatement::CreateStream {
+                    name,
+                    query,
+                    emit: EmitMode::Changes,
+                })
+            }
         }
         other => Err(ParseError::Unsupported(format!(
             "statement type: {}",
@@ -426,6 +430,7 @@ fn transform_join(join: sp::Join) -> Result<JoinClause, ParseError> {
         join_type,
         source,
         on: on_expr,
+        within: None,
     })
 }
 

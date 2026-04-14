@@ -6,21 +6,123 @@ pub mod transform;
 pub use ast::ExqlStatement;
 pub use error::ParseError;
 
+use ast::EmitMode;
 use dialect::ExspeedDialect;
 use sqlparser::parser::Parser;
 
 /// Parse a SQL string into an ExQL AST statement.
+///
+/// Handles Exspeed-specific extensions before delegating to sqlparser:
+/// - `EMIT CHANGES` / `EMIT FINAL` suffix on CREATE VIEW statements
+/// - `WITHIN '<duration>'` on JOIN clauses (for stream-stream joins)
 pub fn parse(sql: &str) -> Result<ExqlStatement, ParseError> {
+    // --- Pre-process: extract EMIT mode ---
+    let (sql_no_emit, emit_mode) = extract_emit_mode(sql);
+
+    // --- Pre-process: extract WITHIN clauses from JOINs ---
+    let (clean_sql, within_values) = extract_within_clauses(&sql_no_emit);
+
     let dialect = ExspeedDialect;
     let statements =
-        Parser::parse_sql(&dialect, sql).map_err(|e| ParseError::Sql(e.to_string()))?;
+        Parser::parse_sql(&dialect, &clean_sql).map_err(|e| ParseError::Sql(e.to_string()))?;
     if statements.is_empty() {
         return Err(ParseError::Sql("empty SQL".into()));
     }
     if statements.len() > 1 {
         return Err(ParseError::Unsupported("multiple statements".into()));
     }
-    transform::transform_statement(statements.into_iter().next().unwrap())
+
+    let mut stmt = transform::transform_statement(statements.into_iter().next().unwrap())?;
+
+    // --- Post-process: apply extracted EMIT mode ---
+    if let Some(mode) = emit_mode {
+        if let ExqlStatement::CreateStream { ref mut emit, .. } = stmt {
+            *emit = mode;
+        }
+    }
+
+    // --- Post-process: apply extracted WITHIN values ---
+    if !within_values.is_empty() {
+        apply_within_values(&mut stmt, &within_values);
+    }
+
+    Ok(stmt)
+}
+
+/// Extract `EMIT CHANGES` or `EMIT FINAL` from the end of a SQL string.
+/// Returns the cleaned SQL and the detected emit mode (if any).
+fn extract_emit_mode(sql: &str) -> (String, Option<EmitMode>) {
+    let trimmed = sql.trim();
+
+    // Case-insensitive check for trailing EMIT FINAL or EMIT CHANGES
+    let upper = trimmed.to_uppercase();
+    if upper.ends_with("EMIT FINAL") {
+        let cleaned = trimmed[..trimmed.len() - "EMIT FINAL".len()].trim().to_string();
+        (cleaned, Some(EmitMode::Final))
+    } else if upper.ends_with("EMIT CHANGES") {
+        let cleaned = trimmed[..trimmed.len() - "EMIT CHANGES".len()]
+            .trim()
+            .to_string();
+        (cleaned, Some(EmitMode::Changes))
+    } else {
+        (trimmed.to_string(), None)
+    }
+}
+
+/// Extract `WITHIN '<duration>'` patterns from JOIN clauses.
+/// Returns the cleaned SQL and a vector of extracted WITHIN values in order.
+fn extract_within_clauses(sql: &str) -> (String, Vec<String>) {
+    let mut within_values = Vec::new();
+    let mut result = sql.to_string();
+
+    // Match WITHIN '<value>' or WITHIN "<value>" patterns (case-insensitive)
+    // This regex finds WITHIN followed by a quoted string
+    loop {
+        // Find case-insensitive WITHIN followed by a quoted string
+        let upper = result.to_uppercase();
+        if let Some(within_pos) = upper.find("WITHIN") {
+            let after_within = &result[within_pos + 6..].trim_start();
+            if after_within.starts_with('\'') || after_within.starts_with('"') {
+                let quote_char = after_within.chars().next().unwrap();
+                if let Some(end_quote) = after_within[1..].find(quote_char) {
+                    let value = after_within[1..1 + end_quote].to_string();
+                    within_values.push(value);
+
+                    // Calculate the full span to remove: from WITHIN to closing quote
+                    let after_within_start = within_pos + 6;
+                    let trimmed_offset =
+                        result[after_within_start..].len() - after_within.len();
+                    let value_end =
+                        after_within_start + trimmed_offset + 1 + end_quote + 1;
+                    result = format!(
+                        "{}{}",
+                        &result[..within_pos].trim_end(),
+                        &result[value_end..]
+                    );
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+
+    (result, within_values)
+}
+
+/// Apply extracted WITHIN values to JoinClauses in the statement.
+fn apply_within_values(stmt: &mut ExqlStatement, within_values: &[String]) {
+    let query = match stmt {
+        ExqlStatement::Query(ref mut q) => q,
+        ExqlStatement::CreateStream { ref mut query, .. } => query,
+        ExqlStatement::CreateMaterializedView { ref mut query, .. } => query,
+        ExqlStatement::DropStream(_) => return,
+    };
+
+    for (i, join) in query.joins.iter_mut().enumerate() {
+        if let Some(val) = within_values.get(i) {
+            join.within = Some(val.clone());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -324,5 +426,98 @@ mod tests {
             format!("{err}").contains("unsupported"),
             "error should mention unsupported: {err}"
         );
+    }
+
+    #[test]
+    fn parse_create_materialized_view() {
+        let stmt = parse(
+            r#"CREATE MATERIALIZED VIEW stats AS SELECT COUNT(*) AS cnt FROM "orders" GROUP BY key"#,
+        )
+        .unwrap();
+        match stmt {
+            ExqlStatement::CreateMaterializedView { name, query } => {
+                assert_eq!(name, "stats");
+                assert_eq!(query.select.len(), 1);
+                assert!(matches!(
+                    &query.select[0].expr,
+                    Expr::Aggregate {
+                        func: AggregateFunc::Count,
+                        ..
+                    }
+                ));
+                assert_eq!(query.select[0].alias.as_deref(), Some("cnt"));
+                assert_eq!(query.group_by.len(), 1);
+                match &query.from {
+                    FromClause::Stream {
+                        name: stream_name, ..
+                    } => {
+                        assert_eq!(stream_name, "orders");
+                    }
+                    other => panic!("expected Stream, got {other:?}"),
+                }
+            }
+            other => panic!("expected CreateMaterializedView, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_emit_final() {
+        let stmt = parse(
+            r#"CREATE VIEW windowed AS SELECT COUNT(*) FROM "orders" GROUP BY key EMIT FINAL"#,
+        )
+        .unwrap();
+        match stmt {
+            ExqlStatement::CreateStream { name, emit, .. } => {
+                assert_eq!(name, "windowed");
+                assert_eq!(emit, EmitMode::Final);
+            }
+            other => panic!("expected CreateStream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_emit_changes_explicit() {
+        let stmt = parse(
+            r#"CREATE VIEW output AS SELECT * FROM "orders" EMIT CHANGES"#,
+        )
+        .unwrap();
+        match stmt {
+            ExqlStatement::CreateStream { name, emit, .. } => {
+                assert_eq!(name, "output");
+                assert_eq!(emit, EmitMode::Changes);
+            }
+            other => panic!("expected CreateStream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_join_within() {
+        // WITHIN parsing is supported via pre-processing: the WITHIN clause
+        // is extracted from the SQL before passing to sqlparser, then applied
+        // to the corresponding JoinClause in the AST.
+        let stmt = parse(
+            r#"SELECT * FROM "a" JOIN "b" ON a.key = b.key WITHIN '1 hour'"#,
+        )
+        .unwrap();
+        match stmt {
+            ExqlStatement::Query(q) => {
+                assert_eq!(q.joins.len(), 1);
+                assert_eq!(q.joins[0].within.as_deref(), Some("1 hour"));
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_join_without_within() {
+        // JOIN without WITHIN should have within: None
+        let stmt = parse(r#"SELECT * FROM "a" JOIN "b" ON a.key = b.key"#).unwrap();
+        match stmt {
+            ExqlStatement::Query(q) => {
+                assert_eq!(q.joins.len(), 1);
+                assert!(q.joins[0].within.is_none());
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
     }
 }

@@ -13,12 +13,17 @@ pub enum ExqlStatement {
         query: QueryExpr,
         emit: EmitMode,
     },
+    CreateMaterializedView {
+        name: String,
+        query: QueryExpr,
+    },
     DropStream(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EmitMode {
     Changes,
+    Final,
 }
 
 // ---------------------------------------------------------------------------
@@ -77,6 +82,7 @@ pub struct JoinClause {
     pub join_type: JoinType,
     pub source: FromClause,
     pub on: Expr,
+    pub within: Option<String>, // e.g., "1 hour" for stream-stream joins
 }
 
 #[derive(Debug, Clone)]
@@ -282,6 +288,7 @@ mod tests {
                         name: "id".into(),
                     }),
                 },
+                within: None,
             }],
             filter: Some(Expr::IsNull {
                 expr: Box::new(Expr::Column {
