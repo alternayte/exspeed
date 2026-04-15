@@ -49,12 +49,14 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     broker.load_consumers()?;
 
     // Create offset store (backend selected by EXSPEED_OFFSET_STORE env var)
+    let offset_backend = std::env::var("EXSPEED_OFFSET_STORE").unwrap_or_else(|_| "file".to_string());
     let offset_store = exspeed_connectors::offset_store::from_env(
         &args.data_dir,
         storage.clone(),
     )
     .await
     .expect("failed to initialize offset store");
+    info!(backend = offset_backend.as_str(), "offset store initialized");
 
     // Create connector manager
     let connector_manager = Arc::new(ConnectorManager::new(

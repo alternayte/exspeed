@@ -5,7 +5,7 @@ pub mod s3;
 pub mod stream;
 
 use async_trait::async_trait;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 use exspeed_streams::StorageEngine;
 
@@ -51,7 +51,7 @@ pub trait OffsetStore: Send + Sync {
 /// Build an OffsetStore from the `EXSPEED_OFFSET_STORE` env var.
 /// Defaults to file-based storage if unset.
 pub async fn from_env(
-    data_dir: &PathBuf,
+    data_dir: &Path,
     storage: Arc<dyn StorageEngine>,
 ) -> Result<Arc<dyn OffsetStore>, OffsetStoreError> {
     let backend = std::env::var("EXSPEED_OFFSET_STORE").unwrap_or_else(|_| "file".to_string());
@@ -74,7 +74,7 @@ pub async fn from_env(
             Ok(Arc::new(store))
         }
         _ => {
-            let store = file::FileOffsetStore::new(data_dir.clone());
+            let store = file::FileOffsetStore::new(data_dir.to_path_buf());
             Ok(Arc::new(store))
         }
     }
