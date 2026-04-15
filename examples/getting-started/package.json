@@ -1,0 +1,11 @@
+{
+  "name": "exspeed-getting-started",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run index.ts"
+  },
+  "dependencies": {
+    "@exspeed/sdk": "file:../../sdks/typescript"
+  }
+}

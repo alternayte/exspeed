@@ -1,0 +1,4 @@
+[connection]
+name = "app-db"
+driver = "postgres"
+url = "postgres://app:secret@postgres:5432/orderdb"

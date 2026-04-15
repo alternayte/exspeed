@@ -1,0 +1,17 @@
+[connector]
+name = "pg-outbox"
+type = "source"
+plugin = "postgres_outbox"
+stream = "order-events"
+subject_template = "{aggregate_type}.{event_type}"
+
+[settings]
+connection = "postgres://app:secret@postgres:5432/orderdb"
+slot_name = "exspeed_orders"
+publication = "outbox_pub"
+outbox_table = "outbox_events"
+id_column = "id"
+aggregate_type_column = "aggregate_type"
+event_type_column = "event_type"
+payload_column = "payload"
+key_column = "aggregate_id"

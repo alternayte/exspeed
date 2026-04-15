@@ -1,0 +1,14 @@
+[connector]
+name = "high-value-notify"
+type = "sink"
+plugin = "http_sink"
+stream = "order-events"
+subject_filter = "order.created"
+
+[settings]
+url = "https://httpbin.org/post"
+method = "POST"
+content_type = "application/json"
+
+[transform]
+sql = "SELECT * WHERE (payload->>'total')::DECIMAL > 500"

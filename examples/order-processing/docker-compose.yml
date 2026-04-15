@@ -1,0 +1,29 @@
+services:
+  exspeed:
+    build: ../../
+    ports:
+      - "5933:5933"
+      - "8080:8080"
+    volumes:
+      - ./exspeed/connectors.d:/var/lib/exspeed/connectors.d
+      - ./exspeed/connections.d:/var/lib/exspeed/connections.d
+      - exspeed-data:/var/lib/exspeed
+    environment:
+      RUST_LOG: info
+    depends_on:
+      - postgres
+
+  postgres:
+    image: postgres:16
+    command: postgres -c wal_level=logical -c max_replication_slots=4 -c max_wal_senders=4
+    environment:
+      POSTGRES_DB: orderdb
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+volumes:
+  exspeed-data:

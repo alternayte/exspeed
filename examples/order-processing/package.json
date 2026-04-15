@@ -1,0 +1,14 @@
+{
+  "name": "exspeed-order-processing",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/app.ts",
+    "consumer": "bun run src/consumer.ts",
+    "dashboard": "bun run src/dashboard.ts"
+  },
+  "dependencies": {
+    "@exspeed/sdk": "file:../../sdks/typescript",
+    "hono": "^4.0.0"
+  }
+}
