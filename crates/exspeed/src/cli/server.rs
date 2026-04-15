@@ -56,6 +56,7 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     });
 
     // Create broker
+    let broker_append_for_connectors = broker_append.clone();
     let broker = Arc::new(Broker::new(
         storage.clone(),
         broker_append,
@@ -76,6 +77,7 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     // Create connector manager
     let connector_manager = Arc::new(ConnectorManager::new(
         storage.clone(),
+        broker_append_for_connectors,
         args.data_dir.clone(),
         metrics.clone(),
         offset_store,

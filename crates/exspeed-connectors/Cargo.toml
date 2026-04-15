@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 exspeed-common = { path = "../exspeed-common" }
 exspeed-streams = { path = "../exspeed-streams" }
+exspeed-broker = { path = "../exspeed-broker" }
 exspeed-storage = { path = "../exspeed-storage" }
 exspeed-processing = { path = "../exspeed-processing" }
 async-trait = { workspace = true }

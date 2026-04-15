@@ -1,20 +1,21 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::{oneshot, RwLock};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use exspeed_common::metrics::Metrics;
 use exspeed_common::{Offset, StreamName};
+use exspeed_broker::broker_append::BrokerAppend;
 use exspeed_streams::record::Record;
 use exspeed_streams::traits::StorageEngine;
 use exspeed_streams::StorageError;
 
 use crate::builtin;
 use crate::config::ConnectorConfig;
-use crate::offset;
 use crate::traits::{SinkBatch, SinkRecord, WriteResult};
 
 // ---------------------------------------------------------------------------
@@ -65,19 +66,40 @@ pub struct RunningConnector {
 
 pub struct ConnectorManager {
     pub storage: Arc<dyn StorageEngine>,
+    pub broker_append: Arc<BrokerAppend>,
     pub connectors: RwLock<HashMap<String, RunningConnector>>,
     pub data_dir: PathBuf,
     pub metrics: Arc<Metrics>,
+    pub offset_store: Arc<dyn crate::offset_store::OffsetStore>,
+    /// Tracks content hashes of TOML connector files for change detection.
+    pub toml_hashes: RwLock<HashMap<String, u64>>,
 }
 
 impl ConnectorManager {
-    pub fn new(storage: Arc<dyn StorageEngine>, data_dir: PathBuf, metrics: Arc<Metrics>) -> Self {
+    pub fn new(
+        storage: Arc<dyn StorageEngine>,
+        broker_append: Arc<BrokerAppend>,
+        data_dir: PathBuf,
+        metrics: Arc<Metrics>,
+        offset_store: Arc<dyn crate::offset_store::OffsetStore>,
+    ) -> Self {
         Self {
             storage,
+            broker_append,
             connectors: RwLock::new(HashMap::new()),
             data_dir,
             metrics,
+            offset_store,
+            toml_hashes: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Hash the contents of a file for change detection.
+    pub fn hash_file(path: &Path) -> Option<u64> {
+        let content = std::fs::read(path).ok()?;
+        let mut hasher = DefaultHasher::new();
+        content.hash(&mut hasher);
+        Some(hasher.finish())
     }
 
     // -- path helpers -------------------------------------------------------
@@ -88,10 +110,6 @@ impl ConnectorManager {
 
     fn config_path(&self, name: &str) -> PathBuf {
         self.configs_dir().join(format!("{name}.json"))
-    }
-
-    fn offset_path(&self, name: &str) -> PathBuf {
-        self.configs_dir().join(format!("{name}.offset.json"))
     }
 
     fn connectors_d_dir(&self) -> PathBuf {
@@ -157,10 +175,10 @@ impl ConnectorManager {
                 .map_err(|e| format!("failed to remove config file: {e}"))?;
         }
 
-        // Remove offset file
-        let offset_path = self.offset_path(name);
-        offset::delete_offset(&offset_path)
-            .map_err(|e| format!("failed to remove offset file: {e}"))?;
+        // Remove offset
+        if let Err(e) = self.offset_store.delete(name).await {
+            warn!(connector = name, error = %e, "failed to delete offset");
+        }
 
         info!(connector = name, "connector deleted");
         Ok(())
@@ -242,13 +260,22 @@ impl ConnectorManager {
             match ConnectorConfig::load_toml(&path) {
                 Ok(mut config) => {
                     config.resolve_env_vars();
+                    let connector_name = config.name.clone();
                     info!(
                         connector = config.name.as_str(),
                         file = ?path,
                         "loaded TOML connector config"
                     );
                     if let Err(e) = self.create(config).await {
-                        warn!(file = ?path, error = %e, "failed to start TOML connector");
+                        if e.contains("already exists") {
+                            debug!(file = ?path, "TOML connector already loaded, skipping");
+                        } else {
+                            warn!(file = ?path, error = %e, "failed to start TOML connector");
+                        }
+                    }
+                    // Record file hash for change detection.
+                    if let Some(hash) = Self::hash_file(&path) {
+                        self.toml_hashes.write().await.insert(connector_name, hash);
                     }
                 }
                 Err(e) => {
@@ -361,9 +388,9 @@ impl ConnectorManager {
 
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
 
-        let storage = self.storage.clone();
+        let broker_append = self.broker_append.clone();
         let metrics = self.metrics.clone();
-        let offset_path = self.offset_path(&name);
+        let offset_store = self.offset_store.clone();
         let stream_str = config.stream.clone();
         let batch_size = config.batch_size as usize;
         let poll_interval = std::time::Duration::from_millis(config.poll_interval_ms);
@@ -390,7 +417,7 @@ impl ConnectorManager {
         // Spawn source task
         tokio::spawn(async move {
             // Load last position
-            let last_pos = match offset::load_offset(&offset_path) {
+            let last_pos = match offset_store.load_source_offset(&task_name).await {
                 Ok(pos) => pos,
                 Err(e) => {
                     error!(connector = task_name.as_str(), error = %e, "failed to load offset");
@@ -510,27 +537,20 @@ impl ConnectorManager {
                         headers: record.headers.clone(),
                     };
 
-                    let st = storage.clone();
-                    let sn = stream_name.clone();
-                    let result =
-                        tokio::task::spawn_blocking(move || st.append(&sn, &storage_record)).await;
+                    let result = broker_append.append(&stream_name, &storage_record).await;
 
                     match result {
-                        Ok(Ok(_offset)) => {
+                        Ok(exspeed_broker::broker_append::AppendResult::Written(_)) => {
                             metrics.record_publish(stream_str.as_str());
                         }
-                        Ok(Err(e)) => {
-                            error!(
-                                connector = task_name.as_str(),
-                                error = %e,
-                                "failed to append record to storage"
-                            );
+                        Ok(exspeed_broker::broker_append::AppendResult::Duplicate(_)) => {
+                            // Silently skip — broker dedup caught it
                         }
                         Err(e) => {
                             error!(
                                 connector = task_name.as_str(),
                                 error = %e,
-                                "spawn_blocking panicked"
+                                "failed to append record"
                             );
                         }
                     }
@@ -538,7 +558,7 @@ impl ConnectorManager {
 
                 // Save offset and commit
                 if let Some(ref pos) = batch.position {
-                    if let Err(e) = offset::save_offset(&offset_path, pos) {
+                    if let Err(e) = offset_store.save_source_offset(&task_name, pos).await {
                         error!(connector = task_name.as_str(), error = %e, "failed to save offset");
                     }
                     if let Err(e) = source.commit(pos.clone()).await {
@@ -570,7 +590,7 @@ impl ConnectorManager {
 
         let storage = self.storage.clone();
         let metrics = self.metrics.clone();
-        let offset_path = self.offset_path(&name);
+        let offset_store = self.offset_store.clone();
         let stream_str = config.stream.clone();
         let subject_filter = config.subject_filter.clone();
         let batch_size = config.batch_size as usize;
@@ -600,7 +620,7 @@ impl ConnectorManager {
             }
 
             // Load last sink offset
-            let mut current_offset = match offset::load_sink_offset(&offset_path) {
+            let mut current_offset = match offset_store.load_sink_offset(&task_name).await {
                 Ok(o) => o,
                 Err(e) => {
                     error!(connector = task_name.as_str(), error = %e, "failed to load sink offset");
@@ -703,7 +723,7 @@ impl ConnectorManager {
                             );
                             // Only advance to after the last successful record
                             let partial_offset = last_successful_offset + 1;
-                            if let Err(e) = offset::save_sink_offset(&offset_path, partial_offset) {
+                            if let Err(e) = offset_store.save_sink_offset(&task_name, partial_offset).await {
                                 error!(connector = task_name.as_str(), error = %e, "failed to save sink offset");
                             }
                             current_offset = partial_offset;
@@ -726,7 +746,7 @@ impl ConnectorManager {
                 current_offset = new_offset;
 
                 // Persist sink offset
-                if let Err(e) = offset::save_sink_offset(&offset_path, current_offset) {
+                if let Err(e) = offset_store.save_sink_offset(&task_name, current_offset).await {
                     error!(connector = task_name.as_str(), error = %e, "failed to save sink offset");
                 }
             }
