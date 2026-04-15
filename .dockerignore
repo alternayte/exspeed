@@ -2,3 +2,18 @@ target/
 .git/
 .DS_Store
 exspeed-data/
+
+# Node/TypeScript (SDK + examples)
+node_modules/
+sdks/typescript/node_modules/
+sdks/typescript/dist/
+examples/*/node_modules/
+
+# Documentation (not needed for build)
+docs/
+
+# Editor files
+*.swp
+*.swo
+.idea/
+.vscode/
