@@ -48,11 +48,20 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     let broker = Arc::new(Broker::new(storage.clone(), args.data_dir.clone()));
     broker.load_consumers()?;
 
+    // Create offset store (backend selected by EXSPEED_OFFSET_STORE env var)
+    let offset_store = exspeed_connectors::offset_store::from_env(
+        &args.data_dir,
+        storage.clone(),
+    )
+    .await
+    .expect("failed to initialize offset store");
+
     // Create connector manager
     let connector_manager = Arc::new(ConnectorManager::new(
-        storage,
+        storage.clone(),
         args.data_dir.clone(),
         metrics.clone(),
+        offset_store,
     ));
 
     // Ensure connectors.d directory exists
@@ -249,6 +258,12 @@ async fn handle_connection(
                 }
             }
         }
+    }
+
+    // Clean up: if this connection had an active subscription, unsubscribe so
+    // the consumer can be re-subscribed on a new connection.
+    if let Some(ref consumer_name) = active_subscription {
+        let _ = broker.unsubscribe(consumer_name);
     }
 
     Ok(())
