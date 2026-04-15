@@ -46,9 +46,9 @@ export class Connection extends EventEmitter {
   private reconnecting = false;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
 
-  private readonly opts: Required<
-    Omit<ConnectionOptions, "auth"> & { auth?: ConnectionOptions["auth"] }
-  >;
+  private readonly opts: Required<Omit<ConnectionOptions, "auth">> & {
+    auth?: ConnectionOptions["auth"];
+  };
 
   constructor(options: ConnectionOptions) {
     super();
