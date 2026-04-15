@@ -79,6 +79,10 @@ impl DedupMap {
     fn len(&self) -> usize {
         self.seen.len()
     }
+
+    fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -138,7 +142,7 @@ impl BrokerAppend {
                 let rec = record.clone();
                 let offset = tokio::task::spawn_blocking(move || st.append(&sn, &rec))
                     .await
-                    .map_err(|e| StorageError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))??;
+                    .map_err(|e| StorageError::Io(std::io::Error::other(e)))??;
 
                 // Insert into dedup map
                 {
@@ -158,7 +162,7 @@ impl BrokerAppend {
                 let rec = record.clone();
                 let offset = tokio::task::spawn_blocking(move || st.append(&sn, &rec))
                     .await
-                    .map_err(|e| StorageError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))??;
+                    .map_err(|e| StorageError::Io(std::io::Error::other(e)))??;
                 Ok(AppendResult::Written(offset))
             }
         }
@@ -175,7 +179,11 @@ impl BrokerAppend {
     /// Rebuild dedup maps by scanning recent records from the log.
     /// Call at startup before accepting writes.
     pub async fn rebuild_from_log(&self) -> Result<(), StorageError> {
-        let streams = self.storage.list_streams()?;
+        let st = self.storage.clone();
+        let streams = tokio::task::spawn_blocking(move || st.list_streams())
+            .await
+            .map_err(|e| StorageError::Io(std::io::Error::other(e)))??;
+
         let cutoff_ns = {
             let now_ns = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -188,12 +196,28 @@ impl BrokerAppend {
 
         for stream_name in &streams {
             let mut map = DedupMap::new(self.default_window);
-            let mut offset = Offset(0);
+
+            // Use seek_by_time to jump to the dedup window boundary
+            let st = self.storage.clone();
+            let sn = stream_name.clone();
+            let mut offset =
+                tokio::task::spawn_blocking(move || st.seek_by_time(&sn, cutoff_ns))
+                    .await
+                    .map_err(|e| StorageError::Io(std::io::Error::other(e)))?
+                    .unwrap_or(Offset(0)); // fallback to full scan if seek fails
+
             let batch_size = 1000;
 
             // Scan forward through the stream
             loop {
-                let records = self.storage.read(stream_name, offset, batch_size)?;
+                let st = self.storage.clone();
+                let sn = stream_name.clone();
+                let off = offset;
+                let records =
+                    tokio::task::spawn_blocking(move || st.read(&sn, off, batch_size))
+                        .await
+                        .map_err(|e| StorageError::Io(std::io::Error::other(e)))??;
+
                 if records.is_empty() {
                     break;
                 }
@@ -214,7 +238,7 @@ impl BrokerAppend {
                 offset = Offset(records.last().unwrap().offset.0 + 1);
             }
 
-            if map.len() > 0 {
+            if !map.is_empty() {
                 tracing::info!(
                     stream = %stream_name,
                     keys = map.len(),
