@@ -1,6 +1,20 @@
 # Development / integration testing services
 # Usage: docker-compose up -d
 services:
+  exspeed:
+    build: .
+    ports:
+      - "5933:5933"
+      - "8080:8080"
+    volumes:
+      - exspeed-data:/var/lib/exspeed
+    environment:
+      RUST_LOG: info
+    depends_on:
+      - postgres
+      - rabbitmq
+      - minio
+
   postgres:
     image: postgres:16
     command: >
@@ -33,3 +47,6 @@ services:
     ports:
       - "9000:9000"
       - "9001:9001"
+
+volumes:
+  exspeed-data:
