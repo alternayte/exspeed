@@ -117,6 +117,18 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     // Spawn retention task
     exspeed_broker::retention_task::spawn_retention_task(file_storage);
 
+    // Spawn dedup eviction task (runs every 60 seconds)
+    {
+        let ba = broker.broker_append.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                ba.evict_expired().await;
+            }
+        });
+    }
+
     // Spawn HTTP API server
     let api_addr: SocketAddr = args.api_bind.parse()?;
     tokio::spawn(exspeed_api::serve(state, api_addr));
