@@ -1,0 +1,14 @@
+services:
+  exspeed:
+    build: ../../
+    ports:
+      - "5933:5933"
+      - "8080:8080"
+    volumes:
+      - ./exspeed/connectors.d:/var/lib/exspeed/connectors.d
+      - exspeed-data:/var/lib/exspeed
+    environment:
+      RUST_LOG: info
+
+volumes:
+  exspeed-data:
