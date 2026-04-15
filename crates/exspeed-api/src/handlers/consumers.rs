@@ -65,6 +65,7 @@ pub async fn delete_consumer(
     match state
         .broker
         .handle_message(ClientMessage::DeleteConsumer(req))
+        .await
     {
         exspeed_protocol::messages::ServerMessage::Ok => {
             (StatusCode::OK, Json(json!({"deleted": name})))

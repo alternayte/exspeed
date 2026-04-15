@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::{error, info, warn};
 
+use exspeed_broker::broker_append::BrokerAppend;
 use exspeed_broker::consumer_state::DeliveryRecord;
 use exspeed_broker::Broker;
 use exspeed_connectors::ConnectorManager;
@@ -44,8 +45,22 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     let (metrics, prometheus_registry) = exspeed_common::Metrics::new();
     let metrics = Arc::new(metrics);
 
+    // Create BrokerAppend with dedup window from env (default 300s)
+    let dedup_window_secs: u64 = std::env::var("EXSPEED_DEDUP_WINDOW_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+    let broker_append = Arc::new(BrokerAppend::new(storage.clone(), dedup_window_secs));
+    broker_append.rebuild_from_log().await.unwrap_or_else(|e| {
+        warn!("failed to rebuild dedup state from log: {}", e);
+    });
+
     // Create broker
-    let broker = Arc::new(Broker::new(storage.clone(), args.data_dir.clone()));
+    let broker = Arc::new(Broker::new(
+        storage.clone(),
+        broker_append,
+        args.data_dir.clone(),
+    ));
     broker.load_consumers()?;
 
     // Create offset store (backend selected by EXSPEED_OFFSET_STORE env var)
@@ -199,12 +214,8 @@ async fn handle_connection(
                                     .await?;
                             }
                             Ok(msg) => {
-                                // All other messages: dispatch to broker via spawn_blocking
-                                let broker = broker.clone();
-                                let response = tokio::task::spawn_blocking(move || {
-                                    broker.handle_message(msg)
-                                })
-                                .await?;
+                                // All other messages: dispatch to broker
+                                let response = broker.handle_message(msg).await;
                                 framed_write
                                     .send(response.into_frame(correlation_id))
                                     .await?;

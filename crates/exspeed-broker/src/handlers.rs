@@ -33,7 +33,7 @@ pub fn handle_create_stream(broker: &Broker, req: CreateStreamRequest) -> Server
     }
 }
 
-pub fn handle_publish(broker: &Broker, req: PublishRequest) -> ServerMessage {
+pub async fn handle_publish(broker: &Broker, req: PublishRequest) -> ServerMessage {
     let stream_name = match StreamName::try_from(req.stream) {
         Ok(n) => n,
         Err(e) => {
@@ -51,8 +51,10 @@ pub fn handle_publish(broker: &Broker, req: PublishRequest) -> ServerMessage {
         headers: req.headers,
     };
 
-    match broker.storage.append(&stream_name, &record) {
-        Ok(offset) => ServerMessage::PublishOk { offset: offset.0 },
+    match broker.broker_append.append(&stream_name, &record).await {
+        Ok(result) => ServerMessage::PublishOk {
+            offset: result.offset().0,
+        },
         Err(e) => ServerMessage::Error {
             code: 404,
             message: format!("append failed: {e}"),
