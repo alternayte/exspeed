@@ -2,6 +2,7 @@ pub mod http_poll;
 pub mod http_sink;
 pub mod http_webhook;
 pub mod jdbc_sink;
+pub mod pgoutput;
 pub mod postgres;
 pub mod postgres_outbox;
 pub mod rabbitmq_sink;
