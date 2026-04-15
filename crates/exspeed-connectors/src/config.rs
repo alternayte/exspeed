@@ -155,28 +155,37 @@ impl TomlConnector {
     }
 }
 
-/// Replace `${VAR}` with env var value. If var not found, leave as-is.
+/// Replace `${VAR}` or `${VAR:-default}` with env var value.
+/// - `${VAR}`: replaced with env var; left as-is if unset.
+/// - `${VAR:-default}`: replaced with env var if set, otherwise with `default`.
 fn resolve_env(input: &str) -> String {
     let mut result = input.to_string();
     let mut search_from = 0;
     while let Some(rel) = result[search_from..].find("${") {
         let start = search_from + rel;
         if let Some(end_rel) = result[start..].find('}') {
-            let var_name = &result[start + 2..start + end_rel];
+            let inner = &result[start + 2..start + end_rel];
+            let (var_name, default_val) = if let Some(sep) = inner.find(":-") {
+                (&inner[..sep], Some(&inner[sep + 2..]))
+            } else {
+                (inner, None)
+            };
             match std::env::var(var_name) {
                 Ok(val) => {
-                    result = format!(
-                        "{}{}{}",
-                        &result[..start],
-                        val,
-                        &result[start + end_rel + 1..]
-                    );
+                    result = format!("{}{}{}", &result[..start], val, &result[start + end_rel + 1..]);
                     search_from = start + val.len();
                 }
-                Err(_) => {
-                    // Leave as-is, skip past this placeholder
-                    search_from = start + end_rel + 1;
-                }
+                Err(_) => match default_val {
+                    Some(default) => {
+                        let default_owned = default.to_string();
+                        result = format!("{}{}{}", &result[..start], default_owned, &result[start + end_rel + 1..]);
+                        search_from = start + default_owned.len();
+                    }
+                    None => {
+                        // Leave as-is, skip past this placeholder
+                        search_from = start + end_rel + 1;
+                    }
+                },
             }
         } else {
             break;
@@ -293,6 +302,49 @@ outbox_table = "outbox_events"
             config.settings.get("val").unwrap(),
             "${NONEXISTENT_VAR_ABC}"
         );
+    }
+
+    #[test]
+    fn env_var_with_default_uses_default_when_unset() {
+        std::env::remove_var("EXSPEED_TEST_UNSET_VAR");
+        let mut config = ConnectorConfig {
+            name: "test".into(), connector_type: "source".into(), plugin: "test".into(),
+            stream: "s".into(), subject_template: "".into(), subject_filter: "".into(),
+            settings: HashMap::from([("val".into(), "${EXSPEED_TEST_UNSET_VAR:-fallback_value}".into())]),
+            batch_size: 100, poll_interval_ms: 50, dedup_enabled: true,
+            dedup_key: String::new(), dedup_window_secs: 86400, transform_sql: String::new(),
+        };
+        config.resolve_env_vars();
+        assert_eq!(config.settings.get("val").unwrap(), "fallback_value");
+    }
+
+    #[test]
+    fn env_var_with_default_uses_env_when_set() {
+        std::env::set_var("EXSPEED_TEST_SET_VAR", "from_env");
+        let mut config = ConnectorConfig {
+            name: "test".into(), connector_type: "source".into(), plugin: "test".into(),
+            stream: "s".into(), subject_template: "".into(), subject_filter: "".into(),
+            settings: HashMap::from([("val".into(), "${EXSPEED_TEST_SET_VAR:-ignored}".into())]),
+            batch_size: 100, poll_interval_ms: 50, dedup_enabled: true,
+            dedup_key: String::new(), dedup_window_secs: 86400, transform_sql: String::new(),
+        };
+        config.resolve_env_vars();
+        assert_eq!(config.settings.get("val").unwrap(), "from_env");
+        std::env::remove_var("EXSPEED_TEST_SET_VAR");
+    }
+
+    #[test]
+    fn env_var_with_empty_default() {
+        std::env::remove_var("EXSPEED_TEST_EMPTY_DEFAULT");
+        let mut config = ConnectorConfig {
+            name: "test".into(), connector_type: "source".into(), plugin: "test".into(),
+            stream: "s".into(), subject_template: "".into(), subject_filter: "".into(),
+            settings: HashMap::from([("val".into(), "${EXSPEED_TEST_EMPTY_DEFAULT:-}".into())]),
+            batch_size: 100, poll_interval_ms: 50, dedup_enabled: true,
+            dedup_key: String::new(), dedup_window_secs: 86400, transform_sql: String::new(),
+        };
+        config.resolve_env_vars();
+        assert_eq!(config.settings.get("val").unwrap(), "");
     }
 
     #[test]
