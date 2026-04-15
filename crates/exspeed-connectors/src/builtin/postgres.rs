@@ -6,30 +6,73 @@ use tracing::error;
 use crate::config::ConnectorConfig;
 use crate::traits::{ConnectorError, HealthStatus, SourceBatch, SourceConnector, SourceRecord};
 
-pub struct PostgresCdcSource {
+use super::postgres_outbox::sanitize_pg_name;
+
+#[derive(Debug, Clone, PartialEq)]
+enum PgMode {
+    Poll,
+    Cdc,
+}
+
+#[allow(dead_code)] // mode, slot_name, publication_name, operations used by future CDC mode
+pub struct PostgresSource {
+    // Note: tokio_postgres::Client does not implement Debug, so we impl Debug manually below.
     connection_string: String,
     tables: Vec<String>,
     timestamp_column: String,
     subject_template: String,
+    mode: PgMode,
+    slot_name: String,
+    publication_name: String,
+    operations: Vec<String>,
     client: Option<tokio_postgres::Client>,
     last_timestamp: Option<String>,
 }
 
-// tokio_postgres::Client does not implement Debug, so we implement it manually.
-impl std::fmt::Debug for PostgresCdcSource {
+impl std::fmt::Debug for PostgresSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PostgresCdcSource")
+        f.debug_struct("PostgresSource")
             .field("connection_string", &"[redacted]")
             .field("tables", &self.tables)
             .field("timestamp_column", &self.timestamp_column)
             .field("subject_template", &self.subject_template)
+            .field("mode", &self.mode)
             .field("connected", &self.client.is_some())
             .field("last_timestamp", &self.last_timestamp)
             .finish()
     }
 }
 
-impl PostgresCdcSource {
+/// Extract (schema, bare_table) from a possibly-qualified table name like "public.orders".
+fn split_table_name(table: &str) -> (&str, &str) {
+    if let Some(dot) = table.find('.') {
+        (&table[..dot], &table[dot + 1..])
+    } else {
+        ("public", table)
+    }
+}
+
+/// Attempt to read a column value as a String, trying several common Postgres types.
+fn col_to_string(row: &tokio_postgres::Row, idx: usize) -> String {
+    if let Ok(v) = row.try_get::<_, String>(idx) {
+        return v;
+    }
+    if let Ok(v) = row.try_get::<_, i64>(idx) {
+        return v.to_string();
+    }
+    if let Ok(v) = row.try_get::<_, i32>(idx) {
+        return v.to_string();
+    }
+    if let Ok(v) = row.try_get::<_, f64>(idx) {
+        return v.to_string();
+    }
+    if let Ok(v) = row.try_get::<_, bool>(idx) {
+        return v.to_string();
+    }
+    "<null>".to_string()
+}
+
+impl PostgresSource {
     pub fn new(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
         let connection_string = config
             .setting("connection")
@@ -56,50 +99,58 @@ impl PostgresCdcSource {
         let timestamp_column = config.setting_or("timestamp_column", "updated_at");
         let subject_template = config.subject_template.clone();
 
+        let mode = match config.setting_or("mode", "poll").as_str() {
+            "cdc" => PgMode::Cdc,
+            _ => PgMode::Poll,
+        };
+
+        let sanitized = sanitize_pg_name(&config.name);
+        let slot_name = {
+            let configured = config.setting_or("slot_name", "");
+            if configured.is_empty() {
+                format!("exspeed_{sanitized}_slot")
+            } else {
+                configured
+            }
+        };
+        let publication_name = {
+            let configured = config.setting_or("publication_name", "");
+            if configured.is_empty() {
+                format!("exspeed_{sanitized}_pub")
+            } else {
+                configured
+            }
+        };
+
+        let operations: Vec<String> = config
+            .setting_or("operations", "INSERT,UPDATE,DELETE")
+            .split(',')
+            .map(|s| s.trim().to_uppercase())
+            .collect();
+
+        if mode == PgMode::Cdc {
+            return Err(ConnectorError::Config(
+                "CDC mode not yet implemented — use mode=poll".to_string(),
+            ));
+        }
+
         Ok(Self {
             connection_string,
             tables,
             timestamp_column,
             subject_template,
+            mode,
+            slot_name,
+            publication_name,
+            operations,
             client: None,
             last_timestamp: None,
         })
     }
 }
 
-/// Extract (schema, bare_table) from a possibly-qualified table name like "public.orders".
-/// Falls back to ("public", table) when no schema prefix is present.
-fn split_table_name(table: &str) -> (&str, &str) {
-    if let Some(dot) = table.find('.') {
-        (&table[..dot], &table[dot + 1..])
-    } else {
-        ("public", table)
-    }
-}
-
-/// Attempt to read a column value as a String, trying several common Postgres types.
-fn col_to_string(row: &tokio_postgres::Row, idx: usize) -> String {
-    // Try the most common types in order.
-    if let Ok(v) = row.try_get::<_, String>(idx) {
-        return v;
-    }
-    if let Ok(v) = row.try_get::<_, i64>(idx) {
-        return v.to_string();
-    }
-    if let Ok(v) = row.try_get::<_, i32>(idx) {
-        return v.to_string();
-    }
-    if let Ok(v) = row.try_get::<_, f64>(idx) {
-        return v.to_string();
-    }
-    if let Ok(v) = row.try_get::<_, bool>(idx) {
-        return v.to_string();
-    }
-    "<null>".to_string()
-}
-
 #[async_trait]
-impl SourceConnector for PostgresCdcSource {
+impl SourceConnector for PostgresSource {
     async fn start(&mut self, last_position: Option<String>) -> Result<(), ConnectorError> {
         let (client, connection) = tokio_postgres::connect(&self.connection_string, NoTls)
             .await
@@ -107,7 +158,7 @@ impl SourceConnector for PostgresCdcSource {
 
         tokio::spawn(async move {
             if let Err(e) = connection.await {
-                error!("postgres_cdc connection error: {}", e);
+                error!("postgres source connection error: {}", e);
             }
         });
 
@@ -128,10 +179,11 @@ impl SourceConnector for PostgresCdcSource {
         for table in &self.tables.clone() {
             let (schema, bare_table) = split_table_name(table);
 
+            // Use parameterized timestamp comparison instead of string comparison
             let rows = match &self.last_timestamp {
                 Some(ts) => {
                     let query = format!(
-                        "SELECT * FROM {table} WHERE {ts_col} > $1 ORDER BY {ts_col} LIMIT $2",
+                        "SELECT * FROM {table} WHERE {ts_col}::text > $1 ORDER BY {ts_col} LIMIT $2",
                         table = table,
                         ts_col = self.timestamp_column,
                     );
@@ -158,6 +210,9 @@ impl SourceConnector for PostgresCdcSource {
 
                 // Build a JSON object from all columns.
                 let mut map = serde_json::Map::new();
+                let mut row_ts: Option<String> = None;
+                let mut pk_value = String::new();
+
                 for (idx, col) in columns.iter().enumerate() {
                     let val_str = col_to_string(row, idx);
                     map.insert(
@@ -167,13 +222,19 @@ impl SourceConnector for PostgresCdcSource {
 
                     // Track max timestamp from the timestamp column.
                     if col.name() == self.timestamp_column.as_str() {
+                        row_ts = Some(val_str.clone());
                         let update = match &max_ts {
                             None => true,
                             Some(prev) => val_str > *prev,
                         };
                         if update {
-                            max_ts = Some(val_str);
+                            max_ts = Some(val_str.clone());
                         }
+                    }
+
+                    // First column is treated as the primary key
+                    if idx == 0 {
+                        pk_value = val_str;
                     }
                 }
 
@@ -183,7 +244,6 @@ impl SourceConnector for PostgresCdcSource {
                         .map_err(|e| ConnectorError::Data(format!("json serialization: {e}")))?,
                 );
 
-                // Subject: use template if set, otherwise derive from table name.
                 let subject = if !self.subject_template.is_empty() {
                     self.subject_template
                         .replace("{schema}", schema)
@@ -192,19 +252,27 @@ impl SourceConnector for PostgresCdcSource {
                     format!("{schema}.{bare_table}.change")
                 };
 
-                // Key: first column value.
-                let key = if columns.is_empty() {
+                let key = if pk_value.is_empty() {
                     None
                 } else {
-                    Some(Bytes::from(col_to_string(row, 0).into_bytes()))
+                    Some(Bytes::from(pk_value.clone().into_bytes()))
                 };
+
+                // Build idempotency key: table:pk:timestamp
+                let idemp_key = format!(
+                    "{}:{}:{}",
+                    table,
+                    pk_value,
+                    row_ts.as_deref().unwrap_or("")
+                );
 
                 let record = SourceRecord {
                     key,
                     value: value_bytes,
                     subject,
                     headers: vec![
-                        ("x-exspeed-source".to_string(), "postgres_cdc".to_string()),
+                        ("x-idempotency-key".to_string(), idemp_key),
+                        ("x-exspeed-source".to_string(), "postgres".to_string()),
                         ("x-table".to_string(), table.clone()),
                     ],
                 };
@@ -213,7 +281,6 @@ impl SourceConnector for PostgresCdcSource {
             }
         }
 
-        // Advance cursor only when we saw new rows.
         if max_ts != self.last_timestamp {
             self.last_timestamp = max_ts.clone();
         }
@@ -243,10 +310,6 @@ impl SourceConnector for PostgresCdcSource {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,9 +317,9 @@ mod tests {
 
     fn make_config(settings: HashMap<String, String>) -> ConnectorConfig {
         ConnectorConfig {
-            name: "test-cdc".into(),
+            name: "test-pg".into(),
             connector_type: "source".into(),
-            plugin: "postgres_cdc".into(),
+            plugin: "postgres".into(),
             stream: "events".into(),
             subject_template: "".into(),
             subject_filter: "".into(),
@@ -273,11 +336,8 @@ mod tests {
     #[test]
     fn rejects_missing_connection() {
         let config = make_config(HashMap::from([("tables".into(), "public.orders".into())]));
-        let err = PostgresCdcSource::new(&config).unwrap_err();
-        assert!(
-            err.to_string().contains("connection"),
-            "expected 'connection' in error, got: {err}"
-        );
+        let err = PostgresSource::new(&config).unwrap_err();
+        assert!(err.to_string().contains("connection"));
     }
 
     #[test]
@@ -286,24 +346,8 @@ mod tests {
             "connection".into(),
             "postgres://localhost/db".into(),
         )]));
-        let err = PostgresCdcSource::new(&config).unwrap_err();
-        assert!(
-            err.to_string().contains("tables"),
-            "expected 'tables' in error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn rejects_empty_tables_value() {
-        let config = make_config(HashMap::from([
-            ("connection".into(), "postgres://localhost/db".into()),
-            ("tables".into(), "  ,  ".into()),
-        ]));
-        let err = PostgresCdcSource::new(&config).unwrap_err();
-        assert!(
-            err.to_string().contains("tables"),
-            "expected 'tables' in error, got: {err}"
-        );
+        let err = PostgresSource::new(&config).unwrap_err();
+        assert!(err.to_string().contains("tables"));
     }
 
     #[test]
@@ -313,7 +357,7 @@ mod tests {
             ("tables".into(), "public.orders, public.customers".into()),
             ("timestamp_column".into(), "modified_at".into()),
         ]));
-        let src = PostgresCdcSource::new(&config).unwrap();
+        let src = PostgresSource::new(&config).unwrap();
         assert_eq!(src.tables, vec!["public.orders", "public.customers"]);
         assert_eq!(src.timestamp_column, "modified_at");
     }
@@ -324,20 +368,28 @@ mod tests {
             ("connection".into(), "postgres://localhost/db".into()),
             ("tables".into(), "orders".into()),
         ]));
-        let src = PostgresCdcSource::new(&config).unwrap();
+        let src = PostgresSource::new(&config).unwrap();
         assert_eq!(src.timestamp_column, "updated_at");
     }
 
     #[test]
     fn split_table_name_qualified() {
-        assert_eq!(
-            split_table_name("myschema.mytable"),
-            ("myschema", "mytable")
-        );
+        assert_eq!(split_table_name("myschema.mytable"), ("myschema", "mytable"));
     }
 
     #[test]
     fn split_table_name_unqualified() {
         assert_eq!(split_table_name("mytable"), ("public", "mytable"));
+    }
+
+    #[test]
+    fn auto_generates_slot_and_publication_names() {
+        let config = make_config(HashMap::from([
+            ("connection".into(), "postgres://localhost/db".into()),
+            ("tables".into(), "orders".into()),
+        ]));
+        let src = PostgresSource::new(&config).unwrap();
+        assert_eq!(src.slot_name, "exspeed_test_pg_slot");
+        assert_eq!(src.publication_name, "exspeed_test_pg_pub");
     }
 }

@@ -2,7 +2,7 @@ pub mod http_poll;
 pub mod http_sink;
 pub mod http_webhook;
 pub mod jdbc_sink;
-pub mod postgres_cdc;
+pub mod postgres;
 pub mod postgres_outbox;
 pub mod rabbitmq_sink;
 pub mod rabbitmq_source;
@@ -16,10 +16,8 @@ pub fn create_source(
     config: &ConnectorConfig,
 ) -> Result<Box<dyn SourceConnector>, ConnectorError> {
     match plugin {
-        "postgres_outbox" => Ok(Box::new(postgres_outbox::PostgresOutboxSource::new(
-            config,
-        )?)),
-        "postgres_cdc" => Ok(Box::new(postgres_cdc::PostgresCdcSource::new(config)?)),
+        "postgres_outbox" => Ok(Box::new(postgres_outbox::PostgresOutboxSource::new(config)?)),
+        "postgres" => Ok(Box::new(postgres::PostgresSource::new(config)?)),
         "rabbitmq" => Ok(Box::new(rabbitmq_source::RabbitmqSource::new(config)?)),
         "http_poll" => Ok(Box::new(http_poll::HttpPollSource::new(config)?)),
         other => Err(ConnectorError::Config(format!(
