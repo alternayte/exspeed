@@ -4,6 +4,7 @@ pub mod dedup;
 pub mod file_watcher;
 pub mod manager;
 pub mod offset;
+pub mod offset_store;
 pub mod traits;
 pub mod transform;
 
