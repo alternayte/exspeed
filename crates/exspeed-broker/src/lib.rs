@@ -1,4 +1,5 @@
 pub mod broker;
+pub mod broker_append;
 pub mod consumer_state;
 pub mod delivery;
 pub mod handlers;

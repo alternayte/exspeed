@@ -97,4 +97,14 @@ impl StorageEngine for MemoryStorage {
         }
         Ok(Offset(records.len() as u64))
     }
+
+    fn list_streams(&self) -> Result<Vec<StreamName>, StorageError> {
+        let map = self.streams.read().unwrap();
+        let mut streams: Vec<StreamName> = map
+            .keys()
+            .filter_map(|k| StreamName::try_from(k.as_str()).ok())
+            .collect();
+        streams.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        Ok(streams)
+    }
 }

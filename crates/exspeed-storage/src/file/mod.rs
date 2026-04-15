@@ -215,4 +215,17 @@ impl StorageEngine for FileStorage {
         let offset = part.seek_by_time(timestamp)?;
         Ok(offset)
     }
+
+    fn list_streams(&self) -> Result<Vec<StreamName>, StorageError> {
+        let map = self.partitions.read().unwrap();
+        let mut streams: Vec<StreamName> = map
+            .keys()
+            .map(|(name, _)| name.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .filter_map(|n| StreamName::try_from(n.as_str()).ok())
+            .collect();
+        streams.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        Ok(streams)
+    }
 }

@@ -21,4 +21,7 @@ pub trait StorageEngine: Send + Sync {
 
     /// Find the offset of the first record at or after the given timestamp.
     fn seek_by_time(&self, stream: &StreamName, timestamp: u64) -> Result<Offset, StorageError>;
+
+    /// List all stream names known to this storage engine.
+    fn list_streams(&self) -> Result<Vec<StreamName>, StorageError>;
 }
