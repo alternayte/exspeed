@@ -55,7 +55,7 @@ pub async fn handle_webhook(
 
     let storage = state.connector_manager.storage.clone();
 
-    match handle_webhook_post(&storage, &config, body, auth_header) {
+    match handle_webhook_post(&storage, &config, body, auth_header).await {
         Ok(offset) => (StatusCode::OK, Json(json!({"offset": offset}))),
         Err(e) if e.contains("unauthorized") => {
             (StatusCode::UNAUTHORIZED, Json(json!({"error": e})))

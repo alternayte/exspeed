@@ -48,19 +48,10 @@ pub async fn run_delivery(
             break;
         }
 
-        // (b) Read a batch from storage via spawn_blocking (storage.read is sync).
-        let storage_clone = Arc::clone(&storage);
-        let sn = stream_name.clone();
-        let offset = Offset(current_offset);
-        let bs = batch_size;
-
-        let read_result =
-            tokio::task::spawn_blocking(move || storage_clone.read(&sn, offset, bs)).await;
-
-        let records = match read_result {
-            Ok(Ok(recs)) => recs,
-            Ok(Err(_)) => break, // storage error — stop delivery
-            Err(_) => break,     // join error — stop delivery
+        // (b) Read a batch from storage.
+        let records = match storage.read(&stream_name, Offset(current_offset), batch_size).await {
+            Ok(recs) => recs,
+            Err(_) => break, // storage error — stop delivery
         };
 
         // (c) If empty, sleep and continue.

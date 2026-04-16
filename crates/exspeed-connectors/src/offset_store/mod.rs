@@ -70,7 +70,7 @@ pub async fn from_env(
             Ok(Arc::new(store))
         }
         "stream" => {
-            let store = stream::StreamOffsetStore::new(storage)?;
+            let store = stream::StreamOffsetStore::new(storage).await?;
             Ok(Arc::new(store))
         }
         _ => {

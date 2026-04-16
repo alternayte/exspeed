@@ -11,7 +11,7 @@ pub mod windowed_aggregate;
 use crate::types::Row;
 
 /// Pull-based operator: call `next()` to get the next row.
-pub trait Operator {
+pub trait Operator: Send {
     /// Return the next row, or `None` when exhausted.
     fn next(&mut self) -> Option<Row>;
 

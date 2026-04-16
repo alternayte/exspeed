@@ -136,13 +136,8 @@ impl BrokerAppend {
                     }
                 }
 
-                // Not a duplicate — write to storage via spawn_blocking (StorageEngine is sync)
-                let st = self.storage.clone();
-                let sn = stream.clone();
-                let rec = record.clone();
-                let offset = tokio::task::spawn_blocking(move || st.append(&sn, &rec))
-                    .await
-                    .map_err(|e| StorageError::Io(std::io::Error::other(e)))??;
+                // Not a duplicate — write to storage
+                let offset = self.storage.append(stream, record).await?;
 
                 // Insert into dedup map
                 {
@@ -156,13 +151,8 @@ impl BrokerAppend {
                 Ok(AppendResult::Written(offset))
             }
             None => {
-                // No idempotency key — pass through directly via spawn_blocking
-                let st = self.storage.clone();
-                let sn = stream.clone();
-                let rec = record.clone();
-                let offset = tokio::task::spawn_blocking(move || st.append(&sn, &rec))
-                    .await
-                    .map_err(|e| StorageError::Io(std::io::Error::other(e)))??;
+                // No idempotency key — pass through directly
+                let offset = self.storage.append(stream, record).await?;
                 Ok(AppendResult::Written(offset))
             }
         }
@@ -179,10 +169,7 @@ impl BrokerAppend {
     /// Rebuild dedup maps by scanning recent records from the log.
     /// Call at startup before accepting writes.
     pub async fn rebuild_from_log(&self) -> Result<(), StorageError> {
-        let st = self.storage.clone();
-        let streams = tokio::task::spawn_blocking(move || st.list_streams())
-            .await
-            .map_err(|e| StorageError::Io(std::io::Error::other(e)))??;
+        let streams = self.storage.list_streams().await?;
 
         let cutoff_ns = {
             let now_ns = std::time::SystemTime::now()
@@ -198,25 +185,15 @@ impl BrokerAppend {
             let mut map = DedupMap::new(self.default_window);
 
             // Use seek_by_time to jump to the dedup window boundary
-            let st = self.storage.clone();
-            let sn = stream_name.clone();
-            let mut offset =
-                tokio::task::spawn_blocking(move || st.seek_by_time(&sn, cutoff_ns))
-                    .await
-                    .map_err(|e| StorageError::Io(std::io::Error::other(e)))?
-                    .unwrap_or(Offset(0)); // fallback to full scan if seek fails
+            let mut offset = self.storage.seek_by_time(stream_name, cutoff_ns)
+                .await
+                .unwrap_or(Offset(0)); // fallback to full scan if seek fails
 
             let batch_size = 1000;
 
             // Scan forward through the stream
             loop {
-                let st = self.storage.clone();
-                let sn = stream_name.clone();
-                let off = offset;
-                let records =
-                    tokio::task::spawn_blocking(move || st.read(&sn, off, batch_size))
-                        .await
-                        .map_err(|e| StorageError::Io(std::io::Error::other(e)))??;
+                let records = self.storage.read(stream_name, offset, batch_size).await?;
 
                 if records.is_empty() {
                     break;
@@ -262,10 +239,11 @@ mod tests {
     use bytes::Bytes;
     use exspeed_storage::memory::MemoryStorage;
 
-    fn make_broker_append() -> BrokerAppend {
+    async fn make_broker_append() -> BrokerAppend {
         let storage = Arc::new(MemoryStorage::new());
         storage
             .create_stream(&StreamName::try_from("events").unwrap(), 0, 0)
+            .await
             .unwrap();
         BrokerAppend::new(storage, 300) // 5 min window
     }
@@ -285,7 +263,7 @@ mod tests {
 
     #[tokio::test]
     async fn append_without_idemp_key_always_writes() {
-        let ba = make_broker_append();
+        let ba = make_broker_append().await;
         let stream = StreamName::try_from("events").unwrap();
         let r1 = make_record("events.created", b"data1", None);
         let r2 = make_record("events.created", b"data1", None); // same data, no key
@@ -299,7 +277,7 @@ mod tests {
 
     #[tokio::test]
     async fn append_with_idemp_key_deduplicates() {
-        let ba = make_broker_append();
+        let ba = make_broker_append().await;
         let stream = StreamName::try_from("events").unwrap();
         let r1 = make_record("events.created", b"data1", Some("order-123"));
         let r2 = make_record("events.created", b"data1", Some("order-123")); // same key
@@ -313,7 +291,7 @@ mod tests {
 
     #[tokio::test]
     async fn different_idemp_keys_both_written() {
-        let ba = make_broker_append();
+        let ba = make_broker_append().await;
         let stream = StreamName::try_from("events").unwrap();
         let r1 = make_record("events.created", b"data1", Some("order-123"));
         let r2 = make_record("events.created", b"data2", Some("order-456"));
@@ -327,11 +305,11 @@ mod tests {
 
     #[tokio::test]
     async fn same_key_different_streams_both_written() {
-        let ba = make_broker_append();
+        let ba = make_broker_append().await;
         let s1 = StreamName::try_from("stream-a").unwrap();
         let s2 = StreamName::try_from("stream-b").unwrap();
-        ba.storage().create_stream(&s1, 0, 0).unwrap();
-        ba.storage().create_stream(&s2, 0, 0).unwrap();
+        ba.storage().create_stream(&s1, 0, 0).await.unwrap();
+        ba.storage().create_stream(&s2, 0, 0).await.unwrap();
 
         let r = make_record("evt", b"data", Some("key-1"));
         let res1 = ba.append(&s1, &r).await.unwrap();
@@ -345,7 +323,7 @@ mod tests {
     async fn rebuild_from_log_restores_dedup_state() {
         let storage = Arc::new(MemoryStorage::new());
         let stream = StreamName::try_from("events").unwrap();
-        storage.create_stream(&stream, 0, 0).unwrap();
+        storage.create_stream(&stream, 0, 0).await.unwrap();
 
         // Write some records with idempotency keys directly to storage
         let r1 = Record {
@@ -360,8 +338,8 @@ mod tests {
             subject: "evt".to_string(),
             headers: vec![("x-idempotency-key".to_string(), "key-B".to_string())],
         };
-        storage.append(&stream, &r1).unwrap();
-        storage.append(&stream, &r2).unwrap();
+        storage.append(&stream, &r1).await.unwrap();
+        storage.append(&stream, &r2).await.unwrap();
 
         // Create BrokerAppend and rebuild
         let ba = BrokerAppend::new(storage, 300);

@@ -177,7 +177,7 @@ async fn run_inner(
     let target_stream_name = if mv_state.is_none() {
         let name = StreamName::try_from(target_stream)
             .map_err(|e| format!("invalid target stream name: {e}"))?;
-        let _ = storage.create_stream(&name, 0, 0);
+        let _ = storage.create_stream(&name, 0, 0).await;
         Some(name)
     } else {
         None
@@ -200,7 +200,7 @@ async fn run_inner(
                     &right_stream_name,
                     &join_info.right_key_expr,
                     join_info.right_alias.as_deref(),
-                )?;
+                ).await?;
                 let elapsed = start.elapsed().as_secs_f64();
                 info!(
                     "query '{}' rebuilding join lookup from '{}': {} records in {:.3}s",
@@ -225,6 +225,7 @@ async fn run_inner(
 
                 let batch = storage
                     .read(&source_stream_name, Offset(current_offset), batch_size)
+                    .await
                     .map_err(|e| format!("read error: {e}"))?;
 
                 if batch.is_empty() {
@@ -262,7 +263,7 @@ async fn run_inner(
                                             target_stream_name.as_ref(),
                                             &mv_state,
                                             &pipeline.group_by_exprs,
-                                        )?;
+                                        ).await?;
                                     }
                                 }
                                 continue;
@@ -294,7 +295,7 @@ async fn run_inner(
                             target_stream_name.as_ref(),
                             &mv_state,
                             &pipeline.group_by_exprs,
-                        )?;
+                        ).await?;
                     }
                 }
 
@@ -339,6 +340,7 @@ async fn run_inner(
 
                 let batch = storage
                     .read(&source_stream_name, Offset(current_offset), batch_size)
+                    .await
                     .map_err(|e| format!("read error: {e}"))?;
 
                 if batch.is_empty() {
@@ -353,7 +355,7 @@ async fn run_inner(
                             target_stream_name.as_ref(),
                             &mv_state,
                             &group_by,
-                        )?;
+                        ).await?;
                     }
 
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -380,7 +382,7 @@ async fn run_inner(
                             target_stream_name.as_ref(),
                             &mv_state,
                             &group_by,
-                        )?;
+                        ).await?;
                     }
                 }
 
@@ -395,7 +397,7 @@ async fn run_inner(
                         target_stream_name.as_ref(),
                         &mv_state,
                         &group_by,
-                    )?;
+                    ).await?;
                 }
 
                 current_offset = last_offset + 1;
@@ -443,6 +445,7 @@ async fn run_inner(
                 // Read from LEFT source
                 let left_batch = storage
                     .read(&source_stream_name, Offset(left_offset), batch_size)
+                    .await
                     .map_err(|e| format!("read left error: {e}"))?;
 
                 for record in &left_batch {
@@ -462,7 +465,7 @@ async fn run_inner(
                                 target_stream_name.as_ref(),
                                 &mv_state,
                                 &pipeline.group_by_exprs,
-                            )?;
+                            ).await?;
                         }
                     }
                     left_offset = record.offset.0 + 1;
@@ -471,6 +474,7 @@ async fn run_inner(
                 // Read from RIGHT source
                 let right_batch = storage
                     .read(&right_stream_name, Offset(right_offset), batch_size)
+                    .await
                     .map_err(|e| format!("read right error: {e}"))?;
 
                 for record in &right_batch {
@@ -490,7 +494,7 @@ async fn run_inner(
                                 target_stream_name.as_ref(),
                                 &mv_state,
                                 &pipeline.group_by_exprs,
-                            )?;
+                            ).await?;
                         }
                     }
                     right_offset = record.offset.0 + 1;
@@ -522,7 +526,7 @@ async fn run_inner(
 // ---------------------------------------------------------------------------
 
 /// Emit a single output row to either the target stream or the MV state.
-fn emit_row(
+async fn emit_row(
     row: &Row,
     target_stream: &str,
     storage: &Arc<dyn StorageEngine>,
@@ -551,6 +555,7 @@ fn emit_row(
         let rec = row_to_record(row, target_stream);
         storage
             .append(name, &rec)
+            .await
             .map_err(|e| format!("append error: {e}"))?;
     }
 
@@ -738,7 +743,7 @@ fn decompose_on_expr(expr: &Expr) -> (Expr, Expr) {
 // Join lookup builder
 // ---------------------------------------------------------------------------
 
-fn build_join_lookup(
+async fn build_join_lookup(
     storage: &Arc<dyn StorageEngine>,
     stream: &StreamName,
     right_key_expr: &Expr,
@@ -751,6 +756,7 @@ fn build_join_lookup(
     loop {
         let batch = storage
             .read(stream, from, batch_size)
+            .await
             .map_err(|e| format!("read join stream: {e}"))?;
         if batch.is_empty() {
             break;
@@ -947,10 +953,11 @@ mod tests {
     use exspeed_storage::memory::MemoryStorage;
     use std::sync::Arc;
 
-    fn setup_source_data() -> Arc<dyn StorageEngine> {
+    async fn setup_source_data() -> Arc<dyn StorageEngine> {
         let storage = Arc::new(MemoryStorage::new());
         storage
             .create_stream(&StreamName::try_from("orders").unwrap(), 0, 0)
+            .await
             .unwrap();
 
         for i in 0..10 {
@@ -966,6 +973,7 @@ mod tests {
             };
             storage
                 .append(&StreamName::try_from("orders").unwrap(), &record)
+                .await
                 .unwrap();
         }
 
@@ -974,7 +982,7 @@ mod tests {
 
     #[tokio::test]
     async fn continuous_query_filter() {
-        let storage = setup_source_data();
+        let storage = setup_source_data().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = Arc::new(QueryRegistry::new(dir.path().to_path_buf()));
 
@@ -1018,7 +1026,7 @@ mod tests {
 
         // Verify target stream has records
         let target_name = StreamName::try_from("eu_orders").unwrap();
-        let results = storage.read(&target_name, Offset(0), 100).unwrap();
+        let results = storage.read(&target_name, Offset(0), 100).await.unwrap();
 
         // 10 records, half are "eu" region (indices 0,2,4,6,8)
         assert_eq!(
@@ -1041,7 +1049,7 @@ mod tests {
 
     #[tokio::test]
     async fn continuous_query_project() {
-        let storage = setup_source_data();
+        let storage = setup_source_data().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = Arc::new(QueryRegistry::new(dir.path().to_path_buf()));
 
@@ -1081,7 +1089,7 @@ mod tests {
         let _ = handle.await;
 
         let target_name = StreamName::try_from("order_totals").unwrap();
-        let results = storage.read(&target_name, Offset(0), 100).unwrap();
+        let results = storage.read(&target_name, Offset(0), 100).await.unwrap();
 
         assert_eq!(results.len(), 10);
 
@@ -1099,7 +1107,7 @@ mod tests {
 
     #[tokio::test]
     async fn continuous_query_checkpoint() {
-        let storage = setup_source_data();
+        let storage = setup_source_data().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = Arc::new(QueryRegistry::new(dir.path().to_path_buf()));
 
@@ -1156,6 +1164,7 @@ mod tests {
         let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
         storage
             .create_stream(&StreamName::try_from("events").unwrap(), 0, 0)
+            .await
             .unwrap();
 
         // Publish 4 records with region=us (amounts: 10, 20, 30, 40)
@@ -1169,6 +1178,7 @@ mod tests {
             };
             storage
                 .append(&StreamName::try_from("events").unwrap(), &record)
+                .await
                 .unwrap();
         }
 
@@ -1265,7 +1275,7 @@ mod tests {
 
         // Manually run the windowed aggregate loop for 1 batch
         let source_name = StreamName::try_from("events").unwrap();
-        let batch = storage.read(&source_name, Offset(0), 1000).unwrap();
+        let batch = storage.read(&source_name, Offset(0), 1000).await.unwrap();
         assert_eq!(batch.len(), 4);
 
         // Extract windowed params
@@ -1320,7 +1330,7 @@ mod tests {
         // Verify that when mv_state is Some, output goes to the HashMap
         // instead of a stream.
 
-        let storage = setup_source_data(); // 10 "orders" records
+        let storage = setup_source_data().await; // 10 "orders" records
         let dir = tempfile::tempdir().unwrap();
         let registry = Arc::new(QueryRegistry::new(dir.path().to_path_buf()));
 
@@ -1389,9 +1399,11 @@ mod tests {
         // Create two streams: clicks and purchases
         storage
             .create_stream(&StreamName::try_from("clicks").unwrap(), 0, 0)
+            .await
             .unwrap();
         storage
             .create_stream(&StreamName::try_from("purchases").unwrap(), 0, 0)
+            .await
             .unwrap();
 
         // Add click records
@@ -1404,6 +1416,7 @@ mod tests {
             };
             storage
                 .append(&StreamName::try_from("clicks").unwrap(), &record)
+                .await
                 .unwrap();
         }
 
@@ -1417,6 +1430,7 @@ mod tests {
             };
             storage
                 .append(&StreamName::try_from("purchases").unwrap(), &record)
+                .await
                 .unwrap();
         }
 
@@ -1505,7 +1519,7 @@ mod tests {
 
         // Process left (clicks) first
         let click_stream = StreamName::try_from("clicks").unwrap();
-        let click_batch = storage.read(&click_stream, Offset(0), 100).unwrap();
+        let click_batch = storage.read(&click_stream, Offset(0), 100).await.unwrap();
 
         let mut all_matches: Vec<Row> = Vec::new();
 
@@ -1519,7 +1533,7 @@ mod tests {
 
         // Process right (purchases)
         let purchase_stream = StreamName::try_from("purchases").unwrap();
-        let purchase_batch = storage.read(&purchase_stream, Offset(0), 100).unwrap();
+        let purchase_batch = storage.read(&purchase_stream, Offset(0), 100).await.unwrap();
 
         for record in &purchase_batch {
             let row = stored_record_to_row(record, None);

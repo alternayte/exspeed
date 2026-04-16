@@ -146,7 +146,7 @@ impl ConnectorManager {
             .map_err(|e| format!("invalid stream name: {e}"))?;
 
         // Auto-create stream if it doesn't exist
-        self.ensure_stream_exists(&stream_name)?;
+        self.ensure_stream_exists(&stream_name).await?;
 
         // Persist config
         let dir = self.configs_dir();
@@ -338,13 +338,14 @@ impl ConnectorManager {
     }
 
     /// Ensure a stream exists, creating it if necessary.
-    fn ensure_stream_exists(&self, stream: &StreamName) -> Result<(), String> {
+    async fn ensure_stream_exists(&self, stream: &StreamName) -> Result<(), String> {
         // Try reading from the stream. If it fails with StreamNotFound, create it.
-        match self.storage.read(stream, Offset(0), 0) {
+        match self.storage.read(stream, Offset(0), 0).await {
             Ok(_) => Ok(()),
             Err(StorageError::StreamNotFound(_)) => self
                 .storage
                 .create_stream(stream, 0, 0)
+                .await
                 .map_err(|e| format!("failed to create stream: {e}")),
             Err(e) => Err(format!("failed to check stream: {e}")),
         }
@@ -649,23 +650,10 @@ impl ConnectorManager {
                 }
 
                 // Read records from storage
-                let read_offset = current_offset;
-                let st = storage.clone();
-                let sn = stream_name.clone();
-                let records = tokio::task::spawn_blocking(move || {
-                    st.read(&sn, Offset(read_offset), batch_size)
-                })
-                .await;
-
-                let stored_records = match records {
-                    Ok(Ok(recs)) => recs,
-                    Ok(Err(e)) => {
-                        error!(connector = task_name.as_str(), error = %e, "failed to read from storage");
-                        tokio::time::sleep(poll_interval).await;
-                        continue;
-                    }
+                let stored_records = match storage.read(&stream_name, Offset(current_offset), batch_size).await {
+                    Ok(recs) => recs,
                     Err(e) => {
-                        error!(connector = task_name.as_str(), error = %e, "spawn_blocking panicked");
+                        error!(connector = task_name.as_str(), error = %e, "failed to read from storage");
                         tokio::time::sleep(poll_interval).await;
                         continue;
                     }

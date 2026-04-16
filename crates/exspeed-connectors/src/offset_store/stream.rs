@@ -25,11 +25,11 @@ pub struct StreamOffsetStore {
 }
 
 impl StreamOffsetStore {
-    pub fn new(storage: Arc<dyn StorageEngine>) -> Result<Self, OffsetStoreError> {
+    pub async fn new(storage: Arc<dyn StorageEngine>) -> Result<Self, OffsetStoreError> {
         let stream_name = StreamName::try_from(OFFSETS_STREAM)
             .map_err(|e| OffsetStoreError::Connection(e.to_string()))?;
 
-        match storage.create_stream(&stream_name, 0, 0) {
+        match storage.create_stream(&stream_name, 0, 0).await {
             Ok(_) => {}
             Err(StorageError::StreamAlreadyExists(_)) => {}
             Err(e) => return Err(OffsetStoreError::Connection(e.to_string())),
@@ -41,14 +41,14 @@ impl StreamOffsetStore {
         })
     }
 
-    fn find_latest(&self, connector: &str) -> Option<OffsetRecord> {
+    async fn find_latest(&self, connector: &str) -> Option<OffsetRecord> {
         let connector_key = Bytes::copy_from_slice(connector.as_bytes());
         let batch_size = 100;
         let mut from = Offset(0);
         let mut latest: Option<OffsetRecord> = None;
 
         loop {
-            let records = match self.storage.read(&self.stream_name, from, batch_size) {
+            let records = match self.storage.read(&self.stream_name, from, batch_size).await {
                 Ok(r) => r,
                 Err(_) => break,
             };
@@ -80,7 +80,7 @@ impl StreamOffsetStore {
         }
     }
 
-    fn append_offset_record(
+    async fn append_offset_record(
         storage: &Arc<dyn StorageEngine>,
         stream_name: &StreamName,
         connector: &str,
@@ -98,6 +98,7 @@ impl StreamOffsetStore {
 
         storage
             .append(stream_name, &r)
+            .await
             .map_err(|e| OffsetStoreError::Connection(e.to_string()))?;
 
         Ok(())
@@ -117,34 +118,20 @@ impl OffsetStore for StreamOffsetStore {
             sink_offset: None,
             tombstone: false,
         };
-        let storage = Arc::clone(&self.storage);
-        let stream_name = self.stream_name.clone();
-        let connector = connector.to_string();
-
-        tokio::task::spawn_blocking(move || {
-            StreamOffsetStore::append_offset_record(&storage, &stream_name, &connector, &record)
-        })
+        StreamOffsetStore::append_offset_record(
+            &self.storage,
+            &self.stream_name,
+            connector,
+            &record,
+        )
         .await
-        .map_err(|e| OffsetStoreError::Connection(e.to_string()))?
     }
 
     async fn load_source_offset(
         &self,
         connector: &str,
     ) -> Result<Option<String>, OffsetStoreError> {
-        let storage = Arc::clone(&self.storage);
-        let stream_name = self.stream_name.clone();
-        let connector = connector.to_string();
-
-        tokio::task::spawn_blocking(move || {
-            let store = StreamOffsetStore {
-                storage,
-                stream_name,
-            };
-            Ok(store.find_latest(&connector).and_then(|r| r.position))
-        })
-        .await
-        .map_err(|e| OffsetStoreError::Connection(e.to_string()))?
+        Ok(self.find_latest(connector).await.and_then(|r| r.position))
     }
 
     async fn save_sink_offset(
@@ -158,34 +145,21 @@ impl OffsetStore for StreamOffsetStore {
             sink_offset: Some(offset),
             tombstone: false,
         };
-        let storage = Arc::clone(&self.storage);
-        let stream_name = self.stream_name.clone();
-        let connector = connector.to_string();
-
-        tokio::task::spawn_blocking(move || {
-            StreamOffsetStore::append_offset_record(&storage, &stream_name, &connector, &record)
-        })
+        StreamOffsetStore::append_offset_record(
+            &self.storage,
+            &self.stream_name,
+            connector,
+            &record,
+        )
         .await
-        .map_err(|e| OffsetStoreError::Connection(e.to_string()))?
     }
 
     async fn load_sink_offset(&self, connector: &str) -> Result<u64, OffsetStoreError> {
-        let storage = Arc::clone(&self.storage);
-        let stream_name = self.stream_name.clone();
-        let connector = connector.to_string();
-
-        tokio::task::spawn_blocking(move || {
-            let store = StreamOffsetStore {
-                storage,
-                stream_name,
-            };
-            Ok(store
-                .find_latest(&connector)
-                .and_then(|r| r.sink_offset)
-                .unwrap_or(0))
-        })
-        .await
-        .map_err(|e| OffsetStoreError::Connection(e.to_string()))?
+        Ok(self
+            .find_latest(connector)
+            .await
+            .and_then(|r| r.sink_offset)
+            .unwrap_or(0))
     }
 
     async fn delete(&self, connector: &str) -> Result<(), OffsetStoreError> {
@@ -195,14 +169,12 @@ impl OffsetStore for StreamOffsetStore {
             sink_offset: None,
             tombstone: true,
         };
-        let storage = Arc::clone(&self.storage);
-        let stream_name = self.stream_name.clone();
-        let connector = connector.to_string();
-
-        tokio::task::spawn_blocking(move || {
-            StreamOffsetStore::append_offset_record(&storage, &stream_name, &connector, &record)
-        })
+        StreamOffsetStore::append_offset_record(
+            &self.storage,
+            &self.stream_name,
+            connector,
+            &record,
+        )
         .await
-        .map_err(|e| OffsetStoreError::Connection(e.to_string()))?
     }
 }

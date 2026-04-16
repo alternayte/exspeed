@@ -17,7 +17,7 @@ use exspeed_streams::traits::StorageEngine;
 /// subject template, builds a [`Record`], and appends it to the configured stream.
 ///
 /// Returns the resulting [`Offset`](exspeed_common::Offset) as a `u64`.
-pub fn handle_webhook_post(
+pub async fn handle_webhook_post(
     storage: &Arc<dyn StorageEngine>,
     config: &ConnectorConfig,
     body: Bytes,
@@ -60,6 +60,7 @@ pub fn handle_webhook_post(
 
     let offset = storage
         .append(&stream, &record)
+        .await
         .map_err(|e| format!("storage error: {e}"))?;
 
     Ok(offset.0)

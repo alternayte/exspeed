@@ -51,13 +51,14 @@ impl ExqlEngine {
     }
 
     /// Execute a bounded (batch) SQL query.
-    pub fn execute_bounded(&self, sql: &str) -> Result<ResultSet, ExqlError> {
+    pub async fn execute_bounded(&self, sql: &str) -> Result<ResultSet, ExqlError> {
         runtime::bounded::execute_bounded_with_mv(
             sql,
             &self.storage,
             Some(&self.connection_registry),
             Some(&self.mv_registry),
         )
+        .await
     }
 
     /// Create and start a continuous query from a CREATE VIEW statement.

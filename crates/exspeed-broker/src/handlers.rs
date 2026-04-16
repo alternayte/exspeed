@@ -10,7 +10,7 @@ use crate::broker::Broker;
 use crate::consumer_state::{ConsumerConfig, ConsumerGroup, ConsumerState};
 use crate::persistence;
 
-pub fn handle_create_stream(broker: &Broker, req: CreateStreamRequest) -> ServerMessage {
+pub async fn handle_create_stream(broker: &Broker, req: CreateStreamRequest) -> ServerMessage {
     let stream_name = match StreamName::try_from(req.stream_name) {
         Ok(n) => n,
         Err(e) => {
@@ -24,6 +24,7 @@ pub fn handle_create_stream(broker: &Broker, req: CreateStreamRequest) -> Server
     match broker
         .storage
         .create_stream(&stream_name, req.max_age_secs, req.max_bytes)
+        .await
     {
         Ok(()) => ServerMessage::Ok,
         Err(e) => ServerMessage::Error {
@@ -62,7 +63,7 @@ pub async fn handle_publish(broker: &Broker, req: PublishRequest) -> ServerMessa
     }
 }
 
-pub fn handle_fetch(broker: &Broker, req: FetchRequest) -> ServerMessage {
+pub async fn handle_fetch(broker: &Broker, req: FetchRequest) -> ServerMessage {
     let stream_name = match StreamName::try_from(req.stream) {
         Ok(n) => n,
         Err(e) => {
@@ -83,6 +84,7 @@ pub fn handle_fetch(broker: &Broker, req: FetchRequest) -> ServerMessage {
     let stored = match broker
         .storage
         .read(&stream_name, Offset(req.offset), fetch_count)
+        .await
     {
         Ok(records) => records,
         Err(e) => {
@@ -112,7 +114,7 @@ pub fn handle_fetch(broker: &Broker, req: FetchRequest) -> ServerMessage {
     ServerMessage::RecordsBatch(RecordsBatch { records })
 }
 
-pub fn handle_create_consumer(broker: &Broker, req: CreateConsumerRequest) -> ServerMessage {
+pub async fn handle_create_consumer(broker: &Broker, req: CreateConsumerRequest) -> ServerMessage {
     // Validate stream name
     let stream_name = match StreamName::try_from(req.stream.clone()) {
         Ok(n) => n,
@@ -125,7 +127,7 @@ pub fn handle_create_consumer(broker: &Broker, req: CreateConsumerRequest) -> Se
     };
 
     // Check stream exists by attempting a zero-count read
-    match broker.storage.read(&stream_name, Offset(0), 0) {
+    match broker.storage.read(&stream_name, Offset(0), 0).await {
         Ok(_) => {}
         Err(StorageError::StreamNotFound(_)) => {
             return ServerMessage::Error {
@@ -158,7 +160,7 @@ pub fn handle_create_consumer(broker: &Broker, req: CreateConsumerRequest) -> Se
         StartFrom::Latest => {
             // Read a large batch to find the last offset.
             // We scan for the highest offset available.
-            match broker.storage.read(&stream_name, Offset(0), usize::MAX) {
+            match broker.storage.read(&stream_name, Offset(0), usize::MAX).await {
                 Ok(records) => {
                     if let Some(last) = records.last() {
                         last.offset.0 + 1
@@ -294,7 +296,7 @@ pub fn handle_ack(broker: &Broker, req: AckRequest) -> ServerMessage {
     ServerMessage::Ok
 }
 
-pub fn handle_nack(broker: &Broker, req: NackRequest) -> ServerMessage {
+pub async fn handle_nack(broker: &Broker, req: NackRequest) -> ServerMessage {
     // Look up consumer
     let (stream, _subject_filter) = {
         let consumers = broker.consumers.read().unwrap();
@@ -334,7 +336,7 @@ pub fn handle_nack(broker: &Broker, req: NackRequest) -> ServerMessage {
             }
         };
 
-        let records = match broker.storage.read(&stream_name, Offset(req.offset), 1) {
+        let records = match broker.storage.read(&stream_name, Offset(req.offset), 1).await {
             Ok(r) => r,
             Err(e) => {
                 return ServerMessage::Error {
@@ -381,7 +383,7 @@ pub fn handle_nack(broker: &Broker, req: NackRequest) -> ServerMessage {
         };
 
         // Ignore StreamAlreadyExists error
-        match broker.storage.create_stream(&dlq_stream_name, 0, 0) {
+        match broker.storage.create_stream(&dlq_stream_name, 0, 0).await {
             Ok(()) => {}
             Err(StorageError::StreamAlreadyExists(_)) => {}
             Err(e) => {
@@ -400,7 +402,7 @@ pub fn handle_nack(broker: &Broker, req: NackRequest) -> ServerMessage {
             headers: dlq_headers,
         };
 
-        if let Err(e) = broker.storage.append(&dlq_stream_name, &dlq_record) {
+        if let Err(e) = broker.storage.append(&dlq_stream_name, &dlq_record).await {
             return ServerMessage::Error {
                 code: 500,
                 message: format!("failed to publish to DLQ: {e}"),
@@ -429,38 +431,44 @@ pub fn handle_nack(broker: &Broker, req: NackRequest) -> ServerMessage {
     ServerMessage::Ok
 }
 
-pub fn handle_seek(broker: &Broker, req: SeekRequest) -> ServerMessage {
+pub async fn handle_seek(broker: &Broker, req: SeekRequest) -> ServerMessage {
     let consumer_name = req.consumer_name;
-    let mut consumers = broker.consumers.write().unwrap();
-    let consumer = match consumers.get_mut(&consumer_name) {
-        Some(c) => c,
-        None => {
-            return ServerMessage::Error {
-                code: 404,
-                message: format!("consumer not found: {consumer_name}"),
-            }
-        }
-    };
 
-    let stream_name = match StreamName::try_from(consumer.config.stream.as_str()) {
-        Ok(n) => n,
-        Err(e) => {
-            return ServerMessage::Error {
-                code: 400,
-                message: e.to_string(),
-            }
-        }
-    };
-
-    match broker.storage.seek_by_time(&stream_name, req.timestamp) {
-        Ok(offset) => {
-            consumer.config.offset = offset.0;
-            // Persist
-            if let Err(e) = persistence::save_consumer(&broker.data_dir, &consumer.config) {
+    // Extract the stream name from consumer config (lock released before .await)
+    let stream_name = {
+        let consumers = broker.consumers.read().unwrap();
+        match consumers.get(&consumer_name) {
+            Some(c) => match StreamName::try_from(c.config.stream.as_str()) {
+                Ok(n) => n,
+                Err(e) => {
+                    return ServerMessage::Error {
+                        code: 400,
+                        message: e.to_string(),
+                    }
+                }
+            },
+            None => {
                 return ServerMessage::Error {
-                    code: 500,
-                    message: format!("persist failed: {e}"),
-                };
+                    code: 404,
+                    message: format!("consumer not found: {consumer_name}"),
+                }
+            }
+        }
+    };
+
+    match broker.storage.seek_by_time(&stream_name, req.timestamp).await {
+        Ok(offset) => {
+            // Re-acquire lock after .await to update consumer state
+            let mut consumers = broker.consumers.write().unwrap();
+            if let Some(consumer) = consumers.get_mut(&consumer_name) {
+                consumer.config.offset = offset.0;
+                // Persist
+                if let Err(e) = persistence::save_consumer(&broker.data_dir, &consumer.config) {
+                    return ServerMessage::Error {
+                        code: 500,
+                        message: format!("persist failed: {e}"),
+                    };
+                }
             }
             ServerMessage::PublishOk { offset: offset.0 } // reuse PublishOk for offset response
         }

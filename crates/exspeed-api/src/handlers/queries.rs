@@ -41,13 +41,12 @@ pub async fn execute_query(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ExecuteQueryRequest>,
 ) -> impl IntoResponse {
-    let exql = state.exql.clone();
     let sql = body.sql;
 
-    let result = tokio::task::spawn_blocking(move || exql.execute_bounded(&sql)).await;
+    let result = state.exql.execute_bounded(&sql).await;
 
     match result {
-        Ok(Ok(result_set)) => {
+        Ok(result_set) => {
             let rows: Vec<Vec<serde_json::Value>> = result_set
                 .rows
                 .iter()
@@ -65,13 +64,9 @@ pub async fn execute_query(
                 })),
             )
         }
-        Ok(Err(e)) => (
+        Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": e.to_string()})),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("task failed: {e}")})),
         ),
     }
 }

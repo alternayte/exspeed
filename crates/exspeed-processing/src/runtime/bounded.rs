@@ -20,24 +20,24 @@ use crate::runtime::operators::Operator;
 use crate::types::{ResultSet, Row, Value};
 
 /// Execute a bounded (batch) SQL query against storage, returning a ResultSet.
-pub fn execute_bounded(
+pub async fn execute_bounded(
     sql: &str,
     storage: &Arc<dyn StorageEngine>,
 ) -> Result<ResultSet, ExqlError> {
-    execute_bounded_with_mv(sql, storage, None, None)
+    execute_bounded_with_mv(sql, storage, None, None).await
 }
 
 /// Execute a bounded (batch) SQL query with optional external connection support.
-pub fn execute_bounded_with_connections(
+pub async fn execute_bounded_with_connections(
     sql: &str,
     storage: &Arc<dyn StorageEngine>,
     connections: Option<&ConnectionRegistry>,
 ) -> Result<ResultSet, ExqlError> {
-    execute_bounded_with_mv(sql, storage, connections, None)
+    execute_bounded_with_mv(sql, storage, connections, None).await
 }
 
 /// Execute a bounded (batch) SQL query with optional connection and MV registry support.
-pub fn execute_bounded_with_mv(
+pub async fn execute_bounded_with_mv(
     sql: &str,
     storage: &Arc<dyn StorageEngine>,
     connections: Option<&ConnectionRegistry>,
@@ -62,7 +62,7 @@ pub fn execute_bounded_with_mv(
     let plan = crate::planner::plan(&query, crate::parser::ast::EmitMode::Changes)?;
 
     // 4. Build operator tree
-    let mut root = build_operator(&plan, storage, connections, mv_registry)?;
+    let mut root = build_operator(&plan, storage, connections, mv_registry).await?;
 
     // 5. Pull all rows from the root operator
     let columns = root.columns();
@@ -81,18 +81,19 @@ pub fn execute_bounded_with_mv(
 }
 
 /// Recursively build an operator tree from a PhysicalPlan.
-fn build_operator(
-    plan: &PhysicalPlan,
-    storage: &Arc<dyn StorageEngine>,
-    connections: Option<&ConnectionRegistry>,
-    mv_registry: Option<&MaterializedViewRegistry>,
-) -> Result<Box<dyn Operator>, ExqlError> {
+fn build_operator<'a>(
+    plan: &'a PhysicalPlan,
+    storage: &'a Arc<dyn StorageEngine>,
+    connections: Option<&'a ConnectionRegistry>,
+    mv_registry: Option<&'a MaterializedViewRegistry>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn Operator>, ExqlError>> + Send + 'a>> {
+    Box::pin(async move {
     match plan {
         PhysicalPlan::SeqScan { stream, alias } => {
             // Check materialized views first
             if let Some(mv_reg) = mv_registry {
                 if let Some((_columns, rows)) = mv_reg.get_rows(stream) {
-                    return Ok(Box::new(ScanOperator::new(rows)));
+                    return Ok(Box::new(ScanOperator::new(rows)) as Box<dyn Operator>);
                 }
             }
 
@@ -109,6 +110,7 @@ fn build_operator(
             loop {
                 let batch = storage
                     .read(&stream_name, from, batch_size)
+                    .await
                     .map_err(|e| ExqlError::Storage(e.to_string()))?;
                 if batch.is_empty() {
                     break;
@@ -124,7 +126,7 @@ fn build_operator(
                 .map(|r| stored_record_to_row(r, alias.as_deref()))
                 .collect();
 
-            Ok(Box::new(ScanOperator::new(rows)))
+            Ok(Box::new(ScanOperator::new(rows)) as Box<dyn Operator>)
         }
 
         PhysicalPlan::ExternalScan {
@@ -140,17 +142,17 @@ fn build_operator(
             // Run the async query synchronously. We use block_in_place so the
             // tokio runtime can still make progress on other tasks while we wait.
             let rows = run_external_query(&resolved_driver, &url, table)?;
-            Ok(Box::new(ScanOperator::new(rows)))
+            Ok(Box::new(ScanOperator::new(rows)) as Box<dyn Operator>)
         }
 
         PhysicalPlan::Filter { input, predicate } => {
-            let child = build_operator(input, storage, connections, mv_registry)?;
-            Ok(Box::new(FilterOperator::new(child, predicate.clone())))
+            let child = build_operator(input, storage, connections, mv_registry).await?;
+            Ok(Box::new(FilterOperator::new(child, predicate.clone())) as Box<dyn Operator>)
         }
 
         PhysicalPlan::Project { input, items } => {
-            let child = build_operator(input, storage, connections, mv_registry)?;
-            Ok(Box::new(ProjectOperator::new(child, items.clone())))
+            let child = build_operator(input, storage, connections, mv_registry).await?;
+            Ok(Box::new(ProjectOperator::new(child, items.clone())) as Box<dyn Operator>)
         }
 
         PhysicalPlan::HashJoin {
@@ -159,14 +161,14 @@ fn build_operator(
             on,
             join_type,
         } => {
-            let left_op = build_operator(left, storage, connections, mv_registry)?;
-            let right_op = build_operator(right, storage, connections, mv_registry)?;
+            let left_op = build_operator(left, storage, connections, mv_registry).await?;
+            let right_op = build_operator(right, storage, connections, mv_registry).await?;
             Ok(Box::new(HashJoinOperator::new(
                 left_op,
                 right_op,
                 join_type.clone(),
                 on.clone(),
-            )))
+            )) as Box<dyn Operator>)
         }
 
         PhysicalPlan::HashAggregate {
@@ -174,17 +176,17 @@ fn build_operator(
             group_by,
             select_items,
         } => {
-            let child = build_operator(input, storage, connections, mv_registry)?;
+            let child = build_operator(input, storage, connections, mv_registry).await?;
             Ok(Box::new(AggregateOperator::new(
                 child,
                 group_by.clone(),
                 select_items.clone(),
-            )))
+            )) as Box<dyn Operator>)
         }
 
         PhysicalPlan::Sort { input, order_by } => {
-            let child = build_operator(input, storage, connections, mv_registry)?;
-            Ok(Box::new(SortOperator::new(child, order_by.clone())))
+            let child = build_operator(input, storage, connections, mv_registry).await?;
+            Ok(Box::new(SortOperator::new(child, order_by.clone())) as Box<dyn Operator>)
         }
 
         PhysicalPlan::Limit {
@@ -192,12 +194,12 @@ fn build_operator(
             limit,
             offset,
         } => {
-            let child = build_operator(input, storage, connections, mv_registry)?;
+            let child = build_operator(input, storage, connections, mv_registry).await?;
             Ok(Box::new(LimitOperator::new(
                 child,
                 *limit,
                 offset.unwrap_or(0),
-            )))
+            )) as Box<dyn Operator>)
         }
 
         PhysicalPlan::WindowedAggregate { .. } => Err(ExqlError::Execution(
@@ -208,6 +210,7 @@ fn build_operator(
             "StreamStreamJoin is not supported in bounded execution".into(),
         )),
     }
+    })
 }
 
 /// Resolve the driver and URL for an external scan.
@@ -346,10 +349,11 @@ mod tests {
     use exspeed_storage::memory::MemoryStorage;
     use exspeed_streams::Record;
 
-    fn setup_test_data() -> Arc<dyn StorageEngine> {
+    async fn setup_test_data() -> Arc<dyn StorageEngine> {
         let storage = Arc::new(MemoryStorage::new());
         storage
             .create_stream(&StreamName::try_from("orders").unwrap(), 0, 0)
+            .await
             .unwrap();
 
         for i in 0..5 {
@@ -365,71 +369,75 @@ mod tests {
             };
             storage
                 .append(&StreamName::try_from("orders").unwrap(), &record)
+                .await
                 .unwrap();
         }
 
         storage
     }
 
-    #[test]
-    fn select_star() {
-        let storage = setup_test_data();
-        let result = execute_bounded("SELECT * FROM \"orders\"", &storage).unwrap();
+    #[tokio::test]
+    async fn select_star() {
+        let storage = setup_test_data().await;
+        let result = execute_bounded("SELECT * FROM \"orders\"", &storage).await.unwrap();
         assert_eq!(result.rows.len(), 5);
     }
 
-    #[test]
-    fn select_with_limit() {
-        let storage = setup_test_data();
-        let result = execute_bounded("SELECT * FROM \"orders\" LIMIT 2", &storage).unwrap();
+    #[tokio::test]
+    async fn select_with_limit() {
+        let storage = setup_test_data().await;
+        let result = execute_bounded("SELECT * FROM \"orders\" LIMIT 2", &storage).await.unwrap();
         assert_eq!(result.rows.len(), 2);
     }
 
-    #[test]
-    fn select_with_where() {
-        let storage = setup_test_data();
+    #[tokio::test]
+    async fn select_with_where() {
+        let storage = setup_test_data().await;
         let result = execute_bounded(
             "SELECT * FROM \"orders\" WHERE payload->>'region' = 'eu'",
             &storage,
         )
+        .await
         .unwrap();
         assert_eq!(result.rows.len(), 3); // indices 0, 2, 4
     }
 
-    #[test]
-    fn select_with_json_access() {
-        let storage = setup_test_data();
+    #[tokio::test]
+    async fn select_with_json_access() {
+        let storage = setup_test_data().await;
         let result = execute_bounded(
             "SELECT payload->>'total' AS total FROM \"orders\" LIMIT 1",
             &storage,
         )
+        .await
         .unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.columns, vec!["total"]);
     }
 
-    #[test]
-    fn select_with_aggregate() {
-        let storage = setup_test_data();
-        let result = execute_bounded("SELECT COUNT(*) AS cnt FROM \"orders\"", &storage).unwrap();
+    #[tokio::test]
+    async fn select_with_aggregate() {
+        let storage = setup_test_data().await;
+        let result = execute_bounded("SELECT COUNT(*) AS cnt FROM \"orders\"", &storage).await.unwrap();
         assert_eq!(result.rows.len(), 1);
         // count should be 5
         assert_eq!(result.rows[0].get("cnt"), Some(&Value::Int(5)));
     }
 
-    #[test]
-    fn select_with_order_by() {
-        let storage = setup_test_data();
+    #[tokio::test]
+    async fn select_with_order_by() {
+        let storage = setup_test_data().await;
         let result = execute_bounded(
             "SELECT key FROM \"orders\" ORDER BY key DESC LIMIT 2",
             &storage,
         )
+        .await
         .unwrap();
         assert_eq!(result.rows.len(), 2);
     }
 
-    #[test]
-    fn select_from_materialized_view() {
+    #[tokio::test]
+    async fn select_from_materialized_view() {
         use crate::materialized_view::MaterializedViewRegistry;
 
         let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
@@ -466,6 +474,7 @@ mod tests {
             None,
             Some(&mv_registry),
         )
+        .await
         .unwrap();
 
         assert_eq!(result.rows.len(), 2);
@@ -484,8 +493,8 @@ mod tests {
         assert!(regions.contains(&"us".to_string()));
     }
 
-    #[test]
-    fn select_from_mv_with_where() {
+    #[tokio::test]
+    async fn select_from_mv_with_where() {
         use crate::materialized_view::MaterializedViewRegistry;
 
         let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
@@ -528,6 +537,7 @@ mod tests {
             None,
             Some(&mv_registry),
         )
+        .await
         .unwrap();
 
         assert_eq!(result.rows.len(), 1);
@@ -537,8 +547,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn select_from_mv_with_limit() {
+    #[tokio::test]
+    async fn select_from_mv_with_limit() {
         use crate::materialized_view::MaterializedViewRegistry;
 
         let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
@@ -569,6 +579,7 @@ mod tests {
             None,
             Some(&mv_registry),
         )
+        .await
         .unwrap();
 
         assert_eq!(result.rows.len(), 3);
