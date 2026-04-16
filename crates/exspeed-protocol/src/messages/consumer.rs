@@ -124,39 +124,62 @@ impl DeleteConsumerRequest {
 
 /// SUBSCRIBE request payload (0x03).
 ///
-/// Wire format: consumer_name(u16+utf8)
+/// Wire format:
+///   consumer_name(u16+utf8) subscriber_id(u16+utf8, optional for backward compat)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubscribeRequest {
     pub consumer_name: String,
+    pub subscriber_id: String,
 }
 
 impl SubscribeRequest {
     pub fn encode(&self, dst: &mut BytesMut) {
         encode_string(dst, &self.consumer_name);
+        encode_string(dst, &self.subscriber_id);
     }
 
     pub fn decode(mut src: Bytes) -> Result<Self, ProtocolError> {
         let consumer_name = decode_string(&mut src, "SUBSCRIBE")?;
-        Ok(SubscribeRequest { consumer_name })
+        // Backward-compat: if no more bytes, legacy client — subscriber_id defaults to empty.
+        let subscriber_id = if src.has_remaining() {
+            decode_string(&mut src, "SUBSCRIBE")?
+        } else {
+            String::new()
+        };
+        Ok(SubscribeRequest {
+            consumer_name,
+            subscriber_id,
+        })
     }
 }
 
 /// UNSUBSCRIBE request payload (0x04).
 ///
-/// Wire format: consumer_name(u16+utf8)
+/// Wire format:
+///   consumer_name(u16+utf8) subscriber_id(u16+utf8, optional for backward compat)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnsubscribeRequest {
     pub consumer_name: String,
+    pub subscriber_id: String,
 }
 
 impl UnsubscribeRequest {
     pub fn encode(&self, dst: &mut BytesMut) {
         encode_string(dst, &self.consumer_name);
+        encode_string(dst, &self.subscriber_id);
     }
 
     pub fn decode(mut src: Bytes) -> Result<Self, ProtocolError> {
         let consumer_name = decode_string(&mut src, "UNSUBSCRIBE")?;
-        Ok(UnsubscribeRequest { consumer_name })
+        let subscriber_id = if src.has_remaining() {
+            decode_string(&mut src, "UNSUBSCRIBE")?
+        } else {
+            String::new()
+        };
+        Ok(UnsubscribeRequest {
+            consumer_name,
+            subscriber_id,
+        })
     }
 }
 
@@ -241,23 +264,94 @@ mod tests {
     fn subscribe_roundtrip() {
         let req = SubscribeRequest {
             consumer_name: "my-consumer".into(),
+            subscriber_id: String::new(),
         };
         let mut buf = BytesMut::new();
         req.encode(&mut buf);
 
         let decoded = SubscribeRequest::decode(buf.freeze()).unwrap();
         assert_eq!(decoded.consumer_name, "my-consumer");
+        assert_eq!(decoded.subscriber_id, "");
     }
 
     #[test]
     fn unsubscribe_roundtrip() {
         let req = UnsubscribeRequest {
             consumer_name: "my-consumer".into(),
+            subscriber_id: String::new(),
         };
         let mut buf = BytesMut::new();
         req.encode(&mut buf);
 
         let decoded = UnsubscribeRequest::decode(buf.freeze()).unwrap();
         assert_eq!(decoded.consumer_name, "my-consumer");
+        assert_eq!(decoded.subscriber_id, "");
+    }
+
+    #[test]
+    fn subscribe_with_subscriber_id_roundtrip() {
+        let req = SubscribeRequest {
+            consumer_name: "my-consumer".into(),
+            subscriber_id: "pod-abc-123".into(),
+        };
+        let mut buf = BytesMut::new();
+        req.encode(&mut buf);
+
+        let decoded = SubscribeRequest::decode(buf.freeze()).unwrap();
+        assert_eq!(decoded.consumer_name, "my-consumer");
+        assert_eq!(decoded.subscriber_id, "pod-abc-123");
+    }
+
+    #[test]
+    fn subscribe_legacy_format_decodes_with_empty_subscriber_id() {
+        // Legacy SDK only encodes consumer_name (no trailing bytes).
+        let mut buf = BytesMut::new();
+        let name = "legacy-consumer";
+        buf.put_u16_le(name.len() as u16);
+        buf.extend_from_slice(name.as_bytes());
+
+        let decoded = SubscribeRequest::decode(buf.freeze()).unwrap();
+        assert_eq!(decoded.consumer_name, "legacy-consumer");
+        assert_eq!(decoded.subscriber_id, "");
+    }
+
+    #[test]
+    fn subscribe_empty_subscriber_id_roundtrip() {
+        let req = SubscribeRequest {
+            consumer_name: "my-consumer".into(),
+            subscriber_id: "".into(),
+        };
+        let mut buf = BytesMut::new();
+        req.encode(&mut buf);
+
+        let decoded = SubscribeRequest::decode(buf.freeze()).unwrap();
+        assert_eq!(decoded.consumer_name, "my-consumer");
+        assert_eq!(decoded.subscriber_id, "");
+    }
+
+    #[test]
+    fn unsubscribe_with_subscriber_id_roundtrip() {
+        let req = UnsubscribeRequest {
+            consumer_name: "my-consumer".into(),
+            subscriber_id: "pod-abc-123".into(),
+        };
+        let mut buf = BytesMut::new();
+        req.encode(&mut buf);
+
+        let decoded = UnsubscribeRequest::decode(buf.freeze()).unwrap();
+        assert_eq!(decoded.consumer_name, "my-consumer");
+        assert_eq!(decoded.subscriber_id, "pod-abc-123");
+    }
+
+    #[test]
+    fn unsubscribe_legacy_format_decodes_with_empty_subscriber_id() {
+        let mut buf = BytesMut::new();
+        let name = "legacy-consumer";
+        buf.put_u16_le(name.len() as u16);
+        buf.extend_from_slice(name.as_bytes());
+
+        let decoded = UnsubscribeRequest::decode(buf.freeze()).unwrap();
+        assert_eq!(decoded.consumer_name, "legacy-consumer");
+        assert_eq!(decoded.subscriber_id, "");
     }
 }

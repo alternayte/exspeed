@@ -333,6 +333,7 @@ mod tests {
     fn subscribe_frame_to_client_message() {
         let req = SubscribeRequest {
             consumer_name: "my-consumer".into(),
+            subscriber_id: String::new(),
         };
         let mut payload = BytesMut::new();
         req.encode(&mut payload);
@@ -349,6 +350,7 @@ mod tests {
     fn unsubscribe_frame_to_client_message() {
         let req = UnsubscribeRequest {
             consumer_name: "my-consumer".into(),
+            subscriber_id: String::new(),
         };
         let mut payload = BytesMut::new();
         req.encode(&mut payload);

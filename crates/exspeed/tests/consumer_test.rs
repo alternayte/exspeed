@@ -141,6 +141,7 @@ fn create_consumer_frame(
 fn subscribe_frame(consumer_name: &str, corr: u32) -> Frame {
     let req = SubscribeRequest {
         consumer_name: consumer_name.into(),
+        subscriber_id: String::new(),
     };
     let mut buf = BytesMut::new();
     req.encode(&mut buf);
@@ -150,6 +151,7 @@ fn subscribe_frame(consumer_name: &str, corr: u32) -> Frame {
 fn unsubscribe_frame(consumer_name: &str, corr: u32) -> Frame {
     let req = UnsubscribeRequest {
         consumer_name: consumer_name.into(),
+        subscriber_id: String::new(),
     };
     let mut buf = BytesMut::new();
     req.encode(&mut buf);
