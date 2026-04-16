@@ -1,13 +1,14 @@
 import { EventEmitter } from "node:events";
+import { randomUUID } from "node:crypto";
 import { Connection, type ConnectionOptions } from "./connection.js";
 import {
   OpCode, encodePublish, encodeAck, encodeFetch, encodeSeek,
   encodeCreateStream, encodeCreateConsumer, encodeDeleteConsumer,
-  encodeSubscribe, decodePublishOk, decodeRecord, decodeRecordsBatch,
+  encodeSubscribe, encodeUnsubscribe, decodePublishOk, decodeRecord, decodeRecordsBatch,
   type Frame, DEFAULT_PORT, START_FROM_EARLIEST, START_FROM_LATEST, START_FROM_OFFSET,
 } from "./protocol/index.js";
 import { Subscription } from "./subscription.js";
-import { ValidationError } from "./errors.js";
+import { ServerError, ValidationError } from "./errors.js";
 import type {
   ClientOptions, PublishOptions, PublishResult, CreateStreamOptions,
   CreateConsumerOptions, SubscribeOptions, FetchOptions, FetchRecord,
@@ -35,7 +36,7 @@ export class ExspeedClient extends EventEmitter {
       const unsubs = Array.from(this.subscriptions.entries()).map(
         async ([name, { sub, conn }]) => {
           try {
-            const payload = encodeSubscribe(name);
+            const payload = encodeUnsubscribe(name, sub.subscriberId);
             await conn.request(OpCode.Unsubscribe, payload);
           } catch {}
           sub.close();
@@ -77,10 +78,15 @@ export class ExspeedClient extends EventEmitter {
   async subscribe(consumerName: string, options?: SubscribeOptions): Promise<Subscription & { unsubscribe(): Promise<void> }> {
     if (!consumerName) throw new ValidationError("Consumer name is required");
 
+    const subscriberId =
+      options?.subscriberId ?? `${this.opts.clientId}-${randomUUID()}`;
+
     const conn = this.createConnection();
     await conn.connect();
 
-    const sub = new Subscription(consumerName, { maxQueueSize: options?.maxQueueSize ?? 1000 });
+    const sub = new Subscription(consumerName, subscriberId, {
+      maxQueueSize: options?.maxQueueSize ?? 1000,
+    });
 
     const ackFn = async (cn: string, offset: bigint) => {
       const payload = encodeAck({ consumerName: cn, offset });
@@ -106,7 +112,9 @@ export class ExspeedClient extends EventEmitter {
 
     conn.on("reconnected", async () => {
       try {
-        const payload = encodeSubscribe(consumerName);
+        // Re-subscribe with the SAME subscriber_id so the server can rebuild
+        // the same subscription identity after reconnect.
+        const payload = encodeSubscribe(consumerName, subscriberId);
         await conn.request(OpCode.Subscribe, payload);
       } catch (err: any) {
         if (err?.code === 404) {
@@ -117,13 +125,13 @@ export class ExspeedClient extends EventEmitter {
       }
     });
 
-    const payload = encodeSubscribe(consumerName);
+    const payload = encodeSubscribe(consumerName, subscriberId);
     await conn.request(OpCode.Subscribe, payload);
     this.subscriptions.set(consumerName, { sub, conn });
 
     const unsubscribe = async () => {
       try {
-        const p = encodeSubscribe(consumerName);
+        const p = encodeUnsubscribe(consumerName, subscriberId);
         await conn.request(OpCode.Unsubscribe, p);
       } catch {}
       sub.close();
@@ -141,7 +149,12 @@ export class ExspeedClient extends EventEmitter {
       maxAgeSecs: BigInt(options?.maxAgeSecs ?? 0),
       maxBytes: BigInt(options?.maxBytes ?? 0),
     });
-    await this.mainConn.request(OpCode.CreateStream, payload);
+    try {
+      await this.mainConn.request(OpCode.CreateStream, payload);
+    } catch (e) {
+      if (options?.ifNotExists && e instanceof ServerError && e.code === 409) return;
+      throw e;
+    }
   }
 
   async createConsumer(options: CreateConsumerOptions): Promise<void> {
@@ -163,7 +176,12 @@ export class ExspeedClient extends EventEmitter {
       group: options.group ?? "", subjectFilter: options.subjectFilter ?? "",
       startFrom, startOffset,
     });
-    await this.mainConn.request(OpCode.CreateConsumer, payload);
+    try {
+      await this.mainConn.request(OpCode.CreateConsumer, payload);
+    } catch (e) {
+      if (options.ifNotExists && e instanceof ServerError && e.code === 409) return;
+      throw e;
+    }
   }
 
   async deleteConsumer(name: string): Promise<void> {

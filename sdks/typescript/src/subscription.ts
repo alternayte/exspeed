@@ -69,14 +69,20 @@ export interface SubscriptionOptions {
 
 export class Subscription extends EventEmitter implements AsyncIterable<Message> {
   readonly consumerName: string;
+  readonly subscriberId: string;
   private queue: QueueEntry[] = [];
   private readonly maxQueueSize: number;
   private _closed = false;
   private waiter: ((value: IteratorResult<Message>) => void) | null = null;
 
-  constructor(consumerName: string, options: SubscriptionOptions = { maxQueueSize: 1000 }) {
+  constructor(
+    consumerName: string,
+    subscriberId: string,
+    options: SubscriptionOptions = { maxQueueSize: 1000 },
+  ) {
     super();
     this.consumerName = consumerName;
+    this.subscriberId = subscriberId;
     this.maxQueueSize = options.maxQueueSize;
   }
 

@@ -51,7 +51,7 @@ describe("Message", () => {
 
 describe("Subscription", () => {
   it("yields messages pushed into it", async () => {
-    const sub = new Subscription("test-consumer", { maxQueueSize: 10 });
+    const sub = new Subscription("test-consumer", "test-sub-id", { maxQueueSize: 10 });
     sub.push(
       { consumerName: "test-consumer", offset: 0n, timestamp: 0n, subject: "s", deliveryAttempt: 1, value: Buffer.from("v"), headers: [] as [string, string][] },
       vi.fn(), vi.fn(),
@@ -67,7 +67,7 @@ describe("Subscription", () => {
   });
 
   it("emits slow event at 80% capacity", () => {
-    const sub = new Subscription("c", { maxQueueSize: 5 });
+    const sub = new Subscription("c", "test-sub-id", { maxQueueSize: 5 });
     const slowHandler = vi.fn();
     sub.on("slow", slowHandler);
 
@@ -81,7 +81,7 @@ describe("Subscription", () => {
   });
 
   it("emits error and drops oldest when queue overflows", () => {
-    const sub = new Subscription("c", { maxQueueSize: 2 });
+    const sub = new Subscription("c", "test-sub-id", { maxQueueSize: 2 });
     const errorHandler = vi.fn();
     sub.on("error", errorHandler);
 
