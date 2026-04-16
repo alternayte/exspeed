@@ -4,6 +4,10 @@ use std::time::Instant;
 use exspeed_common::{Offset, StreamName};
 use exspeed_streams::{StorageEngine, StoredRecord};
 
+/// Boxed future returned by the recursive `build_operator` helper.
+type BuildOperatorFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn Operator>, ExqlError>> + Send + 'a>>;
+
 use crate::error::ExqlError;
 use crate::external::connections::ConnectionRegistry;
 use crate::materialized_view::MaterializedViewRegistry;
@@ -86,7 +90,7 @@ fn build_operator<'a>(
     storage: &'a Arc<dyn StorageEngine>,
     connections: Option<&'a ConnectionRegistry>,
     mv_registry: Option<&'a MaterializedViewRegistry>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn Operator>, ExqlError>> + Send + 'a>> {
+) -> BuildOperatorFuture<'a> {
     Box::pin(async move {
     match plan {
         PhysicalPlan::SeqScan { stream, alias } => {
