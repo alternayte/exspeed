@@ -76,14 +76,24 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         warn!("failed to rebuild dedup state from log: {}", e);
     });
 
+    // Build consumer store (selects backend from EXSPEED_CONSUMER_STORE or EXSPEED_OFFSET_STORE)
+    let consumer_backend = std::env::var("EXSPEED_CONSUMER_STORE")
+        .or_else(|_| std::env::var("EXSPEED_OFFSET_STORE"))
+        .unwrap_or_else(|_| "file".to_string());
+    let consumer_store = exspeed_broker::consumer_store::from_env(&args.data_dir)
+        .await
+        .expect("failed to initialize consumer store");
+    info!(backend = consumer_backend.as_str(), "consumer store initialized");
+
     // Create broker
     let broker_append_for_connectors = broker_append.clone();
     let broker = Arc::new(Broker::new(
         storage.clone(),
         broker_append,
         args.data_dir.clone(),
+        consumer_store,
     ));
-    broker.load_consumers()?;
+    broker.load_consumers().await.map_err(|e| anyhow::anyhow!(e))?;
 
     // Create offset store (backend selected by EXSPEED_OFFSET_STORE env var)
     let offset_backend = std::env::var("EXSPEED_OFFSET_STORE").unwrap_or_else(|_| "file".to_string());
