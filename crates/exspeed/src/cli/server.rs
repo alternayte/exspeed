@@ -196,10 +196,10 @@ async fn handle_connection(
     let mut framed_read = FramedRead::new(reader, ExspeedCodec::new());
     let mut framed_write = FramedWrite::new(writer, ExspeedCodec::new());
 
-    // Per-connection subscription state (Phase 2b: single subscription per connection).
-    let mut active_subscription: Option<String> = None;
+    // Per-connection subscription state (single subscription per TCP connection).
+    // Tracks (consumer_name, subscriber_id) so disconnect cleanup removes the right subscriber.
+    let mut active_subscription: Option<(String, String)> = None;
     let mut delivery_rx: Option<mpsc::Receiver<DeliveryRecord>> = None;
-    // Dropping cancel_tx signals the delivery task to stop (oneshot cancellation).
     let mut cancel_tx: Option<oneshot::Sender<()>> = None;
 
     loop {
@@ -229,9 +229,17 @@ async fn handle_connection(
                                     .into_frame(correlation_id);
                                     framed_write.send(response).await?;
                                 } else {
-                                    match broker.subscribe(&req.consumer_name) {
+                                    // Auto-generate subscriber_id if client didn't provide one
+                                    // (legacy client, or new client opting out of explicit IDs).
+                                    let subscriber_id = if req.subscriber_id.is_empty() {
+                                        uuid::Uuid::new_v4().to_string()
+                                    } else {
+                                        req.subscriber_id.clone()
+                                    };
+
+                                    match broker.subscribe(&req.consumer_name, &subscriber_id) {
                                         Ok((rx, cancel)) => {
-                                            active_subscription = Some(req.consumer_name.clone());
+                                            active_subscription = Some((req.consumer_name.clone(), subscriber_id));
                                             delivery_rx = Some(rx);
                                             drop(cancel_tx.replace(cancel));
                                             framed_write
@@ -250,7 +258,18 @@ async fn handle_connection(
                                 }
                             }
                             Ok(ClientMessage::Unsubscribe(req)) => {
-                                let _ = broker.unsubscribe(&req.consumer_name);
+                                // Use the subscriber_id the client sent, or fall back to the one
+                                // the server generated on the Subscribe call (stored in active_subscription).
+                                let subscriber_id = if !req.subscriber_id.is_empty() {
+                                    req.subscriber_id.clone()
+                                } else if let Some((_, ref sub_id)) = active_subscription {
+                                    sub_id.clone()
+                                } else {
+                                    String::new()
+                                };
+                                if !subscriber_id.is_empty() {
+                                    let _ = broker.unsubscribe(&req.consumer_name, &subscriber_id);
+                                }
                                 drop(cancel_tx.take());
                                 delivery_rx = None;
                                 active_subscription = None;
@@ -295,6 +314,7 @@ async fn handle_connection(
                     let consumer_name = active_subscription
                         .as_ref()
                         .expect("delivery_rx is Some but active_subscription is None")
+                        .0
                         .clone();
                     let record_delivery = RecordDelivery {
                         consumer_name,
@@ -318,10 +338,10 @@ async fn handle_connection(
         }
     }
 
-    // Clean up: if this connection had an active subscription, unsubscribe so
-    // the consumer can be re-subscribed on a new connection.
-    if let Some(ref consumer_name) = active_subscription {
-        let _ = broker.unsubscribe(consumer_name);
+    // Clean up: if this connection had an active subscription, unsubscribe this
+    // specific subscriber so other subscribers on the same consumer are unaffected.
+    if let Some((ref consumer_name, ref subscriber_id)) = active_subscription {
+        let _ = broker.unsubscribe(consumer_name, subscriber_id);
     }
 
     Ok(())
