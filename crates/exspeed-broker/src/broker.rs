@@ -162,8 +162,8 @@ impl Broker {
             ClientMessage::Publish(req) => handlers::handle_publish(self, req).await,
             ClientMessage::Fetch(req) => handlers::handle_fetch(self, req).await,
             ClientMessage::CreateConsumer(req) => handlers::handle_create_consumer(self, req).await,
-            ClientMessage::DeleteConsumer(req) => handlers::handle_delete_consumer(self, req),
-            ClientMessage::Ack(req) => handlers::handle_ack(self, req),
+            ClientMessage::DeleteConsumer(req) => handlers::handle_delete_consumer(self, req).await,
+            ClientMessage::Ack(req) => handlers::handle_ack(self, req).await,
             ClientMessage::Nack(req) => handlers::handle_nack(self, req).await,
             ClientMessage::Seek(req) => handlers::handle_seek(self, req).await,
             ClientMessage::Connect(_) | ClientMessage::Ping => ServerMessage::Error {

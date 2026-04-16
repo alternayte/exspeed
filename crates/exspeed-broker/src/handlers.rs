@@ -8,7 +8,6 @@ use exspeed_streams::StorageError;
 
 use crate::broker::Broker;
 use crate::consumer_state::{ConsumerConfig, ConsumerGroup, ConsumerState};
-use crate::persistence;
 
 pub async fn handle_create_stream(broker: &Broker, req: CreateStreamRequest) -> ServerMessage {
     let stream_name = match StreamName::try_from(req.stream_name) {
@@ -183,7 +182,7 @@ pub async fn handle_create_consumer(broker: &Broker, req: CreateConsumerRequest)
     };
 
     // Persist to disk
-    if let Err(e) = persistence::save_consumer(&broker.data_dir, &config) {
+    if let Err(e) = broker.consumer_store.save(&config).await {
         return ServerMessage::Error {
             code: 500,
             message: format!("failed to persist consumer: {e}"),
@@ -214,7 +213,7 @@ pub async fn handle_create_consumer(broker: &Broker, req: CreateConsumerRequest)
     ServerMessage::Ok
 }
 
-pub fn handle_delete_consumer(broker: &Broker, req: DeleteConsumerRequest) -> ServerMessage {
+pub async fn handle_delete_consumer(broker: &Broker, req: DeleteConsumerRequest) -> ServerMessage {
     // Check consumer exists and get its group
     let group_name = {
         let consumers = broker.consumers.read().unwrap();
@@ -255,27 +254,21 @@ pub fn handle_delete_consumer(broker: &Broker, req: DeleteConsumerRequest) -> Se
     }
 
     // Delete persistence file (ignore errors if file doesn't exist)
-    let _ = persistence::delete_consumer(&broker.data_dir, &req.name);
+    let _ = broker.consumer_store.delete(&req.name).await;
 
     ServerMessage::Ok
 }
 
-pub fn handle_ack(broker: &Broker, req: AckRequest) -> ServerMessage {
-    // Look up consumer and update offset
-    {
+pub async fn handle_ack(broker: &Broker, req: AckRequest) -> ServerMessage {
+    // Look up consumer and update offset; clone config out to release lock before awaiting.
+    let config_to_save = {
         let mut consumers = broker.consumers.write().unwrap();
         match consumers.get_mut(&req.consumer_name) {
             Some(state) => {
                 if req.offset > state.config.offset {
                     state.config.offset = req.offset;
                 }
-                // Persist updated config
-                if let Err(e) = persistence::save_consumer(&broker.data_dir, &state.config) {
-                    return ServerMessage::Error {
-                        code: 500,
-                        message: format!("failed to persist consumer offset: {e}"),
-                    };
-                }
+                state.config.clone()
             }
             None => {
                 return ServerMessage::Error {
@@ -284,6 +277,14 @@ pub fn handle_ack(broker: &Broker, req: AckRequest) -> ServerMessage {
                 }
             }
         }
+    };
+
+    // Persist updated config
+    if let Err(e) = broker.consumer_store.save(&config_to_save).await {
+        return ServerMessage::Error {
+            code: 500,
+            message: format!("failed to persist consumer offset: {e}"),
+        };
     }
 
     // Clean up nack_attempts entries for this consumer where offset <= req.offset
@@ -410,15 +411,18 @@ pub async fn handle_nack(broker: &Broker, req: NackRequest) -> ServerMessage {
         }
 
         // Advance consumer offset past this record
-        {
+        let config_to_save = {
             let mut consumers = broker.consumers.write().unwrap();
-            if let Some(state) = consumers.get_mut(&req.consumer_name) {
+            consumers.get_mut(&req.consumer_name).map(|state| {
                 let new_offset = req.offset + 1;
                 if new_offset > state.config.offset {
                     state.config.offset = new_offset;
                 }
-                let _ = persistence::save_consumer(&broker.data_dir, &state.config);
-            }
+                state.config.clone()
+            })
+        };
+        if let Some(config_to_save) = config_to_save {
+            let _ = broker.consumer_store.save(&config_to_save).await;
         }
 
         // Remove from nack_attempts
@@ -458,12 +462,16 @@ pub async fn handle_seek(broker: &Broker, req: SeekRequest) -> ServerMessage {
 
     match broker.storage.seek_by_time(&stream_name, req.timestamp).await {
         Ok(offset) => {
-            // Re-acquire lock after .await to update consumer state
-            let mut consumers = broker.consumers.write().unwrap();
-            if let Some(consumer) = consumers.get_mut(&consumer_name) {
-                consumer.config.offset = offset.0;
-                // Persist
-                if let Err(e) = persistence::save_consumer(&broker.data_dir, &consumer.config) {
+            // Re-acquire lock after .await to update consumer state; clone config out before awaiting the store.
+            let config_to_save = {
+                let mut consumers = broker.consumers.write().unwrap();
+                consumers.get_mut(&consumer_name).map(|consumer| {
+                    consumer.config.offset = offset.0;
+                    consumer.config.clone()
+                })
+            };
+            if let Some(config_to_save) = config_to_save {
+                if let Err(e) = broker.consumer_store.save(&config_to_save).await {
                     return ServerMessage::Error {
                         code: 500,
                         message: format!("persist failed: {e}"),
