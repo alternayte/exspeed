@@ -12,6 +12,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+use tokio::sync::mpsc;
+
 use async_trait::async_trait;
 use exspeed_common::{Offset, StreamName};
 use exspeed_streams::{Record, StorageEngine, StorageError, StoredRecord};
@@ -22,6 +24,7 @@ use crate::file::stream_config::StreamConfig;
 struct FileStorageInner {
     data_dir: PathBuf,
     partitions: RwLock<HashMap<(String, u32), Partition>>,
+    seal_tx: std::sync::Mutex<Option<mpsc::UnboundedSender<partition::SealedSegmentInfo>>>,
 }
 
 /// File-backed storage engine.
@@ -45,6 +48,7 @@ impl FileStorage {
             inner: Arc::new(FileStorageInner {
                 data_dir: data_dir.to_path_buf(),
                 partitions: RwLock::new(HashMap::new()),
+                seal_tx: std::sync::Mutex::new(None),
             }),
         })
     }
@@ -92,6 +96,7 @@ impl FileStorage {
             inner: Arc::new(FileStorageInner {
                 data_dir: data_dir.to_path_buf(),
                 partitions: RwLock::new(partitions),
+                seal_tx: std::sync::Mutex::new(None),
             }),
         })
     }
@@ -137,6 +142,20 @@ impl FileStorage {
             .join("partitions")
             .join(partition.to_string())
     }
+
+    /// Register a notification sender for sealed (rolled) segments.
+    ///
+    /// Sets the sender on all existing partitions and stores it so that
+    /// partitions created later will also receive the sender.
+    pub fn set_seal_notifier(&self, tx: mpsc::UnboundedSender<partition::SealedSegmentInfo>) {
+        // Set on all existing partitions.
+        let mut map = self.inner.partitions.write().unwrap();
+        for partition in map.values_mut() {
+            partition.set_seal_notifier(tx.clone());
+        }
+        // Store for new partitions created later.
+        *self.inner.seal_tx.lock().unwrap() = Some(tx);
+    }
 }
 
 impl FileStorage {
@@ -179,7 +198,10 @@ impl FileStorage {
         }
 
         let dir = self.partition_dir(stream.as_str(), 0);
-        let partition = Partition::create(&dir, stream.as_str(), 0)?;
+        let mut partition = Partition::create(&dir, stream.as_str(), 0)?;
+        if let Some(ref tx) = *self.inner.seal_tx.lock().unwrap() {
+            partition.set_seal_notifier(tx.clone());
+        }
         map.insert(key, partition);
 
         // Save stream config

@@ -5,6 +5,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use tokio::sync::mpsc;
+
 use exspeed_common::Offset;
 use exspeed_streams::record::{Record, StoredRecord};
 use tracing::info;
@@ -25,6 +27,22 @@ pub struct RetentionStats {
     pub bytes_reclaimed: u64,
 }
 
+/// Information about a segment that has just been sealed (rolled).
+/// Sent via the notification channel so that background tasks (e.g. S3 upload)
+/// can act on the newly sealed segment.
+#[derive(Debug, Clone)]
+pub struct SealedSegmentInfo {
+    pub stream_name: String,
+    pub partition_id: u32,
+    pub seg_path: PathBuf,
+    pub base_offset: u64,
+    pub end_offset: u64,
+    pub size_bytes: u64,
+    pub record_count: u64,
+    pub first_timestamp: u64,
+    pub last_timestamp: u64,
+}
+
 fn now_nanos() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -43,6 +61,7 @@ pub struct Partition {
     stream_name: String,
     partition_id: u32,
     segment_max_bytes: u64,
+    seal_tx: Option<mpsc::UnboundedSender<SealedSegmentInfo>>,
 }
 
 impl Partition {
@@ -62,6 +81,7 @@ impl Partition {
             stream_name: stream_name.to_string(),
             partition_id,
             segment_max_bytes: DEFAULT_SEGMENT_MAX_BYTES,
+            seal_tx: None,
         })
     }
 
@@ -154,6 +174,7 @@ impl Partition {
             stream_name: stream_name.to_string(),
             partition_id,
             segment_max_bytes: DEFAULT_SEGMENT_MAX_BYTES,
+            seal_tx: None,
         })
     }
 
@@ -322,6 +343,16 @@ impl Partition {
         sealed + self.active_writer.bytes_written()
     }
 
+    /// Set the notification sender for sealed segments.
+    pub fn set_seal_notifier(&mut self, tx: mpsc::UnboundedSender<SealedSegmentInfo>) {
+        self.seal_tx = Some(tx);
+    }
+
+    /// Clone the seal notification sender, if one has been set.
+    pub fn seal_tx_clone(&self) -> Option<mpsc::UnboundedSender<SealedSegmentInfo>> {
+        self.seal_tx.clone()
+    }
+
     /// Override the segment max bytes threshold (for testing).
     #[cfg(test)]
     pub(crate) fn set_segment_max_bytes(&mut self, max: u64) {
@@ -340,6 +371,20 @@ impl Partition {
 
         // Open the current segment as a sealed reader (will load the new index files).
         let sealed = SegmentReader::open(&seg_path)?;
+
+        // Collect metadata for the sealed segment notification.
+        let info = SealedSegmentInfo {
+            stream_name: self.stream_name.clone(),
+            partition_id: self.partition_id,
+            seg_path: seg_path.clone(),
+            base_offset: sealed.base_offset(),
+            end_offset: self.next_offset.saturating_sub(1),
+            size_bytes: sealed.file_size(),
+            record_count: 0, // Not tracked per-segment currently
+            first_timestamp: sealed.first_timestamp().unwrap_or(0),
+            last_timestamp: sealed.last_timestamp().unwrap_or(0),
+        };
+
         self.sealed_readers.push(sealed);
 
         // Create a new segment.
@@ -347,6 +392,11 @@ impl Partition {
 
         // Truncate the WAL — all records prior to this point are in sealed segments.
         self.wal.truncate()?;
+
+        // Send sealed-segment notification (non-blocking, best-effort).
+        if let Some(ref tx) = self.seal_tx {
+            let _ = tx.send(info);
+        }
 
         Ok(())
     }

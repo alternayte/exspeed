@@ -2,6 +2,7 @@ use s3::creds::Credentials;
 use s3::{Bucket, Region};
 
 /// Configuration for S3-backed tiered storage, built from environment variables.
+#[derive(Debug)]
 pub struct S3Config {
     pub bucket: Box<Bucket>,
     pub prefix: String,
