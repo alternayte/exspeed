@@ -60,7 +60,7 @@ impl Broker {
                 consumer_name.clone(),
                 ConsumerState {
                     config,
-                    delivery_tx: None,
+                    subscribers: std::collections::HashMap::new(),
                 },
             );
 
@@ -75,49 +75,62 @@ impl Broker {
         Ok(())
     }
 
-    /// Subscribe a consumer: start the delivery task, return the channel receiver.
-    /// Called by the connection handler (not by handle_message — needs async context).
+    /// Subscribe a specific `subscriber_id` to a consumer. Starts a delivery task
+    /// for this subscriber and returns the channel receiver plus a cancel sender
+    /// (dropping the cancel sender stops the delivery task).
+    ///
+    /// - Non-grouped consumer: only one subscriber allowed. Second call returns
+    ///   "consumer already subscribed".
+    /// - Grouped consumer: multiple subscribers allowed, keyed by `subscriber_id`.
+    ///   A duplicate `subscriber_id` returns "subscriber_id already active".
     pub fn subscribe(
         &self,
         consumer_name: &str,
+        subscriber_id: &str,
     ) -> Result<(mpsc::Receiver<DeliveryRecord>, oneshot::Sender<()>), String> {
-        // 1. Look up the consumer.
+        if subscriber_id.is_empty() {
+            return Err("subscriber_id is required".to_string());
+        }
+
         let mut consumers = self.consumers.write().unwrap();
         let consumer = consumers
             .get_mut(consumer_name)
             .ok_or_else(|| format!("consumer '{}' not found", consumer_name))?;
 
-        // 2. Must not already be subscribed.
-        if consumer.delivery_tx.is_some() {
+        let is_grouped = !consumer.config.group.is_empty();
+
+        if !is_grouped && !consumer.subscribers.is_empty() {
+            return Err(format!("consumer '{}' is already subscribed", consumer_name));
+        }
+
+        if consumer.subscribers.contains_key(subscriber_id) {
             return Err(format!(
-                "consumer '{}' is already subscribed",
-                consumer_name
+                "subscriber_id '{}' already active for consumer '{}'",
+                subscriber_id, consumer_name
             ));
         }
 
-        // 3. Create mpsc channel for delivery records.
+        // Create mpsc channel for delivery records.
         let (tx, rx) = mpsc::channel::<DeliveryRecord>(1000);
+        // Cancel channel kept inside the broker (dropped on unsubscribe).
+        let (cancel_tx_store, cancel_rx_store) = oneshot::channel::<()>();
+        // Cancel channel returned to the caller (dropped on disconnect).
+        let (caller_cancel_tx, caller_cancel_rx) = oneshot::channel::<()>();
 
-        // 4. Create oneshot for cancellation.
-        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-
-        // 5. Store tx clone in consumer state.
-        consumer.delivery_tx = Some(tx.clone());
-
-        // 6. Build DeliveryConfig from consumer config.
+        // Build DeliveryConfig.
         let delivery_config = DeliveryConfig {
             consumer_name: consumer.config.name.clone(),
             stream_name: consumer.config.stream.clone(),
             subject_filter: consumer.config.subject_filter.clone(),
             start_offset: consumer.config.offset,
-            group_name: if consumer.config.group.is_empty() {
-                None
-            } else {
+            group_name: if is_grouped {
                 Some(consumer.config.group.clone())
+            } else {
+                None
             },
         };
 
-        // 7. Build group_members watch channel if consumer is in a group.
+        // Build group_members watch if grouped.
         let group_members = if let Some(ref group_name) = delivery_config.group_name {
             let groups = self.groups.read().unwrap();
             let members = groups
@@ -125,8 +138,6 @@ impl Broker {
                 .map(|g| g.members.clone())
                 .unwrap_or_default();
             let (watch_tx, watch_rx) = watch::channel(members);
-            // Leak the sender so the receiver stays valid.
-            // Proper rebalance would store it for later broadcasts.
             std::mem::forget(watch_tx);
             Some(watch_rx)
         } else {
@@ -135,24 +146,39 @@ impl Broker {
 
         let storage = Arc::clone(&self.storage);
 
-        // 8. Spawn the delivery task.
+        // Store the subscriber state in the consumer's subscribers map.
+        consumer.subscribers.insert(
+            subscriber_id.to_string(),
+            crate::consumer_state::SubscriberState {
+                delivery_tx: tx.clone(),
+                cancel_tx: cancel_tx_store,
+            },
+        );
+
+        // Spawn delivery task. Completes when either cancel channel fires, or when
+        // run_delivery itself returns (e.g., client dropped the rx).
         tokio::spawn(async move {
-            run_delivery(delivery_config, storage, tx, cancel_rx, group_members).await;
+            tokio::select! {
+                _ = cancel_rx_store => {}
+                _ = caller_cancel_rx => {}
+                _ = run_delivery(delivery_config, storage, tx, group_members) => {}
+            }
         });
 
-        // 9. Return the receiver and cancel sender.
-        Ok((rx, cancel_tx))
+        Ok((rx, caller_cancel_tx))
     }
 
-    /// Unsubscribe a consumer: stop the delivery task.
-    pub fn unsubscribe(&self, consumer_name: &str) -> Result<(), String> {
+    /// Unsubscribe a specific subscriber from a consumer.
+    /// No-op if the subscriber_id is not active (idempotent).
+    pub fn unsubscribe(&self, consumer_name: &str, subscriber_id: &str) -> Result<(), String> {
         let mut consumers = self.consumers.write().unwrap();
         let consumer = consumers
             .get_mut(consumer_name)
             .ok_or_else(|| format!("consumer '{}' not found", consumer_name))?;
 
-        // Dropping the sender signals the delivery task to stop.
-        consumer.delivery_tx = None;
+        // Removing drops the SubscriberState, which drops cancel_tx, which
+        // signals the delivery task via the tokio::select! to exit.
+        consumer.subscribers.remove(subscriber_id);
         Ok(())
     }
 

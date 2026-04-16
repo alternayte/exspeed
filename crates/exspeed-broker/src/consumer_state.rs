@@ -1,4 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
@@ -35,9 +36,19 @@ pub struct DeliveryRecord {
 // ConsumerState — runtime state (not persisted)
 // ---------------------------------------------------------------------------
 
+/// Runtime state for a single active subscriber of a consumer.
+pub struct SubscriberState {
+    /// Channel sender used to deliver records to this subscriber.
+    pub delivery_tx: mpsc::Sender<DeliveryRecord>,
+    /// Oneshot sender; dropping it signals the delivery task to stop.
+    pub cancel_tx: tokio::sync::oneshot::Sender<()>,
+}
+
 pub struct ConsumerState {
     pub config: ConsumerConfig,
-    pub delivery_tx: Option<mpsc::Sender<DeliveryRecord>>,
+    /// Active subscribers keyed by subscriber_id.
+    /// For non-grouped consumers this map holds at most one entry.
+    pub subscribers: HashMap<String, SubscriberState>,
 }
 
 // ---------------------------------------------------------------------------

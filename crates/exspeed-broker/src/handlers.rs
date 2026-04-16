@@ -196,7 +196,7 @@ pub async fn handle_create_consumer(broker: &Broker, req: CreateConsumerRequest)
             req.name.clone(),
             ConsumerState {
                 config,
-                delivery_tx: None,
+                subscribers: std::collections::HashMap::new(),
             },
         );
     }

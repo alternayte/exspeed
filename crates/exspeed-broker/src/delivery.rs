@@ -2,7 +2,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, watch};
 
 use exspeed_common::{subject_matches, Offset, StreamName};
 use exspeed_streams::StorageEngine;
@@ -29,7 +29,6 @@ pub async fn run_delivery(
     config: DeliveryConfig,
     storage: Arc<dyn StorageEngine>,
     tx: mpsc::Sender<DeliveryRecord>,
-    mut cancel_rx: oneshot::Receiver<()>,
     group_members: Option<watch::Receiver<Vec<String>>>,
 ) {
     // Parse stream name; exit silently if invalid.
@@ -43,11 +42,6 @@ pub async fn run_delivery(
     let batch_size: usize = 100;
 
     loop {
-        // (a) Check cancellation (non-blocking).
-        if cancel_rx.try_recv().is_ok() {
-            break;
-        }
-
         // (b) Read a batch from storage.
         let records = match storage.read(&stream_name, Offset(current_offset), batch_size).await {
             Ok(recs) => recs,
