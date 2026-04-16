@@ -260,7 +260,38 @@ pub async fn handle_delete_consumer(broker: &Broker, req: DeleteConsumerRequest)
 }
 
 pub async fn handle_ack(broker: &Broker, req: AckRequest) -> ServerMessage {
-    // Look up consumer and update offset; clone config out to release lock before awaiting.
+    // Check if the consumer is grouped; also clone out the group name.
+    let group_opt = {
+        let consumers = broker.consumers.read().unwrap();
+        match consumers.get(&req.consumer_name) {
+            Some(state) => {
+                if state.config.group.is_empty() {
+                    None
+                } else {
+                    Some(state.config.group.clone())
+                }
+            }
+            None => {
+                return ServerMessage::Error {
+                    code: 404,
+                    message: format!("consumer '{}' not found", req.consumer_name),
+                }
+            }
+        }
+    };
+
+    if let Some(group) = group_opt {
+        // Grouped: route to coordinator.
+        if let Err(e) = broker.work_coordinator.ack(&group, req.offset).await {
+            return ServerMessage::Error {
+                code: 500,
+                message: format!("coordinator ack failed: {e}"),
+            };
+        }
+        return ServerMessage::Ok;
+    }
+
+    // Non-grouped: existing behavior — bump local offset and persist.
     let config_to_save = {
         let mut consumers = broker.consumers.write().unwrap();
         match consumers.get_mut(&req.consumer_name) {
@@ -279,7 +310,6 @@ pub async fn handle_ack(broker: &Broker, req: AckRequest) -> ServerMessage {
         }
     };
 
-    // Persist updated config
     if let Err(e) = broker.consumer_store.save(&config_to_save).await {
         return ServerMessage::Error {
             code: 500,
@@ -287,7 +317,6 @@ pub async fn handle_ack(broker: &Broker, req: AckRequest) -> ServerMessage {
         };
     }
 
-    // Clean up nack_attempts entries for this consumer where offset <= req.offset
     {
         let mut nack_attempts = broker.nack_attempts.write().unwrap();
         nack_attempts
@@ -298,14 +327,18 @@ pub async fn handle_ack(broker: &Broker, req: AckRequest) -> ServerMessage {
 }
 
 pub async fn handle_nack(broker: &Broker, req: NackRequest) -> ServerMessage {
-    // Look up consumer
-    let (stream, _subject_filter) = {
+    // Extract group + stream under lock.
+    let (group_opt, stream) = {
         let consumers = broker.consumers.read().unwrap();
         match consumers.get(&req.consumer_name) {
-            Some(state) => (
-                state.config.stream.clone(),
-                state.config.subject_filter.clone(),
-            ),
+            Some(state) => {
+                let group = if state.config.group.is_empty() {
+                    None
+                } else {
+                    Some(state.config.group.clone())
+                };
+                (group, state.config.stream.clone())
+            }
             None => {
                 return ServerMessage::Error {
                     code: 404,
@@ -315,18 +348,29 @@ pub async fn handle_nack(broker: &Broker, req: NackRequest) -> ServerMessage {
         }
     };
 
-    // Increment attempt count
-    let attempts = {
-        let mut nack_attempts = broker.nack_attempts.write().unwrap();
-        let entry = nack_attempts
-            .entry((req.consumer_name.clone(), req.offset))
-            .or_insert(0);
-        *entry += 1;
-        *entry
+    // Compute attempts count.
+    let attempts: u16 = match group_opt.as_ref() {
+        Some(group) => match broker.work_coordinator.nack(group, req.offset).await {
+            Ok(a) => a as u16,
+            Err(e) => {
+                return ServerMessage::Error {
+                    code: 500,
+                    message: format!("coordinator nack failed: {e}"),
+                };
+            }
+        },
+        None => {
+            let mut nack_attempts = broker.nack_attempts.write().unwrap();
+            let entry = nack_attempts
+                .entry((req.consumer_name.clone(), req.offset))
+                .or_insert(0);
+            *entry += 1;
+            *entry
+        }
     };
 
     if attempts >= broker.max_delivery_attempts {
-        // Read the record at the NACKed offset from storage
+        // Route to DLQ.
         let stream_name = match StreamName::try_from(stream.clone()) {
             Ok(n) => n,
             Err(e) => {
@@ -357,7 +401,6 @@ pub async fn handle_nack(broker: &Broker, req: NackRequest) -> ServerMessage {
             }
         };
 
-        // Build DLQ headers
         let mut dlq_headers = record.headers.clone();
         dlq_headers.push(("x-exspeed-original-stream".to_string(), stream.clone()));
         dlq_headers.push((
@@ -371,7 +414,6 @@ pub async fn handle_nack(broker: &Broker, req: NackRequest) -> ServerMessage {
         dlq_headers.push(("x-exspeed-failure-count".to_string(), attempts.to_string()));
         dlq_headers.push(("x-exspeed-consumer".to_string(), req.consumer_name.clone()));
 
-        // Create/ensure DLQ stream exists
         let dlq_stream_str = format!("{stream}-dlq");
         let dlq_stream_name = match StreamName::try_from(dlq_stream_str.clone()) {
             Ok(n) => n,
@@ -383,7 +425,6 @@ pub async fn handle_nack(broker: &Broker, req: NackRequest) -> ServerMessage {
             }
         };
 
-        // Ignore StreamAlreadyExists error
         match broker.storage.create_stream(&dlq_stream_name, 0, 0).await {
             Ok(()) => {}
             Err(StorageError::StreamAlreadyExists(_)) => {}
@@ -395,7 +436,6 @@ pub async fn handle_nack(broker: &Broker, req: NackRequest) -> ServerMessage {
             }
         }
 
-        // Publish record to DLQ
         let dlq_record = Record {
             key: record.key.clone(),
             value: record.value.clone(),
@@ -410,23 +450,25 @@ pub async fn handle_nack(broker: &Broker, req: NackRequest) -> ServerMessage {
             };
         }
 
-        // Advance consumer offset past this record
-        let config_to_save = {
-            let mut consumers = broker.consumers.write().unwrap();
-            consumers.get_mut(&req.consumer_name).map(|state| {
-                let new_offset = req.offset + 1;
-                if new_offset > state.config.offset {
-                    state.config.offset = new_offset;
-                }
-                state.config.clone()
-            })
-        };
-        if let Some(config_to_save) = config_to_save {
-            let _ = broker.consumer_store.save(&config_to_save).await;
-        }
-
-        // Remove from nack_attempts
-        {
+        // Advance past this record in the respective offset tracking system.
+        if let Some(group) = group_opt {
+            // Grouped: ack in the coordinator to remove from pending.
+            let _ = broker.work_coordinator.ack(&group, req.offset).await;
+        } else {
+            // Non-grouped: advance consumer offset in ConsumerStore.
+            let config_to_save = {
+                let mut consumers = broker.consumers.write().unwrap();
+                consumers.get_mut(&req.consumer_name).map(|state| {
+                    let new_offset = req.offset + 1;
+                    if new_offset > state.config.offset {
+                        state.config.offset = new_offset;
+                    }
+                    state.config.clone()
+                })
+            };
+            if let Some(cfg) = config_to_save {
+                let _ = broker.consumer_store.save(&cfg).await;
+            }
             let mut nack_attempts = broker.nack_attempts.write().unwrap();
             nack_attempts.remove(&(req.consumer_name.clone(), req.offset));
         }
