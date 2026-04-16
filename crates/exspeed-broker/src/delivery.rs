@@ -113,6 +113,7 @@ async fn run_ungrouped(
 // Grouped delivery: coordinator-driven work distribution across subscribers.
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn run_grouped(
     group: String,
     config: DeliveryConfig,
