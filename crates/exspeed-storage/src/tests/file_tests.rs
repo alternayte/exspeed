@@ -24,18 +24,19 @@ fn record(value: &[u8]) -> Record {
 
 /// Create FileStorage, create stream, write 10 records, drop (simulate crash),
 /// reopen with FileStorage::open, read all 10, verify offsets 0-9.
-#[test]
-fn crash_recovery_replays_wal() {
+#[tokio::test]
+async fn crash_recovery_replays_wal() {
     let dir = TempDir::new().unwrap();
 
     // Phase 1: write records, then drop to simulate crash.
     {
         let storage = FileStorage::new(dir.path()).unwrap();
-        storage.create_stream(&stream("crash"), 0, 0).unwrap();
+        storage.create_stream(&stream("crash"), 0, 0).await.unwrap();
         for i in 0u64..10 {
             let val = format!("val-{}", i);
             let offset = storage
                 .append(&stream("crash"), &record(val.as_bytes()))
+                .await
                 .unwrap();
             assert_eq!(offset, Offset(i));
         }
@@ -45,7 +46,7 @@ fn crash_recovery_replays_wal() {
     // Phase 2: reopen and verify all records survived.
     {
         let storage = FileStorage::open(dir.path()).unwrap();
-        let records = storage.read(&stream("crash"), Offset(0), 100).unwrap();
+        let records = storage.read(&stream("crash"), Offset(0), 100).await.unwrap();
         assert_eq!(records.len(), 10);
         for i in 0u64..10 {
             assert_eq!(records[i as usize].offset, Offset(i));
@@ -57,22 +58,23 @@ fn crash_recovery_replays_wal() {
 
 /// Create storage, create stream, write 1 record,
 /// drop, reopen with FileStorage::open, read back, verify data.
-#[test]
-fn data_persists_across_restart() {
+#[tokio::test]
+async fn data_persists_across_restart() {
     let dir = TempDir::new().unwrap();
 
     {
         let storage = FileStorage::new(dir.path()).unwrap();
-        storage.create_stream(&stream("persist"), 0, 0).unwrap();
+        storage.create_stream(&stream("persist"), 0, 0).await.unwrap();
         storage
             .append(&stream("persist"), &record(b"p0-data"))
+            .await
             .unwrap();
     }
 
     {
         let storage = FileStorage::open(dir.path()).unwrap();
 
-        let p0 = storage.read(&stream("persist"), Offset(0), 10).unwrap();
+        let p0 = storage.read(&stream("persist"), Offset(0), 10).await.unwrap();
         assert_eq!(p0.len(), 1);
         assert_eq!(p0[0].offset, Offset(0));
         assert_eq!(p0[0].value, Bytes::from_static(b"p0-data"));
@@ -81,21 +83,22 @@ fn data_persists_across_restart() {
 
 /// Create storage, create stream, write 1000 records, read all 1000 back,
 /// verify offsets 0-999 and first/last values.
-#[test]
-fn segment_rolling() {
+#[tokio::test]
+async fn segment_rolling() {
     let dir = TempDir::new().unwrap();
     let storage = FileStorage::new(dir.path()).unwrap();
-    storage.create_stream(&stream("rolling"), 0, 0).unwrap();
+    storage.create_stream(&stream("rolling"), 0, 0).await.unwrap();
 
     for i in 0u64..1000 {
         let val = format!("rec-{:04}", i);
         let offset = storage
             .append(&stream("rolling"), &record(val.as_bytes()))
+            .await
             .unwrap();
         assert_eq!(offset, Offset(i));
     }
 
-    let records = storage.read(&stream("rolling"), Offset(0), 1000).unwrap();
+    let records = storage.read(&stream("rolling"), Offset(0), 1000).await.unwrap();
     assert_eq!(records.len(), 1000);
     assert_eq!(records[0].offset, Offset(0));
     assert_eq!(records[0].value, Bytes::from(String::from("rec-0000")));
@@ -104,19 +107,20 @@ fn segment_rolling() {
 }
 
 /// THE MILESTONE TEST: 10,000 records, crash, recover, verify everything.
-#[test]
-fn milestone_10k_records_crash_recover() {
+#[tokio::test]
+async fn milestone_10k_records_crash_recover() {
     let dir = TempDir::new().unwrap();
 
     // Phase 1: write 10,000 records then drop (crash).
     {
         let storage = FileStorage::new(dir.path()).unwrap();
-        storage.create_stream(&stream("milestone"), 0, 0).unwrap();
+        storage.create_stream(&stream("milestone"), 0, 0).await.unwrap();
 
         for i in 0u64..10_000 {
             let val = format!("record-{:05}", i);
             let offset = storage
                 .append(&stream("milestone"), &record(val.as_bytes()))
+                .await
                 .unwrap();
             assert_eq!(offset, Offset(i));
         }
@@ -127,6 +131,7 @@ fn milestone_10k_records_crash_recover() {
         let storage = FileStorage::open(dir.path()).unwrap();
         let records = storage
             .read(&stream("milestone"), Offset(0), 10_000)
+            .await
             .unwrap();
 
         assert_eq!(
@@ -251,33 +256,35 @@ fn retention_deletes_oldest_segments_by_size() {
     );
 }
 
-#[test]
-fn list_streams() {
+#[tokio::test]
+async fn list_streams() {
     let dir = TempDir::new().unwrap();
     let storage = FileStorage::new(dir.path()).unwrap();
-    storage.create_stream(&stream("alpha"), 0, 0).unwrap();
-    storage.create_stream(&stream("beta"), 0, 0).unwrap();
+    storage.create_stream(&stream("alpha"), 0, 0).await.unwrap();
+    storage.create_stream(&stream("beta"), 0, 0).await.unwrap();
     let names = storage.list_streams();
     assert_eq!(names, vec!["alpha", "beta"]);
 }
 
-#[test]
-fn stream_storage_bytes_and_head_offset() {
+#[tokio::test]
+async fn stream_storage_bytes_and_head_offset() {
     let dir = TempDir::new().unwrap();
     let storage = FileStorage::new(dir.path()).unwrap();
     storage
         .create_stream(&stream("metrics-test"), 0, 0)
+        .await
         .unwrap();
     assert_eq!(storage.stream_head_offset("metrics-test"), Some(0));
     storage
         .append(&stream("metrics-test"), &record(b"data"))
+        .await
         .unwrap();
     assert_eq!(storage.stream_head_offset("metrics-test"), Some(1));
     assert!(storage.stream_storage_bytes("metrics-test").unwrap() > 0);
 }
 
-#[test]
-fn nonexistent_stream_query_returns_none() {
+#[tokio::test]
+async fn nonexistent_stream_query_returns_none() {
     let dir = TempDir::new().unwrap();
     let storage = FileStorage::new(dir.path()).unwrap();
     assert!(storage.stream_storage_bytes("nope").is_none());

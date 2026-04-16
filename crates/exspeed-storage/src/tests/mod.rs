@@ -7,54 +7,54 @@ mod memory_tests {
     use super::trait_tests;
     use crate::memory::MemoryStorage;
 
-    #[test]
-    fn create_and_append() {
-        trait_tests::test_create_and_append(&MemoryStorage::new());
+    #[tokio::test]
+    async fn create_and_append() {
+        trait_tests::test_create_and_append(&MemoryStorage::new()).await;
     }
 
-    #[test]
-    fn append_and_read_back() {
-        trait_tests::test_append_and_read_back(&MemoryStorage::new());
+    #[tokio::test]
+    async fn append_and_read_back() {
+        trait_tests::test_append_and_read_back(&MemoryStorage::new()).await;
     }
 
-    #[test]
-    fn sequential_offsets() {
-        trait_tests::test_sequential_offsets(&MemoryStorage::new());
+    #[tokio::test]
+    async fn sequential_offsets() {
+        trait_tests::test_sequential_offsets(&MemoryStorage::new()).await;
     }
 
-    #[test]
-    fn read_range() {
-        trait_tests::test_read_range(&MemoryStorage::new());
+    #[tokio::test]
+    async fn read_range() {
+        trait_tests::test_read_range(&MemoryStorage::new()).await;
     }
 
-    #[test]
-    fn read_empty_stream() {
-        trait_tests::test_read_empty_stream(&MemoryStorage::new());
+    #[tokio::test]
+    async fn read_empty_stream() {
+        trait_tests::test_read_empty_stream(&MemoryStorage::new()).await;
     }
 
-    #[test]
-    fn read_past_end() {
-        trait_tests::test_read_past_end(&MemoryStorage::new());
+    #[tokio::test]
+    async fn read_past_end() {
+        trait_tests::test_read_past_end(&MemoryStorage::new()).await;
     }
 
-    #[test]
-    fn stream_not_found() {
-        trait_tests::test_stream_not_found(&MemoryStorage::new());
+    #[tokio::test]
+    async fn stream_not_found() {
+        trait_tests::test_stream_not_found(&MemoryStorage::new()).await;
     }
 
-    #[test]
-    fn stream_already_exists() {
-        trait_tests::test_stream_already_exists(&MemoryStorage::new());
+    #[tokio::test]
+    async fn stream_already_exists() {
+        trait_tests::test_stream_already_exists(&MemoryStorage::new()).await;
     }
 
-    #[test]
-    fn timestamps_increasing() {
-        trait_tests::test_timestamps_increasing(&MemoryStorage::new());
+    #[tokio::test]
+    async fn timestamps_increasing() {
+        trait_tests::test_timestamps_increasing(&MemoryStorage::new()).await;
     }
 
-    #[test]
-    fn seek_by_time() {
-        trait_tests::test_seek_by_time(&MemoryStorage::new());
+    #[tokio::test]
+    async fn seek_by_time() {
+        trait_tests::test_seek_by_time(&MemoryStorage::new()).await;
     }
 }
 
@@ -69,63 +69,63 @@ mod file_trait_tests {
         (storage, dir) // keep TempDir alive so directory isn't deleted
     }
 
-    #[test]
-    fn create_and_append() {
+    #[tokio::test]
+    async fn create_and_append() {
         let (s, _d) = make_storage();
-        trait_tests::test_create_and_append(&s);
+        trait_tests::test_create_and_append(&s).await;
     }
 
-    #[test]
-    fn append_and_read_back() {
+    #[tokio::test]
+    async fn append_and_read_back() {
         let (s, _d) = make_storage();
-        trait_tests::test_append_and_read_back(&s);
+        trait_tests::test_append_and_read_back(&s).await;
     }
 
-    #[test]
-    fn sequential_offsets() {
+    #[tokio::test]
+    async fn sequential_offsets() {
         let (s, _d) = make_storage();
-        trait_tests::test_sequential_offsets(&s);
+        trait_tests::test_sequential_offsets(&s).await;
     }
 
-    #[test]
-    fn read_range() {
+    #[tokio::test]
+    async fn read_range() {
         let (s, _d) = make_storage();
-        trait_tests::test_read_range(&s);
+        trait_tests::test_read_range(&s).await;
     }
 
-    #[test]
-    fn read_empty_stream() {
+    #[tokio::test]
+    async fn read_empty_stream() {
         let (s, _d) = make_storage();
-        trait_tests::test_read_empty_stream(&s);
+        trait_tests::test_read_empty_stream(&s).await;
     }
 
-    #[test]
-    fn read_past_end() {
+    #[tokio::test]
+    async fn read_past_end() {
         let (s, _d) = make_storage();
-        trait_tests::test_read_past_end(&s);
+        trait_tests::test_read_past_end(&s).await;
     }
 
-    #[test]
-    fn stream_not_found() {
+    #[tokio::test]
+    async fn stream_not_found() {
         let (s, _d) = make_storage();
-        trait_tests::test_stream_not_found(&s);
+        trait_tests::test_stream_not_found(&s).await;
     }
 
-    #[test]
-    fn stream_already_exists() {
+    #[tokio::test]
+    async fn stream_already_exists() {
         let (s, _d) = make_storage();
-        trait_tests::test_stream_already_exists(&s);
+        trait_tests::test_stream_already_exists(&s).await;
     }
 
-    #[test]
-    fn timestamps_increasing() {
+    #[tokio::test]
+    async fn timestamps_increasing() {
         let (s, _d) = make_storage();
-        trait_tests::test_timestamps_increasing(&s);
+        trait_tests::test_timestamps_increasing(&s).await;
     }
 
-    #[test]
-    fn seek_by_time() {
+    #[tokio::test]
+    async fn seek_by_time() {
         let (s, _d) = make_storage();
-        trait_tests::test_seek_by_time(&s);
+        trait_tests::test_seek_by_time(&s).await;
     }
 }

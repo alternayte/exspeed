@@ -30,17 +30,17 @@ fn record_with_key(subject: &str, key: &[u8], value: &[u8]) -> Record {
 // -- Tests --------------------------------------------------------------------
 
 /// Create a stream, append one record, assert offset is 0.
-pub fn test_create_and_append(engine: &impl StorageEngine) {
+pub async fn test_create_and_append(engine: &(impl StorageEngine + Sync)) {
     let s = stream("test-create");
-    engine.create_stream(&s, 0, 0).unwrap();
-    let offset = engine.append(&s, &record("events", b"hello")).unwrap();
+    engine.create_stream(&s, 0, 0).await.unwrap();
+    let offset = engine.append(&s, &record("events", b"hello")).await.unwrap();
     assert_eq!(offset, Offset(0));
 }
 
 /// Create a stream, append a record with key + headers, read back, verify all fields match.
-pub fn test_append_and_read_back(engine: &impl StorageEngine) {
+pub async fn test_append_and_read_back(engine: &(impl StorageEngine + Sync)) {
     let s = stream("test-readback");
-    engine.create_stream(&s, 0, 0).unwrap();
+    engine.create_stream(&s, 0, 0).await.unwrap();
 
     let rec = Record {
         key: Some(Bytes::from_static(b"mykey")),
@@ -52,9 +52,9 @@ pub fn test_append_and_read_back(engine: &impl StorageEngine) {
         ],
     };
 
-    engine.append(&s, &rec).unwrap();
+    engine.append(&s, &rec).await.unwrap();
 
-    let results = engine.read(&s, Offset(0), 10).unwrap();
+    let results = engine.read(&s, Offset(0), 10).await.unwrap();
     assert_eq!(results.len(), 1);
 
     let stored = &results[0];
@@ -74,26 +74,26 @@ pub fn test_append_and_read_back(engine: &impl StorageEngine) {
 }
 
 /// Append 5 records, verify offsets are 0, 1, 2, 3, 4.
-pub fn test_sequential_offsets(engine: &impl StorageEngine) {
+pub async fn test_sequential_offsets(engine: &(impl StorageEngine + Sync)) {
     let s = stream("test-offsets");
-    engine.create_stream(&s, 0, 0).unwrap();
+    engine.create_stream(&s, 0, 0).await.unwrap();
 
     for i in 0u64..5 {
-        let offset = engine.append(&s, &record("events", b"data")).unwrap();
+        let offset = engine.append(&s, &record("events", b"data")).await.unwrap();
         assert_eq!(offset, Offset(i), "expected offset {i} on append #{i}");
     }
 }
 
 /// Append 10 records, read from offset 3 with max 4, verify records 3, 4, 5, 6 are returned.
-pub fn test_read_range(engine: &impl StorageEngine) {
+pub async fn test_read_range(engine: &(impl StorageEngine + Sync)) {
     let s = stream("test-range");
-    engine.create_stream(&s, 0, 0).unwrap();
+    engine.create_stream(&s, 0, 0).await.unwrap();
 
     for i in 0u8..10 {
-        engine.append(&s, &record("events", &[i])).unwrap();
+        engine.append(&s, &record("events", &[i])).await.unwrap();
     }
 
-    let results = engine.read(&s, Offset(3), 4).unwrap();
+    let results = engine.read(&s, Offset(3), 4).await.unwrap();
     assert_eq!(results.len(), 4);
     assert_eq!(results[0].offset, Offset(3));
     assert_eq!(results[1].offset, Offset(4));
@@ -102,28 +102,28 @@ pub fn test_read_range(engine: &impl StorageEngine) {
 }
 
 /// Create a stream, read from an empty stream, get an empty vec.
-pub fn test_read_empty_stream(engine: &impl StorageEngine) {
+pub async fn test_read_empty_stream(engine: &(impl StorageEngine + Sync)) {
     let s = stream("test-empty");
-    engine.create_stream(&s, 0, 0).unwrap();
+    engine.create_stream(&s, 0, 0).await.unwrap();
 
-    let results = engine.read(&s, Offset(0), 100).unwrap();
+    let results = engine.read(&s, Offset(0), 100).await.unwrap();
     assert!(results.is_empty());
 }
 
 /// Append 1 record, read from offset 999, get an empty vec.
-pub fn test_read_past_end(engine: &impl StorageEngine) {
+pub async fn test_read_past_end(engine: &(impl StorageEngine + Sync)) {
     let s = stream("test-past-end");
-    engine.create_stream(&s, 0, 0).unwrap();
-    engine.append(&s, &record("events", b"only")).unwrap();
+    engine.create_stream(&s, 0, 0).await.unwrap();
+    engine.append(&s, &record("events", b"only")).await.unwrap();
 
-    let results = engine.read(&s, Offset(999), 10).unwrap();
+    let results = engine.read(&s, Offset(999), 10).await.unwrap();
     assert!(results.is_empty());
 }
 
 /// Append to a nonexistent stream, get StreamNotFound error.
-pub fn test_stream_not_found(engine: &impl StorageEngine) {
+pub async fn test_stream_not_found(engine: &(impl StorageEngine + Sync)) {
     let s = stream("nonexistent");
-    let err = engine.append(&s, &record("events", b"data")).unwrap_err();
+    let err = engine.append(&s, &record("events", b"data")).await.unwrap_err();
     assert!(
         matches!(err, StorageError::StreamNotFound(_)),
         "expected StreamNotFound, got {err:?}"
@@ -131,11 +131,11 @@ pub fn test_stream_not_found(engine: &impl StorageEngine) {
 }
 
 /// Create the same stream twice, get StreamAlreadyExists error.
-pub fn test_stream_already_exists(engine: &impl StorageEngine) {
+pub async fn test_stream_already_exists(engine: &(impl StorageEngine + Sync)) {
     let s = stream("test-duplicate");
-    engine.create_stream(&s, 0, 0).unwrap();
+    engine.create_stream(&s, 0, 0).await.unwrap();
 
-    let err = engine.create_stream(&s, 0, 0).unwrap_err();
+    let err = engine.create_stream(&s, 0, 0).await.unwrap_err();
     assert!(
         matches!(err, StorageError::StreamAlreadyExists(_)),
         "expected StreamAlreadyExists, got {err:?}"
@@ -143,33 +143,33 @@ pub fn test_stream_already_exists(engine: &impl StorageEngine) {
 }
 
 /// Seek by timestamp: timestamp 0 returns offset 0; far future returns end of stream.
-pub fn test_seek_by_time(engine: &impl StorageEngine) {
+pub async fn test_seek_by_time(engine: &(impl StorageEngine + Sync)) {
     let s = stream("test-seek");
-    engine.create_stream(&s, 0, 0).unwrap();
+    engine.create_stream(&s, 0, 0).await.unwrap();
 
     // Publish records -- we can't control timestamps in MemoryStorage (they use now()),
     // so just verify seek returns a valid offset
-    engine.append(&s, &record("events", b"first")).unwrap();
-    engine.append(&s, &record("events", b"second")).unwrap();
+    engine.append(&s, &record("events", b"first")).await.unwrap();
+    engine.append(&s, &record("events", b"second")).await.unwrap();
 
     // Seek to timestamp 0 (before all records) should return offset 0
-    let offset = engine.seek_by_time(&s, 0).unwrap();
+    let offset = engine.seek_by_time(&s, 0).await.unwrap();
     assert_eq!(offset, Offset(0));
 
     // Seek to far future should return end of stream
-    let offset = engine.seek_by_time(&s, u64::MAX).unwrap();
+    let offset = engine.seek_by_time(&s, u64::MAX).await.unwrap();
     assert!(offset.0 >= 2); // at or past the end
 }
 
 /// Append 2 records, verify the second timestamp is >= the first.
-pub fn test_timestamps_increasing(engine: &impl StorageEngine) {
+pub async fn test_timestamps_increasing(engine: &(impl StorageEngine + Sync)) {
     let s = stream("test-timestamps");
-    engine.create_stream(&s, 0, 0).unwrap();
+    engine.create_stream(&s, 0, 0).await.unwrap();
 
-    engine.append(&s, &record("events", b"first")).unwrap();
-    engine.append(&s, &record("events", b"second")).unwrap();
+    engine.append(&s, &record("events", b"first")).await.unwrap();
+    engine.append(&s, &record("events", b"second")).await.unwrap();
 
-    let results = engine.read(&s, Offset(0), 10).unwrap();
+    let results = engine.read(&s, Offset(0), 10).await.unwrap();
     assert_eq!(results.len(), 2);
     assert!(
         results[1].timestamp >= results[0].timestamp,

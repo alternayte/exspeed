@@ -1,18 +1,20 @@
+use async_trait::async_trait;
 use crate::error::StorageError;
 use crate::record::{Record, StoredRecord};
 use exspeed_common::{Offset, StreamName};
 
+#[async_trait]
 pub trait StorageEngine: Send + Sync {
-    fn create_stream(
+    async fn create_stream(
         &self,
         stream: &StreamName,
         max_age_secs: u64,
         max_bytes: u64,
     ) -> Result<(), StorageError>;
 
-    fn append(&self, stream: &StreamName, record: &Record) -> Result<Offset, StorageError>;
+    async fn append(&self, stream: &StreamName, record: &Record) -> Result<Offset, StorageError>;
 
-    fn read(
+    async fn read(
         &self,
         stream: &StreamName,
         from: Offset,
@@ -20,8 +22,8 @@ pub trait StorageEngine: Send + Sync {
     ) -> Result<Vec<StoredRecord>, StorageError>;
 
     /// Find the offset of the first record at or after the given timestamp.
-    fn seek_by_time(&self, stream: &StreamName, timestamp: u64) -> Result<Offset, StorageError>;
+    async fn seek_by_time(&self, stream: &StreamName, timestamp: u64) -> Result<Offset, StorageError>;
 
     /// List all stream names known to this storage engine.
-    fn list_streams(&self) -> Result<Vec<StreamName>, StorageError>;
+    async fn list_streams(&self) -> Result<Vec<StreamName>, StorageError>;
 }

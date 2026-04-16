@@ -10,13 +10,19 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
+use async_trait::async_trait;
 use exspeed_common::{Offset, StreamName};
 use exspeed_streams::{Record, StorageEngine, StorageError, StoredRecord};
 
 use crate::file::partition::Partition;
 use crate::file::stream_config::StreamConfig;
+
+struct FileStorageInner {
+    data_dir: PathBuf,
+    partitions: RwLock<HashMap<(String, u32), Partition>>,
+}
 
 /// File-backed storage engine.
 ///
@@ -24,9 +30,9 @@ use crate::file::stream_config::StreamConfig;
 ///   `{data_dir}/streams/{stream}/partitions/0/`
 ///
 /// Each partition directory contains `.seg` segment files and a `wal.log`.
+#[derive(Clone)]
 pub struct FileStorage {
-    data_dir: PathBuf,
-    partitions: RwLock<HashMap<(String, u32), Partition>>,
+    inner: Arc<FileStorageInner>,
 }
 
 impl FileStorage {
@@ -36,8 +42,10 @@ impl FileStorage {
     pub fn new(data_dir: &Path) -> io::Result<Self> {
         fs::create_dir_all(data_dir)?;
         Ok(Self {
-            data_dir: data_dir.to_path_buf(),
-            partitions: RwLock::new(HashMap::new()),
+            inner: Arc::new(FileStorageInner {
+                data_dir: data_dir.to_path_buf(),
+                partitions: RwLock::new(HashMap::new()),
+            }),
         })
     }
 
@@ -81,19 +89,21 @@ impl FileStorage {
         }
 
         Ok(Self {
-            data_dir: data_dir.to_path_buf(),
-            partitions: RwLock::new(partitions),
+            inner: Arc::new(FileStorageInner {
+                data_dir: data_dir.to_path_buf(),
+                partitions: RwLock::new(partitions),
+            }),
         })
     }
 
     /// Return the root data directory for this storage engine.
     pub fn data_dir(&self) -> &Path {
-        &self.data_dir
+        &self.inner.data_dir
     }
 
     /// List all stream names.
     pub fn list_streams(&self) -> Vec<String> {
-        let map = self.partitions.read().unwrap();
+        let map = self.inner.partitions.read().unwrap();
         let mut streams: Vec<String> = map
             .keys()
             .map(|(name, _)| name.clone())
@@ -106,21 +116,22 @@ impl FileStorage {
 
     /// Get total storage bytes for a stream.
     pub fn stream_storage_bytes(&self, stream: &str) -> Option<u64> {
-        let map = self.partitions.read().unwrap();
+        let map = self.inner.partitions.read().unwrap();
         let key = (stream.to_string(), 0u32);
         map.get(&key).map(|p| p.total_bytes())
     }
 
     /// Get the head offset (next offset to be assigned) for a stream.
     pub fn stream_head_offset(&self, stream: &str) -> Option<u64> {
-        let map = self.partitions.read().unwrap();
+        let map = self.inner.partitions.read().unwrap();
         let key = (stream.to_string(), 0u32);
         map.get(&key).map(|p| p.next_offset())
     }
 
     /// Return the directory path for a given stream + partition.
     pub fn partition_dir(&self, stream: &str, partition: u32) -> PathBuf {
-        self.data_dir
+        self.inner
+            .data_dir
             .join("streams")
             .join(stream)
             .join("partitions")
@@ -131,10 +142,10 @@ impl FileStorage {
 impl FileStorage {
     /// Enforce retention for all streams.
     pub fn enforce_all_retention(&self) -> io::Result<()> {
-        let mut map = self.partitions.write().unwrap();
+        let mut map = self.inner.partitions.write().unwrap();
 
         for ((stream_name, _), partition) in map.iter_mut() {
-            let stream_dir = self.data_dir.join("streams").join(stream_name);
+            let stream_dir = self.inner.data_dir.join("streams").join(stream_name);
             let config = StreamConfig::load(&stream_dir)?;
 
             let stats = partition.enforce_retention(config.max_age_secs, config.max_bytes)?;
@@ -152,14 +163,16 @@ impl FileStorage {
     }
 }
 
-impl StorageEngine for FileStorage {
-    fn create_stream(
+// -- Sync implementations (called from spawn_blocking) -------------------------
+
+impl FileStorage {
+    fn create_stream_sync(
         &self,
         stream: &StreamName,
         max_age_secs: u64,
         max_bytes: u64,
     ) -> Result<(), StorageError> {
-        let mut map = self.partitions.write().unwrap();
+        let mut map = self.inner.partitions.write().unwrap();
         let key = (stream.as_str().to_string(), 0u32);
         if map.contains_key(&key) {
             return Err(StorageError::StreamAlreadyExists(stream.clone()));
@@ -171,14 +184,14 @@ impl StorageEngine for FileStorage {
 
         // Save stream config
         let config = StreamConfig::from_request(max_age_secs, max_bytes);
-        let stream_dir = self.data_dir.join("streams").join(stream.as_str());
+        let stream_dir = self.inner.data_dir.join("streams").join(stream.as_str());
         config.save(&stream_dir).map_err(StorageError::Io)?;
 
         Ok(())
     }
 
-    fn append(&self, stream: &StreamName, record: &Record) -> Result<Offset, StorageError> {
-        let mut map = self.partitions.write().unwrap();
+    fn append_sync(&self, stream: &StreamName, record: &Record) -> Result<Offset, StorageError> {
+        let mut map = self.inner.partitions.write().unwrap();
         let key = (stream.as_str().to_string(), 0u32);
 
         let part = map
@@ -189,13 +202,13 @@ impl StorageEngine for FileStorage {
         Ok(offset)
     }
 
-    fn read(
+    fn read_sync(
         &self,
         stream: &StreamName,
         from: Offset,
         max_records: usize,
     ) -> Result<Vec<StoredRecord>, StorageError> {
-        let map = self.partitions.read().unwrap();
+        let map = self.inner.partitions.read().unwrap();
         let key = (stream.as_str().to_string(), 0u32);
 
         let part = map
@@ -206,8 +219,12 @@ impl StorageEngine for FileStorage {
         Ok(records)
     }
 
-    fn seek_by_time(&self, stream: &StreamName, timestamp: u64) -> Result<Offset, StorageError> {
-        let map = self.partitions.read().unwrap();
+    fn seek_by_time_sync(
+        &self,
+        stream: &StreamName,
+        timestamp: u64,
+    ) -> Result<Offset, StorageError> {
+        let map = self.inner.partitions.read().unwrap();
         let key = (stream.as_str().to_string(), 0u32);
         let part = map
             .get(&key)
@@ -216,8 +233,8 @@ impl StorageEngine for FileStorage {
         Ok(offset)
     }
 
-    fn list_streams(&self) -> Result<Vec<StreamName>, StorageError> {
-        let map = self.partitions.read().unwrap();
+    fn list_streams_sync(&self) -> Result<Vec<StreamName>, StorageError> {
+        let map = self.inner.partitions.read().unwrap();
         let mut streams: Vec<StreamName> = map
             .keys()
             .map(|(name, _)| name.clone())
@@ -227,5 +244,62 @@ impl StorageEngine for FileStorage {
             .collect();
         streams.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         Ok(streams)
+    }
+}
+
+#[async_trait]
+impl StorageEngine for FileStorage {
+    async fn create_stream(
+        &self,
+        stream: &StreamName,
+        max_age_secs: u64,
+        max_bytes: u64,
+    ) -> Result<(), StorageError> {
+        let this = self.clone();
+        let stream = stream.clone();
+        tokio::task::spawn_blocking(move || this.create_stream_sync(&stream, max_age_secs, max_bytes))
+            .await
+            .map_err(|e| StorageError::Io(std::io::Error::other(e)))?
+    }
+
+    async fn append(&self, stream: &StreamName, record: &Record) -> Result<Offset, StorageError> {
+        let this = self.clone();
+        let stream = stream.clone();
+        let record = record.clone();
+        tokio::task::spawn_blocking(move || this.append_sync(&stream, &record))
+            .await
+            .map_err(|e| StorageError::Io(std::io::Error::other(e)))?
+    }
+
+    async fn read(
+        &self,
+        stream: &StreamName,
+        from: Offset,
+        max_records: usize,
+    ) -> Result<Vec<StoredRecord>, StorageError> {
+        let this = self.clone();
+        let stream = stream.clone();
+        tokio::task::spawn_blocking(move || this.read_sync(&stream, from, max_records))
+            .await
+            .map_err(|e| StorageError::Io(std::io::Error::other(e)))?
+    }
+
+    async fn seek_by_time(
+        &self,
+        stream: &StreamName,
+        timestamp: u64,
+    ) -> Result<Offset, StorageError> {
+        let this = self.clone();
+        let stream = stream.clone();
+        tokio::task::spawn_blocking(move || this.seek_by_time_sync(&stream, timestamp))
+            .await
+            .map_err(|e| StorageError::Io(std::io::Error::other(e)))?
+    }
+
+    async fn list_streams(&self) -> Result<Vec<StreamName>, StorageError> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.list_streams_sync())
+            .await
+            .map_err(|e| StorageError::Io(std::io::Error::other(e)))?
     }
 }

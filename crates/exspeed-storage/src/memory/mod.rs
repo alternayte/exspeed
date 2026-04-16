@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use exspeed_common::{Offset, StreamName};
 use exspeed_streams::{Record, StorageEngine, StorageError, StoredRecord};
 
@@ -30,8 +31,9 @@ fn now_nanos() -> u64 {
         .as_nanos() as u64
 }
 
+#[async_trait]
 impl StorageEngine for MemoryStorage {
-    fn create_stream(
+    async fn create_stream(
         &self,
         stream: &StreamName,
         _max_age_secs: u64,
@@ -46,7 +48,7 @@ impl StorageEngine for MemoryStorage {
         Ok(())
     }
 
-    fn append(&self, stream: &StreamName, record: &Record) -> Result<Offset, StorageError> {
+    async fn append(&self, stream: &StreamName, record: &Record) -> Result<Offset, StorageError> {
         let mut map = self.streams.write().unwrap();
         let key = stream.as_str().to_string();
         let records = map
@@ -65,7 +67,7 @@ impl StorageEngine for MemoryStorage {
         Ok(offset)
     }
 
-    fn read(
+    async fn read(
         &self,
         stream: &StreamName,
         from: Offset,
@@ -84,7 +86,7 @@ impl StorageEngine for MemoryStorage {
         Ok(records[start..end].to_vec())
     }
 
-    fn seek_by_time(&self, stream: &StreamName, timestamp: u64) -> Result<Offset, StorageError> {
+    async fn seek_by_time(&self, stream: &StreamName, timestamp: u64) -> Result<Offset, StorageError> {
         let map = self.streams.read().unwrap();
         let name = stream.as_str().to_string();
         let records = map
@@ -98,7 +100,7 @@ impl StorageEngine for MemoryStorage {
         Ok(Offset(records.len() as u64))
     }
 
-    fn list_streams(&self) -> Result<Vec<StreamName>, StorageError> {
+    async fn list_streams(&self) -> Result<Vec<StreamName>, StorageError> {
         let map = self.streams.read().unwrap();
         let mut streams: Vec<StreamName> = map
             .keys()
