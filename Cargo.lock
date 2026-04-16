@@ -1127,6 +1127,7 @@ dependencies = [
  "futures-util",
  "lapin",
  "notify",
+ "pgwire-replication",
  "redis",
  "reqwest",
  "rust-s3",
@@ -2512,6 +2513,24 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+
+[[package]]
+name = "pgwire-replication"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb5dafc8338ae6dd3949b367c9afd1d4004300ae2dc84af5b883303e424822e7"
+dependencies = [
+ "anyhow",
+ "base64",
+ "bytes",
+ "hmac 0.12.1",
+ "rand 0.9.4",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
 
 [[package]]
 name = "phf"
