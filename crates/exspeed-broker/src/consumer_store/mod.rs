@@ -31,3 +31,34 @@ pub trait ConsumerStore: Send + Sync {
     /// Delete a consumer by name. No error if already absent.
     async fn delete(&self, name: &str) -> Result<(), ConsumerStoreError>;
 }
+
+use std::sync::Arc;
+
+/// Build a ConsumerStore from the `EXSPEED_CONSUMER_STORE` env var.
+/// Defaults to the same backend as `EXSPEED_OFFSET_STORE`, then to `file`.
+pub async fn from_env(
+    data_dir: &std::path::Path,
+) -> Result<Arc<dyn ConsumerStore>, ConsumerStoreError> {
+    let backend = std::env::var("EXSPEED_CONSUMER_STORE")
+        .or_else(|_| std::env::var("EXSPEED_OFFSET_STORE"))
+        .unwrap_or_else(|_| "file".to_string());
+
+    match backend.as_str() {
+        "postgres" => {
+            let store = postgres::PostgresConsumerStore::from_env().await?;
+            Ok(Arc::new(store))
+        }
+        "redis" => {
+            let store = redis::RedisConsumerStore::from_env().await?;
+            Ok(Arc::new(store))
+        }
+        "s3" => {
+            let store = s3::S3ConsumerStore::from_env()?;
+            Ok(Arc::new(store))
+        }
+        _ => {
+            let store = file::FileConsumerStore::new(data_dir.to_path_buf());
+            Ok(Arc::new(store))
+        }
+    }
+}
