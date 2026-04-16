@@ -4,7 +4,7 @@ export * from "./types.js";
 export { encodeConnect, decodeConnect } from "./connect.js";
 export { encodePublish, decodePublish, decodePublishOk } from "./publish.js";
 export { encodeAck, decodeAck } from "./ack.js";
-export { encodeSubscribe, decodeSubscribe } from "./subscribe.js";
+export { encodeSubscribe, encodeUnsubscribe, decodeSubscribe } from "./subscribe.js";
 export { encodeFetch, decodeFetch } from "./fetch.js";
 export { encodeSeek, decodeSeek } from "./seek.js";
 export { encodeCreateStream, decodeCreateStream } from "./stream.js";

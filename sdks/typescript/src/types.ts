@@ -23,6 +23,7 @@ export interface PublishResult {
 export interface CreateStreamOptions {
   maxAgeSecs?: number;
   maxBytes?: number;
+  ifNotExists?: boolean;
 }
 
 export interface CreateConsumerOptions {
@@ -31,10 +32,12 @@ export interface CreateConsumerOptions {
   group?: string;
   subjectFilter?: string;
   startFrom?: "earliest" | "latest" | { offset: bigint };
+  ifNotExists?: boolean;
 }
 
 export interface SubscribeOptions {
   maxQueueSize?: number;
+  subscriberId?: string;
 }
 
 export interface FetchOptions {
