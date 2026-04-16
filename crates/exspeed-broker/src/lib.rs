@@ -1,6 +1,7 @@
 pub mod broker;
 pub mod broker_append;
 pub mod consumer_state;
+pub mod consumer_store;
 pub mod delivery;
 pub mod handlers;
 pub mod persistence;
