@@ -159,6 +159,37 @@ impl FileStorage {
 }
 
 impl FileStorage {
+    /// Re-open a partition from disk, picking up newly downloaded segment files.
+    ///
+    /// This is used by the S3 tiered storage layer after downloading a segment
+    /// from S3 — the partition is replaced with a fresh `Partition::open` so the
+    /// new segment files become visible.  The seal notifier is preserved from
+    /// the previous partition instance.
+    pub fn reload_partition(&self, stream: &str, partition_id: u32) -> io::Result<()> {
+        let dir = self.partition_dir(stream, partition_id);
+        if !dir.exists() {
+            return Ok(());
+        }
+
+        // Preserve seal notifier from existing partition.
+        let seal_tx = {
+            let map = self.inner.partitions.read().unwrap();
+            let key = (stream.to_string(), partition_id);
+            map.get(&key).and_then(|p| p.seal_tx_clone())
+        };
+
+        let mut new_partition = Partition::open(&dir, stream, partition_id)?;
+        if let Some(tx) = seal_tx {
+            new_partition.set_seal_notifier(tx);
+        }
+
+        let mut map = self.inner.partitions.write().unwrap();
+        map.insert((stream.to_string(), partition_id), new_partition);
+        Ok(())
+    }
+}
+
+impl FileStorage {
     /// Enforce retention for all streams.
     pub fn enforce_all_retention(&self) -> io::Result<()> {
         let mut map = self.inner.partitions.write().unwrap();
