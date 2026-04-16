@@ -1,8 +1,12 @@
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use bytes::Bytes;
+use pgwire_replication::{Lsn, ReplicationClient, ReplicationConfig, ReplicationEvent};
 use tokio_postgres::NoTls;
-use tracing::error;
+use tracing::{debug, error, info, warn};
 
+use crate::builtin::pgoutput;
 use crate::config::ConnectorConfig;
 use crate::traits::{ConnectorError, HealthStatus, SourceBatch, SourceConnector, SourceRecord};
 
@@ -14,7 +18,6 @@ enum PgMode {
     Cdc,
 }
 
-#[allow(dead_code)] // mode, slot_name, publication_name, operations used by future CDC mode
 pub struct PostgresSource {
     // Note: tokio_postgres::Client does not implement Debug, so we impl Debug manually below.
     connection_string: String,
@@ -27,6 +30,12 @@ pub struct PostgresSource {
     operations: Vec<String>,
     client: Option<tokio_postgres::Client>,
     last_timestamp: Option<String>,
+    /// pgwire-replication CDC streaming client (CDC mode only).
+    repl_client: Option<ReplicationClient>,
+    /// Relation schemas received from the WAL (CDC mode only).
+    relations: HashMap<u32, pgoutput::Relation>,
+    /// Last committed LSN position (CDC mode only).
+    last_lsn: Option<Lsn>,
 }
 
 impl std::fmt::Debug for PostgresSource {
@@ -39,6 +48,8 @@ impl std::fmt::Debug for PostgresSource {
             .field("mode", &self.mode)
             .field("connected", &self.client.is_some())
             .field("last_timestamp", &self.last_timestamp)
+            .field("repl_connected", &self.repl_client.is_some())
+            .field("last_lsn", &self.last_lsn)
             .finish()
     }
 }
@@ -70,6 +81,46 @@ fn col_to_string(row: &tokio_postgres::Row, idx: usize) -> String {
         return v.to_string();
     }
     "<null>".to_string()
+}
+
+/// Parse a postgres connection string into components for ReplicationConfig.
+///
+/// Supports the URI format: `postgres://user:password@host:port/database`
+fn parse_connection_string(
+    conn_str: &str,
+) -> Result<(String, u16, String, String, String), ConnectorError> {
+    let pg_config: tokio_postgres::Config = conn_str
+        .parse()
+        .map_err(|e| ConnectorError::Config(format!("invalid connection string: {e}")))?;
+
+    let host = pg_config
+        .get_hosts()
+        .first()
+        .map(|h| match h {
+            tokio_postgres::config::Host::Tcp(s) => s.clone(),
+            #[cfg(unix)]
+            tokio_postgres::config::Host::Unix(p) => p.to_string_lossy().into_owned(),
+        })
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+
+    let port = pg_config.get_ports().first().copied().unwrap_or(5432);
+
+    let user = pg_config
+        .get_user()
+        .unwrap_or("postgres")
+        .to_string();
+
+    let password = pg_config
+        .get_password()
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .unwrap_or_default();
+
+    let database = pg_config
+        .get_dbname()
+        .unwrap_or("postgres")
+        .to_string();
+
+    Ok((host, port, user, password, database))
 }
 
 impl PostgresSource {
@@ -128,12 +179,6 @@ impl PostgresSource {
             .map(|s| s.trim().to_uppercase())
             .collect();
 
-        if mode == PgMode::Cdc {
-            return Err(ConnectorError::Config(
-                "CDC mode not yet implemented — use mode=poll".to_string(),
-            ));
-        }
-
         Ok(Self {
             connection_string,
             tables,
@@ -145,13 +190,280 @@ impl PostgresSource {
             operations,
             client: None,
             last_timestamp: None,
+            repl_client: None,
+            relations: HashMap::new(),
+            last_lsn: None,
         })
     }
-}
 
-#[async_trait]
-impl SourceConnector for PostgresSource {
-    async fn start(&mut self, last_position: Option<String>) -> Result<(), ConnectorError> {
+    // -----------------------------------------------------------------------
+    // CDC mode: start / poll / commit / stop
+    // -----------------------------------------------------------------------
+
+    async fn start_cdc(&mut self, last_position: Option<String>) -> Result<(), ConnectorError> {
+        // 1. Open a regular client for publication/slot management
+        let (client, connection) = tokio_postgres::connect(&self.connection_string, NoTls)
+            .await
+            .map_err(|e| ConnectorError::Connection(e.to_string()))?;
+
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                error!("postgres management connection error: {}", e);
+            }
+        });
+
+        // 2. Ensure publication and replication slot exist
+        pgoutput::ensure_publication(&client, &self.publication_name, &self.tables).await?;
+        pgoutput::ensure_replication_slot(&client, &self.slot_name).await?;
+
+        self.client = Some(client);
+
+        // 3. Parse the last_position as an LSN to resume from
+        let start_lsn = match &last_position {
+            Some(pos) => Lsn::parse(pos).map_err(|e| {
+                ConnectorError::Data(format!("invalid LSN position '{pos}': {e}"))
+            })?,
+            None => Lsn::ZERO,
+        };
+
+        // 4. Parse connection string components for ReplicationConfig
+        let (host, port, user, password, database) =
+            parse_connection_string(&self.connection_string)?;
+
+        let repl_config = ReplicationConfig {
+            host,
+            port,
+            user,
+            password,
+            database,
+            slot: self.slot_name.clone(),
+            publication: self.publication_name.clone(),
+            start_lsn,
+            ..Default::default()
+        };
+
+        info!(
+            slot = self.slot_name.as_str(),
+            publication = self.publication_name.as_str(),
+            start_lsn = %start_lsn,
+            tables = ?self.tables,
+            "starting CDC replication for postgres source"
+        );
+
+        let repl_client = ReplicationClient::connect(repl_config)
+            .await
+            .map_err(|e| ConnectorError::Connection(format!("replication connect failed: {e}")))?;
+
+        self.repl_client = Some(repl_client);
+        self.last_lsn = if start_lsn.is_zero() {
+            None
+        } else {
+            Some(start_lsn)
+        };
+
+        Ok(())
+    }
+
+    async fn poll_cdc(&mut self, max_batch: usize) -> Result<SourceBatch, ConnectorError> {
+        let repl_client = match &mut self.repl_client {
+            Some(c) => c,
+            None => {
+                return Err(ConnectorError::Connection(
+                    "replication client not connected".to_string(),
+                ))
+            }
+        };
+
+        let mut records = Vec::new();
+        let mut commit_lsn: Option<Lsn> = None;
+
+        // Collect events until we hit a Commit, reach max_batch, or timeout
+        loop {
+            if records.len() >= max_batch {
+                break;
+            }
+
+            let event = match tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                repl_client.recv(),
+            )
+            .await
+            {
+                Ok(Ok(Some(ev))) => ev,
+                Ok(Ok(None)) => {
+                    debug!("CDC replication stream ended");
+                    break;
+                }
+                Ok(Err(e)) => {
+                    return Err(ConnectorError::Connection(format!(
+                        "replication error: {e}"
+                    )));
+                }
+                Err(_) => {
+                    // Timeout — return what we have so far
+                    break;
+                }
+            };
+
+            match event {
+                ReplicationEvent::XLogData {
+                    data, wal_end, ..
+                } => {
+                    let wal_event = match pgoutput::parse_pgoutput_message(&data) {
+                        Ok(ev) => ev,
+                        Err(e) => {
+                            warn!(error = %e, "failed to parse pgoutput message, skipping");
+                            continue;
+                        }
+                    };
+
+                    match wal_event {
+                        pgoutput::WalEvent::Relation(rel) => {
+                            debug!(
+                                relation_id = rel.id,
+                                table = %rel.table,
+                                "received relation schema"
+                            );
+                            self.relations.insert(rel.id, rel);
+                        }
+                        pgoutput::WalEvent::Insert {
+                            relation_id,
+                            new_tuple,
+                        } => {
+                            if !self.operations.contains(&"INSERT".to_string()) {
+                                continue;
+                            }
+                            let relation = match self.relations.get(&relation_id) {
+                                Some(r) => r,
+                                None => {
+                                    warn!(
+                                        relation_id,
+                                        "received insert for unknown relation, skipping"
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            let record = build_cdc_record(
+                                relation, &new_tuple, "insert", wal_end,
+                            )?;
+                            records.push(record);
+                            repl_client.update_applied_lsn(wal_end);
+                        }
+                        pgoutput::WalEvent::Update {
+                            relation_id,
+                            new_tuple,
+                            ..
+                        } => {
+                            if !self.operations.contains(&"UPDATE".to_string()) {
+                                continue;
+                            }
+                            let relation = match self.relations.get(&relation_id) {
+                                Some(r) => r,
+                                None => {
+                                    warn!(
+                                        relation_id,
+                                        "received update for unknown relation, skipping"
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            let record = build_cdc_record(
+                                relation, &new_tuple, "update", wal_end,
+                            )?;
+                            records.push(record);
+                            repl_client.update_applied_lsn(wal_end);
+                        }
+                        pgoutput::WalEvent::Delete {
+                            relation_id,
+                            old_tuple,
+                        } => {
+                            if !self.operations.contains(&"DELETE".to_string()) {
+                                continue;
+                            }
+                            let relation = match self.relations.get(&relation_id) {
+                                Some(r) => r,
+                                None => {
+                                    warn!(
+                                        relation_id,
+                                        "received delete for unknown relation, skipping"
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            let record = build_cdc_record(
+                                relation, &old_tuple, "delete", wal_end,
+                            )?;
+                            records.push(record);
+                            repl_client.update_applied_lsn(wal_end);
+                        }
+                        pgoutput::WalEvent::Begin { .. } => {
+                            // Transaction boundary — continue collecting
+                        }
+                        pgoutput::WalEvent::Commit { end_lsn, .. } => {
+                            commit_lsn = Some(Lsn::from_u64(end_lsn));
+                            repl_client.update_applied_lsn(Lsn::from_u64(end_lsn));
+                            break;
+                        }
+                        pgoutput::WalEvent::Unknown(tag) => {
+                            debug!(tag, "unknown pgoutput message type, skipping");
+                        }
+                    }
+                }
+                ReplicationEvent::Commit { end_lsn, .. } => {
+                    commit_lsn = Some(end_lsn);
+                    repl_client.update_applied_lsn(end_lsn);
+                    break;
+                }
+                ReplicationEvent::Begin { .. } => {
+                    // Transaction start — continue
+                }
+                ReplicationEvent::KeepAlive { .. } => {
+                    if !records.is_empty() {
+                        break;
+                    }
+                }
+                ReplicationEvent::StoppedAt { .. } => {
+                    debug!("CDC replication reached stop LSN");
+                    break;
+                }
+                ReplicationEvent::Message { .. } => {
+                    // Logical decoding messages — not relevant
+                }
+            }
+        }
+
+        let position = commit_lsn
+            .map(|lsn| lsn.to_string())
+            .or_else(|| self.last_lsn.map(|lsn| lsn.to_string()));
+
+        Ok(SourceBatch { records, position })
+    }
+
+    async fn commit_cdc(&mut self, position: String) -> Result<(), ConnectorError> {
+        let lsn = Lsn::parse(&position).map_err(|e| {
+            ConnectorError::Data(format!("invalid LSN in commit position '{position}': {e}"))
+        })?;
+        self.last_lsn = Some(lsn);
+        Ok(())
+    }
+
+    async fn stop_cdc(&mut self) -> Result<(), ConnectorError> {
+        if let Some(repl_client) = self.repl_client.take() {
+            repl_client.stop();
+        }
+        self.client = None;
+        self.relations.clear();
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Poll mode: start / poll / commit / stop (original implementation)
+    // -----------------------------------------------------------------------
+
+    async fn start_poll(&mut self, last_position: Option<String>) -> Result<(), ConnectorError> {
         let (client, connection) = tokio_postgres::connect(&self.connection_string, NoTls)
             .await
             .map_err(|e| ConnectorError::Connection(e.to_string()))?;
@@ -167,7 +479,7 @@ impl SourceConnector for PostgresSource {
         Ok(())
     }
 
-    async fn poll(&mut self, max_batch: usize) -> Result<SourceBatch, ConnectorError> {
+    async fn poll_poll(&mut self, max_batch: usize) -> Result<SourceBatch, ConnectorError> {
         let client = match &self.client {
             Some(c) => c,
             None => return Err(ConnectorError::Connection("not connected".to_string())),
@@ -179,7 +491,6 @@ impl SourceConnector for PostgresSource {
         for table in &self.tables.clone() {
             let (schema, bare_table) = split_table_name(table);
 
-            // Use parameterized timestamp comparison instead of string comparison
             let rows = match &self.last_timestamp {
                 Some(ts) => {
                     let query = format!(
@@ -208,7 +519,6 @@ impl SourceConnector for PostgresSource {
             for row in &rows {
                 let columns = row.columns();
 
-                // Build a JSON object from all columns.
                 let mut map = serde_json::Map::new();
                 let mut row_ts: Option<String> = None;
                 let mut pk_value = String::new();
@@ -220,7 +530,6 @@ impl SourceConnector for PostgresSource {
                         serde_json::Value::String(val_str.clone()),
                     );
 
-                    // Track max timestamp from the timestamp column.
                     if col.name() == self.timestamp_column.as_str() {
                         row_ts = Some(val_str.clone());
                         let update = match &max_ts {
@@ -232,7 +541,6 @@ impl SourceConnector for PostgresSource {
                         }
                     }
 
-                    // First column is treated as the primary key
                     if idx == 0 {
                         pk_value = val_str;
                     }
@@ -258,7 +566,6 @@ impl SourceConnector for PostgresSource {
                     Some(Bytes::from(pk_value.clone().into_bytes()))
                 };
 
-                // Build idempotency key: table:pk:timestamp
                 let idemp_key = format!(
                     "{}:{}:{}",
                     table,
@@ -291,21 +598,122 @@ impl SourceConnector for PostgresSource {
         })
     }
 
-    async fn commit(&mut self, position: String) -> Result<(), ConnectorError> {
+    async fn commit_poll(&mut self, position: String) -> Result<(), ConnectorError> {
         self.last_timestamp = Some(position);
         Ok(())
     }
 
-    async fn stop(&mut self) -> Result<(), ConnectorError> {
+    async fn stop_poll(&mut self) -> Result<(), ConnectorError> {
         self.client = None;
         Ok(())
     }
+}
+
+/// Build a SourceRecord from a CDC WAL event (insert, update, or delete).
+fn build_cdc_record(
+    relation: &pgoutput::Relation,
+    tuple: &[pgoutput::ColValue],
+    operation: &str,
+    wal_end: Lsn,
+) -> Result<SourceRecord, ConnectorError> {
+    let col_map = pgoutput::tuple_to_map(relation, tuple);
+
+    // Build JSON value from all columns
+    let json_map: serde_json::Map<String, serde_json::Value> = col_map
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                match v {
+                    Some(s) => serde_json::Value::String(s.clone()),
+                    None => serde_json::Value::Null,
+                },
+            )
+        })
+        .collect();
+    let value = serde_json::to_vec(&serde_json::Value::Object(json_map))
+        .map_err(|e| ConnectorError::Data(format!("json serialization: {e}")))?;
+
+    // Subject = {schema}.{table}.{operation}
+    let subject = format!("{}.{}.{}", relation.schema, relation.table, operation);
+
+    // Idempotency key: {table}:{pk}:{lsn} where pk is first column value
+    let pk = col_map
+        .values()
+        .next()
+        .and_then(|v| v.clone())
+        .unwrap_or_default();
+    let idemp_key = format!("{}:{pk}:{wal_end}", relation.table);
+
+    // Key is the primary key value
+    let key = if pk.is_empty() {
+        None
+    } else {
+        Some(Bytes::from(pk.into_bytes()))
+    };
+
+    Ok(SourceRecord {
+        key,
+        value: Bytes::from(value),
+        subject,
+        headers: vec![
+            ("x-idempotency-key".to_string(), idemp_key),
+            ("x-operation".to_string(), operation.to_string()),
+            ("x-table".to_string(), relation.table.clone()),
+            ("x-schema".to_string(), relation.schema.clone()),
+            ("x-exspeed-source".to_string(), "postgres".to_string()),
+        ],
+    })
+}
+
+#[async_trait]
+impl SourceConnector for PostgresSource {
+    async fn start(&mut self, last_position: Option<String>) -> Result<(), ConnectorError> {
+        match self.mode {
+            PgMode::Cdc => self.start_cdc(last_position).await,
+            PgMode::Poll => self.start_poll(last_position).await,
+        }
+    }
+
+    async fn poll(&mut self, max_batch: usize) -> Result<SourceBatch, ConnectorError> {
+        match self.mode {
+            PgMode::Cdc => self.poll_cdc(max_batch).await,
+            PgMode::Poll => self.poll_poll(max_batch).await,
+        }
+    }
+
+    async fn commit(&mut self, position: String) -> Result<(), ConnectorError> {
+        match self.mode {
+            PgMode::Cdc => self.commit_cdc(position).await,
+            PgMode::Poll => self.commit_poll(position).await,
+        }
+    }
+
+    async fn stop(&mut self) -> Result<(), ConnectorError> {
+        match self.mode {
+            PgMode::Cdc => self.stop_cdc().await,
+            PgMode::Poll => self.stop_poll().await,
+        }
+    }
 
     async fn health(&self) -> HealthStatus {
-        if self.client.is_some() {
-            HealthStatus::Healthy
-        } else {
-            HealthStatus::Unhealthy("not connected".to_string())
+        match self.mode {
+            PgMode::Cdc => {
+                if self.repl_client.is_some() && self.client.is_some() {
+                    HealthStatus::Healthy
+                } else if self.client.is_some() {
+                    HealthStatus::Degraded("replication client not connected".to_string())
+                } else {
+                    HealthStatus::Unhealthy("not connected".to_string())
+                }
+            }
+            PgMode::Poll => {
+                if self.client.is_some() {
+                    HealthStatus::Healthy
+                } else {
+                    HealthStatus::Unhealthy("not connected".to_string())
+                }
+            }
         }
     }
 }
@@ -391,5 +799,124 @@ mod tests {
         let src = PostgresSource::new(&config).unwrap();
         assert_eq!(src.slot_name, "exspeed_test_pg_slot");
         assert_eq!(src.publication_name, "exspeed_test_pg_pub");
+    }
+
+    #[test]
+    fn cdc_mode_accepted() {
+        let config = make_config(HashMap::from([
+            ("connection".into(), "postgres://localhost/db".into()),
+            ("tables".into(), "orders".into()),
+            ("mode".into(), "cdc".into()),
+        ]));
+        let src = PostgresSource::new(&config).unwrap();
+        assert_eq!(src.mode, PgMode::Cdc);
+    }
+
+    #[test]
+    fn default_operations_include_all() {
+        let config = make_config(HashMap::from([
+            ("connection".into(), "postgres://localhost/db".into()),
+            ("tables".into(), "orders".into()),
+        ]));
+        let src = PostgresSource::new(&config).unwrap();
+        assert_eq!(src.operations, vec!["INSERT", "UPDATE", "DELETE"]);
+    }
+
+    #[test]
+    fn custom_operations_parsed() {
+        let config = make_config(HashMap::from([
+            ("connection".into(), "postgres://localhost/db".into()),
+            ("tables".into(), "orders".into()),
+            ("operations".into(), "INSERT, UPDATE".into()),
+        ]));
+        let src = PostgresSource::new(&config).unwrap();
+        assert_eq!(src.operations, vec!["INSERT", "UPDATE"]);
+    }
+
+    #[test]
+    fn build_cdc_record_insert() {
+        let relation = pgoutput::Relation {
+            id: 1,
+            schema: "public".into(),
+            table: "orders".into(),
+            columns: vec![
+                pgoutput::ColumnDef {
+                    name: "id".into(),
+                    type_oid: 23,
+                    type_modifier: -1,
+                },
+                pgoutput::ColumnDef {
+                    name: "amount".into(),
+                    type_oid: 23,
+                    type_modifier: -1,
+                },
+                pgoutput::ColumnDef {
+                    name: "status".into(),
+                    type_oid: 25,
+                    type_modifier: -1,
+                },
+            ],
+        };
+        let tuple = vec![
+            pgoutput::ColValue::Text("42".into()),
+            pgoutput::ColValue::Text("100".into()),
+            pgoutput::ColValue::Text("pending".into()),
+        ];
+
+        let lsn = Lsn::from_u64(12345);
+        let record = build_cdc_record(&relation, &tuple, "insert", lsn).unwrap();
+
+        assert_eq!(record.subject, "public.orders.insert");
+        assert!(record.key.is_some());
+
+        // Check headers
+        let headers: HashMap<String, String> = record.headers.into_iter().collect();
+        assert_eq!(headers.get("x-operation").unwrap(), "insert");
+        assert_eq!(headers.get("x-table").unwrap(), "orders");
+        assert_eq!(headers.get("x-schema").unwrap(), "public");
+        assert_eq!(headers.get("x-exspeed-source").unwrap(), "postgres");
+        assert!(headers.get("x-idempotency-key").unwrap().contains("orders:"));
+
+        // Check JSON value contains all columns
+        let value: serde_json::Value = serde_json::from_slice(&record.value).unwrap();
+        let obj = value.as_object().unwrap();
+        assert_eq!(obj.get("id").unwrap(), "42");
+        assert_eq!(obj.get("amount").unwrap(), "100");
+        assert_eq!(obj.get("status").unwrap(), "pending");
+    }
+
+    #[test]
+    fn build_cdc_record_delete_with_null() {
+        let relation = pgoutput::Relation {
+            id: 2,
+            schema: "inventory".into(),
+            table: "items".into(),
+            columns: vec![
+                pgoutput::ColumnDef {
+                    name: "id".into(),
+                    type_oid: 23,
+                    type_modifier: -1,
+                },
+                pgoutput::ColumnDef {
+                    name: "name".into(),
+                    type_oid: 25,
+                    type_modifier: -1,
+                },
+            ],
+        };
+        let tuple = vec![
+            pgoutput::ColValue::Text("7".into()),
+            pgoutput::ColValue::Null,
+        ];
+
+        let lsn = Lsn::from_u64(99999);
+        let record = build_cdc_record(&relation, &tuple, "delete", lsn).unwrap();
+
+        assert_eq!(record.subject, "inventory.items.delete");
+
+        let value: serde_json::Value = serde_json::from_slice(&record.value).unwrap();
+        let obj = value.as_object().unwrap();
+        assert_eq!(obj.get("id").unwrap(), "7");
+        assert!(obj.get("name").unwrap().is_null());
     }
 }
