@@ -39,7 +39,28 @@ pub struct ServerArgs {
 pub async fn run(args: ServerArgs) -> Result<()> {
     // Create storage
     let file_storage = Arc::new(FileStorage::open(&args.data_dir)?);
-    let storage: Arc<dyn StorageEngine> = file_storage.clone();
+    // Check for S3 tiered storage
+    let storage: Arc<dyn StorageEngine> = match exspeed_storage::s3::config::S3Config::from_env() {
+        Ok(Some(s3_config)) => {
+            info!("S3 tiered storage enabled");
+            let s3_storage = exspeed_storage::s3::S3TieredStorage::new(
+                (*file_storage).clone(),
+                s3_config.bucket,
+                s3_config.prefix,
+                s3_config.local_max_bytes,
+            )
+            .await
+            .expect("failed to initialize S3 tiered storage");
+            Arc::new(s3_storage)
+        }
+        Ok(None) => {
+            info!("using local file storage");
+            file_storage.clone()
+        }
+        Err(e) => {
+            panic!("S3 storage configuration error: {e}");
+        }
+    };
 
     // Create metrics
     let (metrics, prometheus_registry) = exspeed_common::Metrics::new();
