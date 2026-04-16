@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -9,7 +8,6 @@ use crate::broker_append::BrokerAppend;
 use crate::consumer_state::{ConsumerGroup, ConsumerState, DeliveryRecord};
 use crate::delivery::{run_delivery, DeliveryConfig};
 use crate::handlers;
-use crate::persistence;
 use exspeed_protocol::messages::{ClientMessage, ServerMessage};
 use exspeed_streams::StorageEngine;
 
@@ -19,6 +17,7 @@ pub struct Broker {
     pub consumers: RwLock<HashMap<String, ConsumerState>>,
     pub(crate) groups: RwLock<HashMap<String, ConsumerGroup>>,
     pub data_dir: PathBuf,
+    pub consumer_store: Arc<dyn crate::consumer_store::ConsumerStore>,
     pub(crate) max_delivery_attempts: u16,
     pub(crate) nack_attempts: RwLock<HashMap<(String, u64), u16>>,
 }
@@ -28,6 +27,7 @@ impl Broker {
         storage: Arc<dyn StorageEngine>,
         broker_append: Arc<BrokerAppend>,
         data_dir: PathBuf,
+        consumer_store: Arc<dyn crate::consumer_store::ConsumerStore>,
     ) -> Self {
         Self {
             storage,
@@ -35,14 +35,20 @@ impl Broker {
             consumers: RwLock::new(HashMap::new()),
             groups: RwLock::new(HashMap::new()),
             data_dir,
+            consumer_store,
             max_delivery_attempts: 5,
             nack_attempts: RwLock::new(HashMap::new()),
         }
     }
 
-    /// Load all persisted consumers from disk and rebuild in-memory state.
-    pub fn load_consumers(&self) -> io::Result<()> {
-        let configs = persistence::load_all_consumers(&self.data_dir)?;
+    /// Load all persisted consumers from the configured ConsumerStore and
+    /// rebuild in-memory state.
+    pub async fn load_consumers(&self) -> Result<(), String> {
+        let configs = self
+            .consumer_store
+            .load_all()
+            .await
+            .map_err(|e| format!("failed to load consumers: {e}"))?;
         let mut consumers = self.consumers.write().unwrap();
         let mut groups = self.groups.write().unwrap();
 
@@ -190,7 +196,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(MemoryStorage::new());
         let broker_append = Arc::new(BrokerAppend::new(storage.clone(), 300));
-        let broker = Broker::new(storage, broker_append, dir.path().to_path_buf());
+        let consumer_store = Arc::new(crate::consumer_store::file::FileConsumerStore::new(
+            dir.path().to_path_buf(),
+        ));
+        let broker = Broker::new(
+            storage,
+            broker_append,
+            dir.path().to_path_buf(),
+            consumer_store,
+        );
         (broker, dir)
     }
 
