@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::broker_append::BrokerAppend;
 use crate::consumer_state::{ConsumerGroup, ConsumerState, DeliveryRecord};
@@ -18,6 +18,7 @@ pub struct Broker {
     pub(crate) groups: RwLock<HashMap<String, ConsumerGroup>>,
     pub data_dir: PathBuf,
     pub consumer_store: Arc<dyn crate::consumer_store::ConsumerStore>,
+    pub work_coordinator: Arc<dyn crate::work_coordinator::WorkCoordinator>,
     pub(crate) max_delivery_attempts: u16,
     pub(crate) nack_attempts: RwLock<HashMap<(String, u64), u16>>,
 }
@@ -28,6 +29,7 @@ impl Broker {
         broker_append: Arc<BrokerAppend>,
         data_dir: PathBuf,
         consumer_store: Arc<dyn crate::consumer_store::ConsumerStore>,
+        work_coordinator: Arc<dyn crate::work_coordinator::WorkCoordinator>,
     ) -> Self {
         Self {
             storage,
@@ -36,6 +38,7 @@ impl Broker {
             groups: RwLock::new(HashMap::new()),
             data_dir,
             consumer_store,
+            work_coordinator,
             max_delivery_attempts: 5,
             nack_attempts: RwLock::new(HashMap::new()),
         }
@@ -128,20 +131,8 @@ impl Broker {
             } else {
                 None
             },
-        };
-
-        // Build group_members watch if grouped.
-        let group_members = if let Some(ref group_name) = delivery_config.group_name {
-            let groups = self.groups.read().unwrap();
-            let members = groups
-                .get(group_name)
-                .map(|g| g.members.clone())
-                .unwrap_or_default();
-            let (watch_tx, watch_rx) = watch::channel(members);
-            std::mem::forget(watch_tx);
-            Some(watch_rx)
-        } else {
-            None
+            subscriber_id: subscriber_id.to_string(),
+            work_coordinator: Arc::clone(&self.work_coordinator),
         };
 
         let storage = Arc::clone(&self.storage);
@@ -161,7 +152,7 @@ impl Broker {
             tokio::select! {
                 _ = cancel_rx_store => {}
                 _ = caller_cancel_rx => {}
-                _ = run_delivery(delivery_config, storage, tx, group_members) => {}
+                _ = run_delivery(delivery_config, storage, tx) => {}
             }
         });
 
@@ -225,11 +216,13 @@ mod tests {
         let consumer_store = Arc::new(crate::consumer_store::file::FileConsumerStore::new(
             dir.path().to_path_buf(),
         ));
+        let work_coordinator = Arc::new(crate::work_coordinator::noop::NoopWorkCoordinator);
         let broker = Broker::new(
             storage,
             broker_append,
             dir.path().to_path_buf(),
             consumer_store,
+            work_coordinator,
         );
         (broker, dir)
     }

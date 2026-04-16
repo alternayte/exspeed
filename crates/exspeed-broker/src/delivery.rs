@@ -1,13 +1,12 @@
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 use exspeed_common::{subject_matches, Offset, StreamName};
 use exspeed_streams::StorageEngine;
 
 use crate::consumer_state::DeliveryRecord;
+use crate::work_coordinator::WorkCoordinator;
 
 // ---------------------------------------------------------------------------
 // DeliveryConfig
@@ -19,44 +18,76 @@ pub struct DeliveryConfig {
     pub subject_filter: String,
     pub start_offset: u64,
     pub group_name: Option<String>,
+    pub subscriber_id: String,
+    pub work_coordinator: Arc<dyn WorkCoordinator>,
 }
 
 // ---------------------------------------------------------------------------
-// run_delivery — the main poll loop
+// run_delivery — branches on grouped vs non-grouped + coordinator support
 // ---------------------------------------------------------------------------
 
 pub async fn run_delivery(
     config: DeliveryConfig,
     storage: Arc<dyn StorageEngine>,
     tx: mpsc::Sender<DeliveryRecord>,
-    group_members: Option<watch::Receiver<Vec<String>>>,
 ) {
-    // Parse stream name; exit silently if invalid.
     let stream_name = match StreamName::try_from(config.stream_name.as_str()) {
         Ok(sn) => sn,
         Err(_) => return,
     };
 
-    let mut current_offset = config.start_offset;
-    let mut round_robin_counter: u64 = 0;
     let batch_size: usize = 100;
+    let ack_timeout_secs: u64 = 30;
+    let max_ack_pending: usize = 1000;
 
+    match config.group_name.clone() {
+        Some(group) if config.work_coordinator.supports_coordination() => {
+            run_grouped(
+                group,
+                config,
+                stream_name,
+                storage,
+                tx,
+                batch_size,
+                ack_timeout_secs,
+                max_ack_pending,
+            )
+            .await
+        }
+        _ => {
+            // Non-grouped OR noop coordinator: use cursor-based loop.
+            run_ungrouped(config, stream_name, storage, tx, batch_size).await
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Non-grouped delivery: cursor-based, one subscriber, existing semantics.
+// ---------------------------------------------------------------------------
+
+async fn run_ungrouped(
+    config: DeliveryConfig,
+    stream_name: StreamName,
+    storage: Arc<dyn StorageEngine>,
+    tx: mpsc::Sender<DeliveryRecord>,
+    batch_size: usize,
+) {
+    let mut current_offset = config.start_offset;
     loop {
-        // (b) Read a batch from storage.
-        let records = match storage.read(&stream_name, Offset(current_offset), batch_size).await {
+        let records = match storage
+            .read(&stream_name, Offset(current_offset), batch_size)
+            .await
+        {
             Ok(recs) => recs,
-            Err(_) => break, // storage error — stop delivery
+            Err(_) => break,
         };
 
-        // (c) If empty, sleep and continue.
         if records.is_empty() {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             continue;
         }
 
-        // (d) Process each record.
         for record in records {
-            // Subject filtering.
             if !config.subject_filter.is_empty()
                 && !subject_matches(&record.subject, &config.subject_filter)
             {
@@ -64,49 +95,122 @@ pub async fn run_delivery(
                 continue;
             }
 
-            // Group routing — skip records not assigned to us.
-            if let Some(ref members_rx) = group_members {
-                let members = members_rx.borrow();
-                if !members.is_empty() {
-                    let target =
-                        route_to_member(&members, record.key.as_deref(), round_robin_counter);
-                    if target != config.consumer_name {
-                        current_offset = record.offset.0 + 1;
-                        round_robin_counter += 1;
-                        continue;
-                    }
-                }
-            }
-
-            // Build DeliveryRecord and send.
             let delivery = DeliveryRecord {
                 record: record.clone(),
                 delivery_attempt: 1,
             };
 
             if tx.send(delivery).await.is_err() {
-                // Channel closed — consumer gone.
                 return;
             }
 
             current_offset = record.offset.0 + 1;
-            round_robin_counter += 1;
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// route_to_member — pick the group member for a record
+// Grouped delivery: coordinator-driven work distribution across subscribers.
 // ---------------------------------------------------------------------------
 
-fn route_to_member(members: &[String], key: Option<&[u8]>, round_robin: u64) -> String {
-    let idx = match key {
-        Some(k) => {
-            let mut hasher = DefaultHasher::new();
-            k.hash(&mut hasher);
-            (hasher.finish() % members.len() as u64) as usize
+async fn run_grouped(
+    group: String,
+    config: DeliveryConfig,
+    stream_name: StreamName,
+    storage: Arc<dyn StorageEngine>,
+    tx: mpsc::Sender<DeliveryRecord>,
+    batch_size: usize,
+    ack_timeout_secs: u64,
+    max_ack_pending: usize,
+) {
+    let coord = Arc::clone(&config.work_coordinator);
+
+    loop {
+        // 1) Top up pending set if below max_ack_pending.
+        let pending = coord.pending_count(&group).await.unwrap_or(0);
+        if pending < max_ack_pending {
+            let head = coord.delivery_head(&group).await.unwrap_or(0);
+            let read_from = if pending == 0 && head == 0 {
+                config.start_offset
+            } else {
+                head + 1
+            };
+
+            let records = match storage
+                .read(&stream_name, Offset(read_from), batch_size)
+                .await
+            {
+                Ok(recs) => recs,
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    continue;
+                }
+            };
+
+            // Filter by subject: only enqueue matching records.
+            let enqueue_offsets: Vec<u64> = records
+                .iter()
+                .filter(|r| {
+                    config.subject_filter.is_empty()
+                        || subject_matches(&r.subject, &config.subject_filter)
+                })
+                .map(|r| r.offset.0)
+                .collect();
+
+            if !enqueue_offsets.is_empty() {
+                if let Err(e) = coord.enqueue(&group, &enqueue_offsets).await {
+                    tracing::warn!(group = group.as_str(), error = %e, "enqueue failed");
+                }
+            }
+
+            // Advance delivery_head past filtered-out records so we don't
+            // re-read them. Enqueue + immediate ack for the max offset read.
+            if let Some(max_read) = records.iter().map(|r| r.offset.0).max() {
+                if enqueue_offsets.is_empty() {
+                    let _ = coord.enqueue(&group, &[max_read]).await;
+                    let _ = coord.ack(&group, max_read).await;
+                }
+            }
         }
-        None => (round_robin % members.len() as u64) as usize,
-    };
-    members[idx].clone()
+
+        // 2) Claim available work for this subscriber.
+        let claims = match coord
+            .claim_batch(&group, &config.subscriber_id, batch_size, ack_timeout_secs)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(group = group.as_str(), error = %e, "claim_batch failed");
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                continue;
+            }
+        };
+
+        if claims.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            continue;
+        }
+
+        // 3) Fetch each claimed record from storage and deliver.
+        for claim in claims {
+            let records = match storage.read(&stream_name, Offset(claim.offset), 1).await {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let record = match records.into_iter().next() {
+                Some(r) if r.offset.0 == claim.offset => r,
+                _ => continue,
+            };
+
+            let delivery = DeliveryRecord {
+                record,
+                delivery_attempt: claim.attempts as u16,
+            };
+
+            if tx.send(delivery).await.is_err() {
+                // Subscriber gone — do not ack; let it expire + be redelivered.
+                return;
+            }
+        }
+    }
 }
