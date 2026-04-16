@@ -85,6 +85,15 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         .expect("failed to initialize consumer store");
     info!(backend = consumer_backend.as_str(), "consumer store initialized");
 
+    // Build work coordinator (uses same backend as consumer store).
+    let work_coordinator = exspeed_broker::work_coordinator::from_env()
+        .await
+        .expect("failed to initialize work coordinator");
+    info!(
+        supports_coordination = work_coordinator.supports_coordination(),
+        "work coordinator initialized"
+    );
+
     // Create broker
     let broker_append_for_connectors = broker_append.clone();
     let broker = Arc::new(Broker::new(
@@ -92,8 +101,27 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         broker_append,
         args.data_dir.clone(),
         consumer_store,
+        work_coordinator.clone(),
     ));
     broker.load_consumers().await.map_err(|e| anyhow::anyhow!(e))?;
+
+    // Warn if grouped consumers exist but the coordinator doesn't support
+    // multi-pod coordination (file/s3 backends).
+    if !work_coordinator.supports_coordination() {
+        let consumers = broker.consumers.read().unwrap();
+        let grouped_count = consumers
+            .values()
+            .filter(|c| !c.config.group.is_empty())
+            .count();
+        if grouped_count > 0 {
+            warn!(
+                grouped_consumers = grouped_count,
+                "grouped consumers exist but the active backend does not support multi-pod \
+                 coordination — running multiple pods will cause duplicate deliveries. \
+                 Set EXSPEED_CONSUMER_STORE=postgres or redis for multi-pod safety."
+            );
+        }
+    }
 
     // Create offset store (backend selected by EXSPEED_OFFSET_STORE env var)
     let offset_backend = std::env::var("EXSPEED_OFFSET_STORE").unwrap_or_else(|_| "file".to_string());
