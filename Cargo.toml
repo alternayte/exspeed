@@ -73,6 +73,9 @@ pgwire-replication = { version = "0.3", default-features = false, features = ["s
 # Filesystem watching
 notify = "7"
 
+# UUIDs
+uuid = { version = "1", features = ["v4"] }
+
 # Observability / Metrics
 opentelemetry = "0.28"
 opentelemetry_sdk = { version = "0.28", features = ["metrics"] }
