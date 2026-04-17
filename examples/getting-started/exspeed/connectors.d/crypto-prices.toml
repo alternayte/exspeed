@@ -4,8 +4,10 @@ type = "source"
 plugin = "http_poll"
 stream = "crypto-prices"
 subject_template = "crypto.prices"
+poll_interval_ms = 60000
 
 [settings]
 url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana&vs_currencies=usd"
-interval_secs = 60
+interval_secs = '60'
 method = "GET"
+headers = "User-Agent: exspeed/0.1"

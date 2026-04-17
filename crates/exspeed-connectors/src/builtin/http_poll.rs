@@ -86,7 +86,10 @@ impl HttpPollSource {
             items_path,
             item_key,
             subject_template,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .user_agent("exspeed-http-poll/0.1")
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             last_poll: None,
             last_etag: None,
             last_modified: None,
@@ -141,7 +144,10 @@ fn extract_key(item: &serde_json::Value, key_path: &str) -> Option<String> {
 #[async_trait]
 impl SourceConnector for HttpPollSource {
     async fn start(&mut self, _last_position: Option<String>) -> Result<(), ConnectorError> {
-        self.client = reqwest::Client::new();
+        self.client = reqwest::Client::builder()
+            .user_agent("exspeed-http-poll/0.1")
+            .build()
+            .map_err(|e| ConnectorError::Connection(format!("failed to build HTTP client: {e}")))?;
         Ok(())
     }
 
