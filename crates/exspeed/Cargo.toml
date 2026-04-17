@@ -1,7 +1,15 @@
 [package]
 name = "exspeed"
-version = "0.1.0"
-edition = "2021"
+description = "A lightweight stream processing platform with an integrated SQL-like query engine (ExQL). One binary, ordered logs, pluggable connectors."
+readme = "../../README.md"
+keywords = ["streaming", "message-broker", "stream-processing", "sql", "event-streaming"]
+categories = ["database", "database-implementations", "network-programming"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 
 [lib]
 name = "exspeed"

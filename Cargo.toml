@@ -12,6 +12,14 @@ members = [
     "crates/exspeed-processing",
 ]
 
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/alternayte/exspeed"
+homepage = "https://github.com/alternayte/exspeed"
+authors = ["Exspeed contributors"]
+
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -84,3 +92,8 @@ prometheus = "0.13"
 
 [profile.dev]
 opt-level = 1
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
