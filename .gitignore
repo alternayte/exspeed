@@ -7,3 +7,6 @@
 # Node / TypeScript SDK build artifacts
 **/node_modules/
 **/dist/
+
+# Local planning / design docs
+/docs/
