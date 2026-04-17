@@ -11,19 +11,19 @@ await client.connect();
 console.log("Connected to Exspeed");
 
 // 2. Create a stream to hold crypto price data
-await client.createStream("crypto-prices");
-console.log("Stream 'crypto-prices' created");
+await client.createStream("crypto-prices", { ifNotExists: true });
+console.log("Stream 'crypto-prices' ready");
 
-// 3. Publish a sample record manually
-const result = await client.publish("crypto-prices", {
-  subject: "crypto.prices",
-  data: {
-    bitcoin: { usd: 67000 },
-    ethereum: { usd: 3500 },
-    solana: { usd: 150 },
-  },
-});
-console.log(`Published at offset ${result.offset}`);
+// // 3. Publish a sample record manually
+// const result = await client.publish("crypto-prices", {
+//   subject: "crypto.prices",
+//   data: {
+//     bitcoin: { usd: 67000 },
+//     ethereum: { usd: 3500 },
+//     solana: { usd: 150 },
+//   },
+// });
+// console.log(`Published at offset ${result.offset}`);
 
 // 4. Fetch the last few records from the stream
 const records = await client.fetch("crypto-prices", {
@@ -40,8 +40,9 @@ await client.createConsumer({
   name: "price-watcher",
   stream: "crypto-prices",
   startFrom: "earliest",
+  ifNotExists: true,
 });
-console.log("\nConsumer 'price-watcher' created");
+console.log("\nConsumer 'price-watcher' ready");
 
 const sub = await client.subscribe("price-watcher");
 
@@ -51,6 +52,6 @@ console.log("Tip: The HTTP poller connector will fetch live crypto prices every 
 console.log("     Place crypto-prices.toml in your server's connectors.d/ folder");
 
 for await (const msg of sub) {
-  console.log(`[${msg.subject}] offset=${msg.offset}`, msg.json());
+  console.log(`[${msg.subject}] timestamp=${msg.timestamp.toLocaleString()} offset=${msg.offset}`, msg.json());
   await msg.ack();
 }
