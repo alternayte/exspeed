@@ -3,3 +3,7 @@
 *.swp
 *.swo
 .DS_Store
+
+# Node / TypeScript SDK build artifacts
+**/node_modules/
+**/dist/
