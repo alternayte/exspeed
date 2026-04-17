@@ -13,6 +13,7 @@ use crate::manager::ConnectorManager;
 /// Scan `connectors_dir` for `.toml` files and reconcile with running connectors.
 ///
 /// - Files present in the directory but not in `manager` → load TOML + create.
+/// - Files present and running but content changed → restart with new config.
 /// - Files absent from the directory but still running in `manager` → delete.
 async fn sync_connectors(manager: &Arc<ConnectorManager>, connectors_dir: &PathBuf) {
     if !connectors_dir.exists() {
@@ -55,10 +56,47 @@ async fn sync_connectors(manager: &Arc<ConnectorManager>, connectors_dir: &PathB
         .map(|info| format!("{}.toml", info.name))
         .collect();
 
-    // New files: present on disk but not running.
+    // New or modified files.
     for filename in &current {
-        if !running_names.contains(filename) {
-            let path = connectors_dir.join(filename);
+        let path = connectors_dir.join(filename);
+        let connector_name = filename
+            .strip_suffix(".toml")
+            .unwrap_or(filename.as_str())
+            .to_string();
+
+        if running_names.contains(filename) {
+            // Already running — check if the file content changed.
+            let new_hash = ConnectorManager::hash_file(&path);
+            let old_hash = manager.toml_hashes.read().await.get(&connector_name).copied();
+
+            if new_hash.is_some() && new_hash != old_hash {
+                // Config changed — reload.
+                match ConnectorConfig::load_toml(&path) {
+                    Ok(mut config) => {
+                        config.resolve_env_vars();
+                        info!(
+                            connector = connector_name.as_str(),
+                            file = ?path,
+                            "file_watcher: TOML connector config changed, restarting"
+                        );
+                        if let Err(e) = manager.delete(&connector_name).await {
+                            warn!(connector = connector_name.as_str(), error = %e, "file_watcher: failed to stop connector for reload");
+                            continue;
+                        }
+                        if let Err(e) = manager.create(config).await {
+                            warn!(file = ?path, error = %e, "file_watcher: failed to recreate connector after config change");
+                        }
+                        if let Some(h) = new_hash {
+                            manager.toml_hashes.write().await.insert(connector_name, h);
+                        }
+                    }
+                    Err(e) => {
+                        warn!(file = ?path, error = %e, "file_watcher: failed to parse modified TOML connector config");
+                    }
+                }
+            }
+        } else {
+            // New file — create connector.
             match ConnectorConfig::load_toml(&path) {
                 Ok(mut config) => {
                     config.resolve_env_vars();
@@ -67,8 +105,12 @@ async fn sync_connectors(manager: &Arc<ConnectorManager>, connectors_dir: &PathB
                         file = ?path,
                         "file_watcher: new TOML connector config detected"
                     );
+                    let name = config.name.clone();
                     if let Err(e) = manager.create(config).await {
                         warn!(file = ?path, error = %e, "file_watcher: failed to create connector from TOML");
+                    }
+                    if let Some(h) = ConnectorManager::hash_file(&path) {
+                        manager.toml_hashes.write().await.insert(name, h);
                     }
                 }
                 Err(e) => {
@@ -93,6 +135,7 @@ async fn sync_connectors(manager: &Arc<ConnectorManager>, connectors_dir: &PathB
             if let Err(e) = manager.delete(&connector_name).await {
                 warn!(connector = connector_name.as_str(), error = %e, "file_watcher: failed to delete connector");
             }
+            manager.toml_hashes.write().await.remove(&connector_name);
         }
     }
 }
