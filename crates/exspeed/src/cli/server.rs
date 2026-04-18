@@ -58,16 +58,11 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         .cloned()
         .map(Arc::new);
 
-    // Validate TLS: both or neither.
-    match (args.tls_cert.as_ref(), args.tls_key.as_ref()) {
-        (Some(_), None) | (None, Some(_)) => {
-            anyhow::bail!(
-                "TLS configuration invalid: EXSPEED_TLS_CERT and EXSPEED_TLS_KEY must both be set or both unset"
-            );
-        }
-        _ => {}
-    }
-    let tls_enabled = args.tls_cert.is_some();
+    let tls_paths = crate::cli::server_tls::TlsPaths::from_args(
+        args.tls_cert.as_deref(),
+        args.tls_key.as_deref(),
+    )?;
+    let tls_enabled = tls_paths.is_some();
 
     // Posture log (always).
     info!(
@@ -241,9 +236,9 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     tokio::spawn(exspeed_api::serve(state, api_addr));
 
     // Load TLS config if enabled.
-    let tls_config = match (&args.tls_cert, &args.tls_key) {
-        (Some(cert), Some(key)) => Some(crate::cli::server_tls::load_tls_config(cert, key)?),
-        _ => None,
+    let tls_config = match &tls_paths {
+        Some(paths) => Some(crate::cli::server_tls::load_tls_config(&paths.cert, &paths.key)?),
+        None => None,
     };
 
     // TCP server
