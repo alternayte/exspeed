@@ -91,6 +91,7 @@ constant_time_eq = "0.3"
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
 rcgen = "0.13"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 
 # Observability / Metrics
 opentelemetry = "0.28"

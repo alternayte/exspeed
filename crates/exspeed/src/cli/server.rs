@@ -233,7 +233,12 @@ pub async fn run(args: ServerArgs) -> Result<()> {
 
     // Spawn HTTP API server
     let api_addr: SocketAddr = args.api_bind.parse()?;
-    tokio::spawn(exspeed_api::serve(state, api_addr));
+    let http_tls = tls_paths.clone();
+    tokio::spawn(async move {
+        if let Err(e) = exspeed_api::serve(state, api_addr, http_tls).await {
+            error!("HTTP API exited: {}", e);
+        }
+    });
 
     // Load TLS config if enabled.
     let tls_config = match &tls_paths {

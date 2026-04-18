@@ -139,3 +139,37 @@ async fn tls_enabled_tcp_handshakes_with_rustls() {
         .unwrap();
     assert_eq!(resp.opcode, OpCode::Ok);
 }
+
+#[tokio::test]
+async fn tls_enabled_http_responds_to_rustls_request() {
+    let (cert_path, key_path, _certs_tmp) = generate_self_signed();
+    let data_tmp = tempfile::tempdir().unwrap();
+    let port = portpicker::pick_unused_port().unwrap();
+    let api_port = portpicker::pick_unused_port().unwrap();
+
+    let args = exspeed::cli::server::ServerArgs {
+        bind: format!("127.0.0.1:{port}"),
+        api_bind: format!("127.0.0.1:{api_port}"),
+        data_dir: data_tmp.path().to_path_buf(),
+        auth_token: None,
+        tls_cert: Some(cert_path.clone()),
+        tls_key: Some(key_path),
+    };
+
+    tokio::spawn(async move {
+        exspeed::cli::server::run(args).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let cert_pem = std::fs::read(&cert_path).unwrap();
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(&cert_pem).unwrap())
+        .build()
+        .unwrap();
+
+    let resp = client
+        .get(format!("https://localhost:{api_port}/healthz"))
+        .send().await.unwrap();
+
+    assert_eq!(resp.status(), 200);
+}

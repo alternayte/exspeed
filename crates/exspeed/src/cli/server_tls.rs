@@ -1,42 +1,16 @@
 use std::fs::File;
 use std::io::BufReader;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::ServerConfig;
 
-/// Paths to a PEM-encoded server certificate chain and its private key.
-#[derive(Debug, Clone)]
-pub struct TlsPaths {
-    pub cert: PathBuf,
-    pub key: PathBuf,
-}
-
-impl TlsPaths {
-    /// Validate the "both-or-neither" constraint on optional cert/key paths.
-    ///
-    /// Returns:
-    /// - `Ok(Some(TlsPaths))` when both are provided.
-    /// - `Ok(None)` when neither is provided.
-    /// - `Err(...)` when exactly one is provided.
-    pub fn from_args(
-        cert: Option<&std::path::Path>,
-        key: Option<&std::path::Path>,
-    ) -> anyhow::Result<Option<Self>> {
-        match (cert, key) {
-            (Some(c), Some(k)) => Ok(Some(Self {
-                cert: c.to_path_buf(),
-                key: k.to_path_buf(),
-            })),
-            (None, None) => Ok(None),
-            _ => anyhow::bail!(
-                "TLS configuration invalid: EXSPEED_TLS_CERT and EXSPEED_TLS_KEY must both be set or both unset"
-            ),
-        }
-    }
-}
+// TlsPaths now lives in exspeed-api so the HTTP TLS listener can share the
+// same "both-or-neither" validation helper. Re-exported here so existing
+// call sites in this binary keep working via `crate::cli::server_tls::TlsPaths`.
+pub use exspeed_api::TlsPaths;
 
 /// Load a PEM-encoded cert chain and private key from disk and build a
 /// rustls ServerConfig. Returns an error if parsing or validation fails.

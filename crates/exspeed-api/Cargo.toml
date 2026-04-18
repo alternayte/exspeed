@@ -12,6 +12,8 @@ exspeed-streams = { path = "../exspeed-streams" }
 exspeed-connectors = { path = "../exspeed-connectors" }
 exspeed-processing = { path = "../exspeed-processing" }
 axum = { workspace = true }
+axum-server = { workspace = true }
+anyhow = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
