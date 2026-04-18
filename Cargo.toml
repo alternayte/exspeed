@@ -87,6 +87,11 @@ uuid = { version = "1", features = ["v4"] }
 # Constant-time byte comparison (defends against timing oracles)
 constant_time_eq = "0.3"
 
+# TLS
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+rcgen = "0.13"
+
 # Observability / Metrics
 opentelemetry = "0.28"
 opentelemetry_sdk = { version = "0.28", features = ["metrics"] }

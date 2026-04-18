@@ -240,6 +240,12 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     let api_addr: SocketAddr = args.api_bind.parse()?;
     tokio::spawn(exspeed_api::serve(state, api_addr));
 
+    // Load TLS config if enabled.
+    let tls_config = match (&args.tls_cert, &args.tls_key) {
+        (Some(cert), Some(key)) => Some(crate::cli::server_tls::load_tls_config(cert, key)?),
+        _ => None,
+    };
+
     // TCP server
     let tcp_addr: SocketAddr = args.bind.parse()?;
     let listener = TcpListener::bind(tcp_addr).await?;
@@ -254,8 +260,19 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         let broker = broker.clone();
         let metrics_clone = metrics.clone();
         let auth_token_clone = auth_token.clone();
+        let tls_config_clone = tls_config.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(socket, peer, broker, auth_token_clone).await {
+            let result: Result<()> = async move {
+                if let Some(tls_cfg) = tls_config_clone {
+                    let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
+                    let tls_stream = acceptor.accept(socket).await?;
+                    handle_connection(tls_stream, peer, broker, auth_token_clone).await
+                } else {
+                    handle_connection(socket, peer, broker, auth_token_clone).await
+                }
+            }
+            .await;
+            if let Err(e) = result {
                 error!(%peer, "connection error: {}", e);
             }
             metrics_clone.connection_closed();
@@ -264,13 +281,16 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     }
 }
 
-async fn handle_connection(
-    socket: tokio::net::TcpStream,
+async fn handle_connection<S>(
+    socket: S,
     peer: SocketAddr,
     broker: Arc<Broker>,
     auth_token: Option<Arc<String>>,
-) -> Result<()> {
-    let (reader, writer) = socket.into_split();
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (reader, writer) = tokio::io::split(socket);
     let mut framed_read = FramedRead::new(reader, ExspeedCodec::new());
     let mut framed_write = FramedWrite::new(writer, ExspeedCodec::new());
 
