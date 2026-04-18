@@ -16,9 +16,19 @@ use axum::Router;
 use crate::state::AppState;
 
 pub fn build_router(state: Arc<AppState>) -> Router {
-    Router::new()
+    use axum::middleware::from_fn_with_state;
+
+    // Unauthenticated routes: probes, metrics, webhooks (webhooks carry their
+    // own per-webhook auth — see handlers/webhooks.rs).
+    let unauth = Router::new()
         .route("/healthz", get(health::healthz))
         .route("/readyz", get(health::readyz))
+        .route("/metrics", get(metrics::prometheus_metrics))
+        .route("/webhooks/{*path}", post(webhooks::handle_webhook))
+        .with_state(state.clone());
+
+    // Authenticated routes: all /api/v1/*.
+    let authed = Router::new()
         .route(
             "/api/v1/streams",
             get(streams::list_streams).post(streams::create_stream),
@@ -70,7 +80,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/v1/connections/{name}",
             delete(connections::delete_connection),
         )
-        .route("/webhooks/{*path}", post(webhooks::handle_webhook))
-        .route("/metrics", get(metrics::prometheus_metrics))
-        .with_state(state)
+        .layer(from_fn_with_state(state.clone(), crate::middleware::require_bearer))
+        .with_state(state);
+
+    unauth.merge(authed)
 }

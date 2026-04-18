@@ -125,3 +125,103 @@ async fn auth_enabled_blocks_ops_before_connect() {
         .await.unwrap().unwrap().unwrap();
     assert_eq!(resp.opcode, OpCode::Error);
 }
+
+async fn start_server_with_api(
+    auth_token: Option<String>,
+) -> (String, u16, TempDir) {
+    let port = portpicker::pick_unused_port().unwrap();
+    let api_port = portpicker::pick_unused_port().unwrap();
+    let bind = format!("127.0.0.1:{port}");
+    let api_bind = format!("127.0.0.1:{api_port}");
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().to_path_buf();
+
+    let args = exspeed::cli::server::ServerArgs {
+        bind: bind.clone(),
+        api_bind,
+        data_dir,
+        auth_token,
+        tls_cert: None,
+        tls_key: None,
+    };
+
+    tokio::spawn(async move {
+        exspeed::cli::server::run(args).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    (bind, api_port, tmp)
+}
+
+#[tokio::test]
+async fn http_rejects_missing_bearer() {
+    let (_, api_port, _tmp) = start_server_with_api(Some("secret123".into())).await;
+    let resp = reqwest::get(format!("http://127.0.0.1:{api_port}/api/v1/streams"))
+        .await.unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn http_rejects_malformed_authorization() {
+    let (_, api_port, _tmp) = start_server_with_api(Some("secret123".into())).await;
+    let resp = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{api_port}/api/v1/streams"))
+        .header("Authorization", "Basic abc")
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn http_rejects_wrong_bearer() {
+    let (_, api_port, _tmp) = start_server_with_api(Some("secret123".into())).await;
+    let resp = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{api_port}/api/v1/streams"))
+        .header("Authorization", "Bearer wrong-token")
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn http_accepts_valid_bearer() {
+    let (_, api_port, _tmp) = start_server_with_api(Some("secret123".into())).await;
+    let resp = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{api_port}/api/v1/streams"))
+        .header("Authorization", "Bearer secret123")
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn http_healthz_bypasses_auth() {
+    let (_, api_port, _tmp) = start_server_with_api(Some("secret123".into())).await;
+    let resp = reqwest::get(format!("http://127.0.0.1:{api_port}/healthz")).await.unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn http_readyz_bypasses_auth() {
+    let (_, api_port, _tmp) = start_server_with_api(Some("secret123".into())).await;
+    let resp = reqwest::get(format!("http://127.0.0.1:{api_port}/readyz")).await.unwrap();
+    // /readyz returns 200 when ready, 503 when not. Either is fine; it must
+    // NOT return 401 — that's the auth check.
+    assert_ne!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn http_metrics_bypasses_auth() {
+    let (_, api_port, _tmp) = start_server_with_api(Some("secret123".into())).await;
+    let resp = reqwest::get(format!("http://127.0.0.1:{api_port}/metrics")).await.unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn http_webhooks_bypass_auth() {
+    // Webhooks bypass the broker-wide bearer because they carry their own
+    // per-webhook auth. No matching connector → 404, NOT 401.
+    let (_, api_port, _tmp) = start_server_with_api(Some("secret123".into())).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{api_port}/webhooks/nonexistent"))
+        .body("{}")
+        .send().await.unwrap();
+    assert_ne!(resp.status(), 401);
+}

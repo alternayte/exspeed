@@ -1099,6 +1099,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bytes",
+ "constant_time_eq",
  "exspeed-broker",
  "exspeed-common",
  "exspeed-connectors",
