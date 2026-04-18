@@ -84,6 +84,9 @@ notify = "7"
 # UUIDs
 uuid = { version = "1", features = ["v4"] }
 
+# Constant-time byte comparison (defends against timing oracles)
+constant_time_eq = "0.3"
+
 # Observability / Metrics
 opentelemetry = "0.28"
 opentelemetry_sdk = { version = "0.28", features = ["metrics"] }

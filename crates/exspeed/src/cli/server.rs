@@ -253,8 +253,9 @@ pub async fn run(args: ServerArgs) -> Result<()> {
 
         let broker = broker.clone();
         let metrics_clone = metrics.clone();
+        let auth_token_clone = auth_token.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(socket, peer, broker).await {
+            if let Err(e) = handle_connection(socket, peer, broker, auth_token_clone).await {
                 error!(%peer, "connection error: {}", e);
             }
             metrics_clone.connection_closed();
@@ -267,10 +268,14 @@ async fn handle_connection(
     socket: tokio::net::TcpStream,
     peer: SocketAddr,
     broker: Arc<Broker>,
+    auth_token: Option<Arc<String>>,
 ) -> Result<()> {
     let (reader, writer) = socket.into_split();
     let mut framed_read = FramedRead::new(reader, ExspeedCodec::new());
     let mut framed_write = FramedWrite::new(writer, ExspeedCodec::new());
+
+    // Auth state. Pre-authenticated when auth is off.
+    let mut authenticated = auth_token.is_none();
 
     // Per-connection subscription state (single subscription per TCP connection).
     // Tracks (consumer_name, subscriber_id) so disconnect cleanup removes the right subscriber.
@@ -286,11 +291,59 @@ async fn handle_connection(
                     Some(Ok(frame)) => {
                         let correlation_id = frame.correlation_id;
 
-                        match ClientMessage::from_frame(frame) {
+                        let parsed = ClientMessage::from_frame(frame);
+
+                        // Auth gate: all non-Connect ops require authentication.
+                        if !authenticated {
+                            match &parsed {
+                                Ok(ClientMessage::Connect(_)) => { /* allowed */ }
+                                _ => {
+                                    warn!(%peer, "rejected op before auth");
+                                    let response = ServerMessage::Error {
+                                        code: 401,
+                                        message: "unauthorized".into(),
+                                    }
+                                    .into_frame(correlation_id);
+                                    framed_write.send(response).await?;
+                                    break;
+                                }
+                            }
+                        }
+
+                        match parsed {
                             Ok(ClientMessage::Connect(req)) => {
-                                info!(%peer, client_id = %req.client_id, "CONNECT");
-                                let response = ServerMessage::Ok.into_frame(correlation_id);
-                                framed_write.send(response).await?;
+                                let result = if let Some(expected) = &auth_token {
+                                    if req.auth_type != exspeed_protocol::messages::connect::AuthType::Token {
+                                        Err("unauthorized")
+                                    } else if !constant_time_eq::constant_time_eq(
+                                        &req.auth_payload,
+                                        expected.as_bytes(),
+                                    ) {
+                                        Err("unauthorized")
+                                    } else {
+                                        Ok(())
+                                    }
+                                } else {
+                                    Ok(())
+                                };
+                                match result {
+                                    Ok(()) => {
+                                        authenticated = true;
+                                        info!(%peer, client_id = %req.client_id, "CONNECT authenticated");
+                                        let response = ServerMessage::Ok.into_frame(correlation_id);
+                                        framed_write.send(response).await?;
+                                    }
+                                    Err(msg) => {
+                                        warn!(%peer, client_id = %req.client_id, "CONNECT rejected");
+                                        let response = ServerMessage::Error {
+                                            code: 401,
+                                            message: msg.to_string(),
+                                        }
+                                        .into_frame(correlation_id);
+                                        framed_write.send(response).await?;
+                                        break; // close the socket
+                                    }
+                                }
                             }
                             Ok(ClientMessage::Ping) => {
                                 let response = ServerMessage::Pong.into_frame(correlation_id);
