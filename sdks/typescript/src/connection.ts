@@ -133,6 +133,8 @@ export class Connection extends EventEmitter {
       const useTls = this.opts.tls !== undefined && this.opts.tls !== false;
       const baseOpts = { host: this.opts.host, port: this.opts.port };
 
+      // onReady fires on 'connect' for plain TCP, 'secureConnect' for TLS —
+      // both mean the socket is ready for application I/O.
       const onReady = () => {
         socket.removeListener("error", reject);
         this.socketReady = true;
@@ -144,11 +146,11 @@ export class Connection extends EventEmitter {
         const tlsOpts: tls.ConnectionOptions = {
           ...baseOpts,
           rejectUnauthorized:
-            typeof this.opts.tls === "object" && this.opts.tls.rejectUnauthorized === false
+            typeof this.opts.tls === "object" && this.opts.tls !== null && this.opts.tls.rejectUnauthorized === false
               ? false
               : true,
           ca:
-            typeof this.opts.tls === "object" && this.opts.tls.ca
+            typeof this.opts.tls === "object" && this.opts.tls !== null && this.opts.tls.ca
               ? (Array.isArray(this.opts.tls.ca) ? this.opts.tls.ca : [this.opts.tls.ca])
               : undefined,
         };
@@ -157,11 +159,14 @@ export class Connection extends EventEmitter {
         socket = net.createConnection(baseOpts, onReady);
       }
 
+      // Register error listener BEFORE other listeners so synchronous errors
+      // during socket setup properly reject the promise instead of being
+      // absorbed by onSocketError with no listener.
+      socket.once("error", reject);
       socket.setKeepAlive(true, 10000);
       socket.on("data", (data) => this.onData(data));
       socket.on("error", (err) => this.onSocketError(err));
       socket.on("close", () => this.onSocketClose());
-      socket.once("error", reject);
       this.socket = socket;
     });
   }
