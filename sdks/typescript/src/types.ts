@@ -9,6 +9,16 @@ export interface ClientOptions {
   reconnectMaxDelay?: number;
   requestTimeout?: number;
   pingInterval?: number;
+  /**
+   * TLS configuration.
+   * - `true` = TLS with full cert verification against Node's trust store.
+   * - `false` or undefined = plain TCP (default, current behaviour).
+   * - object = TLS with overrides for self-signed certs or custom CAs.
+   */
+  tls?: boolean | {
+    rejectUnauthorized?: boolean;
+    ca?: Buffer | Buffer[];
+  };
 }
 
 export type PublishOptions =

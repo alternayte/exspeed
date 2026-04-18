@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import * as net from "node:net";
+import * as tls from "node:tls";
 import {
   OpCode,
   PROTOCOL_VERSION,
@@ -27,6 +28,10 @@ export interface ConnectionOptions {
   reconnectMaxDelay?: number;
   requestTimeout: number;
   pingInterval: number;
+  tls?: boolean | {
+    rejectUnauthorized?: boolean;
+    ca?: Buffer | Buffer[];
+  };
 }
 
 interface PendingRequest {
@@ -46,8 +51,9 @@ export class Connection extends EventEmitter {
   private reconnecting = false;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
 
-  private readonly opts: Required<Omit<ConnectionOptions, "auth">> & {
+  private readonly opts: Required<Omit<ConnectionOptions, "auth" | "tls">> & {
     auth?: ConnectionOptions["auth"];
+    tls?: ConnectionOptions["tls"];
   };
 
   constructor(options: ConnectionOptions) {
@@ -124,14 +130,33 @@ export class Connection extends EventEmitter {
 
   private openSocket(): Promise<void> {
     return new Promise((resolve, reject) => {
-      const socket = net.createConnection(
-        { host: this.opts.host, port: this.opts.port },
-        () => {
-          socket.removeListener("error", reject);
-          this.socketReady = true;
-          resolve();
-        },
-      );
+      const useTls = this.opts.tls !== undefined && this.opts.tls !== false;
+      const baseOpts = { host: this.opts.host, port: this.opts.port };
+
+      const onReady = () => {
+        socket.removeListener("error", reject);
+        this.socketReady = true;
+        resolve();
+      };
+
+      let socket: net.Socket;
+      if (useTls) {
+        const tlsOpts: tls.ConnectionOptions = {
+          ...baseOpts,
+          rejectUnauthorized:
+            typeof this.opts.tls === "object" && this.opts.tls.rejectUnauthorized === false
+              ? false
+              : true,
+          ca:
+            typeof this.opts.tls === "object" && this.opts.tls.ca
+              ? (Array.isArray(this.opts.tls.ca) ? this.opts.tls.ca : [this.opts.tls.ca])
+              : undefined,
+        };
+        socket = tls.connect(tlsOpts, onReady);
+      } else {
+        socket = net.createConnection(baseOpts, onReady);
+      }
+
       socket.setKeepAlive(true, 10000);
       socket.on("data", (data) => this.onData(data));
       socket.on("error", (err) => this.onSocketError(err));

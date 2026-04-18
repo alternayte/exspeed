@@ -230,6 +230,7 @@ export class ExspeedClient extends EventEmitter {
       reconnectMaxDelay: this.opts.reconnectMaxDelay,
       requestTimeout: this.opts.requestTimeout ?? 10000,
       pingInterval: this.opts.pingInterval ?? 30000,
+      tls: this.opts.tls ?? false,
     };
     const conn = new Connection(connOpts);
     conn.on("connected", () => this.emit("connected"));
