@@ -315,9 +315,9 @@ async fn handle_connection(
                                 let result = if let Some(expected) = &auth_token {
                                     if req.auth_type != exspeed_protocol::messages::connect::AuthType::Token {
                                         Err("unauthorized")
-                                    } else if !constant_time_eq::constant_time_eq(
+                                    } else if !exspeed_common::auth::verify_token(
                                         &req.auth_payload,
-                                        expected.as_bytes(),
+                                        expected,
                                     ) {
                                         Err("unauthorized")
                                     } else {

@@ -1071,7 +1071,6 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
- "constant_time_eq",
  "exspeed-api",
  "exspeed-broker",
  "exspeed-common",
@@ -1099,7 +1098,6 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bytes",
- "constant_time_eq",
  "exspeed-broker",
  "exspeed-common",
  "exspeed-connectors",
@@ -1141,6 +1139,7 @@ name = "exspeed-common"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "constant_time_eq",
  "opentelemetry",
  "opentelemetry-prometheus",
  "opentelemetry_sdk",

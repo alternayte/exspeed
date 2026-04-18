@@ -18,4 +18,3 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 prometheus = { workspace = true }
 tracing = { workspace = true }
-constant_time_eq = { workspace = true }

@@ -10,11 +10,15 @@ use serde_json::json;
 
 use crate::state::AppState;
 
-/// Reject the request with 401 and a JSON body.
-fn unauthorized(msg: &str) -> Response {
+/// Reject the request with 401 + the RFC 7235 `WWW-Authenticate: Bearer`
+/// header. The body is always the same opaque `"unauthorized"` so the
+/// failure reason (missing header / wrong scheme / wrong token) is not
+/// exposed to an attacker.
+fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
-        Json(json!({"error": msg})),
+        [("www-authenticate", "Bearer")],
+        Json(json!({"error": "unauthorized"})),
     )
         .into_response()
 }
@@ -31,17 +35,15 @@ pub async fn require_bearer(
         return next.run(req).await;
     };
 
-    let header = match req.headers().get(AUTHORIZATION).and_then(|v| v.to_str().ok()) {
-        Some(h) => h,
-        None => return unauthorized("missing Authorization header"),
+    let Some(header) = req.headers().get(AUTHORIZATION).and_then(|v| v.to_str().ok()) else {
+        return unauthorized();
     };
-    let token = match header.strip_prefix("Bearer ") {
-        Some(t) => t,
-        None => return unauthorized("invalid Authorization header"),
+    let Some(token) = header.strip_prefix("Bearer ") else {
+        return unauthorized();
     };
 
-    if !constant_time_eq::constant_time_eq(token.as_bytes(), expected.as_bytes()) {
-        return unauthorized("unauthorized");
+    if !exspeed_common::auth::verify_token(token.as_bytes(), expected) {
+        return unauthorized();
     }
 
     next.run(req).await
