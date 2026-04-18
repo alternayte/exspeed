@@ -49,6 +49,11 @@ pub struct ServerArgs {
 }
 
 pub async fn run(args: ServerArgs) -> Result<()> {
+    // Install the rustls crypto provider once, before anything else. This
+    // ensures both the sync TCP load_tls_config path and the axum-server
+    // (HTTP) spawn always see a provider, regardless of scheduler ordering.
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+
     // Normalize auth token: empty string → unset (guards against shells
     // passing EXSPEED_AUTH_TOKEN="" through).
     let auth_token: Option<Arc<String>> = args
