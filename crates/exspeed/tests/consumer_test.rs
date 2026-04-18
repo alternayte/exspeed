@@ -33,6 +33,9 @@ async fn start_server() -> String {
             bind,
             api_bind: format!("127.0.0.1:{}", portpicker::pick_unused_port().unwrap()),
             data_dir,
+            auth_token: None,
+            tls_cert: None,
+            tls_key: None,
         })
         .await
         .unwrap();

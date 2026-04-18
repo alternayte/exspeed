@@ -23,6 +23,9 @@ async fn start_server() -> (String, String) {
             bind: tcp_addr_clone,
             api_bind: http_addr_clone,
             data_dir,
+            auth_token: None,
+            tls_cert: None,
+            tls_key: None,
         })
         .await
         .unwrap();

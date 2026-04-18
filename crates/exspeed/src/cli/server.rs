@@ -34,9 +34,56 @@ pub struct ServerArgs {
     /// Directory for persistent data
     #[arg(long, default_value = "./exspeed-data")]
     pub data_dir: PathBuf,
+
+    /// Shared bearer token. When set, required on all TCP and HTTP connections.
+    #[arg(long, env = "EXSPEED_AUTH_TOKEN", hide_env_values = true)]
+    pub auth_token: Option<String>,
+
+    /// Path to PEM-encoded server certificate (full chain). Must be set with --tls-key.
+    #[arg(long, env = "EXSPEED_TLS_CERT")]
+    pub tls_cert: Option<PathBuf>,
+
+    /// Path to PEM-encoded private key. Must be set with --tls-cert.
+    #[arg(long, env = "EXSPEED_TLS_KEY")]
+    pub tls_key: Option<PathBuf>,
 }
 
 pub async fn run(args: ServerArgs) -> Result<()> {
+    // Normalize auth token: empty string → unset (guards against shells
+    // passing EXSPEED_AUTH_TOKEN="" through).
+    let auth_token: Option<Arc<String>> = args
+        .auth_token
+        .as_ref()
+        .filter(|v| !v.is_empty())
+        .cloned()
+        .map(Arc::new);
+
+    // Validate TLS: both or neither.
+    match (args.tls_cert.as_ref(), args.tls_key.as_ref()) {
+        (Some(_), None) | (None, Some(_)) => {
+            anyhow::bail!(
+                "TLS configuration invalid: EXSPEED_TLS_CERT and EXSPEED_TLS_KEY must both be set or both unset"
+            );
+        }
+        _ => {}
+    }
+    let tls_enabled = args.tls_cert.is_some();
+
+    // Posture log (always).
+    info!(
+        auth = if auth_token.is_some() { "on" } else { "off" },
+        tls = if tls_enabled { "on" } else { "off" },
+        bind = %args.bind,
+        api_bind = %args.api_bind,
+        "exspeed server starting"
+    );
+    if auth_token.is_none() {
+        warn!("auth disabled — do not expose broker ports to the public internet");
+    }
+    if !tls_enabled {
+        warn!("TLS disabled — do not expose broker ports to the public internet");
+    }
+
     // Create storage
     let file_storage = Arc::new(FileStorage::open(&args.data_dir)?);
     // Check for S3 tiered storage
@@ -171,6 +218,7 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         prometheus_registry,
         connector_manager,
         exql,
+        auth_token: auth_token.clone(),
     });
 
     // Spawn retention task

@@ -16,4 +16,7 @@ pub struct AppState {
     pub prometheus_registry: Registry,
     pub connector_manager: Arc<ConnectorManager>,
     pub exql: Arc<ExqlEngine>,
+    /// Shared bearer token required on protected HTTP endpoints.
+    /// When None, all HTTP endpoints are unauthenticated.
+    pub auth_token: Option<Arc<String>>,
 }
