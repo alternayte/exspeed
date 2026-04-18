@@ -225,3 +225,23 @@ async fn http_webhooks_bypass_auth() {
         .send().await.unwrap();
     assert_ne!(resp.status(), 401);
 }
+
+#[tokio::test]
+async fn cli_client_sends_bearer_when_env_set() {
+    // This test exercises the CliClient against an authenticated server.
+    // If the Authorization header is correctly set, the request succeeds.
+    let (_, api_port, _tmp) = start_server_with_api(Some("cli-secret".into())).await;
+
+    std::env::set_var("EXSPEED_AUTH_TOKEN", "cli-secret");
+    // Use the same CliClient the CLI binary uses.
+    let client =
+        exspeed::cli::client::CliClient::new(&format!("http://127.0.0.1:{api_port}"));
+    std::env::remove_var("EXSPEED_AUTH_TOKEN");
+
+    // GET /api/v1/streams is the standard list-streams call (see cli/stream.rs::list).
+    let result = client.get("/api/v1/streams").await;
+    assert!(
+        result.is_ok(),
+        "expected Authorization header to authenticate: {result:?}"
+    );
+}

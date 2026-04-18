@@ -11,9 +11,43 @@ pub struct CliClient {
 
 impl CliClient {
     /// Create a new client targeting `server_url` (e.g. `http://localhost:8080`).
+    ///
+    /// Reads two environment variables at construction time:
+    ///
+    /// - `EXSPEED_AUTH_TOKEN` — if set and non-empty, every request is sent
+    ///   with an `Authorization: Bearer <token>` header.
+    /// - `EXSPEED_INSECURE_SKIP_VERIFY` — if set to `"1"`, TLS certificate
+    ///   verification is disabled. Intended for dev/testing against a server
+    ///   using a self-signed cert. A warning is logged when enabled.
     pub fn new(server_url: &str) -> Self {
+        let mut builder = reqwest::Client::builder();
+
+        // Allow self-signed certs for dev/testing.
+        if std::env::var("EXSPEED_INSECURE_SKIP_VERIFY").ok().as_deref() == Some("1") {
+            tracing::warn!(
+                "EXSPEED_INSECURE_SKIP_VERIFY=1 set — TLS certs will not be verified"
+            );
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+
+        // Bearer auth via env var.
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        if let Ok(token) = std::env::var("EXSPEED_AUTH_TOKEN") {
+            if !token.is_empty() {
+                let value = reqwest::header::HeaderValue::from_str(
+                    &format!("Bearer {token}"),
+                )
+                .expect("valid Authorization header");
+                default_headers.insert(reqwest::header::AUTHORIZATION, value);
+            }
+        }
+        if !default_headers.is_empty() {
+            builder = builder.default_headers(default_headers);
+        }
+
+        let client = builder.build().expect("reqwest Client::build");
         Self {
-            client: reqwest::Client::new(),
+            client,
             base_url: server_url.trim_end_matches('/').to_string(),
         }
     }
