@@ -8,6 +8,7 @@ use crate::broker_append::BrokerAppend;
 use crate::consumer_state::{ConsumerGroup, ConsumerState, DeliveryRecord};
 use crate::delivery::{run_delivery, DeliveryConfig};
 use crate::handlers;
+use crate::lease::LeaderLease;
 use exspeed_protocol::messages::{ClientMessage, ServerMessage};
 use exspeed_streams::StorageEngine;
 
@@ -19,6 +20,7 @@ pub struct Broker {
     pub data_dir: PathBuf,
     pub consumer_store: Arc<dyn crate::consumer_store::ConsumerStore>,
     pub work_coordinator: Arc<dyn crate::work_coordinator::WorkCoordinator>,
+    pub lease: Arc<dyn LeaderLease>,
     pub(crate) max_delivery_attempts: u16,
     pub(crate) nack_attempts: RwLock<HashMap<(String, u64), u16>>,
 }
@@ -30,6 +32,7 @@ impl Broker {
         data_dir: PathBuf,
         consumer_store: Arc<dyn crate::consumer_store::ConsumerStore>,
         work_coordinator: Arc<dyn crate::work_coordinator::WorkCoordinator>,
+        lease: Arc<dyn LeaderLease>,
     ) -> Self {
         Self {
             storage,
@@ -39,6 +42,7 @@ impl Broker {
             data_dir,
             consumer_store,
             work_coordinator,
+            lease,
             max_delivery_attempts: 5,
             nack_attempts: RwLock::new(HashMap::new()),
         }
@@ -217,12 +221,14 @@ mod tests {
             dir.path().to_path_buf(),
         ));
         let work_coordinator = Arc::new(crate::work_coordinator::noop::NoopWorkCoordinator);
+        let lease = Arc::new(crate::lease::NoopLeaderLease::new());
         let broker = Broker::new(
             storage,
             broker_append,
             dir.path().to_path_buf(),
             consumer_store,
             work_coordinator,
+            lease,
         );
         (broker, dir)
     }

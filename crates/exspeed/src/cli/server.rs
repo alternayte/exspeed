@@ -69,14 +69,6 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     )?;
     let tls_enabled = tls_paths.is_some();
 
-    // Posture log (always).
-    info!(
-        auth = if auth_token.is_some() { "on" } else { "off" },
-        tls = if tls_enabled { "on" } else { "off" },
-        bind = %args.bind,
-        api_bind = %args.api_bind,
-        "exspeed server starting"
-    );
     if auth_token.is_none() {
         warn!("auth disabled — do not expose broker ports to the public internet");
     }
@@ -141,6 +133,43 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         "work coordinator initialized"
     );
 
+    // Build lease backend (same env var dispatch as work coordinator).
+    let lease = exspeed_broker::lease::from_env()
+        .await
+        .expect("failed to initialize lease backend");
+    info!(
+        lease_backend = if lease.supports_coordination() { "coordinated" } else { "noop" },
+        "lease backend initialized"
+    );
+
+    // Warn if file-backed — multi-pod deployments need postgres/redis.
+    if !lease.supports_coordination() {
+        warn!(
+            "lease backend is file — multi-pod deployment not supported; \
+             all connectors and continuous queries will run on this pod. \
+             Set EXSPEED_CONSUMER_STORE=postgres|redis for multi-pod coordination."
+        );
+    }
+
+    // Posture log (always). Emitted after lease is built so the backend name
+    // appears alongside auth/tls state.
+    let lease_backend_name = if lease.supports_coordination() {
+        // Read the env var so we show postgres/redis rather than "coordinated"
+        std::env::var("EXSPEED_CONSUMER_STORE")
+            .or_else(|_| std::env::var("EXSPEED_OFFSET_STORE"))
+            .unwrap_or_else(|_| "file".to_string())
+    } else {
+        "file".to_string()
+    };
+    info!(
+        auth = if auth_token.is_some() { "on" } else { "off" },
+        tls = if tls_enabled { "on" } else { "off" },
+        lease = %lease_backend_name,
+        bind = %args.bind,
+        api_bind = %args.api_bind,
+        "exspeed server starting"
+    );
+
     // Create broker
     let broker_append_for_connectors = broker_append.clone();
     let broker = Arc::new(Broker::new(
@@ -149,6 +178,7 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         args.data_dir.clone(),
         consumer_store,
         work_coordinator.clone(),
+        lease.clone(),
     ));
     broker.load_consumers().await.map_err(|e| anyhow::anyhow!(e))?;
 
@@ -219,6 +249,7 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         connector_manager,
         exql,
         auth_token: auth_token.clone(),
+        lease: lease.clone(),
     });
 
     // Spawn retention task
