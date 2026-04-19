@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use exspeed_common::{subject_matches, Offset, StreamName};
+use exspeed_common::{subject_matches, Metrics, Offset, StreamName};
 use exspeed_streams::StorageEngine;
 
 use crate::consumer_state::DeliveryRecord;
@@ -20,6 +20,22 @@ pub struct DeliveryConfig {
     pub group_name: Option<String>,
     pub subscriber_id: String,
     pub work_coordinator: Arc<dyn WorkCoordinator>,
+    pub metrics: Arc<Metrics>,
+}
+
+/// Compute consume latency in seconds: `now - record_timestamp`, clamped to 0
+/// if the record was written in the future (clock skew) or the UNIX_EPOCH
+/// subtraction fails.
+fn consume_latency_secs(record_timestamp_nanos: u64) -> f64 {
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    if now_nanos > record_timestamp_nanos {
+        (now_nanos - record_timestamp_nanos) as f64 / 1_000_000_000.0
+    } else {
+        0.0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +115,12 @@ async fn run_ungrouped(
                 record: record.clone(),
                 delivery_attempt: 1,
             };
+
+            config.metrics.record_consume_latency(
+                &config.stream_name,
+                &config.consumer_name,
+                consume_latency_secs(record.timestamp),
+            );
 
             if tx.send(delivery).await.is_err() {
                 return;
@@ -203,10 +225,17 @@ async fn run_grouped(
                 _ => continue,
             };
 
+            let record_timestamp = record.timestamp;
             let delivery = DeliveryRecord {
                 record,
                 delivery_attempt: claim.attempts as u16,
             };
+
+            config.metrics.record_consume_latency(
+                &config.stream_name,
+                &config.consumer_name,
+                consume_latency_secs(record_timestamp),
+            );
 
             if tx.send(delivery).await.is_err() {
                 // Subscriber gone — do not ack; let it expire + be redelivered.

@@ -141,6 +141,7 @@ impl Broker {
             },
             subscriber_id: subscriber_id.to_string(),
             work_coordinator: Arc::clone(&self.work_coordinator),
+            metrics: Arc::clone(&self.metrics),
         };
 
         let storage = Arc::clone(&self.storage);
