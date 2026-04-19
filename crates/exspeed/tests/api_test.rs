@@ -359,6 +359,62 @@ async fn http_publish_with_msg_id_dedupes() {
 }
 
 #[tokio::test]
+async fn http_publish_msg_id_header_dedupes_same_as_field() {
+    let (_tcp, http) = start_server().await;
+
+    // Create stream.
+    reqwest::Client::new()
+        .post(format!("{}/api/v1/streams", http))
+        .json(&serde_json::json!({ "name": "hdr-dedup" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let client = reqwest::Client::new();
+
+    // First publish via x-idempotency-key header only (no body msg_id field).
+    let r1: serde_json::Value = client
+        .post(format!("{}/api/v1/streams/hdr-dedup/publish", http))
+        .header("x-idempotency-key", "header-key-1")
+        .json(&serde_json::json!({ "data": {"x": 1} }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        r1["duplicate"], false,
+        "first publish via header should not be a duplicate; body: {:?}",
+        r1
+    );
+
+    // Second publish with same x-idempotency-key header — should be deduplicated.
+    let r2: serde_json::Value = client
+        .post(format!("{}/api/v1/streams/hdr-dedup/publish", http))
+        .header("x-idempotency-key", "header-key-1")
+        .json(&serde_json::json!({ "data": {"x": 1} }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        r2["duplicate"], true,
+        "second publish with same header key should be duplicate; body: {:?}",
+        r2
+    );
+    assert_eq!(
+        r1["offset"], r2["offset"],
+        "duplicate should return the same offset; r1={:?} r2={:?}",
+        r1, r2
+    );
+}
+
+#[tokio::test]
 async fn http_publish_msg_id_collision_returns_conflict() {
     let (_tcp, http) = start_server().await;
 

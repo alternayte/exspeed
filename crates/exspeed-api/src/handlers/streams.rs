@@ -288,6 +288,7 @@ pub struct PublishBody {
 pub async fn publish_to_stream(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    headers_in: HeaderMap,
     Json(body): Json<PublishBody>,
 ) -> axum::response::Response {
     let stream_name = match StreamName::try_from(name.as_str()) {
@@ -320,9 +321,29 @@ pub async fn publish_to_stream(
 
     let key = body.key.map(|k| Bytes::from(k.into_bytes()));
 
-    // Translate msg_id → x-idempotency-key header.
+    // Read x-idempotency-key from the HTTP request header (if present).
+    let header_msg_id = headers_in
+        .get("x-idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    // Prefer the explicit body field; log DEBUG when both are present but differ.
+    let effective_msg_id = match (&body.msg_id, &header_msg_id) {
+        (Some(field), Some(header)) if field != header => {
+            tracing::debug!(
+                stream = %name,
+                "publish has both explicit msg_id and x-idempotency-key header; using explicit field"
+            );
+            Some(field.clone())
+        }
+        (Some(field), _) => Some(field.clone()),
+        (None, Some(header)) => Some(header.clone()),
+        (None, None) => None,
+    };
+
+    // Translate effective_msg_id → x-idempotency-key header.
     let mut headers = vec![];
-    if let Some(ref id) = body.msg_id {
+    if let Some(ref id) = effective_msg_id {
         headers.push(("x-idempotency-key".to_string(), id.clone()));
     }
 
