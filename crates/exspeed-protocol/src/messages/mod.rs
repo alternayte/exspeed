@@ -10,7 +10,7 @@ pub mod seek;
 pub mod stream_mgmt;
 
 pub use ack::{AckRequest, NackRequest};
-pub use connect::{AuthType, ConnectRequest};
+pub use connect::{AuthType, ConnectRequest, ConnectResponse, WIRE_VERSION};
 pub use consumer::{
     CreateConsumerRequest, DeleteConsumerRequest, StartFrom, SubscribeRequest, UnsubscribeRequest,
 };
@@ -22,11 +22,16 @@ pub use records_batch::{BatchRecord, RecordsBatch};
 pub use seek::SeekRequest;
 pub use stream_mgmt::CreateStreamRequest;
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 
 use crate::error::ProtocolError;
 use crate::frame::Frame;
 use crate::opcodes::OpCode;
+
+/// Error code: a publish key collided with a duplicate-detected record at a different value.
+pub const ERR_KEY_COLLISION: u16 = 0x1001;
+/// Error code: the per-stream dedup map is full; caller should retry later.
+pub const ERR_DEDUP_MAP_FULL: u16 = 0x1002;
 
 /// A decoded client -> server message.
 #[derive(Debug)]
@@ -92,7 +97,10 @@ pub enum ServerMessage {
     Ok,
     Error { code: u16, message: String },
     Pong,
-    PublishOk { offset: u64 },
+    PublishOk { offset: u64, duplicate: bool },
+    KeyCollision { stored_offset: u64 },
+    DedupMapFull { retry_after_secs: u32 },
+    ConnectOk(ConnectResponse),
     RecordsBatch(RecordsBatch),
     Record(RecordDelivery),
 }
@@ -103,15 +111,45 @@ impl ServerMessage {
             ServerMessage::Ok => Frame::empty(OpCode::Ok, correlation_id),
             ServerMessage::Pong => Frame::empty(OpCode::Pong, correlation_id),
             ServerMessage::Error { code, message } => {
-                let mut payload = Vec::with_capacity(2 + message.len());
-                payload.extend_from_slice(&code.to_le_bytes());
-                payload.extend_from_slice(message.as_bytes());
-                Frame::new(OpCode::Error, correlation_id, Bytes::from(payload))
+                let mb = message.as_bytes();
+                let mut payload = BytesMut::with_capacity(2 + 2 + mb.len());
+                payload.put_u16_le(code);
+                payload.put_u16_le(mb.len() as u16);
+                payload.extend_from_slice(mb);
+                Frame::new(OpCode::Error, correlation_id, payload.freeze())
             }
-            ServerMessage::PublishOk { offset } => {
-                let mut payload = BytesMut::with_capacity(8);
-                payload.put_u64_le(offset);
-                Frame::new(OpCode::Ok, correlation_id, payload.freeze())
+            ServerMessage::PublishOk { offset, duplicate } => {
+                let mut payload = BytesMut::with_capacity(9);
+                payload.extend_from_slice(&offset.to_le_bytes());
+                payload.put_u8(if duplicate { 0x01 } else { 0x00 });
+                Frame::new(OpCode::PublishOk, correlation_id, payload.freeze())
+            }
+            ServerMessage::KeyCollision { stored_offset } => {
+                let message = format!("key collision at offset {stored_offset}");
+                let mb = message.as_bytes();
+                let mut payload = BytesMut::with_capacity(2 + 2 + mb.len() + 1 + 8);
+                payload.put_u16_le(ERR_KEY_COLLISION);
+                payload.put_u16_le(mb.len() as u16);
+                payload.extend_from_slice(mb);
+                payload.put_u8(0x01);
+                payload.extend_from_slice(&stored_offset.to_le_bytes());
+                Frame::new(OpCode::Error, correlation_id, payload.freeze())
+            }
+            ServerMessage::DedupMapFull { retry_after_secs } => {
+                let message = format!("dedup map full, retry after {retry_after_secs}s");
+                let mb = message.as_bytes();
+                let mut payload = BytesMut::with_capacity(2 + 2 + mb.len() + 1 + 4);
+                payload.put_u16_le(ERR_DEDUP_MAP_FULL);
+                payload.put_u16_le(mb.len() as u16);
+                payload.extend_from_slice(mb);
+                payload.put_u8(0x02);
+                payload.extend_from_slice(&retry_after_secs.to_le_bytes());
+                Frame::new(OpCode::Error, correlation_id, payload.freeze())
+            }
+            ServerMessage::ConnectOk(resp) => {
+                let mut payload = BytesMut::new();
+                resp.encode(&mut payload);
+                Frame::new(OpCode::ConnectOk, correlation_id, payload.freeze())
             }
             ServerMessage::RecordsBatch(batch) => {
                 let mut payload = BytesMut::new();
@@ -125,12 +163,74 @@ impl ServerMessage {
             }
         }
     }
+
+    pub fn from_frame(frame: Frame) -> Result<Self, ProtocolError> {
+        match frame.opcode {
+            OpCode::Ok => Ok(ServerMessage::Ok),
+            OpCode::Pong => Ok(ServerMessage::Pong),
+            OpCode::PublishOk => {
+                let mut src = frame.payload;
+                if src.remaining() < 8 {
+                    return Err(ProtocolError::Decode("PublishOk payload too short".into()));
+                }
+                let offset = src.get_u64_le();
+                let duplicate = if src.remaining() >= 1 {
+                    src.get_u8() != 0
+                } else {
+                    false
+                };
+                Ok(ServerMessage::PublishOk { offset, duplicate })
+            }
+            OpCode::ConnectOk => {
+                Ok(ServerMessage::ConnectOk(ConnectResponse::decode(frame.payload)?))
+            }
+            OpCode::Error => {
+                let mut src = frame.payload;
+                if src.remaining() < 4 {
+                    return Err(ProtocolError::Decode("Error payload too short".into()));
+                }
+                let code = src.get_u16_le();
+                let msg_len = src.get_u16_le() as usize;
+                if src.remaining() < msg_len {
+                    return Err(ProtocolError::Decode(
+                        "Error payload truncated at message".into(),
+                    ));
+                }
+                let message = String::from_utf8(src.split_to(msg_len).to_vec())
+                    .map_err(|e| ProtocolError::Decode(format!("error message utf8: {e}")))?;
+
+                if src.remaining() >= 1 {
+                    let extras = src.get_u8();
+                    if code == ERR_KEY_COLLISION && extras & 0x01 != 0 && src.remaining() >= 8 {
+                        return Ok(ServerMessage::KeyCollision {
+                            stored_offset: src.get_u64_le(),
+                        });
+                    }
+                    if code == ERR_DEDUP_MAP_FULL && extras & 0x02 != 0 && src.remaining() >= 4 {
+                        return Ok(ServerMessage::DedupMapFull {
+                            retry_after_secs: src.get_u32_le(),
+                        });
+                    }
+                }
+                Ok(ServerMessage::Error { code, message })
+            }
+            OpCode::RecordsBatch => Ok(ServerMessage::RecordsBatch(RecordsBatch::decode(
+                frame.payload,
+            )?)),
+            OpCode::Record => Ok(ServerMessage::Record(RecordDelivery::decode(
+                frame.payload,
+            )?)),
+            other => Err(ProtocolError::Decode(format!(
+                "unhandled server opcode: {other:?}"
+            ))),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::{Buf, BytesMut};
+    use bytes::{Buf, Bytes, BytesMut};
 
     #[test]
     fn ping_frame_to_client_message() {
@@ -206,6 +306,7 @@ mod tests {
             stream: "events".into(),
             subject: "events.click".into(),
             key: None,
+            msg_id: None,
             value: Bytes::from_static(b"data"),
             headers: vec![],
         };
@@ -251,13 +352,18 @@ mod tests {
 
     #[test]
     fn publish_ok_to_frame() {
-        let frame = ServerMessage::PublishOk { offset: 999 }.into_frame(50);
-        assert_eq!(frame.opcode, OpCode::Ok);
+        let frame = ServerMessage::PublishOk {
+            offset: 999,
+            duplicate: false,
+        }
+        .into_frame(50);
+        assert_eq!(frame.opcode, OpCode::PublishOk);
         assert_eq!(frame.correlation_id, 50);
-        assert_eq!(frame.payload.len(), 8);
+        assert_eq!(frame.payload.len(), 9);
         let mut payload = frame.payload;
         let offset = payload.get_u64_le();
         assert_eq!(offset, 999);
+        assert_eq!(payload.get_u8(), 0x00);
     }
 
     #[test]
@@ -428,5 +534,91 @@ mod tests {
         assert_eq!(decoded.key, Some(Bytes::from_static(b"key-1")));
         assert_eq!(decoded.value, Bytes::from_static(b"payload-data"));
         assert_eq!(decoded.headers, vec![("trace".into(), "t1".into())]);
+    }
+
+    // --- Task 4 Sub-unit 4.2 tests ---
+
+    #[test]
+    fn publish_ok_encodes_duplicate_flag() {
+        let frame = ServerMessage::PublishOk {
+            offset: 99,
+            duplicate: true,
+        }
+        .into_frame(1);
+        assert_eq!(frame.payload.len(), 9);
+        assert_eq!(&frame.payload[0..8], &99u64.to_le_bytes());
+        assert_eq!(frame.payload[8], 0x01);
+    }
+
+    #[test]
+    fn publish_ok_default_not_duplicate() {
+        let frame = ServerMessage::PublishOk {
+            offset: 50,
+            duplicate: false,
+        }
+        .into_frame(1);
+        assert_eq!(frame.payload.len(), 9);
+        assert_eq!(frame.payload[8], 0x00);
+    }
+
+    #[test]
+    fn key_collision_error_roundtrip() {
+        let msg = ServerMessage::KeyCollision { stored_offset: 42 };
+        let frame = msg.into_frame(7);
+        match ServerMessage::from_frame(frame).unwrap() {
+            ServerMessage::KeyCollision { stored_offset } => assert_eq!(stored_offset, 42),
+            other => panic!("expected KeyCollision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dedup_map_full_error_roundtrip() {
+        let msg = ServerMessage::DedupMapFull {
+            retry_after_secs: 30,
+        };
+        let frame = msg.into_frame(7);
+        match ServerMessage::from_frame(frame).unwrap() {
+            ServerMessage::DedupMapFull { retry_after_secs } => {
+                assert_eq!(retry_after_secs, 30)
+            }
+            other => panic!("expected DedupMapFull, got {other:?}"),
+        }
+    }
+
+    // --- Task 4 Sub-unit 4.3 tests ---
+
+    #[test]
+    fn connect_ok_frame_roundtrip() {
+        let msg = ServerMessage::ConnectOk(ConnectResponse { server_version: 2 });
+        let frame = msg.into_frame(5);
+        match ServerMessage::from_frame(frame).unwrap() {
+            ServerMessage::ConnectOk(r) => assert_eq!(r.server_version, 2),
+            other => panic!("expected ConnectOk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn publish_ok_from_frame_roundtrip() {
+        let msg = ServerMessage::PublishOk {
+            offset: 77,
+            duplicate: true,
+        };
+        let frame = msg.into_frame(10);
+        match ServerMessage::from_frame(frame).unwrap() {
+            ServerMessage::PublishOk { offset, duplicate } => {
+                assert_eq!(offset, 77);
+                assert!(duplicate);
+            }
+            other => panic!("expected PublishOk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_ok_from_frame() {
+        let frame = ServerMessage::Ok.into_frame(1);
+        assert!(matches!(
+            ServerMessage::from_frame(frame).unwrap(),
+            ServerMessage::Ok
+        ));
     }
 }

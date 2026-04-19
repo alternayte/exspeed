@@ -124,7 +124,7 @@ async fn over_long_consumer_name_rejected() {
     let (mut reader, mut writer) = connect_to(&addr).await;
 
     let resp = send_recv(&mut writer, &mut reader, connect_frame(1)).await;
-    assert_eq!(resp.opcode, OpCode::Ok, "CONNECT should return Ok");
+    assert_eq!(resp.opcode, OpCode::ConnectOk, "CONNECT should return ConnectOk");
 
     let resp = send_recv(&mut writer, &mut reader, create_stream_frame("events", 2)).await;
     assert_eq!(resp.opcode, OpCode::Ok, "CREATE_STREAM should return Ok");

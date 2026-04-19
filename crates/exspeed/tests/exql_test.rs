@@ -77,6 +77,7 @@ fn publish_frame(stream: &str, subject: &str, value: &[u8], corr: u32) -> Frame 
         stream: stream.into(),
         subject: subject.into(),
         key: None,
+        msg_id: None,
         value: Bytes::copy_from_slice(value),
         headers: vec![],
     };
@@ -108,7 +109,7 @@ async fn setup_stream(stream_name: &str, records: &[(&str, &str)], tcp_addr: &st
     // Publish records via TCP
     let (mut reader, mut writer) = connect_to(tcp_addr).await;
     let resp = send_recv(&mut writer, &mut reader, connect_frame(1)).await;
-    assert_eq!(resp.opcode, OpCode::Ok, "CONNECT should return Ok");
+    assert_eq!(resp.opcode, OpCode::ConnectOk, "CONNECT should return ConnectOk");
 
     for (i, (subject, payload)) in records.iter().enumerate() {
         let resp = send_recv(
@@ -119,8 +120,8 @@ async fn setup_stream(stream_name: &str, records: &[(&str, &str)], tcp_addr: &st
         .await;
         assert_eq!(
             resp.opcode,
-            OpCode::Ok,
-            "PUBLISH record {} should return Ok",
+            OpCode::PublishOk,
+            "PUBLISH record {} should return PublishOk",
             i
         );
     }

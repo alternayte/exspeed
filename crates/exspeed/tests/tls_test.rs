@@ -137,7 +137,7 @@ async fn tls_enabled_tcp_handshakes_with_rustls() {
         .unwrap()
         .unwrap()
         .unwrap();
-    assert_eq!(resp.opcode, OpCode::Ok);
+    assert_eq!(resp.opcode, OpCode::ConnectOk);
 }
 
 #[tokio::test]

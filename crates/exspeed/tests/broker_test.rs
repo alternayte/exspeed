@@ -90,6 +90,7 @@ fn publish_frame(stream: &str, subject: &str, value: &[u8], corr: u32) -> Frame 
         stream: stream.into(),
         subject: subject.into(),
         key: None,
+        msg_id: None,
         value: Bytes::copy_from_slice(value),
         headers: vec![],
     };
@@ -127,7 +128,7 @@ async fn publish_and_fetch() {
 
     // 1. Connect
     let resp = send_recv(&mut writer, &mut reader, connect_frame(1)).await;
-    assert_eq!(resp.opcode, OpCode::Ok, "CONNECT should return Ok");
+    assert_eq!(resp.opcode, OpCode::ConnectOk, "CONNECT should return ConnectOk");
     assert_eq!(resp.correlation_id, 1);
 
     // 2. Create stream "orders"
@@ -144,7 +145,7 @@ async fn publish_and_fetch() {
             publish_frame("orders", "order.created", value.as_bytes(), 10 + i),
         )
         .await;
-        assert_eq!(resp.opcode, OpCode::Ok, "PUBLISH {} should return Ok", i);
+        assert_eq!(resp.opcode, OpCode::PublishOk, "PUBLISH {} should return PublishOk", i);
         assert_eq!(resp.correlation_id, 10 + i);
     }
 
@@ -180,7 +181,7 @@ async fn fetch_with_subject_filter() {
 
     // Connect
     let resp = send_recv(&mut writer, &mut reader, connect_frame(1)).await;
-    assert_eq!(resp.opcode, OpCode::Ok);
+    assert_eq!(resp.opcode, OpCode::ConnectOk);
 
     // Create stream "events"
     let resp = send_recv(&mut writer, &mut reader, create_stream_frame("events", 2)).await;
@@ -203,8 +204,8 @@ async fn fetch_with_subject_filter() {
         .await;
         assert_eq!(
             resp.opcode,
-            OpCode::Ok,
-            "PUBLISH '{}' should return Ok",
+            OpCode::PublishOk,
+            "PUBLISH '{}' should return PublishOk",
             subject
         );
     }

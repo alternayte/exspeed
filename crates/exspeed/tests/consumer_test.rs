@@ -111,6 +111,7 @@ fn publish_frame(stream: &str, subject: &str, value: &[u8], corr: u32) -> Frame 
         stream: stream.into(),
         subject: subject.into(),
         key: None,
+        msg_id: None,
         value: Bytes::copy_from_slice(value),
         headers: vec![],
     };
@@ -207,7 +208,7 @@ async fn setup_stream_with_records(
 ) {
     // Connect
     let resp = send_recv(writer, reader, connect_frame(1)).await;
-    assert_eq!(resp.opcode, OpCode::Ok, "CONNECT should return Ok");
+    assert_eq!(resp.opcode, OpCode::ConnectOk, "CONNECT should return ConnectOk");
 
     // Create stream
     let resp = send_recv(writer, reader, create_stream_frame(stream, 2)).await;
@@ -222,7 +223,7 @@ async fn setup_stream_with_records(
             publish_frame(stream, subject, value.as_bytes(), 100 + i),
         )
         .await;
-        assert_eq!(resp.opcode, OpCode::Ok, "PUBLISH {} should return Ok", i);
+        assert_eq!(resp.opcode, OpCode::PublishOk, "PUBLISH {} should return PublishOk", i);
     }
 }
 
@@ -341,7 +342,7 @@ async fn resume_after_disconnect() {
 
         // Connect (no need to recreate stream or consumer — they're persisted)
         let resp = send_recv(&mut writer, &mut reader, connect_frame(1)).await;
-        assert_eq!(resp.opcode, OpCode::Ok, "CONNECT should return Ok");
+        assert_eq!(resp.opcode, OpCode::ConnectOk, "CONNECT should return ConnectOk");
 
         // Subscribe the same consumer again
         let resp = send_recv(&mut writer, &mut reader, subscribe_frame("resumable", 301)).await;
@@ -373,7 +374,7 @@ async fn subject_filter_delivery() {
 
     // Connect
     let resp = send_recv(&mut writer, &mut reader, connect_frame(1)).await;
-    assert_eq!(resp.opcode, OpCode::Ok);
+    assert_eq!(resp.opcode, OpCode::ConnectOk);
 
     // Create stream
     let resp = send_recv(&mut writer, &mut reader, create_stream_frame("events", 2)).await;
@@ -410,7 +411,7 @@ async fn subject_filter_delivery() {
             publish_frame("events", subject, value, 100 + i as u32),
         )
         .await;
-        assert_eq!(resp.opcode, OpCode::Ok);
+        assert_eq!(resp.opcode, OpCode::PublishOk);
     }
 
     // Subscribe

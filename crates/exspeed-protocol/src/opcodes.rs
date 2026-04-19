@@ -34,6 +34,8 @@ pub enum OpCode {
     QueryResult = 0x85,
     Rebalance = 0x86,
     Drain = 0x87,
+    PublishOk = 0x88,
+    ConnectOk = 0x89,
     Pong = 0xF1,
 }
 
@@ -72,6 +74,8 @@ impl OpCode {
                 | OpCode::QueryResult
                 | OpCode::Rebalance
                 | OpCode::Drain
+                | OpCode::PublishOk
+                | OpCode::ConnectOk
                 | OpCode::Pong
         )
     }
@@ -111,6 +115,8 @@ impl TryFrom<u8> for OpCode {
             0x85 => Ok(OpCode::QueryResult),
             0x86 => Ok(OpCode::Rebalance),
             0x87 => Ok(OpCode::Drain),
+            0x88 => Ok(OpCode::PublishOk),
+            0x89 => Ok(OpCode::ConnectOk),
             0xF1 => Ok(OpCode::Pong),
             other => Err(ProtocolError::UnknownOpCode(other)),
         }

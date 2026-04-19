@@ -159,7 +159,7 @@ async fn two_subscribers_can_bind_to_grouped_consumer() {
         let (mut reader, mut writer) = connect_to(&addr).await;
 
         let resp = send_recv(&mut writer, &mut reader, connect_frame(1)).await;
-        assert_eq!(resp.opcode, OpCode::Ok, "CONNECT should return Ok");
+        assert_eq!(resp.opcode, OpCode::ConnectOk, "CONNECT should return ConnectOk");
 
         let resp = send_recv(&mut writer, &mut reader, create_stream_frame("events", 2)).await;
         assert_eq!(resp.opcode, OpCode::Ok, "CREATE_STREAM should return Ok");
@@ -189,7 +189,7 @@ async fn two_subscribers_can_bind_to_grouped_consumer() {
     // --- Connection B: subscribe with subscriber_id="sub-a" ---
     let (mut reader_b, mut writer_b) = connect_to(&addr).await;
     let resp = send_recv(&mut writer_b, &mut reader_b, connect_frame(10)).await;
-    assert_eq!(resp.opcode, OpCode::Ok, "B: CONNECT should return Ok");
+    assert_eq!(resp.opcode, OpCode::ConnectOk, "B: CONNECT should return ConnectOk");
 
     let resp = send_recv(
         &mut writer_b,
@@ -207,7 +207,7 @@ async fn two_subscribers_can_bind_to_grouped_consumer() {
     // --- Connection C: subscribe with subscriber_id="sub-b" ---
     let (mut reader_c, mut writer_c) = connect_to(&addr).await;
     let resp = send_recv(&mut writer_c, &mut reader_c, connect_frame(20)).await;
-    assert_eq!(resp.opcode, OpCode::Ok, "C: CONNECT should return Ok");
+    assert_eq!(resp.opcode, OpCode::ConnectOk, "C: CONNECT should return ConnectOk");
 
     let resp = send_recv(
         &mut writer_c,
@@ -248,7 +248,7 @@ async fn non_grouped_consumer_rejects_second_subscriber() {
         let (mut reader, mut writer) = connect_to(&addr).await;
 
         let resp = send_recv(&mut writer, &mut reader, connect_frame(1)).await;
-        assert_eq!(resp.opcode, OpCode::Ok, "CONNECT should return Ok");
+        assert_eq!(resp.opcode, OpCode::ConnectOk, "CONNECT should return ConnectOk");
 
         let resp = send_recv(&mut writer, &mut reader, create_stream_frame("events", 2)).await;
         assert_eq!(resp.opcode, OpCode::Ok, "CREATE_STREAM should return Ok");
@@ -275,7 +275,7 @@ async fn non_grouped_consumer_rejects_second_subscriber() {
     // --- Connection A: subscribe with subscriber_id="sub-a" -> Ok ---
     let (mut reader_a, mut writer_a) = connect_to(&addr).await;
     let resp = send_recv(&mut writer_a, &mut reader_a, connect_frame(10)).await;
-    assert_eq!(resp.opcode, OpCode::Ok, "A: CONNECT should return Ok");
+    assert_eq!(resp.opcode, OpCode::ConnectOk, "A: CONNECT should return ConnectOk");
 
     let resp = send_recv(
         &mut writer_a,
@@ -292,7 +292,7 @@ async fn non_grouped_consumer_rejects_second_subscriber() {
     // --- Connection B: subscribe to same consumer with subscriber_id="sub-b" -> Error ---
     let (mut reader_b, mut writer_b) = connect_to(&addr).await;
     let resp = send_recv(&mut writer_b, &mut reader_b, connect_frame(20)).await;
-    assert_eq!(resp.opcode, OpCode::Ok, "B: CONNECT should return Ok");
+    assert_eq!(resp.opcode, OpCode::ConnectOk, "B: CONNECT should return ConnectOk");
 
     let resp = send_recv(
         &mut writer_b,

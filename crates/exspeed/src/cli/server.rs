@@ -702,7 +702,12 @@ where
                                     Ok(()) => {
                                         authenticated = true;
                                         info!(%peer, client_id = %req.client_id, "CONNECT authenticated");
-                                        let response = ServerMessage::Ok.into_frame(correlation_id);
+                                        let response = ServerMessage::ConnectOk(
+                                            exspeed_protocol::messages::ConnectResponse {
+                                                server_version: exspeed_protocol::messages::WIRE_VERSION,
+                                            },
+                                        )
+                                        .into_frame(correlation_id);
                                         framed_write.send(response).await?;
                                     }
                                     Err(msg) => {

@@ -270,6 +270,7 @@ mod tests {
                 stream: stream.into(),
                 subject: subject.into(),
                 key: None,
+                msg_id: None,
                 value: Bytes::copy_from_slice(value),
                 headers: vec![],
             }))
@@ -289,6 +290,7 @@ mod tests {
                 stream: stream.into(),
                 subject: subject.into(),
                 key,
+                msg_id: None,
                 value: Bytes::copy_from_slice(value),
                 headers,
             }))
@@ -321,7 +323,7 @@ mod tests {
 
     fn unwrap_publish_offset(msg: ServerMessage) -> u64 {
         match msg {
-            ServerMessage::PublishOk { offset } => offset,
+            ServerMessage::PublishOk { offset, .. } => offset,
             other => panic!("expected PublishOk, got {:?}", other),
         }
     }

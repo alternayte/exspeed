@@ -58,27 +58,52 @@ pub async fn handle_publish(broker: &Broker, req: PublishRequest) -> ServerMessa
         }
     };
 
+    // Translate msg_id field → x-idempotency-key header.
+    let mut headers = req.headers;
+    if let Some(ref id) = req.msg_id {
+        headers.retain(|(k, _)| k != "x-idempotency-key");
+        headers.push(("x-idempotency-key".to_string(), id.clone()));
+    }
+
     let record = Record {
         key: req.key,
         value: req.value,
         subject: req.subject,
-        headers: req.headers,
+        headers,
     };
 
     let start = std::time::Instant::now();
     match broker.broker_append.append(&stream_name, &record).await {
-        Ok(result) => {
+        Ok(crate::broker_append::AppendResult::Written(offset)) => {
             let elapsed_secs = start.elapsed().as_secs_f64();
             broker
                 .metrics
                 .record_publish_latency(stream_name.as_str(), elapsed_secs);
             broker.metrics.record_publish(stream_name.as_str());
             ServerMessage::PublishOk {
-                offset: result.offset().0,
+                offset: offset.0,
+                duplicate: false,
             }
         }
+        Ok(crate::broker_append::AppendResult::Duplicate(offset)) => {
+            let elapsed_secs = start.elapsed().as_secs_f64();
+            broker
+                .metrics
+                .record_publish_latency(stream_name.as_str(), elapsed_secs);
+            broker.metrics.record_publish(stream_name.as_str());
+            ServerMessage::PublishOk {
+                offset: offset.0,
+                duplicate: true,
+            }
+        }
+        Err(StorageError::KeyCollision { stored_offset }) => {
+            ServerMessage::KeyCollision { stored_offset }
+        }
+        Err(StorageError::DedupMapFull { retry_after_secs }) => {
+            ServerMessage::DedupMapFull { retry_after_secs }
+        }
         Err(e) => ServerMessage::Error {
-            code: 404,
+            code: 500,
             message: format!("append failed: {e}"),
         },
     }
@@ -570,7 +595,10 @@ pub async fn handle_seek(broker: &Broker, req: SeekRequest) -> ServerMessage {
                     };
                 }
             }
-            ServerMessage::PublishOk { offset: offset.0 } // reuse PublishOk for offset response
+            ServerMessage::PublishOk {
+                offset: offset.0,
+                duplicate: false,
+            } // reuse PublishOk for offset response
         }
         Err(e) => ServerMessage::Error {
             code: 500,
