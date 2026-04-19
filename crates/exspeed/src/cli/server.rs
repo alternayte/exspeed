@@ -295,6 +295,10 @@ where
     ));
     broker.load_consumers().await.map_err(|e| anyhow::anyhow!(e))?;
 
+    // Spawn queue-depth sampler (5s interval) — reports per-subscription
+    // delivery channel fill ratio to `subscription_queue_fill_ratio`.
+    exspeed_broker::queue_depth_task::spawn_queue_depth_sampler(broker.clone(), metrics.clone());
+
     // Warn if grouped consumers exist but the coordinator doesn't support
     // multi-pod coordination (file/s3 backends).
     if !work_coordinator.supports_coordination() {

@@ -7,6 +7,7 @@ pub mod handlers;
 pub mod lease;
 pub mod leadership;
 pub mod persistence;
+pub mod queue_depth_task;
 pub mod retention_task;
 pub mod work_coordinator;
 
