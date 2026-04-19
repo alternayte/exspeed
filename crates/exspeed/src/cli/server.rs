@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -8,6 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio_util::codec::{FramedRead, FramedWrite};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use exspeed_broker::broker_append::BrokerAppend;
@@ -49,10 +51,65 @@ pub struct ServerArgs {
 }
 
 pub async fn run(args: ServerArgs) -> Result<()> {
+    run_with_shutdown(args, signal_listener()).await
+}
+
+/// SIGTERM | SIGINT | Ctrl-C, whichever fires first. Returns when one is received.
+async fn signal_listener() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("failed to install SIGTERM handler: {}; falling back to ctrl_c", e);
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = sigterm.recv().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = sigterm.recv() => info!("received SIGTERM, shutting down"),
+            _ = sigint.recv() => info!("received SIGINT, shutting down"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("received Ctrl-C, shutting down");
+    }
+}
+
+/// Run the server until `shutdown` resolves (or it fails fatally).
+///
+/// On shutdown:
+/// 1. Cancellation propagates to the leader supervisor and the accept loop.
+/// 2. Per-connection child tokens fire so in-flight `select!`s break out.
+/// 3. We wait up to 10s for active connections to drain (semaphore permits returned).
+pub async fn run_with_shutdown<F>(args: ServerArgs, shutdown: F) -> Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     // Install the rustls crypto provider once, before anything else. This
     // ensures both the sync TCP load_tls_config path and the axum-server
     // (HTTP) spawn always see a provider, regardless of scheduler ordering.
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+
+    // Cancellation token. Forwarder task waits for shutdown future, then cancels.
+    let cancel_token = CancellationToken::new();
+    {
+        let cancel_for_signal = cancel_token.clone();
+        tokio::spawn(async move {
+            shutdown.await;
+            cancel_for_signal.cancel();
+        });
+    }
 
     // Normalize auth token: empty string → unset (guards against shells
     // passing EXSPEED_AUTH_TOKEN="" through).
@@ -318,17 +375,28 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     // Spawn the leader supervisor: waits for is_leader=true, then runs
     // connectors + continuous queries + retention under the current
     // leader token. Loops so that if we get demoted and re-promoted,
-    // we resume.
+    // we resume. Also observes the process-wide cancel token so SIGTERM
+    // unblocks the supervisor and lets the leadership Drop release the lease.
     {
         let leadership_sup = leadership.clone();
         let connector_manager_sup = connector_manager_for_supervisor;
         let exql_sup = exql_for_supervisor;
         let storage_sup = file_storage.clone();
+        let supervisor_cancel = cancel_token.clone();
         tokio::spawn(async move {
             let mut is_leader_rx = leadership_sup.is_leader.clone();
             loop {
-                if is_leader_rx.wait_for(|&v| v).await.is_err() {
-                    return; // watcher closed → shutdown
+                tokio::select! {
+                    biased;
+                    _ = supervisor_cancel.cancelled() => {
+                        info!("leader supervisor: shutdown signal received");
+                        return;
+                    }
+                    res = is_leader_rx.wait_for(|&v| v) => {
+                        if res.is_err() {
+                            return; // watcher closed → shutdown
+                        }
+                    }
                 }
                 let token = leadership_sup.current_child_token().await;
                 info!("leader supervisor: assuming leadership; starting work");
@@ -341,11 +409,23 @@ pub async fn run(args: ServerArgs) -> Result<()> {
                             token.clone(),
                         ) => {}
                     _ = token.cancelled() => {}
+                    _ = supervisor_cancel.cancelled() => {
+                        info!("leader supervisor: cancelled");
+                        return;
+                    }
                 }
 
                 info!("leader supervisor: tenure ended; awaiting re-promotion");
                 // Wait for demotion before looping so we don't tight-loop.
-                let _ = is_leader_rx.wait_for(|&v| !v).await;
+                // Also bail out early on shutdown.
+                tokio::select! {
+                    biased;
+                    _ = supervisor_cancel.cancelled() => {
+                        info!("leader supervisor: shutdown while awaiting re-promotion");
+                        return;
+                    }
+                    _ = is_leader_rx.wait_for(|&v| !v) => {}
+                }
             }
         });
     }
@@ -393,44 +473,84 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     info!(max_conns, "connection cap configured");
 
     loop {
-        let (socket, peer) = listener.accept().await?;
-
-        let permit = match conn_sem.clone().try_acquire_owned() {
-            Ok(p) => p,
-            Err(_) => {
-                metrics.connection_rejected();
-                warn!(%peer, max_conns, "connection rejected: max_conns reached");
-                drop(socket);
-                continue;
+        tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => {
+                info!("shutdown signal received; stopping accept loop");
+                break;
             }
-        };
+            accept_result = listener.accept() => {
+                let (socket, peer) = match accept_result {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!("accept error: {}", e);
+                        continue;
+                    }
+                };
 
-        info!(%peer, "new connection");
-        metrics.connection_opened();
+                let permit = match conn_sem.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        metrics.connection_rejected();
+                        warn!(%peer, max_conns, "connection rejected: max_conns reached");
+                        drop(socket);
+                        continue;
+                    }
+                };
 
-        let broker = broker.clone();
-        let metrics_clone = metrics.clone();
-        let auth_token_clone = auth_token.clone();
-        let tls_config_clone = tls_config.clone();
-        tokio::spawn(async move {
-            let _permit = permit; // released when this task ends
-            let result: Result<()> = async move {
-                if let Some(tls_cfg) = tls_config_clone {
-                    let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
-                    let tls_stream = acceptor.accept(socket).await?;
-                    handle_connection(tls_stream, peer, broker, auth_token_clone).await
-                } else {
-                    handle_connection(socket, peer, broker, auth_token_clone).await
-                }
+                info!(%peer, "new connection");
+                metrics.connection_opened();
+
+                let broker = broker.clone();
+                let metrics_clone = metrics.clone();
+                let auth_token_clone = auth_token.clone();
+                let tls_config_clone = tls_config.clone();
+                let conn_token = cancel_token.child_token();
+                tokio::spawn(async move {
+                    let _permit = permit; // released when this task ends
+                    let result: Result<()> = async move {
+                        if let Some(tls_cfg) = tls_config_clone {
+                            let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
+                            let tls_stream = acceptor.accept(socket).await?;
+                            handle_connection(tls_stream, peer, broker, auth_token_clone, conn_token).await
+                        } else {
+                            handle_connection(socket, peer, broker, auth_token_clone, conn_token).await
+                        }
+                    }
+                    .await;
+                    if let Err(e) = result {
+                        error!(%peer, "connection error: {}", e);
+                    }
+                    metrics_clone.connection_closed();
+                    info!(%peer, "connection closed");
+                });
             }
-            .await;
-            if let Err(e) = result {
-                error!(%peer, "connection error: {}", e);
-            }
-            metrics_clone.connection_closed();
-            info!(%peer, "connection closed");
-        });
+        }
     }
+
+    // Drain: wait for active connections to finish, up to 10 seconds. Each
+    // connection holds one semaphore permit for its lifetime; when permits
+    // return to `max_conns` available, all connection tasks have exited.
+    let drain_deadline = std::time::Duration::from_secs(10);
+    let drain_start = std::time::Instant::now();
+    let active_at_start = max_conns - conn_sem.available_permits();
+    info!(
+        active = active_at_start,
+        "waiting up to {:?} for active connections to drain",
+        drain_deadline
+    );
+    while conn_sem.available_permits() < max_conns {
+        if drain_start.elapsed() >= drain_deadline {
+            warn!(
+                remaining = max_conns - conn_sem.available_permits(),
+                "drain deadline reached, exiting with active connections"
+            );
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    info!("server stopped");
+    Ok(())
 }
 
 async fn handle_connection<S>(
@@ -438,6 +558,7 @@ async fn handle_connection<S>(
     peer: SocketAddr,
     broker: Arc<Broker>,
     auth_token: Option<Arc<String>>,
+    cancel: CancellationToken,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -457,6 +578,13 @@ where
 
     loop {
         tokio::select! {
+            biased;
+            // Branch 0: process-wide shutdown (SIGTERM/SIGINT).
+            // `biased` ensures cancel wins races against in-flight reads.
+            _ = cancel.cancelled() => {
+                info!(%peer, "connection cancelled by shutdown");
+                break;
+            }
             // Branch 1: incoming frame from client
             frame_result = framed_read.next() => {
                 match frame_result {

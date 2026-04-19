@@ -77,3 +77,68 @@ async fn connection_cap_rejects_overflow() {
     drop(c1);
     drop(c2);
 }
+
+use bytes::{Bytes, BytesMut};
+use exspeed_protocol::codec::ExspeedCodec;
+use exspeed_protocol::frame::Frame;
+use exspeed_protocol::messages::connect::{AuthType, ConnectRequest};
+use exspeed_protocol::opcodes::OpCode;
+use futures_util::{SinkExt, StreamExt};
+use tokio::sync::oneshot;
+use tokio_util::codec::{FramedRead, FramedWrite};
+
+#[tokio::test]
+async fn sigterm_signal_token_stops_accept_loop() {
+    let port = portpicker::pick_unused_port().unwrap();
+    let api_port = portpicker::pick_unused_port().unwrap();
+    let bind = format!("127.0.0.1:{port}");
+    let api_bind = format!("127.0.0.1:{api_port}");
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().to_path_buf();
+
+    let (tx, rx) = oneshot::channel::<()>();
+    let server_fut = tokio::spawn(async move {
+        exspeed::cli::server::run_with_shutdown(
+            exspeed::cli::server::ServerArgs {
+                bind,
+                api_bind,
+                data_dir,
+                auth_token: None,
+                tls_cert: None,
+                tls_key: None,
+            },
+            async {
+                let _ = rx.await;
+            },
+        )
+        .await
+    });
+
+    // Give the server a moment to bind the listener.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Open a connection, send CONNECT, then trigger shutdown.
+    let stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
+    let (reader, writer) = stream.into_split();
+    let mut framed_read = FramedRead::new(reader, ExspeedCodec::new());
+    let mut framed_write = FramedWrite::new(writer, ExspeedCodec::new());
+    let mut payload = BytesMut::new();
+    ConnectRequest {
+        client_id: "shutdown-test".into(),
+        auth_type: AuthType::None,
+        auth_payload: Bytes::new(),
+    }
+    .encode(&mut payload);
+    framed_write
+        .send(Frame::new(OpCode::Connect, 1, payload.freeze()))
+        .await
+        .unwrap();
+    let _ = framed_read.next().await.unwrap().unwrap(); // OK
+
+    let _ = tx.send(());
+
+    let result = tokio::time::timeout(Duration::from_secs(15), server_fut).await;
+    let outer = result.expect("server should exit within 15s");
+    let inner = outer.expect("server task should not panic");
+    inner.expect("server should return Ok on graceful shutdown");
+}
