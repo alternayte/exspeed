@@ -49,6 +49,27 @@ pub struct Metrics {
     /// Fill ratio (0.0–1.0) of the per-subscription delivery mpsc channel.
     /// Labeled by `consumer` and `subscriber`.
     pub subscription_queue_fill_ratio: Gauge<f64>,
+
+    // -- dedup observability ------------------------------------------------
+
+    /// Current number of live dedup entries per stream. Labeled by `stream`.
+    pub dedup_map_entries: Gauge<i64>,
+    /// Counts idempotent publish outcomes. Labeled by `stream` and `result`
+    /// (`"written"` | `"duplicate"`).
+    pub dedup_writes_total: Counter<u64>,
+    /// Counts key-collision events (same msg_id, different body) per stream.
+    /// Labeled by `stream`.
+    pub dedup_collisions_total: Counter<u64>,
+    /// Counts events where the dedup map was full and a publish was rejected.
+    /// Labeled by `stream`.
+    pub dedup_map_full_total: Counter<u64>,
+    /// Histogram of time spent writing a dedup snapshot to disk, in seconds.
+    pub dedup_snapshot_write_duration_seconds: Histogram<f64>,
+    /// Histogram of dedup map rebuild duration per stream. Labeled by
+    /// `stream` and `source` (`"snapshot"` | `"full_scan"`).
+    pub dedup_rebuild_duration_seconds: Histogram<f64>,
+    /// Configured dedup window in seconds per stream. Labeled by `stream`.
+    pub dedup_window_secs: Gauge<i64>,
 }
 
 impl Metrics {
@@ -125,6 +146,37 @@ impl Metrics {
             .with_description("Fill ratio (0.0–1.0) of the per-subscription delivery channel")
             .build();
 
+        // -- dedup instruments -----------------------------------------------
+
+        let dedup_map_entries = meter
+            .i64_gauge("exspeed_dedup_map_entries")
+            .with_description("Current number of live dedup entries per stream")
+            .build();
+        let dedup_writes_total = meter
+            .u64_counter("exspeed_dedup_writes_total")
+            .with_description("Idempotent publish outcomes (written or duplicate) per stream")
+            .build();
+        let dedup_collisions_total = meter
+            .u64_counter("exspeed_dedup_collisions_total")
+            .with_description("Key-collision events (same msg_id, different body) per stream")
+            .build();
+        let dedup_map_full_total = meter
+            .u64_counter("exspeed_dedup_map_full_total")
+            .with_description("Publishes rejected because the dedup map was full, per stream")
+            .build();
+        let dedup_snapshot_write_duration_seconds = meter
+            .f64_histogram("exspeed_dedup_snapshot_write_duration_seconds")
+            .with_description("Time spent writing a dedup snapshot to disk, in seconds")
+            .build();
+        let dedup_rebuild_duration_seconds = meter
+            .f64_histogram("exspeed_dedup_rebuild_duration_seconds")
+            .with_description("Dedup map rebuild duration per stream, in seconds")
+            .build();
+        let dedup_window_secs = meter
+            .i64_gauge("exspeed_dedup_window_secs")
+            .with_description("Configured dedup window in seconds per stream")
+            .build();
+
         // Keep the provider alive — dropping it shuts down the metrics pipeline.
         std::mem::forget(provider);
 
@@ -145,6 +197,13 @@ impl Metrics {
             consume_latency_seconds,
             storage_write_errors,
             subscription_queue_fill_ratio,
+            dedup_map_entries,
+            dedup_writes_total,
+            dedup_collisions_total,
+            dedup_map_full_total,
+            dedup_snapshot_write_duration_seconds,
+            dedup_rebuild_duration_seconds,
+            dedup_window_secs,
         };
 
         (metrics, registry)
@@ -290,5 +349,60 @@ impl Metrics {
                 KeyValue::new("subscriber", subscriber.to_owned()),
             ],
         );
+    }
+
+    // -- dedup helpers -------------------------------------------------------
+
+    /// Increment `exspeed_dedup_writes_total`. `result` is `"written"` or
+    /// `"duplicate"`.
+    pub fn record_dedup_write(&self, stream: &str, result: &str) {
+        self.dedup_writes_total.add(
+            1,
+            &[
+                KeyValue::new("stream", stream.to_owned()),
+                KeyValue::new("result", result.to_owned()),
+            ],
+        );
+    }
+
+    /// Increment `exspeed_dedup_collisions_total` for the given stream.
+    pub fn record_dedup_collision(&self, stream: &str) {
+        self.dedup_collisions_total
+            .add(1, &[KeyValue::new("stream", stream.to_owned())]);
+    }
+
+    /// Increment `exspeed_dedup_map_full_total` for the given stream.
+    pub fn record_dedup_map_full(&self, stream: &str) {
+        self.dedup_map_full_total
+            .add(1, &[KeyValue::new("stream", stream.to_owned())]);
+    }
+
+    /// Set the current live dedup entry count for a stream.
+    pub fn set_dedup_map_entries(&self, stream: &str, n: i64) {
+        self.dedup_map_entries
+            .record(n, &[KeyValue::new("stream", stream.to_owned())]);
+    }
+
+    /// Record the duration of a dedup snapshot write, in seconds.
+    pub fn observe_dedup_snapshot_write_duration(&self, secs: f64) {
+        self.dedup_snapshot_write_duration_seconds.record(secs, &[]);
+    }
+
+    /// Record the duration of a dedup map rebuild, in seconds. `source` is
+    /// `"snapshot"` or `"full_scan"`.
+    pub fn observe_dedup_rebuild_duration(&self, stream: &str, source: &str, secs: f64) {
+        self.dedup_rebuild_duration_seconds.record(
+            secs,
+            &[
+                KeyValue::new("stream", stream.to_owned()),
+                KeyValue::new("source", source.to_owned()),
+            ],
+        );
+    }
+
+    /// Set the configured dedup window in seconds for a stream.
+    pub fn set_dedup_window_secs(&self, stream: &str, secs: i64) {
+        self.dedup_window_secs
+            .record(secs, &[KeyValue::new("stream", stream.to_owned())]);
     }
 }

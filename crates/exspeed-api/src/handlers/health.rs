@@ -46,6 +46,13 @@ pub async fn readyz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         );
     }
 
+    if !state.broker.is_dedup_ready() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "dedup_rebuild_in_progress"})),
+        );
+    }
+
     if let Err(e) = probe_data_dir(&state.data_dir).await {
         tracing::warn!(error = %e, data_dir = %state.data_dir.display(), "/readyz probe failed");
         return (

@@ -38,6 +38,38 @@ async fn readyz_returns_503_with_starting_when_not_ready() {
     assert_eq!(json, serde_json::json!({"status": "starting"}));
 }
 
+/// `/readyz` returns 503 while dedup rebuild is still in progress.
+#[tokio::test]
+async fn readyz_returns_503_while_dedup_rebuilding() {
+    use std::sync::atomic::Ordering;
+    let state = make_state_with_leader(true).await;
+    // Override the dedup_ready flag to simulate an ongoing rebuild.
+    state
+        .broker
+        .dedup_ready
+        .store(false, Ordering::Release);
+
+    let app = exspeed_api::handlers::build_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/readyz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({"status": "dedup_rebuild_in_progress"})
+    );
+}
+
 /// Sanity check the happy path so a regression in the helper doesn't
 /// silently turn the 503 test into a tautology.
 #[tokio::test]

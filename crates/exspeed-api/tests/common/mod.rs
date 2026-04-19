@@ -87,6 +87,12 @@ pub async fn make_state_with_leader(leader: bool) -> Arc<exspeed_api::AppState> 
         lease.clone(),
         metrics.clone(),
     ));
+    // Mark dedup rebuild as complete — the helper represents a fully started
+    // server for test purposes. Tests that want to exercise the not-ready
+    // branch should override this after calling `make_state_with_leader`.
+    broker
+        .dedup_ready
+        .store(true, std::sync::atomic::Ordering::Release);
 
     let oss = offset_store::from_env(tmp.path(), storage_dyn.clone())
         .await

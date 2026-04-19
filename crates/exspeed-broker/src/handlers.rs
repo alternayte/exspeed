@@ -61,6 +61,16 @@ pub async fn handle_publish(broker: &Broker, req: PublishRequest) -> ServerMessa
     // Translate msg_id field → x-idempotency-key header.
     let mut headers = req.headers;
     if let Some(ref id) = req.msg_id {
+        // Log at DEBUG when both explicit msg_id and x-idempotency-key header are
+        // present but disagree, so operators can detect misconfigured callers.
+        if let Some((_, existing)) = headers.iter().find(|(k, _)| k == "x-idempotency-key") {
+            if existing != id {
+                tracing::debug!(
+                    stream = %stream_name,
+                    "publish has both explicit msg_id and x-idempotency-key header; using explicit field"
+                );
+            }
+        }
         headers.retain(|(k, _)| k != "x-idempotency-key");
         headers.push(("x-idempotency-key".to_string(), id.clone()));
     }

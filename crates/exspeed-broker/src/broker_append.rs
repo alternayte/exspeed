@@ -200,6 +200,9 @@ impl BrokerAppend {
                 m.max_entries = max_entries;
             })
             .or_insert_with(|| DedupMap::new(Duration::from_secs(window_secs), max_entries));
+        if let Some(m) = &self.metrics {
+            m.set_dedup_window_secs(stream.as_str(), window_secs as i64);
+        }
     }
 
     /// Return the number of live dedup entries for a stream (tests / metrics).
@@ -274,9 +277,22 @@ impl BrokerAppend {
             if let Some(map) = maps.get(stream) {
                 match map.check(&key, body_hash) {
                     DedupCheckResult::HitSameBody { offset } => {
+                        if let Some(m) = &self.metrics {
+                            m.record_dedup_write(stream.as_str(), "duplicate");
+                        }
                         return Ok(AppendResult::Duplicate(Offset(offset)));
                     }
                     DedupCheckResult::HitDifferentBody { stored_offset } => {
+                        if let Some(m) = &self.metrics {
+                            m.record_dedup_collision(stream.as_str());
+                        }
+                        tracing::warn!(
+                            stream = %stream,
+                            msg_id = %key,
+                            stored_offset = stored_offset,
+                            body_hash_prefix = format!("{:08x}", body_hash >> 32),
+                            "dedup key collision"
+                        );
                         return Err(StorageError::KeyCollision { stored_offset });
                     }
                     DedupCheckResult::Miss => {}
@@ -293,9 +309,22 @@ impl BrokerAppend {
 
             match map.check(&key, body_hash) {
                 DedupCheckResult::HitSameBody { offset } => {
+                    if let Some(m) = &self.metrics {
+                        m.record_dedup_write(stream.as_str(), "duplicate");
+                    }
                     return Ok(AppendResult::Duplicate(Offset(offset)));
                 }
                 DedupCheckResult::HitDifferentBody { stored_offset } => {
+                    if let Some(m) = &self.metrics {
+                        m.record_dedup_collision(stream.as_str());
+                    }
+                    tracing::warn!(
+                        stream = %stream,
+                        msg_id = %key,
+                        stored_offset = stored_offset,
+                        body_hash_prefix = format!("{:08x}", body_hash >> 32),
+                        "dedup key collision"
+                    );
                     return Err(StorageError::KeyCollision { stored_offset });
                 }
                 DedupCheckResult::Miss => {}
@@ -305,6 +334,16 @@ impl BrokerAppend {
                 map.evict_expired();
                 if map.seen.len() as u64 >= map.max_entries {
                     let retry_after_secs = map.time_until_oldest_expires().as_secs() as u32;
+                    if let Some(m) = &self.metrics {
+                        m.record_dedup_map_full(stream.as_str());
+                    }
+                    tracing::warn!(
+                        stream = %stream,
+                        entries = map.seen.len(),
+                        window_secs = map.window.as_secs(),
+                        retry_after_secs = retry_after_secs,
+                        "dedup map full"
+                    );
                     return Err(StorageError::DedupMapFull { retry_after_secs });
                 }
             }
@@ -324,6 +363,10 @@ impl BrokerAppend {
                 .entry(stream.clone())
                 .or_insert_with(|| DedupMap::new(self.default_window, self.default_max_entries));
             map.insert(key, offset.0, body_hash);
+        }
+
+        if let Some(m) = &self.metrics {
+            m.record_dedup_write(stream.as_str(), "written");
         }
 
         Ok(AppendResult::Written(offset))
@@ -373,7 +416,14 @@ impl BrokerAppend {
             entries,
         };
         let path = crate::broker_append_snapshot::snapshot_path(stream_dir);
-        crate::broker_append_snapshot::write_snapshot(&path, &snap)
+        let write_start = Instant::now();
+        let result = crate::broker_append_snapshot::write_snapshot(&path, &snap);
+        if result.is_ok() {
+            if let Some(m) = &self.metrics {
+                m.observe_dedup_snapshot_write_duration(write_start.elapsed().as_secs_f64());
+            }
+        }
+        result
     }
 
     /// Snapshot all streams' dedup maps to disk.
@@ -386,6 +436,9 @@ impl BrokerAppend {
             let stream_dir = data_dir.join("streams").join(s.as_str());
             if let Err(e) = self.snapshot_stream(&s, &stream_dir).await {
                 tracing::warn!(stream = %s, error = %e, "dedup snapshot write failed");
+            } else if let Some(m) = &self.metrics {
+                let count = self.entry_count(&s).await;
+                m.set_dedup_map_entries(s.as_str(), count as i64);
             }
         }
         Ok(())
@@ -406,6 +459,8 @@ impl BrokerAppend {
         stream: &StreamName,
         stream_dir: &std::path::Path,
     ) -> Result<(), StorageError> {
+        let rebuild_start = Instant::now();
+
         let (window_secs, max_entries) = {
             let maps = self.dedup_maps.read().await;
             maps.get(stream)
@@ -503,6 +558,24 @@ impl BrokerAppend {
                 }
             }
             cursor = Offset(batch.last().unwrap().offset.0 + 1);
+        }
+
+        let elapsed = rebuild_start.elapsed();
+        let source = if snapshot_covers_through_unix_ms.is_some() {
+            "snapshot"
+        } else {
+            "full_scan"
+        };
+        tracing::info!(
+            stream = %stream,
+            window_secs = window_secs,
+            max_entries = max_entries,
+            rebuild_source = source,
+            rebuild_ms = elapsed.as_millis(),
+            "dedup rebuilt"
+        );
+        if let Some(m) = &self.metrics {
+            m.observe_dedup_rebuild_duration(stream.as_str(), source, elapsed.as_secs_f64());
         }
 
         Ok(())
