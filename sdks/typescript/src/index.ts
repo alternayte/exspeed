@@ -8,8 +8,10 @@ export {
   ConnectionError,
   ValidationError,
   BufferFullError,
+  QueueOverflowError,
 } from "./errors.js";
 export type {
+  BrokerEndpoint,
   ClientOptions,
   PublishOptions,
   PublishResult,

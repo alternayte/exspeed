@@ -49,3 +49,24 @@ export class BufferFullError extends ExspeedError {
     this.name = "BufferFullError";
   }
 }
+
+/**
+ * Thrown by Subscription.push (when overflowPolicy === 'error') and emitted
+ * as the "overflow" event payload (when overflowPolicy === 'drop-oldest')
+ * to surface that a record was dropped.
+ */
+export class QueueOverflowError extends ExspeedError {
+  readonly offset: bigint;
+  readonly subject: string;
+  readonly droppedCount: number;
+
+  constructor(offset: bigint, subject: string, droppedCount: number = 1) {
+    super(
+      `Subscription queue overflow: dropped record offset=${offset} subject=${subject}`,
+    );
+    this.name = "QueueOverflowError";
+    this.offset = offset;
+    this.subject = subject;
+    this.droppedCount = droppedCount;
+  }
+}
