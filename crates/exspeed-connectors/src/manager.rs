@@ -5,12 +5,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::{oneshot, RwLock};
-use tracing::{debug, error, info, warn};
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
 
 use exspeed_common::metrics::Metrics;
 use exspeed_common::{Offset, StreamName};
 use exspeed_broker::broker_append::BrokerAppend;
-use exspeed_broker::lease::LeaderLease;
+use exspeed_broker::leadership::ClusterLeadership;
 use exspeed_streams::record::Record;
 use exspeed_streams::traits::StorageEngine;
 use exspeed_streams::StorageError;
@@ -74,15 +75,10 @@ pub struct ConnectorManager {
     pub offset_store: Arc<dyn crate::offset_store::OffsetStore>,
     /// Tracks content hashes of TOML connector files for change detection.
     pub toml_hashes: RwLock<HashMap<String, u64>>,
-    /// Cluster-wide lease backend. Source/sink connector tasks only spawn
-    /// after acquiring `connector:<name>`. Noop always grants (single-pod).
-    pub lease: Arc<dyn LeaderLease>,
-    /// Names of connectors for which this pod currently holds the lease and
-    /// has an active task. Used to avoid re-spawning and by the LeaseRetrier
-    /// to skip already-running entries. The value is unit — the actual
-    /// `LeaseGuard` lives inside each spawned task. Wrapped in `Arc` so
-    /// spawned tasks can clear their own entry on exit.
-    pub running_leases: Arc<RwLock<HashMap<String, ()>>>,
+    /// Cluster-leader lease wrapper. Used to check whether this pod is
+    /// currently the leader before starting connector tasks, and to obtain
+    /// the current leader `CancellationToken` for the spawned tasks.
+    pub leadership: Arc<ClusterLeadership>,
 }
 
 impl ConnectorManager {
@@ -92,7 +88,7 @@ impl ConnectorManager {
         data_dir: PathBuf,
         metrics: Arc<Metrics>,
         offset_store: Arc<dyn crate::offset_store::OffsetStore>,
-        lease: Arc<dyn LeaderLease>,
+        leadership: Arc<ClusterLeadership>,
     ) -> Self {
         Self {
             storage,
@@ -102,8 +98,7 @@ impl ConnectorManager {
             metrics,
             offset_store,
             toml_hashes: RwLock::new(HashMap::new()),
-            lease,
-            running_leases: Arc::new(RwLock::new(HashMap::new())),
+            leadership,
         }
     }
 
@@ -246,13 +241,15 @@ impl ConnectorManager {
     }
 
     /// Load all persisted connector configs (REST JSON + TOML from connectors.d/).
+    /// Only parses and registers configs — does NOT start connector tasks.
+    /// Starting is handled by the leader supervisor via `run_all(token)`.
     pub async fn load_all(&self) -> Result<(), String> {
         self.load_json_configs().await?;
         self.load_toml_configs().await?;
         Ok(())
     }
 
-    /// Load TOML configs from connectors.d/ directory.
+    /// Load TOML configs from connectors.d/ directory (config-only, no starting).
     pub async fn load_toml_configs(&self) -> Result<(), String> {
         let dir = self.connectors_d_dir();
         if !dir.exists() {
@@ -279,13 +276,15 @@ impl ConnectorManager {
                         file = ?path,
                         "loaded TOML connector config"
                     );
-                    if let Err(e) = self.create(config).await {
-                        if e.contains("already exists") {
-                            debug!(file = ?path, "TOML connector already loaded, skipping");
-                        } else {
-                            warn!(file = ?path, error = %e, "failed to start TOML connector");
-                        }
-                    }
+                    // Register config without starting (leader supervisor handles startup).
+                    let mut map = self.connectors.write().await;
+                    map.entry(connector_name.clone()).or_insert_with(|| RunningConnector {
+                        config,
+                        status: ConnectorStatus::Stopped,
+                        cancel_tx: None,
+                        started_at: Instant::now(),
+                    });
+                    drop(map);
                     // Record file hash for change detection.
                     if let Some(hash) = Self::hash_file(&path) {
                         self.toml_hashes.write().await.insert(connector_name, hash);
@@ -303,6 +302,7 @@ impl ConnectorManager {
     // -- internal -----------------------------------------------------------
 
     /// Load JSON configs from the connectors/ directory (configs created via REST).
+    /// Only registers configs — does NOT start connector tasks.
     async fn load_json_configs(&self) -> Result<(), String> {
         let dir = self.configs_dir();
         if !dir.exists() {
@@ -337,9 +337,15 @@ impl ConnectorManager {
                         file = ?path,
                         "loaded JSON connector config"
                     );
-                    if let Err(e) = self.start_connector(config).await {
-                        warn!(file = ?path, error = %e, "failed to start connector");
-                    }
+                    // Register config without starting (leader supervisor handles startup).
+                    let name = config.name.clone();
+                    let mut map = self.connectors.write().await;
+                    map.entry(name).or_insert_with(|| RunningConnector {
+                        config,
+                        status: ConnectorStatus::Stopped,
+                        cancel_tx: None,
+                        started_at: Instant::now(),
+                    });
                 }
                 Err(e) => {
                     warn!(file = ?path, error = %e, "failed to parse connector config");
@@ -364,23 +370,71 @@ impl ConnectorManager {
         }
     }
 
-    /// Start a connector based on its type (source or sink).
-    async fn start_connector(&self, config: ConnectorConfig) -> Result<(), String> {
+    /// Start a connector based on its type (source or sink). Called from REST
+    /// API endpoints (POST /api/v1/connectors, restart, etc.) and the
+    /// file-watcher hot-reload path.
+    ///
+    /// If this pod is not the leader the call returns an error immediately —
+    /// the `leader_gate` middleware should have already returned 503 for REST
+    /// callers, but we check here as defence-in-depth.
+    pub async fn start_connector(&self, config: ConnectorConfig) -> Result<(), String> {
+        if !self.leadership.is_currently_leader() {
+            return Err("not leader; connector creation is handled by the leader".to_string());
+        }
+        let token = self.leadership.current_child_token().await;
+        self.start_connector_under_token(config, token).await
+    }
+
+    /// Internal: dispatch by type but spawn under the provided token.
+    async fn start_connector_under_token(
+        &self,
+        config: ConnectorConfig,
+        token: CancellationToken,
+    ) -> Result<(), String> {
         match config.connector_type.as_str() {
-            "source" => self.start_source(config).await,
-            "sink" => self.start_sink(config).await,
+            "source" => self.start_source_under_token(config, token).await,
+            "sink" => self.start_sink_under_token(config, token).await,
             other => Err(format!("unknown connector type: {other}")),
         }
     }
 
-    /// Start a source connector.
-    async fn start_source(&self, config: ConnectorConfig) -> Result<(), String> {
+    /// Start every loaded source + sink connector under `token`. Called
+    /// exactly once per leadership tenure by the leader supervisor in
+    /// `crates/exspeed/src/cli/server.rs`. Returns when `token.cancelled()`
+    /// fires — on demotion or shutdown.
+    ///
+    /// Callers should NOT call this method outside the leader supervisor;
+    /// if you need to start a single connector at create-time (e.g., the
+    /// `/api/v1/connectors` POST handler), use `start_connector` which
+    /// checks the current leadership state.
+    pub async fn run_all(&self, token: CancellationToken) {
+        // Snapshot the config list under read-lock so we don't hold it
+        // across await points that might try to take the write lock.
+        let configs: Vec<ConnectorConfig> = {
+            let conns = self.connectors.read().await;
+            conns.values().map(|rc| rc.config.clone()).collect()
+        };
+
+        for cfg in configs {
+            if let Err(e) = self.start_connector_under_token(cfg, token.clone()).await {
+                warn!(error = %e, "failed to start connector under leader supervisor");
+            }
+        }
+
+        token.cancelled().await;
+        info!("connector manager leader tenure ended; connector tasks will drain");
+    }
+
+    /// Start a source connector under the given cancellation token.
+    async fn start_source_under_token(
+        &self,
+        config: ConnectorConfig,
+        token: CancellationToken,
+    ) -> Result<(), String> {
         let name = config.name.clone();
 
         // HTTP webhook sources don't have a task loop — they're axum handlers
-        // driven by inbound HTTP requests. They don't need a lease (the
-        // ingress layer routes each request to one pod, and the broker append
-        // is itself idempotent on dedup keys).
+        // driven by inbound HTTP requests.
         if config.plugin == "http_webhook" {
             let mut map = self.connectors.write().await;
             map.insert(
@@ -399,71 +453,20 @@ impl ConnectorManager {
             return Ok(());
         }
 
-        // Lease-gate: only one pod runs the poll loop at a time. Noop backend
-        // always acquires (preserves single-pod behavior). On Pg/Redis,
-        // returning Ok(()) when another pod holds the lease leaves the
-        // connector in standby — the LeaseRetrier will retry on its tick.
-        //
-        // We hold the running_leases write lock across try_acquire+insert so
-        // two concurrent start_source calls for the same name (e.g., retrier
-        // racing a TOML hot-reload) can't both attempt acquire and end up
-        // with one taking the lease while the other plants a stale Stopped
-        // entry. The lock serializes startup but not steady-state operation.
-        let lease_name = format!("connector:{name}");
-        let ttl = exspeed_broker::lease::ttl_from_env();
-        let guard = {
-            let mut held = self.running_leases.write().await;
-            if held.contains_key(&name) {
-                return Ok(());
-            }
-            match self.lease.try_acquire(&lease_name, ttl).await {
-                Ok(Some(g)) => {
-                    held.insert(name.clone(), ());
-                    self.metrics
-                        .record_lease_acquire_attempt(&lease_name, "acquired");
-                    self.metrics.set_lease_held(&lease_name, true);
-                    g
-                }
-                Ok(None) => {
-                    debug!(connector = %name, "another pod holds the lease; standby");
-                    drop(held);
-                    self.metrics
-                        .record_lease_acquire_attempt(&lease_name, "rejected");
-                    // Still record the config so list/get_status reflect it,
-                    // but don't spawn the task. Use Stopped status to signal
-                    // standby (operator can distinguish via the API).
-                    let mut map = self.connectors.write().await;
-                    map.entry(name.clone()).or_insert_with(|| RunningConnector {
-                        config: config.clone(),
-                        status: ConnectorStatus::Stopped,
-                        cancel_tx: None,
-                        started_at: Instant::now(),
-                    });
-                    return Ok(());
-                }
-                Err(e) => {
-                    error!(connector = %name, error = %e, "lease backend error");
-                    self.metrics
-                        .record_lease_acquire_attempt(&lease_name, "error");
-                    return Err(format!("lease backend: {e}"));
-                }
-            }
-        };
-        let mut on_lost = guard.on_lost.clone();
-
         // Create the source connector via plugin registry
         let mut source = match builtin::create_source(&config.plugin, &config) {
             Ok(s) => s,
             Err(e) => {
-                // Release the lease we just took.
-                self.running_leases.write().await.remove(&name);
-                self.metrics.set_lease_held(&lease_name, false);
-                drop(guard);
                 return Err(format!("failed to create source: {e}"));
             }
         };
 
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+
+        // Derive a child token so that dropping cancel_tx (for manual stop /
+        // restart) doesn't disturb sibling connector tasks that share the
+        // parent token.
+        let child_token = token.child_token();
 
         let broker_append = self.broker_append.clone();
         let metrics = self.metrics.clone();
@@ -476,6 +479,7 @@ impl ConnectorManager {
         let dedup_key_header = config.dedup_key.clone();
         let transform_sql = config.transform_sql.clone();
         let task_name = name.clone();
+        let name_for_select = name.clone();
 
         // Insert into map before spawning
         {
@@ -491,18 +495,11 @@ impl ConnectorManager {
             );
         }
 
-        // Spawn source task
-        let running_leases_for_task = self.running_leases.clone();
-        let name_for_cleanup = name.clone();
-        let lease_name_for_task = lease_name.clone();
-        let metrics_for_task = self.metrics.clone();
-        tokio::spawn(async move {
-            // Keep the lease guard alive for the lifetime of this task.
-            // When the task exits (normal, error, or cancellation), the
-            // guard drops and the heartbeat stops — releasing the lease so
-            // another pod can take over via the LeaseRetrier.
-            let _guard = guard;
+        let log_name = name.clone();
 
+        // Spawn source task
+        tokio::spawn(async move {
+            let name = name_for_select;
             let work = async move {
             // Load last position
             let last_pos = match offset_store.load_source_offset(&task_name).await {
@@ -550,18 +547,7 @@ impl ConnectorManager {
                 None
             };
 
-            let mut cancel_rx = cancel_rx;
-
             loop {
-                // Check for cancellation
-                match cancel_rx.try_recv() {
-                    Ok(()) | Err(oneshot::error::TryRecvError::Closed) => {
-                        info!(connector = task_name.as_str(), "source task cancelled");
-                        break;
-                    }
-                    Err(oneshot::error::TryRecvError::Empty) => {}
-                }
-
                 // Poll for records
                 let batch = match source.poll(batch_size).await {
                     Ok(b) => b,
@@ -654,98 +640,45 @@ impl ConnectorManager {
                     }
                 }
             }
-
-            // Graceful shutdown
-            if let Err(e) = source.stop().await {
-                error!(connector = task_name.as_str(), error = %e, "source stop failed");
-            }
-            info!(connector = task_name.as_str(), "source task exited");
             }; // end of `work` async block
 
             tokio::select! {
-                _ = work => {
-                    // Clean task exit — not a loss.
-                    metrics_for_task.set_lease_held(&lease_name_for_task, false);
+                _ = work => {}
+                _ = child_token.cancelled() => {
+                    info!(connector = %name, "stopping source (leader token fired)");
                 }
-                _ = on_lost.changed() => {
-                    warn!(connector = %name_for_cleanup, "lease lost; stopping source connector");
-                    metrics_for_task.record_lease_lost(&lease_name_for_task);
-                    metrics_for_task.set_lease_held(&lease_name_for_task, false);
+                _ = cancel_rx => {
+                    info!(connector = %name, "stopping source (manual cancel)");
                 }
             }
-
-            // Clear the running_leases entry so the retrier can pick us up
-            // again if the lease is lost or the task exited for any reason.
-            running_leases_for_task.write().await.remove(&name_for_cleanup);
         });
 
-        info!(connector = name.as_str(), "source connector started");
+        info!(connector = log_name.as_str(), "source connector started");
         Ok(())
     }
 
-    /// Start a sink connector.
-    async fn start_sink(&self, config: ConnectorConfig) -> Result<(), String> {
+    /// Start a sink connector under the given cancellation token.
+    async fn start_sink_under_token(
+        &self,
+        config: ConnectorConfig,
+        token: CancellationToken,
+    ) -> Result<(), String> {
         let name = config.name.clone();
-
-        // Lease-gate: only one pod runs the sink poll loop at a time. Noop
-        // always acquires (single-pod). The plan notes that sinks inside a
-        // consumer group don't need a lease (the WorkCoordinator splits work),
-        // but ConnectorConfig carries no group field today — so we lease all
-        // sinks. One extra atomic op per sink is cheap; multi-pod correctness
-        // is the prize.
-        // Hold the running_leases write lock across try_acquire+insert to
-        // avoid a check-then-acquire race; see start_source for rationale.
-        let lease_name = format!("connector:{name}");
-        let ttl = exspeed_broker::lease::ttl_from_env();
-        let guard = {
-            let mut held = self.running_leases.write().await;
-            if held.contains_key(&name) {
-                return Ok(());
-            }
-            match self.lease.try_acquire(&lease_name, ttl).await {
-                Ok(Some(g)) => {
-                    held.insert(name.clone(), ());
-                    self.metrics
-                        .record_lease_acquire_attempt(&lease_name, "acquired");
-                    self.metrics.set_lease_held(&lease_name, true);
-                    g
-                }
-                Ok(None) => {
-                    debug!(connector = %name, "another pod holds the lease; standby");
-                    drop(held);
-                    self.metrics
-                        .record_lease_acquire_attempt(&lease_name, "rejected");
-                    let mut map = self.connectors.write().await;
-                    map.entry(name.clone()).or_insert_with(|| RunningConnector {
-                        config: config.clone(),
-                        status: ConnectorStatus::Stopped,
-                        cancel_tx: None,
-                        started_at: Instant::now(),
-                    });
-                    return Ok(());
-                }
-                Err(e) => {
-                    error!(connector = %name, error = %e, "lease backend error");
-                    self.metrics
-                        .record_lease_acquire_attempt(&lease_name, "error");
-                    return Err(format!("lease backend: {e}"));
-                }
-            }
-        };
-        let mut on_lost = guard.on_lost.clone();
 
         // Create the sink connector via plugin registry
         let mut sink = match builtin::create_sink(&config.plugin, &config) {
             Ok(s) => s,
             Err(e) => {
-                self.running_leases.write().await.remove(&name);
-                self.metrics.set_lease_held(&lease_name, false);
-                drop(guard);
                 return Err(format!("failed to create sink: {e}"));
             }
         };
 
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+
+        // Derive a child token so that dropping cancel_tx (for manual stop /
+        // restart) doesn't disturb sibling connector tasks that share the
+        // parent token.
+        let child_token = token.child_token();
 
         let storage = self.storage.clone();
         let metrics = self.metrics.clone();
@@ -755,6 +688,7 @@ impl ConnectorManager {
         let batch_size = config.batch_size as usize;
         let poll_interval = std::time::Duration::from_millis(config.poll_interval_ms);
         let task_name = name.clone();
+        let name_for_select = name.clone();
 
         // Insert into map before spawning
         {
@@ -770,15 +704,11 @@ impl ConnectorManager {
             );
         }
 
-        // Spawn sink task
-        let running_leases_for_task = self.running_leases.clone();
-        let name_for_cleanup = name.clone();
-        let lease_name_for_task = lease_name.clone();
-        let metrics_for_task = self.metrics.clone();
-        tokio::spawn(async move {
-            // Keep the lease alive for the task's lifetime.
-            let _guard = guard;
+        let log_name = name.clone();
 
+        // Spawn sink task
+        tokio::spawn(async move {
+            let name = name_for_select;
             let work = async move {
             // Start the sink
             if let Err(e) = sink.start().await {
@@ -803,18 +733,7 @@ impl ConnectorManager {
                 }
             };
 
-            let mut cancel_rx = cancel_rx;
-
             loop {
-                // Check for cancellation
-                match cancel_rx.try_recv() {
-                    Ok(()) | Err(oneshot::error::TryRecvError::Closed) => {
-                        info!(connector = task_name.as_str(), "sink task cancelled");
-                        break;
-                    }
-                    Err(oneshot::error::TryRecvError::Empty) => {}
-                }
-
                 // Read records from storage
                 let stored_records = match storage.read(&stream_name, Offset(current_offset), batch_size).await {
                     Ok(recs) => recs,
@@ -904,33 +823,20 @@ impl ConnectorManager {
                     error!(connector = task_name.as_str(), error = %e, "failed to save sink offset");
                 }
             }
-
-            // Graceful shutdown: flush + stop
-            if let Err(e) = sink.flush().await {
-                error!(connector = task_name.as_str(), error = %e, "sink flush failed");
-            }
-            if let Err(e) = sink.stop().await {
-                error!(connector = task_name.as_str(), error = %e, "sink stop failed");
-            }
-            info!(connector = task_name.as_str(), "sink task exited");
             }; // end of `work` async block
 
             tokio::select! {
-                _ = work => {
-                    // Clean task exit — not a loss.
-                    metrics_for_task.set_lease_held(&lease_name_for_task, false);
+                _ = work => {}
+                _ = child_token.cancelled() => {
+                    info!(connector = %name, "stopping sink (leader token fired)");
                 }
-                _ = on_lost.changed() => {
-                    warn!(connector = %name_for_cleanup, "lease lost; stopping sink connector");
-                    metrics_for_task.record_lease_lost(&lease_name_for_task);
-                    metrics_for_task.set_lease_held(&lease_name_for_task, false);
+                _ = cancel_rx => {
+                    info!(connector = %name, "stopping sink (manual cancel)");
                 }
             }
-
-            running_leases_for_task.write().await.remove(&name_for_cleanup);
         });
 
-        info!(connector = name.as_str(), "sink connector started");
+        info!(connector = log_name.as_str(), "sink connector started");
         Ok(())
     }
 
@@ -948,47 +854,5 @@ impl ConnectorManager {
             }
             None => Err(format!("connector '{name}' not found")),
         }
-    }
-
-    /// Called by [`exspeed_broker::LeaseRetrier`] on every tick. For each
-    /// configured connector this pod is not currently running (no entry in
-    /// `running_leases`), attempt to acquire its lease and start the task.
-    ///
-    /// This is the failover mechanism: when a peer pod crashes and its
-    /// lease expires, another pod picks up the work on the next tick.
-    ///
-    /// Named `_impl` to avoid ambiguity with the trait method of the same
-    /// name (see the `LeaseRetrierTarget` impl below).
-    pub async fn attempt_acquire_unheld_impl(&self) {
-        // Snapshot the set of configured connectors (clone to drop the read
-        // guard before calling start_connector which takes a write lock).
-        let configs: Vec<ConnectorConfig> = {
-            let connectors = self.connectors.read().await;
-            connectors.values().map(|rc| rc.config.clone()).collect()
-        };
-
-        for config in configs {
-            let name = config.name.clone();
-            // Skip http_webhook — it has no poll task, nothing to lease.
-            if config.connector_type == "source" && config.plugin == "http_webhook" {
-                continue;
-            }
-            if self.running_leases.read().await.contains_key(&name) {
-                continue;
-            }
-            if let Err(e) = self.start_connector(config).await {
-                debug!(connector = %name, error = %e, "retrier start_connector failed");
-            }
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl exspeed_broker::LeaseRetrierTarget for ConnectorManager {
-    async fn attempt_acquire_unheld(&self) {
-        self.attempt_acquire_unheld_impl().await;
-    }
-    fn name(&self) -> &'static str {
-        "connectors"
     }
 }

@@ -38,6 +38,8 @@ async fn healthz_returns_ok() {
     let (_tcp, http) = start_server().await;
     let client = reqwest::Client::new();
 
+    // /healthz is leader-aware: returns 200 with {"leader": true} when this
+    // pod holds the cluster-leader lease (always the case with Noop backend).
     let resp = client
         .get(format!("{}/healthz", http))
         .send()
@@ -46,7 +48,17 @@ async fn healthz_returns_ok() {
     assert_eq!(resp.status(), 200);
 
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["status"], "ok");
+    assert_eq!(
+        body["leader"],
+        true,
+        "single-pod server should always be leader; body: {:?}",
+        body
+    );
+    assert!(
+        body.get("holder").is_some(),
+        "response should include holder id; body: {:?}",
+        body
+    );
 }
 
 #[tokio::test]

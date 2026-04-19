@@ -735,35 +735,118 @@ network, k8s namespace).
 
 ## Multi-pod deployment
 
-Exspeed supports **hot-standby multi-pod** via a shared coordination backend.
-Running N broker pods means N pods with identical configuration — exactly
-one at a time holds the leases for each source connector, ungrouped sink,
-and continuous query. If the leader crashes, the survivor takes over within
-the lease TTL.
+Exspeed supports **hot-standby multi-pod** via a single cluster-leader
+lease. Running N broker pods means N identical pods; exactly one is the
+**leader** at any moment and serves all traffic. Standbys are silent
+until failover. If the leader crashes, a survivor takes over within the
+lease TTL.
+
+### A health-check-aware load balancer is REQUIRED
+
+Standby pods return `503` on every `/api/v1/*` endpoint except
+`/api/v1/leases`. Without a probe-aware LB, consumers connecting to a
+standby will see 503s on ~(N−1)/N of their requests. **This is a
+deployment misconfiguration, not a bug.**
 
 ### Requirements
 
 1. **Shared consumer store.** `EXSPEED_CONSUMER_STORE=postgres` or `=redis`.
-   The `file` backend does NOT support multi-pod coordination; the server
+   The `file` backend does not support multi-pod coordination; the server
    warns loudly on every boot when file-backed.
 
-2. **One `data_dir` per pod.** Plan A's `flock` guarantees exclusive access
-   to each data directory. Multi-pod does NOT mean shared storage in v1 —
-   each pod owns its own streams. Typical deployment: N identical pods,
-   each with its own PV / local disk, serving identical config. Only the
-   lease-holding pod runs background tasks; other pods are hot standbys.
+2. **One `data_dir` per pod.** Plan A's `flock` guarantees exclusive
+   access. Multi-pod does NOT mean shared storage — each pod owns its own
+   streams. Typical deployment: N identical pods, each with its own PV /
+   local disk.
 
-3. **Reachable coordination backend.** Postgres or Redis must be reachable
-   from every pod. Use the same URL env vars as the consumer store:
-   `EXSPEED_OFFSET_STORE_POSTGRES_URL` or `EXSPEED_OFFSET_STORE_REDIS_URL`.
+3. **A probe-aware LB in front of both HTTP (8080) and TCP (5933).** k8s
+   `Service` + `readinessProbe` handles this natively — only pods passing
+   the probe receive traffic on any port.
+
+### k8s deployment (recommended)
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: exspeed
+spec:
+  selector: { app: exspeed }
+  ports:
+    - name: api
+      port: 8080
+      targetPort: 8080
+    - name: tcp
+      port: 5933
+      targetPort: 5933
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: exspeed
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: exspeed }
+  serviceName: exspeed
+  template:
+    metadata:
+      labels: { app: exspeed }
+    spec:
+      containers:
+        - name: exspeed
+          image: exspeed:latest
+          ports:
+            - containerPort: 8080
+            - containerPort: 5933
+          env:
+            - name: EXSPEED_CONSUMER_STORE
+              value: postgres
+            - name: EXSPEED_OFFSET_STORE_POSTGRES_URL
+              valueFrom: { secretKeyRef: { name: pg, key: url } }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 5
+            failureThreshold: 2
+            successThreshold: 1
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/exspeed
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources: { requests: { storage: 10Gi } }
+```
+
+### nginx (active health check; nginx Plus or a compatible module)
+
+```nginx
+upstream exspeed {
+    server exspeed-0:8080;
+    server exspeed-1:8080;
+    health_check uri=/healthz interval=5s fails=2 passes=1;
+}
+```
+
+### HAProxy
+
+```
+backend exspeed
+    option httpchk GET /healthz
+    http-check expect status 200
+    default-server check inter 5s fall 2 rise 1
+    server pod0 exspeed-0:8080
+    server pod1 exspeed-1:8080
+```
 
 ### Failover timing
 
 | Scenario | Time to failover |
 |---|---|
-| Leader pod crashes (SIGKILL, OOM) | ≤ TTL + retry interval (default ~40s) |
-| Leader pod shuts down gracefully (SIGTERM) | ≤ retry interval (default ~10s) |
-| Heartbeat partitioned from backend | Lease released after 2 consecutive heartbeat failures (~20s), then failover per above |
+| Leader crashes (SIGKILL / OOM) | ≤ TTL + TTL/3 + probe_interval ≈ **30–40s** |
+| Leader SIGTERM (graceful) | ≤ TTL/3 + probe_interval ≈ **5–15s** |
+| Backend partition (heartbeat fails) | ~20s to detect, then failover per above |
 
 ### Tuning
 
@@ -772,34 +855,33 @@ EXSPEED_LEASE_TTL_SECS=30         # default 30
 EXSPEED_LEASE_HEARTBEAT_SECS=10   # default 10 (~TTL/3)
 ```
 
-Shorter TTL = faster failover + more chatty backend traffic. Longer TTL =
-slower failover + less traffic. The defaults are fine for most deployments.
+Shorter TTL = faster failover + more chatty backend traffic. Longer TTL
+= slower failover + less traffic.
 
 ### Operator visibility
 
-- `GET /api/v1/leases` returns the current lease table (bearer-authed if
-  auth is on).
-- Prometheus metrics: `exspeed_lease_held{name}`,
-  `exspeed_lease_acquire_total{name,result}`, `exspeed_lease_lost_total{name}`.
-  **Note:** the metric series include a sentinel `name="__init__"` value-0
-  observation (emitted at startup so descriptors appear in scrapes before
-  any real lease is acquired). Filter it out in dashboard queries:
-  `exspeed_lease_held{name!="__init__"}`.
-- The Postgres backend stores leases in a table you can query directly:
-  `SELECT * FROM exspeed_leases`.
+- `GET /healthz` — 200 if this pod is the leader, 503 otherwise. Public.
+- `GET /metrics` — Prometheus. Public. Includes `exspeed_is_leader`,
+  `exspeed_leader_transitions_total{direction}`, and the existing
+  `exspeed_lease_*` series (`name="cluster:leader"`).
+- `GET /api/v1/leases` — bearer-authed; returns the single
+  `cluster:leader` row. Available on any pod (leader and standby) so
+  operators can discover who's in charge from anywhere.
+- Postgres backend: `SELECT * FROM exspeed_leases WHERE name = 'cluster:leader';`
 
 ### What's not in v1
 
-- **Replicated stream storage.** Pods have independent data dirs; a stream
-  created on pod A is not visible from pod B. Horizontal scale for stream
-  traffic is a later plan.
-- **Cross-pod query/connector routing.** A continuous query that reads
-  stream-X must be lease-held by the pod that owns stream-X's data dir.
-  With hot-standby this is automatic; with more complex topologies
-  operators are responsible.
+- **Replicated stream storage.** Pods have independent data dirs; a
+  stream created on one pod is not visible from another. On failover,
+  the new leader's data dir is what clients see. Materialized views
+  rebuild from source streams on the new leader. Horizontal scale for
+  stream traffic is a later plan.
+- **Cross-pod query/connector routing.** A continuous query on the
+  leader pod writes to the leader's data dir; that's where clients read
+  it. Hot-standby makes this automatic.
 - **mTLS or encrypted inter-pod coordination.** Shared Postgres/Redis
-  coordination traffic rides on whatever security those services provide.
-  Run them on a private network / VPC.
+  traffic rides on whatever security those services provide. Run them
+  on a private network / VPC.
 
 ## Docker Deployment
 

@@ -1163,6 +1163,7 @@ name = "exspeed-api"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "axum-server",
  "bytes",
@@ -1173,10 +1174,13 @@ dependencies = [
  "exspeed-protocol",
  "exspeed-storage",
  "exspeed-streams",
+ "http-body-util",
  "prometheus",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "tower",
  "tracing",
 ]
 
@@ -1199,6 +1203,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-postgres",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -1243,6 +1248,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-postgres",
+ "tokio-util",
  "toml",
  "tracing",
 ]
@@ -1264,6 +1270,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
 ]

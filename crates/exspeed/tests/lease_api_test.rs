@@ -77,3 +77,58 @@ async fn metrics_expose_lease_counters() {
         "expected lease metrics in /metrics body; got:\n{body}"
     );
 }
+
+fn skip_if_no_postgres() -> bool {
+    std::env::var("EXSPEED_OFFSET_STORE_POSTGRES_URL").is_err()
+}
+
+async fn ensure_schema(schema: &str) {
+    let url = std::env::var("EXSPEED_OFFSET_STORE_POSTGRES_URL").unwrap();
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .expect("connect to postgres");
+    tokio::spawn(async move { let _ = connection.await; });
+    let sql = format!("CREATE SCHEMA IF NOT EXISTS {schema}");
+    client.execute(&sql, &[]).await.expect("create schema");
+}
+
+#[tokio::test]
+async fn leases_endpoint_postgres_backend_returns_single_cluster_leader_row() {
+    if skip_if_no_postgres() {
+        return;
+    }
+
+    let schema = format!("lease_api_{}", uuid::Uuid::new_v4().simple());
+    ensure_schema(&schema).await;
+
+    std::env::set_var("EXSPEED_CONSUMER_STORE", "postgres");
+    std::env::set_var("EXSPEED_OFFSET_STORE_POSTGRES_SCHEMA", &schema);
+    std::env::set_var("EXSPEED_LEASE_TTL_SECS", "5");
+    std::env::set_var("EXSPEED_LEASE_HEARTBEAT_SECS", "1");
+
+    let (api_port, _tmp) = start_server(None).await;
+
+    // Give the leader race a moment to settle.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let resp = reqwest::get(format!("http://127.0.0.1:{api_port}/api/v1/leases"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: Vec<serde_json::Value> = resp.json().await.unwrap();
+    assert_eq!(
+        body.len(),
+        1,
+        "expected exactly one lease (cluster:leader); got {body:?}"
+    );
+    assert_eq!(body[0]["name"], "cluster:leader");
+    assert!(body[0]["holder"].is_string(), "holder should be a UUID string");
+    assert!(body[0]["expires_at"].is_string(), "expires_at should be a timestamp string");
+
+    // Clean up env vars.
+    std::env::remove_var("EXSPEED_CONSUMER_STORE");
+    std::env::remove_var("EXSPEED_OFFSET_STORE_POSTGRES_SCHEMA");
+    std::env::remove_var("EXSPEED_LEASE_TTL_SECS");
+    std::env::remove_var("EXSPEED_LEASE_HEARTBEAT_SECS");
+}
