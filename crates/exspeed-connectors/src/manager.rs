@@ -403,33 +403,45 @@ impl ConnectorManager {
         // always acquires (preserves single-pod behavior). On Pg/Redis,
         // returning Ok(()) when another pod holds the lease leaves the
         // connector in standby — the LeaseRetrier will retry on its tick.
-        if self.running_leases.read().await.contains_key(&name) {
-            return Ok(());
-        }
+        //
+        // We hold the running_leases write lock across try_acquire+insert so
+        // two concurrent start_source calls for the same name (e.g., retrier
+        // racing a TOML hot-reload) can't both attempt acquire and end up
+        // with one taking the lease while the other plants a stale Stopped
+        // entry. The lock serializes startup but not steady-state operation.
         let lease_name = format!("connector:{name}");
         let ttl = exspeed_broker::lease::ttl_from_env();
-        let guard = match self.lease.try_acquire(&lease_name, ttl).await {
-            Ok(Some(g)) => g,
-            Ok(None) => {
-                debug!(connector = %name, "another pod holds the lease; standby");
-                // Still record the config so list/get_status reflect it,
-                // but don't spawn the task. Use Stopped status to signal
-                // standby (operator can distinguish via the API).
-                let mut map = self.connectors.write().await;
-                map.entry(name.clone()).or_insert_with(|| RunningConnector {
-                    config: config.clone(),
-                    status: ConnectorStatus::Stopped,
-                    cancel_tx: None,
-                    started_at: Instant::now(),
-                });
+        let guard = {
+            let mut held = self.running_leases.write().await;
+            if held.contains_key(&name) {
                 return Ok(());
             }
-            Err(e) => {
-                error!(connector = %name, error = %e, "lease backend error");
-                return Err(format!("lease backend: {e}"));
+            match self.lease.try_acquire(&lease_name, ttl).await {
+                Ok(Some(g)) => {
+                    held.insert(name.clone(), ());
+                    g
+                }
+                Ok(None) => {
+                    debug!(connector = %name, "another pod holds the lease; standby");
+                    drop(held);
+                    // Still record the config so list/get_status reflect it,
+                    // but don't spawn the task. Use Stopped status to signal
+                    // standby (operator can distinguish via the API).
+                    let mut map = self.connectors.write().await;
+                    map.entry(name.clone()).or_insert_with(|| RunningConnector {
+                        config: config.clone(),
+                        status: ConnectorStatus::Stopped,
+                        cancel_tx: None,
+                        started_at: Instant::now(),
+                    });
+                    return Ok(());
+                }
+                Err(e) => {
+                    error!(connector = %name, error = %e, "lease backend error");
+                    return Err(format!("lease backend: {e}"));
+                }
             }
         };
-        self.running_leases.write().await.insert(name.clone(), ());
         let mut on_lost = guard.on_lost.clone();
 
         // Create the source connector via plugin registry
@@ -666,30 +678,38 @@ impl ConnectorManager {
         // but ConnectorConfig carries no group field today — so we lease all
         // sinks. One extra atomic op per sink is cheap; multi-pod correctness
         // is the prize.
-        if self.running_leases.read().await.contains_key(&name) {
-            return Ok(());
-        }
+        // Hold the running_leases write lock across try_acquire+insert to
+        // avoid a check-then-acquire race; see start_source for rationale.
         let lease_name = format!("connector:{name}");
         let ttl = exspeed_broker::lease::ttl_from_env();
-        let guard = match self.lease.try_acquire(&lease_name, ttl).await {
-            Ok(Some(g)) => g,
-            Ok(None) => {
-                debug!(connector = %name, "another pod holds the lease; standby");
-                let mut map = self.connectors.write().await;
-                map.entry(name.clone()).or_insert_with(|| RunningConnector {
-                    config: config.clone(),
-                    status: ConnectorStatus::Stopped,
-                    cancel_tx: None,
-                    started_at: Instant::now(),
-                });
+        let guard = {
+            let mut held = self.running_leases.write().await;
+            if held.contains_key(&name) {
                 return Ok(());
             }
-            Err(e) => {
-                error!(connector = %name, error = %e, "lease backend error");
-                return Err(format!("lease backend: {e}"));
+            match self.lease.try_acquire(&lease_name, ttl).await {
+                Ok(Some(g)) => {
+                    held.insert(name.clone(), ());
+                    g
+                }
+                Ok(None) => {
+                    debug!(connector = %name, "another pod holds the lease; standby");
+                    drop(held);
+                    let mut map = self.connectors.write().await;
+                    map.entry(name.clone()).or_insert_with(|| RunningConnector {
+                        config: config.clone(),
+                        status: ConnectorStatus::Stopped,
+                        cancel_tx: None,
+                        started_at: Instant::now(),
+                    });
+                    return Ok(());
+                }
+                Err(e) => {
+                    error!(connector = %name, error = %e, "lease backend error");
+                    return Err(format!("lease backend: {e}"));
+                }
             }
         };
-        self.running_leases.write().await.insert(name.clone(), ());
         let mut on_lost = guard.on_lost.clone();
 
         // Create the sink connector via plugin registry
