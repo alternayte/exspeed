@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::hash::Hasher;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::{Mutex, RwLock};
 use twox_hash::XxHash64;
@@ -335,6 +335,177 @@ impl BrokerAppend {
         for map in maps.values_mut() {
             map.evict_expired();
         }
+    }
+
+    /// Snapshot the dedup map for a single stream to disk.
+    pub async fn snapshot_stream(
+        &self,
+        stream: &StreamName,
+        stream_dir: &std::path::Path,
+    ) -> std::io::Result<()> {
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let maps = self.dedup_maps.read().await;
+        let Some(map) = maps.get(stream) else {
+            return Ok(());
+        };
+
+        let entries: Vec<crate::broker_append_snapshot::SnapshotEntry> = map
+            .seen
+            .iter()
+            .map(|(k, e)| {
+                let elapsed_ms = e.inserted_at.elapsed().as_millis() as u64;
+                let inserted_at_unix_ms = now_ms.saturating_sub(elapsed_ms);
+                crate::broker_append_snapshot::SnapshotEntry {
+                    msg_id: k.clone(),
+                    offset: e.offset,
+                    inserted_at_unix_ms,
+                    body_hash: e.body_hash,
+                }
+            })
+            .collect();
+
+        let snap = crate::broker_append_snapshot::Snapshot {
+            covers_through_unix_ms: now_ms,
+            entries,
+        };
+        let path = crate::broker_append_snapshot::snapshot_path(stream_dir);
+        crate::broker_append_snapshot::write_snapshot(&path, &snap)
+    }
+
+    /// Snapshot all streams' dedup maps to disk.
+    pub async fn snapshot_all(&self, data_dir: &std::path::Path) -> std::io::Result<()> {
+        let streams: Vec<StreamName> = {
+            let maps = self.dedup_maps.read().await;
+            maps.keys().cloned().collect()
+        };
+        for s in streams {
+            let stream_dir = data_dir.join("streams").join(s.as_str());
+            if let Err(e) = self.snapshot_stream(&s, &stream_dir).await {
+                tracing::warn!(stream = %s, error = %e, "dedup snapshot write failed");
+            }
+        }
+        Ok(())
+    }
+
+    /// Rebuild the dedup map for a single stream using the snapshot + tail scan.
+    ///
+    /// Algorithm:
+    ///   1. Try to load the snapshot — if valid, populate the map from it and
+    ///      note `covers_through_unix_ms` so we only need to scan records written
+    ///      after the snapshot was taken.
+    ///   2. If the snapshot is missing or corrupt, log a warning and fall back to
+    ///      a full scan from the dedup window boundary.
+    ///   3. In either case, scan forward from the determined start offset,
+    ///      inserting any idempotency-keyed records found.
+    pub async fn rebuild_stream(
+        &self,
+        stream: &StreamName,
+        stream_dir: &std::path::Path,
+    ) -> Result<(), StorageError> {
+        let (window_secs, max_entries) = {
+            let maps = self.dedup_maps.read().await;
+            maps.get(stream)
+                .map(|m| (m.window.as_secs(), m.max_entries))
+                .unwrap_or((self.default_window.as_secs(), self.default_max_entries))
+        };
+
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let snapshot_covers_through_unix_ms: Option<u64> = match crate::broker_append_snapshot::read_snapshot(
+            &crate::broker_append_snapshot::snapshot_path(stream_dir),
+        ) {
+            Ok(snap) => {
+                let covers = snap.covers_through_unix_ms;
+                let mut maps = self.dedup_maps.write().await;
+                let map = maps.entry(stream.clone()).or_insert_with(|| {
+                    DedupMap::new(Duration::from_secs(window_secs), max_entries)
+                });
+                for e in snap.entries {
+                    let age_ms = now_ms.saturating_sub(e.inserted_at_unix_ms);
+                    if age_ms >= window_secs * 1000 {
+                        continue; // already expired
+                    }
+                    let inserted_at =
+                        Instant::now() - Duration::from_millis(age_ms);
+                    map.seen.insert(
+                        e.msg_id,
+                        DedupEntry {
+                            offset: e.offset,
+                            inserted_at,
+                            body_hash: e.body_hash,
+                        },
+                    );
+                }
+                Some(covers)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    stream = %stream,
+                    error = %e,
+                    "dedup snapshot invalid, falling back to full log scan"
+                );
+                None
+            }
+        };
+
+        // Determine where to start scanning the log.
+        let cutoff_unix_ms = snapshot_covers_through_unix_ms
+            .unwrap_or_else(|| now_ms.saturating_sub(window_secs * 1000));
+        let cutoff_ns = cutoff_unix_ms * 1_000_000;
+
+        let start_offset = match self.storage.seek_by_time(stream, cutoff_ns).await {
+            Ok(o) => o,
+            Err(StorageError::StreamNotFound(_)) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+
+        let mut cursor = start_offset;
+        loop {
+            let batch = match self.storage.read(stream, cursor, 1000).await {
+                Ok(b) => b,
+                Err(StorageError::StreamNotFound(_)) => break,
+                Err(e) => return Err(e),
+            };
+            if batch.is_empty() {
+                break;
+            }
+            for rec in &batch {
+                if let Some((_, idemp)) = rec
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k == IDEMPOTENCY_HEADER)
+                {
+                    let body_hash = hash_body(&rec.value);
+                    let rec_ms = rec.timestamp / 1_000_000;
+                    let age_ms = now_ms.saturating_sub(rec_ms);
+                    let clamped_age = age_ms.min(window_secs * 1000);
+                    let inserted_at =
+                        Instant::now() - Duration::from_millis(clamped_age);
+                    let mut maps = self.dedup_maps.write().await;
+                    let map = maps.entry(stream.clone()).or_insert_with(|| {
+                        DedupMap::new(Duration::from_secs(window_secs), max_entries)
+                    });
+                    map.seen.insert(
+                        idemp.clone(),
+                        DedupEntry {
+                            offset: rec.offset.0,
+                            inserted_at,
+                            body_hash,
+                        },
+                    );
+                }
+            }
+            cursor = Offset(batch.last().unwrap().offset.0 + 1);
+        }
+
+        Ok(())
     }
 
     /// Rebuild dedup maps by scanning recent records from the log.
@@ -683,5 +854,105 @@ mod tests {
         assert_eq!(written_count, 1, "expected exactly 1 Written; got r1={r1:?}, r2={r2:?}");
         assert_eq!(duplicate_count, 1, "expected exactly 1 Duplicate; got r1={r1:?}, r2={r2:?}");
         assert_eq!(r1.offset(), r2.offset(), "offsets must agree");
+    }
+
+    // --- Sub-unit 3.2: snapshot_writes_file ---
+
+    #[tokio::test]
+    async fn snapshot_writes_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let stream_dir = data_dir.join("streams").join("test");
+        std::fs::create_dir_all(&stream_dir).unwrap();
+
+        let ba = Arc::new(BrokerAppend::new(make_storage().await, 300));
+        let stream = StreamName::try_from("test").unwrap();
+        ba.configure_stream(&stream, 300, 500_000).await;
+        ba.append(&stream, &make_record(Some("k1"), Bytes::from_static(b"a")))
+            .await
+            .unwrap();
+
+        ba.snapshot_all(&data_dir).await.unwrap();
+
+        let path = crate::broker_append_snapshot::snapshot_path(&stream_dir);
+        assert!(path.exists());
+        let snap = crate::broker_append_snapshot::read_snapshot(&path).unwrap();
+        assert_eq!(snap.entries.len(), 1);
+        assert_eq!(snap.entries[0].msg_id, "k1");
+    }
+
+    // --- Sub-unit 3.3: rebuild_stream ---
+
+    #[tokio::test]
+    async fn startup_loads_from_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let stream_dir = data_dir.join("streams").join("test");
+        std::fs::create_dir_all(&stream_dir).unwrap();
+
+        let storage = make_storage().await;
+        let stream = StreamName::try_from("test").unwrap();
+
+        {
+            let ba = BrokerAppend::new(storage.clone(), 300);
+            ba.configure_stream(&stream, 300, 500_000).await;
+            ba.append(
+                &stream,
+                &make_record(Some("k-retained"), Bytes::from_static(b"body")),
+            )
+            .await
+            .unwrap();
+            ba.snapshot_all(&data_dir).await.unwrap();
+        }
+
+        let ba2 = BrokerAppend::new(storage.clone(), 300);
+        ba2.configure_stream(&stream, 300, 500_000).await;
+        ba2.rebuild_stream(&stream, &stream_dir).await.unwrap();
+
+        let res = ba2
+            .append(
+                &stream,
+                &make_record(Some("k-retained"), Bytes::from_static(b"body")),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(res, AppendResult::Duplicate(_)));
+    }
+
+    #[tokio::test]
+    async fn startup_falls_back_to_full_scan_on_corrupt_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let stream_dir = data_dir.join("streams").join("test");
+        std::fs::create_dir_all(&stream_dir).unwrap();
+
+        let storage = make_storage().await;
+        let stream = StreamName::try_from("test").unwrap();
+
+        {
+            let ba = BrokerAppend::new(storage.clone(), 300);
+            ba.configure_stream(&stream, 300, 500_000).await;
+            ba.append(
+                &stream,
+                &make_record(Some("k-tail"), Bytes::from_static(b"body")),
+            )
+            .await
+            .unwrap();
+            // Write garbage to the snapshot file to simulate corruption.
+            std::fs::write(stream_dir.join("dedup_snapshot.bin"), b"garbage").unwrap();
+        }
+
+        let ba2 = BrokerAppend::new(storage.clone(), 300);
+        ba2.configure_stream(&stream, 300, 500_000).await;
+        ba2.rebuild_stream(&stream, &stream_dir).await.unwrap();
+
+        let res = ba2
+            .append(
+                &stream,
+                &make_record(Some("k-tail"), Bytes::from_static(b"body")),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(res, AppendResult::Duplicate(_)));
     }
 }

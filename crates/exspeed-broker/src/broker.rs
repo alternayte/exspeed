@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use tokio::sync::{mpsc, oneshot};
@@ -25,6 +26,8 @@ pub struct Broker {
     pub(crate) max_delivery_attempts: u16,
     pub(crate) nack_attempts: RwLock<HashMap<(String, u64), u16>>,
     pub metrics: Arc<Metrics>,
+    /// Set to `true` once all startup dedup rebuild tasks complete.
+    pub dedup_ready: Arc<AtomicBool>,
 }
 
 impl Broker {
@@ -49,7 +52,13 @@ impl Broker {
             max_delivery_attempts: 5,
             nack_attempts: RwLock::new(HashMap::new()),
             metrics,
+            dedup_ready: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Returns `true` once all startup dedup rebuild tasks have completed.
+    pub fn is_dedup_ready(&self) -> bool {
+        self.dedup_ready.load(Ordering::Acquire)
     }
 
     /// Load all persisted consumers from the configured ConsumerStore and
