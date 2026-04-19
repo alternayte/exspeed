@@ -263,22 +263,11 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     let exql = Arc::new(ExqlEngine::new(
         exql_storage,
         args.data_dir.clone(),
-        lease.clone(),
+        leadership.clone(),
         metrics.clone(),
     ));
     exql.load().unwrap_or_else(|e| warn!("ExQL load: {e}"));
-    exql.resume_all();
-
-    // Spawn the lease retrier (ticks every TTL/3). Only needed on coordinated
-    // backends — Noop always acquires so the initial resume_all call already
-    // claimed everything. Targets only the continuous-query engine; connector
-    // failover is handled by the cluster-leader supervisor (Task 9).
-    if lease.supports_coordination() {
-        exspeed_broker::spawn_lease_retrier(vec![
-            exql.clone() as Arc<dyn exspeed_broker::LeaseRetrierTarget>,
-        ]);
-        info!("lease retrier spawned");
-    }
+    // resume_all_and_run(token) is called by the leader supervisor (Task 9).
 
     // Create shared AppState
     let state = Arc::new(exspeed_api::AppState {
