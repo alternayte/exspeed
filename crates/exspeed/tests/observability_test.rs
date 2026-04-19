@@ -141,3 +141,47 @@ async fn over_long_consumer_name_rejected() {
         "over-long consumer name should return Error"
     );
 }
+
+#[tokio::test]
+async fn publish_latency_histogram_reported_via_metrics() {
+    let (_addr, api_port, _tmp) = start_server().await;
+
+    let client = reqwest::Client::new();
+
+    // Create stream via HTTP API.
+    let resp = client
+        .post(format!("http://127.0.0.1:{api_port}/api/v1/streams"))
+        .json(&serde_json::json!({"name": "lat-test", "max_age_secs": 0, "max_bytes": 0}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "create stream: {}", resp.status());
+
+    // Publish a record via the HTTP API.
+    let resp = client
+        .post(format!(
+            "http://127.0.0.1:{api_port}/api/v1/streams/lat-test/publish"
+        ))
+        .json(&serde_json::json!({"subject": "test", "data": {"msg": "hello"}}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "publish: {}", resp.status());
+
+    // Scrape /metrics.
+    let metrics = reqwest::get(format!("http://127.0.0.1:{api_port}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(
+        metrics.contains("publish_latency_seconds"),
+        "metrics body did not include publish_latency_seconds; got:\n{metrics}"
+    );
+    assert!(
+        metrics.contains("stream=\"lat-test\""),
+        "metrics body did not include stream=lat-test label; got:\n{metrics}"
+    );
+}

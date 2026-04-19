@@ -158,8 +158,16 @@ pub async fn publish_to_stream(
         headers: vec![],
     };
 
+    let start = std::time::Instant::now();
     match state.storage.append(&stream_name, &record).await {
-        Ok(offset) => (StatusCode::CREATED, Json(json!({"offset": offset.0}))),
+        Ok(offset) => {
+            let elapsed_secs = start.elapsed().as_secs_f64();
+            state
+                .metrics
+                .record_publish_latency(stream_name.as_str(), elapsed_secs);
+            state.metrics.record_publish(stream_name.as_str());
+            (StatusCode::CREATED, Json(json!({"offset": offset.0})))
+        }
         Err(exspeed_streams::StorageError::StreamNotFound(_)) => (
             StatusCode::NOT_FOUND,
             Json(json!({"error": format!("stream '{}' not found", name)})),

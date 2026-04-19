@@ -289,6 +289,7 @@ where
         consumer_store,
         work_coordinator.clone(),
         lease.clone(),
+        metrics.clone(),
     ));
     broker.load_consumers().await.map_err(|e| anyhow::anyhow!(e))?;
 

@@ -51,10 +51,18 @@ pub async fn handle_publish(broker: &Broker, req: PublishRequest) -> ServerMessa
         headers: req.headers,
     };
 
+    let start = std::time::Instant::now();
     match broker.broker_append.append(&stream_name, &record).await {
-        Ok(result) => ServerMessage::PublishOk {
-            offset: result.offset().0,
-        },
+        Ok(result) => {
+            let elapsed_secs = start.elapsed().as_secs_f64();
+            broker
+                .metrics
+                .record_publish_latency(stream_name.as_str(), elapsed_secs);
+            broker.metrics.record_publish(stream_name.as_str());
+            ServerMessage::PublishOk {
+                offset: result.offset().0,
+            }
+        }
         Err(e) => ServerMessage::Error {
             code: 404,
             message: format!("append failed: {e}"),
