@@ -175,6 +175,21 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         );
     }
 
+    // Give the retry loop one full tick to race for the lease before we
+    // log posture or spawn the supervisor. We wait for is_leader=true with
+    // a short deadline (min(TTL/3, 2s)). Under Noop backend the first tick
+    // fires immediately so this resolves in <10ms; under Postgres/Redis it
+    // takes ~TTL/3 (default 10s, clamped to 2s here).
+    let startup_deadline = std::cmp::min(lease_ttl / 3, std::time::Duration::from_secs(2));
+    let mut leadership_rx = leadership.is_leader.clone();
+    let _ = tokio::time::timeout(
+        startup_deadline,
+        leadership_rx.wait_for(|&v| v),
+    )
+    .await;
+
+    let role = if leadership.is_currently_leader() { "leader" } else { "standby" };
+
     // Posture log (always). Emitted after lease is built so the backend name
     // appears alongside auth/tls state.
     let lease_backend_name = if lease.supports_coordination() {
@@ -189,10 +204,18 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         auth = if auth_token.is_some() { "on" } else { "off" },
         tls = if tls_enabled { "on" } else { "off" },
         lease = %lease_backend_name,
+        role = role,
         bind = %args.bind,
         api_bind = %args.api_bind,
         "exspeed server starting"
     );
+    if role == "standby" {
+        info!(
+            "role=standby — this pod does not serve client traffic. \
+             Configure your load balancer to probe GET /healthz and only \
+             route to pods returning 200."
+        );
+    }
 
     // Create broker
     let broker_append_for_connectors = broker_append.clone();
@@ -269,6 +292,10 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     exql.load().unwrap_or_else(|e| warn!("ExQL load: {e}"));
     // resume_all_and_run(token) is called by the leader supervisor (Task 9).
 
+    // Clone before moving into AppState so the leader supervisor can capture them.
+    let connector_manager_for_supervisor = connector_manager.clone();
+    let exql_for_supervisor = exql.clone();
+
     // Create shared AppState
     let state = Arc::new(exspeed_api::AppState {
         broker: broker.clone(),
@@ -283,8 +310,40 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         leadership: leadership.clone(),
     });
 
-    // Spawn retention task
-    exspeed_broker::retention_task::spawn_retention_task(file_storage);
+    // Spawn the leader supervisor: waits for is_leader=true, then runs
+    // connectors + continuous queries + retention under the current
+    // leader token. Loops so that if we get demoted and re-promoted,
+    // we resume.
+    {
+        let leadership_sup = leadership.clone();
+        let connector_manager_sup = connector_manager_for_supervisor;
+        let exql_sup = exql_for_supervisor;
+        let storage_sup = file_storage.clone();
+        tokio::spawn(async move {
+            let mut is_leader_rx = leadership_sup.is_leader.clone();
+            loop {
+                if is_leader_rx.wait_for(|&v| v).await.is_err() {
+                    return; // watcher closed → shutdown
+                }
+                let token = leadership_sup.current_child_token().await;
+                info!("leader supervisor: assuming leadership; starting work");
+
+                tokio::select! {
+                    _ = connector_manager_sup.run_all(token.clone()) => {}
+                    _ = exql_sup.clone().resume_all_and_run(token.clone()) => {}
+                    _ = exspeed_broker::retention_task::run(
+                            storage_sup.clone(),
+                            token.clone(),
+                        ) => {}
+                    _ = token.cancelled() => {}
+                }
+
+                info!("leader supervisor: tenure ended; awaiting re-promotion");
+                // Wait for demotion before looping so we don't tight-loop.
+                let _ = is_leader_rx.wait_for(|&v| !v).await;
+            }
+        });
+    }
 
     // Spawn dedup eviction task (runs every 60 seconds)
     {
