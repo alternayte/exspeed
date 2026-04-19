@@ -35,11 +35,16 @@ impl LeaderLease for NoopLeaderLease {
         _ttl: Duration,
     ) -> Result<Option<LeaseGuard>, LeaseError> {
         let (cancel_tx, _cancel_rx) = oneshot::channel::<()>();
-        let (_lost_tx, lost_rx) = watch::channel(false);
+        let (lost_tx, lost_rx) = watch::channel(false);
         Ok(Some(LeaseGuard {
             name: name.to_string(),
             holder_id: Uuid::new_v4(),
             on_lost: lost_rx,
+            // Keep the sender alive so `on_lost.changed()` stays pending.
+            // Without this, owner tasks that select on `on_lost.changed()`
+            // would stop immediately because the dropped sender causes
+            // `changed()` to resolve with `Err(_)`.
+            _lost_tx: Some(lost_tx),
             _cancel_heartbeat: cancel_tx,
         }))
     }

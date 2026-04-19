@@ -78,7 +78,7 @@ pub async fn create_continuous(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateContinuousRequest>,
 ) -> impl IntoResponse {
-    match state.exql.create_continuous(&body.sql) {
+    match state.exql.create_continuous(&body.sql).await {
         Ok(query_id) => (
             StatusCode::CREATED,
             Json(json!({"query_id": query_id, "status": "running"})),

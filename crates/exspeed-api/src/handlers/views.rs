@@ -102,7 +102,7 @@ pub async fn create_view(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateViewRequest>,
 ) -> impl IntoResponse {
-    match state.exql.create_materialized_view(&body.sql) {
+    match state.exql.create_materialized_view(&body.sql).await {
         Ok(query_id) => (
             StatusCode::CREATED,
             Json(json!({"query_id": query_id, "status": "running"})),

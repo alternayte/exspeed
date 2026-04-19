@@ -264,6 +264,9 @@ fn spawn_heartbeat(
         name,
         holder_id,
         on_lost: lost_rx,
+        // Sender is owned by the heartbeat task (moved into `tokio::spawn`
+        // above); the guard keeps nothing here.
+        _lost_tx: None,
         _cancel_heartbeat: cancel_tx,
     }
 }

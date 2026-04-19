@@ -46,6 +46,13 @@ pub struct LeaseGuard {
     /// if the heartbeat task fails to refresh the lease. Owner code should
     /// select on `on_lost.changed()` to stop work cleanly.
     pub on_lost: watch::Receiver<bool>,
+    /// Keeps the `on_lost` sender alive for the lifetime of the guard.
+    /// Backends that don't expose lost-signaling (e.g. Noop) store the
+    /// sender here so `on_lost.changed()` stays pending indefinitely
+    /// instead of resolving with `Err(_)` the instant the sender drops.
+    /// Backends that do signal lost (postgres/redis) move the real sender
+    /// into their heartbeat task and set this to `None`.
+    pub _lost_tx: Option<watch::Sender<bool>>,
     /// Dropping the guard sends on this, stopping the heartbeat task.
     _cancel_heartbeat: oneshot::Sender<()>,
 }
