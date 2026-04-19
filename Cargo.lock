@@ -1252,6 +1252,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "exspeed-broker",
  "exspeed-common",
  "exspeed-storage",
  "exspeed-streams",

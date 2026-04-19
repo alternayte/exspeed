@@ -228,16 +228,6 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         warn!("failed to load connector configs: {}", e);
     }
 
-    // Spawn the lease retrier (ticks every TTL/3). Only needed on coordinated
-    // backends — Noop always acquires so the initial start_connector call
-    // already claimed everything.
-    if lease.supports_coordination() {
-        exspeed_broker::spawn_lease_retrier(vec![
-            connector_manager.clone() as Arc<dyn exspeed_broker::LeaseRetrierTarget>,
-        ]);
-        info!("lease retrier spawned");
-    }
-
     // Spawn TOML file watcher for hot-reload of connectors.d/
     exspeed_connectors::file_watcher::spawn_file_watcher(
         connector_manager.clone(),
@@ -246,9 +236,26 @@ pub async fn run(args: ServerArgs) -> Result<()> {
 
     // Create ExQL engine (use file_storage as the StorageEngine trait object)
     let exql_storage: Arc<dyn StorageEngine> = file_storage.clone();
-    let exql = Arc::new(ExqlEngine::new(exql_storage, args.data_dir.clone()));
+    let exql = Arc::new(ExqlEngine::new(
+        exql_storage,
+        args.data_dir.clone(),
+        lease.clone(),
+    ));
     exql.load().unwrap_or_else(|e| warn!("ExQL load: {e}"));
     exql.resume_all();
+
+    // Spawn the lease retrier (ticks every TTL/3). Only needed on coordinated
+    // backends — Noop always acquires so the initial start_connector /
+    // resume_all calls already claimed everything. Include both connectors
+    // and continuous queries as retrier targets so a failed peer's leases
+    // get picked up on the next tick.
+    if lease.supports_coordination() {
+        exspeed_broker::spawn_lease_retrier(vec![
+            connector_manager.clone() as Arc<dyn exspeed_broker::LeaseRetrierTarget>,
+            exql.clone() as Arc<dyn exspeed_broker::LeaseRetrierTarget>,
+        ]);
+        info!("lease retrier spawned");
+    }
 
     // Create shared AppState
     let state = Arc::new(exspeed_api::AppState {

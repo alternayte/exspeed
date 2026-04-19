@@ -7,6 +7,7 @@ edition = "2021"
 exspeed-common = { path = "../exspeed-common" }
 exspeed-streams = { path = "../exspeed-streams" }
 exspeed-storage = { path = "../exspeed-storage" }
+exspeed-broker = { path = "../exspeed-broker" }
 sqlparser = { workspace = true }
 sqlx = { workspace = true }
 tokio = { workspace = true }
