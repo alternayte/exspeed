@@ -69,7 +69,8 @@ async fn signal_listener() {
         };
         let mut sigint = match signal(SignalKind::interrupt()) {
             Ok(s) => s,
-            Err(_) => {
+            Err(e) => {
+                error!("failed to install SIGINT handler: {}; SIGTERM only", e);
                 let _ = sigterm.recv().await;
                 return;
             }
@@ -383,6 +384,10 @@ where
         let exql_sup = exql_for_supervisor;
         let storage_sup = file_storage.clone();
         let supervisor_cancel = cancel_token.clone();
+        // Leader supervisor: three select-wraps observe `supervisor_cancel` because the
+        // supervisor has three idle states (awaiting promotion, active tenure, awaiting
+        // demotion). Without the third wrap, SIGTERM during the post-tenure idle window
+        // would block until the next promotion or watcher channel close.
         tokio::spawn(async move {
             let mut is_leader_rx = leadership_sup.is_leader.clone();
             loop {
