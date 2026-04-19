@@ -240,6 +240,7 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         exql_storage,
         args.data_dir.clone(),
         lease.clone(),
+        metrics.clone(),
     ));
     exql.load().unwrap_or_else(|e| warn!("ExQL load: {e}"));
     exql.resume_all();

@@ -2,6 +2,7 @@ pub mod connections;
 pub mod connectors;
 pub mod consumers;
 pub mod health;
+pub mod leases;
 pub mod metrics;
 pub mod queries;
 pub mod streams;
@@ -80,6 +81,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/v1/connections/{name}",
             delete(connections::delete_connection),
         )
+        .route("/api/v1/leases", get(leases::list_leases))
         .layer(from_fn_with_state(state.clone(), crate::middleware::require_bearer))
         .with_state(state);
 

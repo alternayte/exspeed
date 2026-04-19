@@ -419,11 +419,16 @@ impl ConnectorManager {
             match self.lease.try_acquire(&lease_name, ttl).await {
                 Ok(Some(g)) => {
                     held.insert(name.clone(), ());
+                    self.metrics
+                        .record_lease_acquire_attempt(&lease_name, "acquired");
+                    self.metrics.set_lease_held(&lease_name, true);
                     g
                 }
                 Ok(None) => {
                     debug!(connector = %name, "another pod holds the lease; standby");
                     drop(held);
+                    self.metrics
+                        .record_lease_acquire_attempt(&lease_name, "rejected");
                     // Still record the config so list/get_status reflect it,
                     // but don't spawn the task. Use Stopped status to signal
                     // standby (operator can distinguish via the API).
@@ -438,6 +443,8 @@ impl ConnectorManager {
                 }
                 Err(e) => {
                     error!(connector = %name, error = %e, "lease backend error");
+                    self.metrics
+                        .record_lease_acquire_attempt(&lease_name, "error");
                     return Err(format!("lease backend: {e}"));
                 }
             }
@@ -450,6 +457,7 @@ impl ConnectorManager {
             Err(e) => {
                 // Release the lease we just took.
                 self.running_leases.write().await.remove(&name);
+                self.metrics.set_lease_held(&lease_name, false);
                 drop(guard);
                 return Err(format!("failed to create source: {e}"));
             }
@@ -486,6 +494,8 @@ impl ConnectorManager {
         // Spawn source task
         let running_leases_for_task = self.running_leases.clone();
         let name_for_cleanup = name.clone();
+        let lease_name_for_task = lease_name.clone();
+        let metrics_for_task = self.metrics.clone();
         tokio::spawn(async move {
             // Keep the lease guard alive for the lifetime of this task.
             // When the task exits (normal, error, or cancellation), the
@@ -653,9 +663,14 @@ impl ConnectorManager {
             }; // end of `work` async block
 
             tokio::select! {
-                _ = work => {}
+                _ = work => {
+                    // Clean task exit — not a loss.
+                    metrics_for_task.set_lease_held(&lease_name_for_task, false);
+                }
                 _ = on_lost.changed() => {
                     warn!(connector = %name_for_cleanup, "lease lost; stopping source connector");
+                    metrics_for_task.record_lease_lost(&lease_name_for_task);
+                    metrics_for_task.set_lease_held(&lease_name_for_task, false);
                 }
             }
 
@@ -690,11 +705,16 @@ impl ConnectorManager {
             match self.lease.try_acquire(&lease_name, ttl).await {
                 Ok(Some(g)) => {
                     held.insert(name.clone(), ());
+                    self.metrics
+                        .record_lease_acquire_attempt(&lease_name, "acquired");
+                    self.metrics.set_lease_held(&lease_name, true);
                     g
                 }
                 Ok(None) => {
                     debug!(connector = %name, "another pod holds the lease; standby");
                     drop(held);
+                    self.metrics
+                        .record_lease_acquire_attempt(&lease_name, "rejected");
                     let mut map = self.connectors.write().await;
                     map.entry(name.clone()).or_insert_with(|| RunningConnector {
                         config: config.clone(),
@@ -706,6 +726,8 @@ impl ConnectorManager {
                 }
                 Err(e) => {
                     error!(connector = %name, error = %e, "lease backend error");
+                    self.metrics
+                        .record_lease_acquire_attempt(&lease_name, "error");
                     return Err(format!("lease backend: {e}"));
                 }
             }
@@ -717,6 +739,7 @@ impl ConnectorManager {
             Ok(s) => s,
             Err(e) => {
                 self.running_leases.write().await.remove(&name);
+                self.metrics.set_lease_held(&lease_name, false);
                 drop(guard);
                 return Err(format!("failed to create sink: {e}"));
             }
@@ -750,6 +773,8 @@ impl ConnectorManager {
         // Spawn sink task
         let running_leases_for_task = self.running_leases.clone();
         let name_for_cleanup = name.clone();
+        let lease_name_for_task = lease_name.clone();
+        let metrics_for_task = self.metrics.clone();
         tokio::spawn(async move {
             // Keep the lease alive for the task's lifetime.
             let _guard = guard;
@@ -891,9 +916,14 @@ impl ConnectorManager {
             }; // end of `work` async block
 
             tokio::select! {
-                _ = work => {}
+                _ = work => {
+                    // Clean task exit — not a loss.
+                    metrics_for_task.set_lease_held(&lease_name_for_task, false);
+                }
                 _ = on_lost.changed() => {
                     warn!(connector = %name_for_cleanup, "lease lost; stopping sink connector");
+                    metrics_for_task.record_lease_lost(&lease_name_for_task);
+                    metrics_for_task.set_lease_held(&lease_name_for_task, false);
                 }
             }
 

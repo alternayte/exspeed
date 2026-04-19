@@ -15,6 +15,17 @@ pub struct Metrics {
     pub storage_bytes: Gauge<i64>,
     pub connections_active: UpDownCounter<i64>,
     pub uptime_seconds: Gauge<f64>,
+    /// Whether this pod currently holds the named lease. Gauge value is 1
+    /// when held, 0 when released/lost. Labeled by `name` (e.g.
+    /// `connector:orders-source` or `query:abc123`).
+    pub lease_held: Gauge<i64>,
+    /// Counts every `try_acquire` attempt this pod made. Labeled by `name`
+    /// and `result`, where `result` is one of `"acquired"`, `"rejected"`
+    /// (another pod holds the lease), or `"error"` (backend failure).
+    pub lease_acquire_total: Counter<u64>,
+    /// Counts every lease lost involuntarily (heartbeat failure, TTL
+    /// expiry). Labeled by `name`. Does not fire on clean release/shutdown.
+    pub lease_lost_total: Counter<u64>,
 }
 
 impl Metrics {
@@ -38,6 +49,26 @@ impl Metrics {
         let storage_bytes = meter.i64_gauge("storage_bytes").build();
         let connections_active = meter.i64_up_down_counter("connections_active").build();
         let uptime_seconds = meter.f64_gauge("uptime_seconds").build();
+        let lease_held = meter.i64_gauge("exspeed_lease_held").build();
+        let lease_acquire_total = meter.u64_counter("exspeed_lease_acquire_total").build();
+        let lease_lost_total = meter.u64_counter("exspeed_lease_lost_total").build();
+
+        // Zero-initialize the lease metrics so the descriptor shows up in
+        // /metrics output even before any acquire attempt (e.g., on pods
+        // with no connectors/queries configured). Operator dashboards can
+        // then alert on absence; we don't want the metric to vanish simply
+        // because nothing has fired yet. The `__init__` label is a sentinel
+        // distinct from any real lease name.
+        let init_label = [KeyValue::new("name", "__init__")];
+        lease_held.record(0, &init_label);
+        lease_acquire_total.add(
+            0,
+            &[
+                KeyValue::new("name", "__init__"),
+                KeyValue::new("result", "acquired"),
+            ],
+        );
+        lease_lost_total.add(0, &init_label);
 
         // Keep the provider alive — dropping it shuts down the metrics pipeline.
         std::mem::forget(provider);
@@ -49,6 +80,9 @@ impl Metrics {
             storage_bytes,
             connections_active,
             uptime_seconds,
+            lease_held,
+            lease_acquire_total,
+            lease_lost_total,
         };
 
         (metrics, registry)
@@ -103,5 +137,35 @@ impl Metrics {
     /// Record the server uptime in seconds.
     pub fn set_uptime(&self, seconds: f64) {
         self.uptime_seconds.record(seconds, &[]);
+    }
+
+    /// Flip the `exspeed_lease_held` gauge for the named lease. Call with
+    /// `held=true` on successful acquire and `held=false` on release or loss.
+    pub fn set_lease_held(&self, name: &str, held: bool) {
+        self.lease_held.record(
+            if held { 1 } else { 0 },
+            &[KeyValue::new("name", name.to_owned())],
+        );
+    }
+
+    /// Increment `exspeed_lease_acquire_total` with a `result` label. The
+    /// accepted values are exactly `"acquired"`, `"rejected"`, or `"error"`
+    /// — keep these stable as operator dashboards depend on them.
+    pub fn record_lease_acquire_attempt(&self, name: &str, result: &'static str) {
+        self.lease_acquire_total.add(
+            1,
+            &[
+                KeyValue::new("name", name.to_owned()),
+                KeyValue::new("result", result),
+            ],
+        );
+    }
+
+    /// Increment `exspeed_lease_lost_total` — fired only on involuntary
+    /// lease loss (heartbeat failure / TTL expiry). Clean release must not
+    /// call this.
+    pub fn record_lease_lost(&self, name: &str) {
+        self.lease_lost_total
+            .add(1, &[KeyValue::new("name", name.to_owned())]);
     }
 }

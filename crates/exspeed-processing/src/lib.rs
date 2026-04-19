@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use exspeed_broker::lease::LeaderLease;
+use exspeed_common::metrics::Metrics;
 use exspeed_streams::StorageEngine;
 use tokio::sync::oneshot;
 use tokio::sync::RwLock as AsyncRwLock;
@@ -43,6 +44,11 @@ pub struct ExqlEngine {
     /// skip already-running entries. The value is unit — the actual
     /// `LeaseGuard` lives inside each spawned task.
     pub running_query_leases: Arc<AsyncRwLock<HashMap<String, ()>>>,
+    /// Shared server metrics. Used to emit the `exspeed_lease_*` Prometheus
+    /// instruments when continuous query leases are acquired / rejected /
+    /// lost. Cloned into each spawned task so loss events can still fire
+    /// after the engine reference is gone.
+    pub metrics: Arc<Metrics>,
 }
 
 impl ExqlEngine {
@@ -51,6 +57,7 @@ impl ExqlEngine {
         storage: Arc<dyn StorageEngine>,
         data_dir: PathBuf,
         lease: Arc<dyn LeaderLease>,
+        metrics: Arc<Metrics>,
     ) -> Self {
         let connection_registry = Arc::new(ConnectionRegistry::new(data_dir.clone()));
         let query_registry = Arc::new(QueryRegistry::new(data_dir));
@@ -62,6 +69,7 @@ impl ExqlEngine {
             mv_registry,
             lease,
             running_query_leases: Arc::new(AsyncRwLock::new(HashMap::new())),
+            metrics,
         }
     }
 
@@ -123,6 +131,9 @@ impl ExqlEngine {
             match self.lease.try_acquire(&lease_name, ttl).await {
                 Ok(Some(g)) => {
                     held.insert(id.clone(), ());
+                    self.metrics
+                        .record_lease_acquire_attempt(&lease_name, "acquired");
+                    self.metrics.set_lease_held(&lease_name, true);
                     g
                 }
                 Ok(None) => {
@@ -130,9 +141,13 @@ impl ExqlEngine {
                         query_id = %id,
                         "query registered; another pod holds lease (standby)"
                     );
+                    self.metrics
+                        .record_lease_acquire_attempt(&lease_name, "rejected");
                     return Ok(id);
                 }
                 Err(e) => {
+                    self.metrics
+                        .record_lease_acquire_attempt(&lease_name, "error");
                     return Err(ExqlError::Execution(format!(
                         "lease backend error acquiring query:{id}: {e}"
                     )));
@@ -146,6 +161,7 @@ impl ExqlEngine {
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
         if let Err(e) = self.query_registry.set_running(&id, cancel_tx) {
             self.running_query_leases.write().await.remove(&id);
+            self.metrics.set_lease_held(&lease_name, false);
             drop(guard);
             return Err(ExqlError::Execution(e));
         }
@@ -160,6 +176,8 @@ impl ExqlEngine {
         let sql_owned = sql.to_string();
         let target = target_stream.clone();
         let running = self.running_query_leases.clone();
+        let metrics_for_task = self.metrics.clone();
+        let lease_name_for_task = lease_name.clone();
 
         tokio::spawn(async move {
             let _guard = guard;
@@ -175,12 +193,16 @@ impl ExqlEngine {
             );
 
             tokio::select! {
-                _ = work => {}
+                _ = work => {
+                    metrics_for_task.set_lease_held(&lease_name_for_task, false);
+                }
                 _ = on_lost.changed() => {
                     tracing::warn!(
                         query_id = %query_id,
                         "lease lost; stopping continuous query"
                     );
+                    metrics_for_task.record_lease_lost(&lease_name_for_task);
+                    metrics_for_task.set_lease_held(&lease_name_for_task, false);
                 }
             }
 
@@ -253,6 +275,9 @@ impl ExqlEngine {
             match self.lease.try_acquire(&lease_name, ttl).await {
                 Ok(Some(g)) => {
                     held.insert(id.clone(), ());
+                    self.metrics
+                        .record_lease_acquire_attempt(&lease_name, "acquired");
+                    self.metrics.set_lease_held(&lease_name, true);
                     g
                 }
                 Ok(None) => {
@@ -261,9 +286,13 @@ impl ExqlEngine {
                         view = %name,
                         "materialized view registered; another pod holds lease (standby)"
                     );
+                    self.metrics
+                        .record_lease_acquire_attempt(&lease_name, "rejected");
                     return Ok(id);
                 }
                 Err(e) => {
+                    self.metrics
+                        .record_lease_acquire_attempt(&lease_name, "error");
                     return Err(ExqlError::Execution(format!(
                         "lease backend error acquiring query:{id}: {e}"
                     )));
@@ -274,6 +303,7 @@ impl ExqlEngine {
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
         if let Err(e) = self.query_registry.set_running(&id, cancel_tx) {
             self.running_query_leases.write().await.remove(&id);
+            self.metrics.set_lease_held(&lease_name, false);
             drop(guard);
             return Err(ExqlError::Execution(e));
         }
@@ -285,6 +315,8 @@ impl ExqlEngine {
         let sql_owned = sql.to_string();
         let mv_name = name.clone();
         let running = self.running_query_leases.clone();
+        let metrics_for_task = self.metrics.clone();
+        let lease_name_for_task = lease_name.clone();
 
         tokio::spawn(async move {
             let _guard = guard;
@@ -300,12 +332,16 @@ impl ExqlEngine {
             );
 
             tokio::select! {
-                _ = work => {}
+                _ = work => {
+                    metrics_for_task.set_lease_held(&lease_name_for_task, false);
+                }
                 _ = on_lost.changed() => {
                     tracing::warn!(
                         query_id = %query_id,
                         "lease lost; stopping materialized view"
                     );
+                    metrics_for_task.record_lease_lost(&lease_name_for_task);
+                    metrics_for_task.set_lease_held(&lease_name_for_task, false);
                 }
             }
 
@@ -377,6 +413,9 @@ impl ExqlEngine {
                 match self.lease.try_acquire(&lease_name, ttl).await {
                     Ok(Some(g)) => {
                         held.insert(query_id.clone(), ());
+                        self.metrics
+                            .record_lease_acquire_attempt(&lease_name, "acquired");
+                        self.metrics.set_lease_held(&lease_name, true);
                         g
                     }
                     Ok(None) => {
@@ -384,6 +423,8 @@ impl ExqlEngine {
                             query_id = %query_id,
                             "another pod holds lease; standby"
                         );
+                        self.metrics
+                            .record_lease_acquire_attempt(&lease_name, "rejected");
                         continue;
                     }
                     Err(e) => {
@@ -392,6 +433,8 @@ impl ExqlEngine {
                             error = %e,
                             "lease backend error"
                         );
+                        self.metrics
+                            .record_lease_acquire_attempt(&lease_name, "error");
                         continue;
                     }
                 }
@@ -408,6 +451,7 @@ impl ExqlEngine {
                 .is_err()
             {
                 self.running_query_leases.write().await.remove(&query_id);
+                self.metrics.set_lease_held(&lease_name, false);
                 drop(guard);
                 continue;
             }
@@ -418,6 +462,8 @@ impl ExqlEngine {
             let target = snap.target_stream.clone();
             let qid_task = query_id.clone();
             let running = self.running_query_leases.clone();
+            let metrics_for_task = self.metrics.clone();
+            let lease_name_for_task = lease_name.clone();
 
             tokio::spawn(async move {
                 // Keep the lease guard alive for the lifetime of this task.
@@ -437,12 +483,16 @@ impl ExqlEngine {
                 );
 
                 tokio::select! {
-                    _ = work => {}
+                    _ = work => {
+                        metrics_for_task.set_lease_held(&lease_name_for_task, false);
+                    }
                     _ = on_lost.changed() => {
                         tracing::warn!(
                             query_id = %qid_task,
                             "lease lost; stopping continuous query"
                         );
+                        metrics_for_task.record_lease_lost(&lease_name_for_task);
+                        metrics_for_task.set_lease_held(&lease_name_for_task, false);
                     }
                 }
 
@@ -486,7 +536,13 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let lease: Arc<dyn LeaderLease> = Arc::new(NoopLeaderLease::new());
-        let engine = Arc::new(ExqlEngine::new(storage, dir.path().to_path_buf(), lease));
+        let metrics = Arc::new(Metrics::new().0);
+        let engine = Arc::new(ExqlEngine::new(
+            storage,
+            dir.path().to_path_buf(),
+            lease,
+            metrics,
+        ));
 
         let id = engine
             .create_continuous(r#"CREATE VIEW derived AS SELECT * FROM "src""#)
@@ -513,7 +569,13 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let lease: Arc<dyn LeaderLease> = Arc::new(NoopLeaderLease::new());
-        let engine = Arc::new(ExqlEngine::new(storage, dir.path().to_path_buf(), lease));
+        let metrics = Arc::new(Metrics::new().0);
+        let engine = Arc::new(ExqlEngine::new(
+            storage,
+            dir.path().to_path_buf(),
+            lease,
+            metrics,
+        ));
 
         let id = engine
             .create_materialized_view(
