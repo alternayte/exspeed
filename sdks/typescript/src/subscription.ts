@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import type { RecordDelivery } from "./protocol/types.js";
+import { QueueOverflowError } from "./errors.js";
 
 type AckFn = (consumerName: string, offset: bigint) => Promise<void>;
 type NackFn = (consumerName: string, offset: bigint) => Promise<void>;
@@ -65,7 +66,6 @@ export class Message {
 
 export interface SubscriptionOptions {
   maxQueueSize: number;
-  /** Accepted but behavior is implemented in Task 4. */
   overflowPolicy?: "drop-oldest" | "error";
 }
 
@@ -74,7 +74,9 @@ export class Subscription extends EventEmitter implements AsyncIterable<Message>
   readonly subscriberId: string;
   private queue: QueueEntry[] = [];
   private readonly maxQueueSize: number;
+  private readonly overflowPolicy: "drop-oldest" | "error";
   private _closed = false;
+  private _paused = false;
   private waiter: ((value: IteratorResult<Message>) => void) | null = null;
 
   constructor(
@@ -86,12 +88,14 @@ export class Subscription extends EventEmitter implements AsyncIterable<Message>
     this.consumerName = consumerName;
     this.subscriberId = subscriberId;
     this.maxQueueSize = options.maxQueueSize;
+    this.overflowPolicy = options.overflowPolicy ?? "drop-oldest";
   }
 
   push(record: RecordDelivery, ackFn: AckFn, nackFn: NackFn): void {
     if (this._closed) return;
 
-    if (this.waiter) {
+    // Fast path: a waiter is parked AND we are not paused -> deliver directly.
+    if (this.waiter && !this._paused) {
       const msg = new Message(record, ackFn, nackFn);
       const w = this.waiter;
       this.waiter = null;
@@ -100,8 +104,17 @@ export class Subscription extends EventEmitter implements AsyncIterable<Message>
     }
 
     if (this.queue.length >= this.maxQueueSize) {
-      this.queue.shift();
-      this.emit("error", new Error("Queue overflow, dropped oldest message"));
+      if (this.overflowPolicy === "error") {
+        // Reject the incoming record; do NOT enqueue.
+        this.emit("error", new QueueOverflowError(record.offset, record.subject));
+        return;
+      }
+      // drop-oldest: shift the oldest, emit typed event referencing it.
+      const dropped = this.queue.shift()!;
+      this.emit(
+        "overflow",
+        new QueueOverflowError(dropped.record.offset, dropped.record.subject),
+      );
     }
 
     this.queue.push({ record, ackFn, nackFn });
@@ -109,6 +122,27 @@ export class Subscription extends EventEmitter implements AsyncIterable<Message>
     if (this.queue.length >= this.maxQueueSize * 0.8) {
       this.emit("slow");
     }
+  }
+
+  /** Pause iteration. While paused, `next()` awaits a `resume()` call. */
+  pause(): void {
+    this._paused = true;
+  }
+
+  /** Resume iteration. Wakes a parked iterator if the queue has work. */
+  resume(): void {
+    this._paused = false;
+    if (this.waiter && this.queue.length > 0) {
+      const entry = this.queue.shift()!;
+      const msg = new Message(entry.record, entry.ackFn, entry.nackFn);
+      const w = this.waiter;
+      this.waiter = null;
+      w({ value: msg, done: false });
+    }
+  }
+
+  get paused(): boolean {
+    return this._paused;
   }
 
   close(): void {
@@ -127,7 +161,7 @@ export class Subscription extends EventEmitter implements AsyncIterable<Message>
   [Symbol.asyncIterator](): AsyncIterator<Message> {
     return {
       next: (): Promise<IteratorResult<Message>> => {
-        if (this.queue.length > 0) {
+        if (this.queue.length > 0 && !this._paused) {
           const entry = this.queue.shift()!;
           const msg = new Message(entry.record, entry.ackFn, entry.nackFn);
           return Promise.resolve({ value: msg, done: false });
