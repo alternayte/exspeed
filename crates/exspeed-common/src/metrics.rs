@@ -26,6 +26,13 @@ pub struct Metrics {
     /// Counts every lease lost involuntarily (heartbeat failure, TTL
     /// expiry). Labeled by `name`. Does not fire on clean release/shutdown.
     pub lease_lost_total: Counter<u64>,
+    /// Whether this pod currently holds the cluster leader lease.
+    /// `1` = leader, `0` = standby. Exactly one pod in a cluster should
+    /// observe `1` at any given time.
+    pub is_leader: Gauge<i64>,
+    /// Counts every promotion / demotion event this pod has observed,
+    /// labeled `direction = "acquired" | "lost"`.
+    pub leader_transitions_total: Counter<u64>,
 }
 
 impl Metrics {
@@ -70,6 +77,17 @@ impl Metrics {
         );
         lease_lost_total.add(0, &init_label);
 
+        let is_leader = meter.i64_gauge("exspeed_is_leader").build();
+        let leader_transitions_total = meter
+            .u64_counter("exspeed_leader_transitions_total")
+            .build();
+
+        // Zero-initialize so the descriptor appears in /metrics before any
+        // transition fires.
+        is_leader.record(0, &[]);
+        leader_transitions_total.add(0, &[KeyValue::new("direction", "acquired")]);
+        leader_transitions_total.add(0, &[KeyValue::new("direction", "lost")]);
+
         // Keep the provider alive — dropping it shuts down the metrics pipeline.
         std::mem::forget(provider);
 
@@ -83,6 +101,8 @@ impl Metrics {
             lease_held,
             lease_acquire_total,
             lease_lost_total,
+            is_leader,
+            leader_transitions_total,
         };
 
         (metrics, registry)
@@ -167,5 +187,18 @@ impl Metrics {
     pub fn record_lease_lost(&self, name: &str) {
         self.lease_lost_total
             .add(1, &[KeyValue::new("name", name.to_owned())]);
+    }
+
+    /// Flip the `exspeed_is_leader` gauge. `true` on promotion, `false` on
+    /// demotion.
+    pub fn set_is_leader(&self, leader: bool) {
+        self.is_leader.record(if leader { 1 } else { 0 }, &[]);
+    }
+
+    /// Record a leadership transition. `direction` must be either
+    /// `"acquired"` or `"lost"` — operator dashboards depend on these labels.
+    pub fn record_leader_transition(&self, direction: &'static str) {
+        self.leader_transitions_total
+            .add(1, &[KeyValue::new("direction", direction)]);
     }
 }
