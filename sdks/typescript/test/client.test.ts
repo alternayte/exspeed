@@ -217,62 +217,88 @@ describe("subscribe() ack/nack routing", () => {
   afterEach(() => vi.restoreAllMocks());
 
   it("ackFn binds to subscription's own connection (not mainConn)", async () => {
-    const { QueueOverflowError: _ } = await import("../src/errors.js"); // side-effect-free import just to ensure module loads
     const client = new ExspeedClient({
       brokers: [{ host: "127.0.0.1", port: 9 }], // discard port — we stub connect
       clientId: "ack-routing-test",
       reconnect: false,
     });
 
-    // Stub Connection so we don't actually touch the network.
     vi.spyOn(Connection.prototype as any, "connect").mockResolvedValue(undefined);
-    vi.spyOn(Connection.prototype as any, "request").mockResolvedValue({
-      opcode: 0x10, payload: Buffer.alloc(0), correlationId: 0, version: 1,
-    });
+    const reqSpy = vi
+      .spyOn(Connection.prototype as any, "request")
+      .mockResolvedValue({ opcode: 0x10, payload: Buffer.alloc(0), correlationId: 0, version: 1 });
 
     const sub = await client.subscribe("c");
     const entry = (client as any).subscriptions.get("c");
     expect(entry).toBeDefined();
     expect(entry.conn).not.toBe((client as any).mainConn);
 
-    // Push a synthetic record via the subscription's "push" event pipeline.
-    const { encodeRecord: encRec } = await import("../src/protocol/record.js");
+    // Drive a synthetic Record push onto the subscription's connection.
     const { OpCode } = await import("../src/protocol/index.js");
-    const frame = {
-      opcode: OpCode.Record,
-      correlationId: 0,
-      payload: encRec({
+    const { encodeRecord } = await import("../src/protocol/record.js");
+    entry.conn.emit("push", {
+      opcode: OpCode.Record, correlationId: 0, version: 1,
+      payload: encodeRecord({
         consumerName: "c", offset: 5n, timestamp: 0n,
         subject: "s", deliveryAttempt: 1, key: undefined,
         value: Buffer.from(""), headers: [],
       }),
-      version: 1,
-    };
-    entry.conn.emit("push", frame);
+    });
 
-    // Pull from the iterator and ack.
     const iter = entry.sub[Symbol.asyncIterator]();
     const next = await iter.next();
     expect(next.done).toBe(false);
 
-    // Reset the request spy so we only observe the ack call.
-    const reqSpy = vi.spyOn(Connection.prototype as any, "request");
-    reqSpy.mockClear();
-    // Re-mock after clearing (spyOn restores to original, so re-spy with mock)
-    reqSpy.mockResolvedValue({
-      opcode: 0x10, payload: Buffer.alloc(0), correlationId: 0, version: 1,
-    });
-
+    reqSpy.mockClear();          // reset history AFTER subscribe's handshake calls
     await next.value!.ack();
 
-    // The ack should have called request on entry.conn (subscription's own),
-    // NOT on mainConn. We inspect mock.instances to verify the `this` binding.
     expect(reqSpy).toHaveBeenCalledTimes(1);
-    const ackThis = reqSpy.mock.instances[0];
-    expect(ackThis).toBe(entry.conn);
-    expect(ackThis).not.toBe((client as any).mainConn);
+    expect(reqSpy.mock.instances[0]).toBe(entry.conn);
+    expect(reqSpy.mock.instances[0]).not.toBe((client as any).mainConn);
 
     await client.close(100);
+    vi.restoreAllMocks();
+  });
+
+  it("nackFn binds to subscription's own connection (not mainConn)", async () => {
+    const client = new ExspeedClient({
+      brokers: [{ host: "127.0.0.1", port: 9 }],
+      clientId: "nack-routing-test",
+      reconnect: false,
+    });
+
+    vi.spyOn(Connection.prototype as any, "connect").mockResolvedValue(undefined);
+    const reqSpy = vi
+      .spyOn(Connection.prototype as any, "request")
+      .mockResolvedValue({ opcode: 0x10, payload: Buffer.alloc(0), correlationId: 0, version: 1 });
+
+    const sub = await client.subscribe("c");
+    const entry = (client as any).subscriptions.get("c");
+
+    const { OpCode } = await import("../src/protocol/index.js");
+    const { encodeRecord } = await import("../src/protocol/record.js");
+    entry.conn.emit("push", {
+      opcode: OpCode.Record, correlationId: 0, version: 1,
+      payload: encodeRecord({
+        consumerName: "c", offset: 7n, timestamp: 0n,
+        subject: "s", deliveryAttempt: 1, key: undefined,
+        value: Buffer.from(""), headers: [],
+      }),
+    });
+
+    const iter = entry.sub[Symbol.asyncIterator]();
+    const next = await iter.next();
+    expect(next.done).toBe(false);
+
+    reqSpy.mockClear();
+    await next.value!.nack();
+
+    expect(reqSpy).toHaveBeenCalledTimes(1);
+    expect(reqSpy.mock.instances[0]).toBe(entry.conn);
+    expect(reqSpy.mock.instances[0]).not.toBe((client as any).mainConn);
+
+    await client.close(100);
+    vi.restoreAllMocks();
   });
 
   it("legacy host/port still works", () => {
