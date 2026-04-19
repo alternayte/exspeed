@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
 
-use exspeed_common::{Offset, StreamName};
+use exspeed_common::{Metrics, Offset, StreamName};
+use exspeed_storage::file::io_errors::is_storage_full;
 use exspeed_streams::record::Record;
 use exspeed_streams::traits::StorageEngine;
 use exspeed_streams::StorageError;
@@ -95,6 +96,7 @@ pub struct BrokerAppend {
     storage: Arc<dyn StorageEngine>,
     dedup_maps: RwLock<HashMap<StreamName, DedupMap>>,
     default_window: Duration,
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl BrokerAppend {
@@ -103,12 +105,29 @@ impl BrokerAppend {
             storage,
             dedup_maps: RwLock::new(HashMap::new()),
             default_window: Duration::from_secs(default_window_secs),
+            metrics: None,
         }
+    }
+
+    /// Attach a Metrics handle so storage write failures bump
+    /// `storage_write_errors_total{stream, kind}`.
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Get a reference to the underlying storage engine (for read operations).
     pub fn storage(&self) -> &Arc<dyn StorageEngine> {
         &self.storage
+    }
+
+    fn record_write_error(&self, stream: &StreamName, err: &StorageError) {
+        let Some(m) = &self.metrics else { return };
+        let kind = match err {
+            StorageError::Io(io_err) if is_storage_full(io_err) => "storage_full",
+            _ => "other",
+        };
+        m.record_storage_write_error(stream.as_str(), kind);
     }
 
     /// Append a record with idempotency dedup.
@@ -137,7 +156,13 @@ impl BrokerAppend {
                 }
 
                 // Not a duplicate — write to storage
-                let offset = self.storage.append(stream, record).await?;
+                let offset = match self.storage.append(stream, record).await {
+                    Ok(o) => o,
+                    Err(e) => {
+                        self.record_write_error(stream, &e);
+                        return Err(e);
+                    }
+                };
 
                 // Insert into dedup map
                 {
@@ -152,7 +177,13 @@ impl BrokerAppend {
             }
             None => {
                 // No idempotency key — pass through directly
-                let offset = self.storage.append(stream, record).await?;
+                let offset = match self.storage.append(stream, record).await {
+                    Ok(o) => o,
+                    Err(e) => {
+                        self.record_write_error(stream, &e);
+                        return Err(e);
+                    }
+                };
                 Ok(AppendResult::Written(offset))
             }
         }

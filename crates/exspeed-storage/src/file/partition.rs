@@ -9,7 +9,9 @@ use tokio::sync::mpsc;
 
 use exspeed_common::Offset;
 use exspeed_streams::record::{Record, StoredRecord};
-use tracing::info;
+use tracing::{error, info};
+
+use crate::file::io_errors::is_storage_full;
 
 use crate::file::offset_index::OffsetIndex;
 use crate::file::segment_reader::SegmentReader;
@@ -48,6 +50,28 @@ fn now_nanos() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos() as u64
+}
+
+/// Emit a structured `error!` log for a partition write failure. Disk-full
+/// errors are highlighted separately so operators can alert on them.
+fn log_write_error(stream_name: &str, partition_id: u32, msg: &'static str, err: &io::Error) {
+    if is_storage_full(err) {
+        error!(
+            stream = stream_name,
+            partition = partition_id,
+            error = %err,
+            kind = "storage_full",
+            "{msg}: storage full"
+        );
+    } else {
+        error!(
+            stream = stream_name,
+            partition = partition_id,
+            error = %err,
+            kind = "other",
+            "{msg}"
+        );
+    }
 }
 
 /// Manages a single partition's on-disk state: active segment writer,
@@ -188,16 +212,27 @@ impl Partition {
         let timestamp = now_nanos();
 
         // WAL first — durable after sync_data inside WalWriter::append.
-        self.wal.append(
+        if let Err(e) = self.wal.append(
             &self.stream_name,
             self.partition_id,
             offset,
             timestamp,
             record,
-        )?;
+        ) {
+            log_write_error(&self.stream_name, self.partition_id, "WAL write failed", &e);
+            return Err(e);
+        }
 
         // Then segment.
-        self.active_writer.append(offset, timestamp, record)?;
+        if let Err(e) = self.active_writer.append(offset, timestamp, record) {
+            log_write_error(
+                &self.stream_name,
+                self.partition_id,
+                "segment write failed",
+                &e,
+            );
+            return Err(e);
+        }
         self.next_offset += 1;
 
         // Check if we need to roll the segment.

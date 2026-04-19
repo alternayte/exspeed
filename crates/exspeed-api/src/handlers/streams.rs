@@ -158,15 +158,36 @@ pub async fn publish_to_stream(
         headers: vec![],
     };
 
+    let start = std::time::Instant::now();
     match state.storage.append(&stream_name, &record).await {
-        Ok(offset) => (StatusCode::CREATED, Json(json!({"offset": offset.0}))),
+        Ok(offset) => {
+            let elapsed_secs = start.elapsed().as_secs_f64();
+            state
+                .metrics
+                .record_publish_latency(stream_name.as_str(), elapsed_secs);
+            state.metrics.record_publish(stream_name.as_str());
+            (StatusCode::CREATED, Json(json!({"offset": offset.0})))
+        }
         Err(exspeed_streams::StorageError::StreamNotFound(_)) => (
             StatusCode::NOT_FOUND,
             Json(json!({"error": format!("stream '{}' not found", name)})),
         ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        ),
+        Err(e) => {
+            let kind = match &e {
+                exspeed_streams::StorageError::Io(io_err)
+                    if exspeed_storage::file::io_errors::is_storage_full(io_err) =>
+                {
+                    "storage_full"
+                }
+                _ => "other",
+            };
+            state
+                .metrics
+                .record_storage_write_error(stream_name.as_str(), kind);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        }
     }
 }

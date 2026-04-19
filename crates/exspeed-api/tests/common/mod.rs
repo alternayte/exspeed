@@ -85,6 +85,7 @@ pub async fn make_state_with_leader(leader: bool) -> Arc<exspeed_api::AppState> 
         cs,
         wc,
         lease.clone(),
+        metrics.clone(),
     ));
 
     let oss = offset_store::from_env(tmp.path(), storage_dyn.clone())

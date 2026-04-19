@@ -84,6 +84,10 @@ pgwire-replication = { version = "0.3", default-features = false, features = ["s
 # File locking
 fs4 = "0.13"
 
+# Archive + compression (used by `exspeed snapshot`)
+tar = "0.4"
+flate2 = "1"
+
 # Filesystem watching
 notify = "7"
 

@@ -31,6 +31,8 @@ exspeed-processing = { path = "../exspeed-processing" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 fs4 = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

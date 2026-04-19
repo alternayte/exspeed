@@ -173,7 +173,9 @@ where
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(300);
-    let broker_append = Arc::new(BrokerAppend::new(storage.clone(), dedup_window_secs));
+    let broker_append = Arc::new(
+        BrokerAppend::new(storage.clone(), dedup_window_secs).with_metrics(metrics.clone()),
+    );
     broker_append.rebuild_from_log().await.unwrap_or_else(|e| {
         warn!("failed to rebuild dedup state from log: {}", e);
     });
@@ -289,8 +291,13 @@ where
         consumer_store,
         work_coordinator.clone(),
         lease.clone(),
+        metrics.clone(),
     ));
     broker.load_consumers().await.map_err(|e| anyhow::anyhow!(e))?;
+
+    // Spawn queue-depth sampler (5s interval) — reports per-subscription
+    // delivery channel fill ratio to `subscription_queue_fill_ratio`.
+    exspeed_broker::queue_depth_task::spawn_queue_depth_sampler(broker.clone(), metrics.clone());
 
     // Warn if grouped consumers exist but the coordinator doesn't support
     // multi-pod coordination (file/s3 backends).

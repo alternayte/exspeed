@@ -1,4 +1,4 @@
-use opentelemetry::metrics::{Counter, Gauge, MeterProvider, UpDownCounter};
+use opentelemetry::metrics::{Counter, Gauge, Histogram, MeterProvider, UpDownCounter};
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 
@@ -37,6 +37,18 @@ pub struct Metrics {
     /// Counts every promotion / demotion event this pod has observed,
     /// labeled `direction = "acquired" | "lost"`.
     pub leader_transitions_total: Counter<u64>,
+    /// End-to-end latency of a successful publish, in seconds. Labeled by
+    /// `stream`.
+    pub publish_latency_seconds: Histogram<f64>,
+    /// Time from a record's write timestamp to its delivery to a subscriber,
+    /// in seconds. Labeled by `stream` and `consumer`.
+    pub consume_latency_seconds: Histogram<f64>,
+    /// Storage write failures. Labeled by `stream` and `kind`
+    /// (`"storage_full"` or `"other"`).
+    pub storage_write_errors: Counter<u64>,
+    /// Fill ratio (0.0–1.0) of the per-subscription delivery mpsc channel.
+    /// Labeled by `consumer` and `subscriber`.
+    pub subscription_queue_fill_ratio: Gauge<f64>,
 }
 
 impl Metrics {
@@ -96,6 +108,23 @@ impl Metrics {
         leader_transitions_total.add(0, &[KeyValue::new("direction", "acquired")]);
         leader_transitions_total.add(0, &[KeyValue::new("direction", "lost")]);
 
+        let publish_latency_seconds = meter
+            .f64_histogram("publish_latency_seconds")
+            .with_description("End-to-end latency of a successful publish in seconds")
+            .build();
+        let consume_latency_seconds = meter
+            .f64_histogram("consume_latency_seconds")
+            .with_description("Time from record write to delivery to a subscriber, in seconds")
+            .build();
+        let storage_write_errors = meter
+            .u64_counter("storage_write_errors_total")
+            .with_description("Storage write failures (kind label: storage_full, other)")
+            .build();
+        let subscription_queue_fill_ratio = meter
+            .f64_gauge("subscription_queue_fill_ratio")
+            .with_description("Fill ratio (0.0–1.0) of the per-subscription delivery channel")
+            .build();
+
         // Keep the provider alive — dropping it shuts down the metrics pipeline.
         std::mem::forget(provider);
 
@@ -112,6 +141,10 @@ impl Metrics {
             lease_lost_total,
             is_leader,
             leader_transitions_total,
+            publish_latency_seconds,
+            consume_latency_seconds,
+            storage_write_errors,
+            subscription_queue_fill_ratio,
         };
 
         (metrics, registry)
@@ -216,5 +249,46 @@ impl Metrics {
     pub fn record_leader_transition(&self, direction: &'static str) {
         self.leader_transitions_total
             .add(1, &[KeyValue::new("direction", direction)]);
+    }
+
+    /// Record the latency of a successful publish, in seconds.
+    pub fn record_publish_latency(&self, stream: &str, secs: f64) {
+        self.publish_latency_seconds
+            .record(secs, &[KeyValue::new("stream", stream.to_owned())]);
+    }
+
+    /// Record the time from a record's write timestamp to when it was
+    /// delivered to a consumer, in seconds.
+    pub fn record_consume_latency(&self, stream: &str, consumer: &str, secs: f64) {
+        self.consume_latency_seconds.record(
+            secs,
+            &[
+                KeyValue::new("stream", stream.to_owned()),
+                KeyValue::new("consumer", consumer.to_owned()),
+            ],
+        );
+    }
+
+    /// Increment the storage_write_errors counter. `kind` is one of
+    /// `"storage_full"` or `"other"`.
+    pub fn record_storage_write_error(&self, stream: &str, kind: &'static str) {
+        self.storage_write_errors.add(
+            1,
+            &[
+                KeyValue::new("stream", stream.to_owned()),
+                KeyValue::new("kind", kind),
+            ],
+        );
+    }
+
+    /// Set the fill ratio (0.0–1.0) of a subscription's delivery channel.
+    pub fn set_subscription_queue_fill(&self, consumer: &str, subscriber: &str, ratio: f64) {
+        self.subscription_queue_fill_ratio.record(
+            ratio,
+            &[
+                KeyValue::new("consumer", consumer.to_owned()),
+                KeyValue::new("subscriber", subscriber.to_owned()),
+            ],
+        );
     }
 }
