@@ -237,7 +237,7 @@ impl FileStorage {
         map.insert(key, partition);
 
         // Save stream config
-        let config = StreamConfig::from_request(max_age_secs, max_bytes);
+        let config = StreamConfig::from_request(max_age_secs, max_bytes, 0, 0);
         let stream_dir = self.inner.data_dir.join("streams").join(stream.as_str());
         config.save(&stream_dir).map_err(StorageError::Io)?;
 
