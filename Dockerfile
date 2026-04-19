@@ -34,9 +34,16 @@ RUN find crates -name "*.rs" -exec touch {} +
 RUN cargo build --release
 
 # Runtime image
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+FROM debian:trixie-slim
+RUN apt-get update \
+ && apt-get install -y ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system --gid 1000 exspeed \
+ && useradd --system --uid 1000 --gid 1000 --home-dir /var/lib/exspeed --shell /usr/sbin/nologin exspeed \
+ && mkdir -p /var/lib/exspeed \
+ && chown -R exspeed:exspeed /var/lib/exspeed
 COPY --from=builder /app/target/release/exspeed /usr/local/bin/exspeed
+USER 1000:1000
 EXPOSE 5933 8080
 VOLUME /var/lib/exspeed
 ENTRYPOINT ["exspeed"]

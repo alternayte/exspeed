@@ -106,6 +106,8 @@ pub async fn make_state_with_leader(leader: bool) -> Arc<exspeed_api::AppState> 
         metrics.clone(),
     ));
 
+    let data_dir = tmp.path().to_path_buf();
+
     // Leak the tempdir so file storage stays alive for the test body.
     // Tests are short-lived; this is acceptable.
     std::mem::forget(tmp);
@@ -121,5 +123,10 @@ pub async fn make_state_with_leader(leader: bool) -> Arc<exspeed_api::AppState> 
         auth_token: None,
         lease,
         leadership,
+        // Pre-flip ready=true: tests that exercise /healthz or other
+        // routes assume startup is complete. Tests that exercise
+        // /readyz directly should set this themselves.
+        ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        data_dir,
     })
 }

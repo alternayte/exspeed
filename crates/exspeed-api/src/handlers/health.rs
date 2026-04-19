@@ -30,8 +30,40 @@ pub async fn healthz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     )
 }
 
-/// `GET /readyz` — alias for `/healthz`. Kept for backward compatibility
-/// with any deployment that probes `/readyz`. Same semantics.
-pub async fn readyz(state: State<Arc<AppState>>) -> impl IntoResponse {
-    healthz(state).await
+/// `GET /readyz` — startup + data-dir writability probe.
+///
+/// Distinct from `/healthz`. Returns 503 while startup is still in
+/// progress (`state.ready == false`) and 503 if a touch+remove probe
+/// against `data_dir` fails (read-only mount, full disk, permission
+/// loss, etc.). Returns 200 only when both checks pass. Intended for
+/// k8s readiness gates; `/healthz` is the load-balancer routing probe.
+pub async fn readyz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    use std::sync::atomic::Ordering;
+    if !state.ready.load(Ordering::Acquire) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "starting"})),
+        );
+    }
+
+    if let Err(e) = probe_data_dir(&state.data_dir).await {
+        tracing::warn!(error = %e, data_dir = %state.data_dir.display(), "/readyz probe failed");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "data_dir_unwritable"})),
+        );
+    }
+
+    (StatusCode::OK, Json(json!({"status": "ready"})))
+}
+
+async fn probe_data_dir(data_dir: &std::path::Path) -> std::io::Result<()> {
+    let probe = data_dir.join(".readyz-probe");
+    tokio::task::spawn_blocking(move || {
+        std::fs::write(&probe, b"ok")?;
+        std::fs::remove_file(&probe)
+    })
+    .await
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))??;
+    Ok(())
 }

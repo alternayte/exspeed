@@ -12,6 +12,7 @@ A lightweight streaming platform built in Rust. One binary, zero partitions, ord
 - [HTTP API Reference](#http-api-reference)
 - [Configuration](#configuration)
 - [Securing Exspeed](#securing-exspeed)
+- [Operations & deployment](#operations--deployment)
 - [Multi-pod deployment](#multi-pod-deployment)
 - [Docker Deployment](#docker-deployment)
 - [Architecture](#architecture)
@@ -445,8 +446,8 @@ Base URL: `http://localhost:8080`
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/healthz` | Liveness probe |
-| `GET` | `/readyz` | Readiness probe |
+| `GET` | `/healthz` | Leader probe — 200 only if this pod is the cluster leader, else 503. Use for LB traffic routing. |
+| `GET` | `/readyz` | Readiness probe — 200 once startup is complete and `data_dir` is writable. Use for k8s readiness gates. |
 
 ### Streams
 
@@ -631,6 +632,8 @@ Exposes: uptime, storage bytes per stream, consumer lag per stream/consumer, act
 |----------|-------------|
 | `EXSPEED_URL` | Server URL for CLI commands (default `http://localhost:8080`) |
 | `RUST_LOG` | Log level filter (e.g. `info`, `debug`, `exspeed=debug`) |
+| `LOG_FORMAT` | `text` (default) or `json` — JSON for K8s/Loki/ELK ingestion |
+| `EXSPEED_MAX_CONNS` | Cap on concurrent TCP connections (default `1024`); over-cap closes are logged and counted in `exspeed_connections_rejected_total` |
 
 ### Retention Defaults
 
@@ -732,6 +735,66 @@ roadmap but not in v1.
 Anyone with the token has full admin on the broker. The target deployment
 model is "trust the network boundary" (VPC, service mesh, Hetzner private
 network, k8s namespace).
+
+## Operations & deployment
+
+Single-node hardening knobs and behaviors useful in production. Defaults are sensible — most deployments only touch these for K8s integration or capacity tuning.
+
+### Structured logging
+
+```bash
+LOG_FORMAT=json   # JSON lines, one event per line — for Loki / ELK / Cloud Logging
+LOG_FORMAT=text   # default; human-readable, ANSI-coloured
+```
+
+Combine with `RUST_LOG` for level/target filtering. JSON output preserves spans and fields (`request_id`, `stream`, etc.) for downstream querying.
+
+### Connection cap
+
+```bash
+EXSPEED_MAX_CONNS=1024   # default
+```
+
+Caps concurrent TCP connections to the broker port. When the cap is reached, new connections are accepted-then-immediately-closed; each rejection is logged and increments `exspeed_connections_rejected_total`. Tune by watching that counter alongside `exspeed_active_connections`.
+
+### Exclusive data-dir lock
+
+`exspeed server` takes an exclusive `flock` on `{data_dir}/.exspeed.lock` at startup. A second process pointed at the same `data_dir` fails fast with a clear "already in use" error — no silent dual-writer corruption. The lock is released when the process exits (including crashes; the kernel frees the flock).
+
+Do not delete the lockfile manually to "recover" — it's a TOCTOU footgun and not necessary. If the holding process is gone, the next start succeeds.
+
+### Graceful shutdown
+
+On `SIGTERM` or `SIGINT` the server stops accepting new TCP connections, waits up to **10 seconds** for in-flight connections to drain, then exits. The HTTP listener and background tasks are cancelled in the same window.
+
+For Kubernetes, set `terminationGracePeriodSeconds: 30` (or higher) on the pod so the kubelet doesn't `SIGKILL` the process before the drain completes.
+
+### `/healthz` vs `/readyz`
+
+| Endpoint | Returns 200 when | Recommended use |
+|---|---|---|
+| `/healthz` | This pod is the cluster leader | LB traffic routing (only the leader serves traffic — see [Multi-pod deployment](#multi-pod-deployment)) |
+| `/readyz` | Startup complete **and** `data_dir` is writable | k8s `readinessProbe` and startup gates |
+
+Single-node deployments still benefit from `/readyz` — it stays 503 during WAL replay and connector startup, so an LB or systemd unit knows when the broker is actually serving.
+
+### Non-root container
+
+The published Docker image runs as `uid 1000` (no shell, no home dir). For Kubernetes with a mounted PV:
+
+```yaml
+spec:
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000          # so the PV is writable by uid 1000
+  containers:
+    - name: exspeed
+      image: exspeed:latest
+      ...
+```
+
+Without `fsGroup`, the volume mount may be owned by root and the broker will fail at startup (the `flock` and segment writes both need write access).
 
 ## Multi-pod deployment
 

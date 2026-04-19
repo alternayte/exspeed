@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -29,4 +31,12 @@ pub struct AppState {
     /// `leader_gate` middleware (added in Task 5) to decide whether to
     /// accept client traffic.
     pub leadership: Arc<ClusterLeadership>,
+    /// Set to true after the HTTP API server has been spawned and the
+    /// startup pipeline has completed. Until then, `/readyz` returns 503
+    /// with `{"status": "starting"}`.
+    pub ready: Arc<AtomicBool>,
+    /// Used by the `/readyz` probe to verify the data dir is writable
+    /// (touch+remove probe on each request). Independent of `/healthz`,
+    /// which only reports cluster-leader status.
+    pub data_dir: PathBuf,
 }

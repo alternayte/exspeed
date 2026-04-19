@@ -5,6 +5,7 @@ pub mod format;
 pub mod publish;
 pub mod query;
 pub mod server;
+pub mod server_lock;
 pub mod server_tls;
 pub mod stream;
 pub mod tail;
