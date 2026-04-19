@@ -151,6 +151,21 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         );
     }
 
+    // Validate heartbeat vs TTL — heartbeat must be well under TTL or the
+    // first heartbeat fires after the lease has already expired and the
+    // cluster will thrash.
+    let lease_ttl = exspeed_broker::lease::ttl_from_env();
+    let lease_hb = exspeed_broker::lease::heartbeat_interval_from_env();
+    if lease_hb * 2 >= lease_ttl {
+        warn!(
+            ttl_secs = lease_ttl.as_secs(),
+            heartbeat_secs = lease_hb.as_secs(),
+            "EXSPEED_LEASE_HEARTBEAT_SECS should be at most TTL/2 to avoid \
+             expiring the lease before the first refresh; current config will \
+             cause leader thrashing"
+        );
+    }
+
     // Posture log (always). Emitted after lease is built so the backend name
     // appears alongside auth/tls state.
     let lease_backend_name = if lease.supports_coordination() {
