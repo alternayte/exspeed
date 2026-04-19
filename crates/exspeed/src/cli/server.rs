@@ -359,6 +359,10 @@ where
     let connector_manager_for_supervisor = connector_manager.clone();
     let exql_for_supervisor = exql.clone();
 
+    // Readiness flag, flipped to true after the HTTP API server is spawned.
+    // Until then, /readyz returns 503 with {"status":"starting"}.
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // Create shared AppState
     let state = Arc::new(exspeed_api::AppState {
         broker: broker.clone(),
@@ -371,6 +375,8 @@ where
         auth_token: auth_token.clone(),
         lease: lease.clone(),
         leadership: leadership.clone(),
+        ready: ready.clone(),
+        data_dir: args.data_dir.clone(),
     });
 
     // Spawn the leader supervisor: waits for is_leader=true, then runs
@@ -455,6 +461,12 @@ where
             error!("HTTP API exited: {}", e);
         }
     });
+
+    // Mark ready: API server has been spawned; the startup pipeline
+    // (storage open, broker.load_consumers, connector load, ExQL load)
+    // completed above. /readyz now performs the per-request data_dir
+    // writability check on top of this gate.
+    ready.store(true, std::sync::atomic::Ordering::Release);
 
     // Load TLS config if enabled.
     let tls_config = match &tls_paths {

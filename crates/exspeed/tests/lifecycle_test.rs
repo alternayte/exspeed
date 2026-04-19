@@ -142,3 +142,48 @@ async fn sigterm_signal_token_stops_accept_loop() {
     let inner = outer.expect("server task should not panic");
     inner.expect("server should return Ok on graceful shutdown");
 }
+
+#[tokio::test]
+async fn readyz_returns_503_when_data_dir_unwritable() {
+    let port = portpicker::pick_unused_port().unwrap();
+    let api_port = portpicker::pick_unused_port().unwrap();
+    let bind = format!("127.0.0.1:{port}");
+    let api_bind = format!("127.0.0.1:{api_port}");
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().to_path_buf();
+    let data_for_chmod = data_dir.clone();
+
+    tokio::spawn(async move {
+        exspeed::cli::server::run(exspeed::cli::server::ServerArgs {
+            bind,
+            api_bind,
+            data_dir,
+            auth_token: None,
+            tls_cert: None,
+            tls_key: None,
+        })
+        .await
+        .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let url = format!("http://127.0.0.1:{api_port}/readyz");
+    let ok = reqwest::get(&url).await.unwrap();
+    assert_eq!(ok.status(), 200, "should be ready after startup");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&data_for_chmod, std::fs::Permissions::from_mode(0o555)).unwrap();
+    }
+
+    let bad = reqwest::get(&url).await.unwrap();
+    assert_eq!(bad.status(), 503, "should be unready when data_dir is unwritable");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&data_for_chmod, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
