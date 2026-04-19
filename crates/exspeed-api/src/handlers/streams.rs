@@ -21,6 +21,26 @@ pub struct CreateStreamRequest {
     pub max_age_secs: u64,
     #[serde(default)]
     pub max_bytes: u64,
+    pub dedup_window_secs: Option<u64>,
+    pub dedup_max_entries: Option<u64>,
+}
+
+/// Build a `StreamInfo`-shaped JSON value from a name + config.
+fn stream_info_json(
+    name: &str,
+    config: &StreamConfig,
+    storage_bytes: u64,
+    head_offset: u64,
+) -> serde_json::Value {
+    json!({
+        "name": name,
+        "storage_bytes": storage_bytes,
+        "head_offset": head_offset,
+        "max_age_secs": config.max_age_secs,
+        "max_bytes": config.max_bytes,
+        "dedup_window_secs": config.dedup_window_secs,
+        "dedup_max_entries": config.dedup_max_entries,
+    })
 }
 
 pub async fn list_streams(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -33,13 +53,7 @@ pub async fn list_streams(State(state): State<Arc<AppState>>) -> impl IntoRespon
         let stream_dir = state.storage.data_dir().join("streams").join(name);
         let config = StreamConfig::load(&stream_dir).unwrap_or_default();
 
-        streams.push(json!({
-            "name": name,
-            "storage_bytes": storage_bytes,
-            "head_offset": head_offset,
-            "max_age_secs": config.max_age_secs,
-            "max_bytes": config.max_bytes,
-        }));
+        streams.push(stream_info_json(name, &config, storage_bytes, head_offset));
     }
 
     (StatusCode::OK, Json(json!(streams)))
@@ -59,20 +73,43 @@ pub async fn create_stream(
         }
     };
 
+    // Build a full config with defaults applied for any missing dedup fields.
+    let cfg = StreamConfig::from_request(
+        body.max_age_secs,
+        body.max_bytes,
+        body.dedup_window_secs.unwrap_or(0),
+        body.dedup_max_entries.unwrap_or(0),
+    );
+
+    // Validate before touching storage.
+    if let Err(msg) = StreamConfig::validate(
+        cfg.max_age_secs,
+        cfg.max_bytes,
+        cfg.dedup_window_secs,
+        cfg.dedup_max_entries,
+    ) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": msg})));
+    }
+
     match state
         .storage
         .create_stream(&stream_name, body.max_age_secs, body.max_bytes)
         .await
     {
         Ok(()) => {
-            // Load the stream config written by create_stream and wire per-stream
-            // dedup parameters into BrokerAppend so new publishes honour them.
+            // Overwrite the config written by create_stream_sync with the full
+            // config including dedup fields.
             let stream_dir = state
                 .storage
                 .data_dir()
                 .join("streams")
                 .join(stream_name.as_str());
-            let cfg = StreamConfig::load(&stream_dir).unwrap_or_default();
+            if let Err(e) = cfg.save(&stream_dir) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("failed to save stream config: {e}")})),
+                );
+            }
             state
                 .broker
                 .broker_append
@@ -114,15 +151,127 @@ pub async fn get_stream(
 
     (
         StatusCode::OK,
-        Json(json!({
-            "name": name,
-            "storage_bytes": storage_bytes,
-            "head_offset": head_offset,
-            "max_age_secs": config.max_age_secs,
-            "max_bytes": config.max_bytes,
-        })),
+        Json(stream_info_json(&name, &config, storage_bytes, head_offset)),
     )
 }
+
+// ---------------------------------------------------------------------------
+// PATCH /api/v1/streams/:name
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateStreamRequest {
+    pub max_age_secs: Option<u64>,
+    pub max_bytes: Option<u64>,
+    pub dedup_window_secs: Option<u64>,
+    pub dedup_max_entries: Option<u64>,
+}
+
+pub async fn patch_stream(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<UpdateStreamRequest>,
+) -> impl IntoResponse {
+    let stream_name = match StreamName::try_from(name.as_str()) {
+        Ok(n) => n,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            );
+        }
+    };
+
+    let stream_dir = state.storage.data_dir().join("streams").join(&name);
+
+    // 404 if the stream doesn't exist.
+    if state.storage.stream_storage_bytes(&name).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("stream '{}' not found", name)})),
+        );
+    }
+
+    let mut cfg = match StreamConfig::load(&stream_dir) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("failed to load stream config: {e}")})),
+            );
+        }
+    };
+
+    // Apply partial updates.
+    if let Some(v) = req.max_age_secs {
+        cfg.max_age_secs = v;
+    }
+    if let Some(v) = req.max_bytes {
+        cfg.max_bytes = v;
+    }
+    if let Some(v) = req.dedup_window_secs {
+        cfg.dedup_window_secs = v;
+    }
+    if let Some(v) = req.dedup_max_entries {
+        cfg.dedup_max_entries = v;
+    }
+
+    // Validate the merged config.
+    if let Err(msg) = StreamConfig::validate(
+        cfg.max_age_secs,
+        cfg.max_bytes,
+        cfg.dedup_window_secs,
+        cfg.dedup_max_entries,
+    ) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": msg})));
+    }
+
+    // Guard against shrinking dedup_max_entries below the current live count.
+    if let Some(new_cap) = req.dedup_max_entries {
+        let current = state
+            .broker
+            .broker_append
+            .entry_count(&stream_name)
+            .await;
+        if (new_cap as usize) < current {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!(
+                        "cannot shrink dedup_max_entries below current entry count ({current})"
+                    )
+                })),
+            );
+        }
+    }
+
+    // Persist.
+    if let Err(e) = cfg.save(&stream_dir) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("failed to save stream config: {e}")})),
+        );
+    }
+
+    // Hot-reconfigure the in-memory dedup map.
+    state
+        .broker
+        .broker_append
+        .configure_stream(&stream_name, cfg.dedup_window_secs, cfg.dedup_max_entries)
+        .await;
+
+    let storage_bytes = state.storage.stream_storage_bytes(&name).unwrap_or(0);
+    let head_offset = state.storage.stream_head_offset(&name).unwrap_or(0);
+
+    (
+        StatusCode::OK,
+        Json(stream_info_json(&name, &cfg, storage_bytes, head_offset)),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Publish
+// ---------------------------------------------------------------------------
 
 #[derive(serde::Deserialize)]
 pub struct PublishBody {

@@ -103,6 +103,28 @@ impl CliClient {
         Ok((status, resp_body))
     }
 
+    /// PATCH `path` with a JSON body, returning `(status_code, response_body)`.
+    ///
+    /// Does **not** treat non-2xx as an automatic error — callers decide.
+    pub async fn patch(&self, path: &str, body: &Value) -> Result<(u16, Value)> {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self
+            .client
+            .patch(&url)
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("failed to connect to {url}"))?;
+
+        let status = resp.status().as_u16();
+        let resp_body: Value = resp
+            .json()
+            .await
+            .with_context(|| format!("failed to parse JSON from PATCH {url}"))?;
+
+        Ok((status, resp_body))
+    }
+
     /// DELETE `path`, parse the response as JSON.
     ///
     /// Returns an error on connection failure or non-2xx status.

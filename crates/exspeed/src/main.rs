@@ -18,7 +18,36 @@ async fn main() -> anyhow::Result<()> {
             name,
             retention,
             max_size,
-        } => cli::stream::create(&client, &name, &retention, &max_size).await,
+            dedup_window,
+            dedup_max_entries,
+        } => {
+            cli::stream::create(
+                &client,
+                &name,
+                &retention,
+                &max_size,
+                dedup_window.as_deref(),
+                dedup_max_entries.as_deref(),
+            )
+            .await
+        }
+        cli::Command::UpdateStream {
+            name,
+            retention,
+            max_size,
+            dedup_window,
+            dedup_max_entries,
+        } => {
+            cli::stream::update(
+                &client,
+                &name,
+                retention.as_deref(),
+                max_size.as_deref(),
+                dedup_window.as_deref(),
+                dedup_max_entries.as_deref(),
+            )
+            .await
+        }
         cli::Command::Delete { name } => cli::stream::delete(&client, &name).await,
         cli::Command::Streams => cli::stream::list(&client, json).await,
         cli::Command::Info { name } => cli::stream::info(&client, &name, json).await,
@@ -27,7 +56,18 @@ async fn main() -> anyhow::Result<()> {
             data,
             subject,
             key,
-        } => cli::publish::run(&client, &stream, &data, subject.as_deref(), key.as_deref()).await,
+            msg_id,
+        } => {
+            cli::publish::run(
+                &client,
+                &stream,
+                &data,
+                subject.as_deref(),
+                key.as_deref(),
+                msg_id.as_deref(),
+            )
+            .await
+        }
         cli::Command::Tail {
             stream,
             last,

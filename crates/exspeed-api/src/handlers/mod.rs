@@ -45,7 +45,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/v1/streams",
             get(streams::list_streams).post(streams::create_stream),
         )
-        .route("/api/v1/streams/{name}", get(streams::get_stream))
+        .route(
+            "/api/v1/streams/{name}",
+            get(streams::get_stream).patch(streams::patch_stream),
+        )
         .route(
             "/api/v1/streams/{name}/publish",
             post(streams::publish_to_stream),

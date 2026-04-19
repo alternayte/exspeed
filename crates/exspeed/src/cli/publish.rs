@@ -7,6 +7,7 @@ pub async fn run(
     data: &str,
     subject: Option<&str>,
     key: Option<&str>,
+    msg_id: Option<&str>,
 ) -> Result<()> {
     // Parse data as JSON (if it's valid JSON), otherwise wrap as a JSON string
     let json_data: serde_json::Value =
@@ -19,13 +20,21 @@ pub async fn run(
     if let Some(k) = key {
         body["key"] = serde_json::Value::String(k.to_string());
     }
+    if let Some(id) = msg_id {
+        body["msg_id"] = serde_json::Value::String(id.to_string());
+    }
 
     let (status, resp) = client
         .post(&format!("/api/v1/streams/{stream}/publish"), &body)
         .await?;
     if status == 201 || status == 200 {
         let offset = resp.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
-        println!("Published to '{}' at offset {}", stream, offset);
+        let duplicate = resp.get("duplicate").and_then(|v| v.as_bool()).unwrap_or(false);
+        if duplicate {
+            println!("Published to '{}' at offset {} (duplicate=true)", stream, offset);
+        } else {
+            println!("Published to '{}' at offset {}", stream, offset);
+        }
     } else {
         let msg = resp
             .get("error")
