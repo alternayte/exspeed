@@ -1,3 +1,4 @@
+pub mod io_errors;
 pub mod offset_index;
 pub mod partition;
 pub mod segment_reader;

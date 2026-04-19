@@ -173,7 +173,9 @@ where
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(300);
-    let broker_append = Arc::new(BrokerAppend::new(storage.clone(), dedup_window_secs));
+    let broker_append = Arc::new(
+        BrokerAppend::new(storage.clone(), dedup_window_secs).with_metrics(metrics.clone()),
+    );
     broker_append.rebuild_from_log().await.unwrap_or_else(|e| {
         warn!("failed to rebuild dedup state from log: {}", e);
     });

@@ -172,9 +172,22 @@ pub async fn publish_to_stream(
             StatusCode::NOT_FOUND,
             Json(json!({"error": format!("stream '{}' not found", name)})),
         ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        ),
+        Err(e) => {
+            let kind = match &e {
+                exspeed_streams::StorageError::Io(io_err)
+                    if exspeed_storage::file::io_errors::is_storage_full(io_err) =>
+                {
+                    "storage_full"
+                }
+                _ => "other",
+            };
+            state
+                .metrics
+                .record_storage_write_error(stream_name.as_str(), kind);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        }
     }
 }
