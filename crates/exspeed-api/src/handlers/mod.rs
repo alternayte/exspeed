@@ -36,9 +36,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state.clone());
 
     // Main authenticated router: bearer-gated AND leader-gated.
-    // Layer order: `.layer(outer).layer(inner)` means outer runs first.
-    // We want: require_bearer → leader_gate → handler, so leader_gate is
-    // the inner layer and require_bearer is the outer layer.
+    // Tower wrapping: `.layer(A).layer(B)` produces `B(A(handler))`, so
+    // B (the LAST .layer() call) is the outermost wrapper and runs first.
+    // We want require_bearer -> leader_gate -> handler, so require_bearer
+    // must be the LAST .layer() call.
     let authed = Router::new()
         .route(
             "/api/v1/streams",
