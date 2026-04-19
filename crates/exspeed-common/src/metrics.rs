@@ -14,6 +14,10 @@ pub struct Metrics {
     pub consumer_lag: Gauge<i64>,
     pub storage_bytes: Gauge<i64>,
     pub connections_active: UpDownCounter<i64>,
+    /// Counts every TCP connection rejected because the per-process
+    /// `EXSPEED_MAX_CONNS` cap was reached at accept time. Operators can
+    /// alert on the rate of this counter to detect saturation.
+    pub connections_rejected: Counter<u64>,
     pub uptime_seconds: Gauge<f64>,
     /// Whether this pod currently holds the named lease. Gauge value is 1
     /// when held, 0 when released/lost. Labeled by `name` (e.g.
@@ -55,6 +59,10 @@ impl Metrics {
         let consumer_lag = meter.i64_gauge("consumer_lag").build();
         let storage_bytes = meter.i64_gauge("storage_bytes").build();
         let connections_active = meter.i64_up_down_counter("connections_active").build();
+        let connections_rejected = meter
+            .u64_counter("connections_rejected_total")
+            .with_description("Connections rejected because EXSPEED_MAX_CONNS was reached")
+            .build();
         let uptime_seconds = meter.f64_gauge("uptime_seconds").build();
         let lease_held = meter.i64_gauge("exspeed_lease_held").build();
         let lease_acquire_total = meter.u64_counter("exspeed_lease_acquire_total").build();
@@ -97,6 +105,7 @@ impl Metrics {
             consumer_lag,
             storage_bytes,
             connections_active,
+            connections_rejected,
             uptime_seconds,
             lease_held,
             lease_acquire_total,
@@ -152,6 +161,13 @@ impl Metrics {
     /// Decrement the active-connections gauge by 1.
     pub fn connection_closed(&self) {
         self.connections_active.add(-1, &[]);
+    }
+
+    /// Increment `connections_rejected_total` by 1. Called from the TCP
+    /// accept loop when a new connection is dropped because the
+    /// `EXSPEED_MAX_CONNS` semaphore is exhausted.
+    pub fn connection_rejected(&self) {
+        self.connections_rejected.add(1, &[]);
     }
 
     /// Record the server uptime in seconds.

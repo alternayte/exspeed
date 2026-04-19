@@ -31,6 +31,8 @@ async fn start_test_server(max_conns: u32) -> (String, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().to_path_buf();
 
+    // NOTE: env var is process-global and not serialized — only one consumer (this test) exists today.
+    // If a sibling test reads EXSPEED_MAX_CONNS, add Mutex serialization (see log_format.rs tests).
     std::env::set_var("EXSPEED_MAX_CONNS", max_conns.to_string());
 
     let bind_clone = bind.clone();

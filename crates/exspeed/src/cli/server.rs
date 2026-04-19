@@ -398,7 +398,8 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         let permit = match conn_sem.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
-                warn!(%peer, "connection rejected: max_conns reached");
+                metrics.connection_rejected();
+                warn!(%peer, max_conns, "connection rejected: max_conns reached");
                 drop(socket);
                 continue;
             }
