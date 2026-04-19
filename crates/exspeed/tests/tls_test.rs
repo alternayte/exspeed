@@ -173,3 +173,43 @@ async fn tls_enabled_http_responds_to_rustls_request() {
 
     assert_eq!(resp.status(), 200);
 }
+
+#[tokio::test]
+async fn auth_and_tls_together_end_to_end() {
+    let (cert_path, key_path, _certs_tmp) = generate_self_signed();
+    let data_tmp = tempfile::tempdir().unwrap();
+    let port = portpicker::pick_unused_port().unwrap();
+    let api_port = portpicker::pick_unused_port().unwrap();
+
+    let args = exspeed::cli::server::ServerArgs {
+        bind: format!("127.0.0.1:{port}"),
+        api_bind: format!("127.0.0.1:{api_port}"),
+        data_dir: data_tmp.path().to_path_buf(),
+        auth_token: Some("e2e-secret".into()),
+        tls_cert: Some(cert_path.clone()),
+        tls_key: Some(key_path),
+    };
+
+    tokio::spawn(async move {
+        exspeed::cli::server::run(args).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // HTTP: GET /api/v1/streams with the bearer over TLS.
+    let cert_pem = std::fs::read(&cert_path).unwrap();
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(&cert_pem).unwrap())
+        .build()
+        .unwrap();
+    let resp = client
+        .get(format!("https://localhost:{api_port}/api/v1/streams"))
+        .header("Authorization", "Bearer e2e-secret")
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Same request without bearer → 401 even over TLS.
+    let resp = client
+        .get(format!("https://localhost:{api_port}/api/v1/streams"))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 401);
+}

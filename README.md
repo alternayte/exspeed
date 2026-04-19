@@ -11,6 +11,7 @@ A lightweight streaming platform built in Rust. One binary, zero partitions, ord
 - [Connectors](#connectors)
 - [HTTP API Reference](#http-api-reference)
 - [Configuration](#configuration)
+- [Securing Exspeed](#securing-exspeed)
 - [Docker Deployment](#docker-deployment)
 - [Architecture](#architecture)
 - [Building from Source](#building-from-source)
@@ -648,6 +649,88 @@ Connector TOML configs support `${ENV_VAR}` syntax for secrets:
 connection_url = "${DATABASE_URL}"
 auth_token = "${WEBHOOK_SECRET}"
 ```
+
+## Securing Exspeed
+
+Auth and TLS are both off by default. Turn each on independently via environment
+variables.
+
+### Token authentication
+
+```bash
+export EXSPEED_AUTH_TOKEN=$(openssl rand -hex 32)
+```
+
+When set, every TCP client must include this token in the `Connect` handshake
+(`AuthType::Token`) and every HTTP request to `/api/v1/*` must include
+`Authorization: Bearer <token>`. The following paths always bypass auth —
+they're designed to be reachable by probes, scrapers, and webhook senders:
+
+| Path | Who uses it |
+|---|---|
+| `GET /healthz` | Liveness probes |
+| `GET /readyz` | Readiness probes |
+| `GET /metrics` | Prometheus scrape |
+| `POST /webhooks/*` | External webhook senders (they carry their own per-webhook auth) |
+
+If you need to authenticate `/metrics` as well, run a reverse-proxy sidecar
+that adds Basic auth. Broker-wide bearer tokens aren't a good fit for scrapers.
+
+### TLS
+
+```bash
+export EXSPEED_TLS_CERT=/etc/exspeed/tls/fullchain.pem
+export EXSPEED_TLS_KEY=/etc/exspeed/tls/privkey.pem
+```
+
+Both variables must be set together, or neither. When set, **both** the TCP
+(5933) and HTTP (8080) listeners serve TLS using the same cert/key pair — one
+cert, two ports. Make sure the cert's SAN list covers every hostname clients
+will use.
+
+TLS uses pure-Rust `rustls`. Default protocol versions: TLS 1.2 and 1.3.
+
+#### Dev certs
+
+For local development, generate a self-signed cert:
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+  -keyout dev-key.pem -out dev-cert.pem
+```
+
+Point the server at it:
+
+```bash
+EXSPEED_TLS_CERT=dev-cert.pem EXSPEED_TLS_KEY=dev-key.pem \
+  exspeed server
+```
+
+Clients that don't trust your dev CA need to opt in:
+
+- CLI: `EXSPEED_INSECURE_SKIP_VERIFY=1 exspeed streams`
+- TypeScript SDK: `new ExspeedClient({ tls: { rejectUnauthorized: false } })`
+
+### Rotation
+
+Cert and token rotation require a server restart. Combined with Plan A's
+graceful shutdown, a restart is a ~10-second blip on a single node and
+zero-downtime behind a multi-pod deployment. Live SIGHUP reload is on the
+roadmap but not in v1.
+
+### What's not in v1
+
+- mTLS (no client-cert verification)
+- SASL / JWT / OAuth2
+- Per-stream ACLs or RBAC
+- Multiple tokens / named client identities
+- Rate limiting on failed auth attempts — use an ingress WAF or fail2ban
+
+Anyone with the token has full admin on the broker. The target deployment
+model is "trust the network boundary" (VPC, service mesh, Hetzner private
+network, k8s namespace).
 
 ## Docker Deployment
 
