@@ -9,7 +9,7 @@ import {
   decodeFrame,
   type Frame,
 } from "./protocol/index.js";
-import { encodeConnect } from "./protocol/connect.js";
+import { encodeConnect, decodeConnectResponse } from "./protocol/connect.js";
 import { decodeErrorFrame } from "./protocol/error-frame.js";
 import {
   ConnectionError,
@@ -53,6 +53,8 @@ export class Connection extends EventEmitter {
   private connecting = false;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private currentEndpointIndex = 0;
+  private _serverVersion = 1;
+  private _warnedV1 = false;
 
   private readonly opts: Required<Omit<ConnectionOptions, "auth" | "tls">> & {
     auth?: ConnectionOptions["auth"];
@@ -71,6 +73,16 @@ export class Connection extends EventEmitter {
 
   currentEndpoint(): BrokerEndpoint {
     return this.opts.endpoints[this.currentEndpointIndex]!;
+  }
+
+  getServerVersion(): number {
+    return this._serverVersion;
+  }
+
+  /** Test-only: override server version without a real handshake. */
+  _setServerVersionForTest(v: number): void {
+    this._serverVersion = v;
+    this._warnedV1 = true; // suppress warning in tests
   }
 
   async connect(): Promise<void> {
@@ -236,6 +248,21 @@ export class Connection extends EventEmitter {
     if (response.opcode === OpCode.Error) {
       const err = decodeErrorFrame(response.payload);
       throw new ServerError(err.code, err.message);
+    }
+
+    if (response.opcode === OpCode.ConnectOk) {
+      const { serverVersion } = decodeConnectResponse(response.payload);
+      this._serverVersion = serverVersion;
+    } else {
+      // Legacy Ok from v1 broker — leave _serverVersion at 1
+      this._serverVersion = 1;
+    }
+
+    if (this._serverVersion < 2 && !this._warnedV1) {
+      this._warnedV1 = true;
+      console.warn(
+        "[exspeed] connected to broker wire v1 — msgId publishes will use x-idempotency-key header (upgrade broker for full feature)",
+      );
     }
   }
 

@@ -27,6 +27,8 @@ export enum OpCode {
   QueryResult = 0x85,
   Rebalance = 0x86,
   Drain = 0x87,
+  PublishOk = 0x88,
+  ConnectOk = 0x89,
   Pong = 0xf1,
 }
 

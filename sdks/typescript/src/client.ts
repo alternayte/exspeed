@@ -69,10 +69,22 @@ export class ExspeedClient extends EventEmitter {
       key = typeof options.key === "string" ? Buffer.from(options.key, "utf8") : options.key;
     }
 
-    const payload = encodePublish({ stream, subject: options.subject, value, key, headers: options.headers });
+    let headers = options.headers;
+    let msgId: string | undefined;
+
+    if (options.msgId) {
+      if (this.mainConn.getServerVersion() >= 2) {
+        msgId = options.msgId;
+      } else {
+        headers = { ...(headers ?? []) } as unknown as [string, string][];
+        headers = [...(options.headers ?? []), ["x-idempotency-key", options.msgId]] as [string, string][];
+      }
+    }
+
+    const payload = encodePublish({ stream, subject: options.subject, value, key, headers, msgId });
     const response = await this.mainConn.request(OpCode.Publish, payload);
-    const { offset } = decodePublishOk(response.payload);
-    return { offset, toJSON: () => ({ offset: offset.toString() }) };
+    const { offset, duplicate } = decodePublishOk(response.payload);
+    return { offset, duplicate, toJSON: () => ({ offset: offset.toString() }) };
   }
 
   async subscribe(consumerName: string, options?: SubscribeOptions): Promise<Subscription & { unsubscribe(): Promise<void> }> {

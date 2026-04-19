@@ -331,3 +331,95 @@ describe("subscribe() ack/nack routing", () => {
     expect(endpoints).toEqual([{ host: "broker.example.com", port: 5933 }]);
   });
 });
+
+describe("version negotiation", () => {
+  let testServer: ReturnType<typeof createTestServer>;
+
+  afterEach(async () => {
+    if (testServer) await testServer.stop();
+  });
+
+  it("publish() sets ConnectOk serverVersion and returns duplicate flag", async () => {
+    testServer = createTestServer((frame, socket) => {
+      if (frame.opcode === OpCode.Connect) {
+        // v2 broker replies with ConnectOk (0x89) + server_version=2
+        const payload = Buffer.alloc(1);
+        payload.writeUInt8(2, 0);
+        socket.write(encodeFrame({
+          version: PROTOCOL_VERSION,
+          opcode: OpCode.ConnectOk,
+          correlationId: frame.correlationId,
+          payload,
+        }));
+      } else if (frame.opcode === OpCode.Publish) {
+        // Return PublishOk (9 bytes: offset u64 + duplicate u8)
+        const payload = Buffer.alloc(9);
+        payload.writeBigUInt64LE(7n, 0);
+        payload[8] = 0x01; // duplicate = true
+        socket.write(encodeFrame({
+          version: PROTOCOL_VERSION,
+          opcode: OpCode.PublishOk,
+          correlationId: frame.correlationId,
+          payload,
+        }));
+      }
+    });
+    const port = await testServer.start();
+
+    const client = new ExspeedClient({ host: "127.0.0.1", port, clientId: "test-v2", reconnect: false });
+    await client.connect();
+
+    const conn: Connection = (client as any).mainConn;
+    expect(conn.getServerVersion()).toBe(2);
+
+    const result = await client.publish("orders", { subject: "orders.created", data: {} });
+    expect(result.offset).toBe(7n);
+    expect(result.duplicate).toBe(true);
+
+    await client.close();
+  });
+
+  it("falls back to x-idempotency-key header against v1 broker", async () => {
+    let capturedPublish: any;
+    testServer = createTestServer((frame, socket) => {
+      if (frame.opcode === OpCode.Connect) {
+        // v1 broker replies with Ok (0x80)
+        socket.write(encodeFrame({
+          version: PROTOCOL_VERSION,
+          opcode: OpCode.Ok,
+          correlationId: frame.correlationId,
+          payload: Buffer.alloc(0),
+        }));
+      } else if (frame.opcode === OpCode.Publish) {
+        capturedPublish = decodePublish(frame.payload);
+        const payload = Buffer.alloc(8);
+        payload.writeBigUInt64LE(1n, 0);
+        socket.write(encodeFrame({
+          version: PROTOCOL_VERSION,
+          opcode: OpCode.Ok,
+          correlationId: frame.correlationId,
+          payload,
+        }));
+      }
+    });
+    const port = await testServer.start();
+
+    const client = new ExspeedClient({ host: "127.0.0.1", port, clientId: "test-v1", reconnect: false });
+    await client.connect();
+
+    const conn: Connection = (client as any).mainConn;
+    expect(conn.getServerVersion()).toBe(1);
+
+    await client.publish("s", { subject: "s", data: {}, msgId: "my-msg-id" });
+
+    // Flag bit 1 (FLAG_HAS_MSG_ID) should NOT be set
+    expect(capturedPublish.msgId).toBeUndefined();
+    // x-idempotency-key header should carry the msgId value
+    const headers: [string, string][] = capturedPublish.headers;
+    const idempotencyHeader = headers.find(([k]) => k === "x-idempotency-key");
+    expect(idempotencyHeader).toBeDefined();
+    expect(idempotencyHeader![1]).toBe("my-msg-id");
+
+    await client.close();
+  });
+});

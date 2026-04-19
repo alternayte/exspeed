@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { encodeConnect, decodeConnect } from "../../src/protocol/connect.js";
+import { encodeConnect, decodeConnect, decodeConnectResponse } from "../../src/protocol/connect.js";
 import { AUTH_NONE, AUTH_TOKEN } from "../../src/protocol/types.js";
 
 describe("connect", () => {
@@ -26,5 +26,17 @@ describe("connect", () => {
     expect(buf.readUInt16LE(0)).toBe(2);
     expect(buf.toString("utf8", 2, 4)).toBe("ab");
     expect(buf[4]).toBe(AUTH_NONE);
+  });
+});
+
+describe("decodeConnectResponse", () => {
+  it("decodes server_version from 1-byte payload", () => {
+    const payload = Buffer.alloc(1);
+    payload.writeUInt8(2, 0);
+    expect(decodeConnectResponse(payload)).toEqual({ serverVersion: 2 });
+  });
+
+  it("defaults to serverVersion 1 when payload is empty (legacy Ok)", () => {
+    expect(decodeConnectResponse(Buffer.alloc(0))).toEqual({ serverVersion: 1 });
   });
 });
