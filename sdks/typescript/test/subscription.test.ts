@@ -80,10 +80,10 @@ describe("Subscription", () => {
     expect(slowHandler).toHaveBeenCalled();
   });
 
-  it("emits error and drops oldest when queue overflows", () => {
+  it("emits typed overflow event and drops oldest when queue overflows", () => {
     const sub = new Subscription("c", "test-sub-id", { maxQueueSize: 2 });
-    const errorHandler = vi.fn();
-    sub.on("error", errorHandler);
+    const handler = vi.fn();
+    sub.on("overflow", handler);
 
     for (let i = 0; i < 3; i++) {
       sub.push(
@@ -91,6 +91,84 @@ describe("Subscription", () => {
         vi.fn(), vi.fn(),
       );
     }
-    expect(errorHandler).toHaveBeenCalled();
+    expect(handler).toHaveBeenCalled();
+  });
+
+  it("emits a typed QueueOverflowError on drop-oldest overflow", async () => {
+    const { QueueOverflowError } = await import("../src/errors.js");
+    const sub = new Subscription("c", "s-id", { maxQueueSize: 2, overflowPolicy: "drop-oldest" });
+
+    const overflowEvents: any[] = [];
+    sub.on("overflow", (e) => overflowEvents.push(e));
+
+    const mk = (off: bigint) => ({
+      consumerName: "c",
+      offset: off,
+      timestamp: 0n,
+      subject: `s-${off}`,
+      deliveryAttempt: 1,
+      value: Buffer.from(""),
+      headers: [] as [string, string][],
+    });
+
+    sub.push(mk(0n), () => Promise.resolve(), () => Promise.resolve());
+    sub.push(mk(1n), () => Promise.resolve(), () => Promise.resolve());
+    sub.push(mk(2n), () => Promise.resolve(), () => Promise.resolve()); // drops offset 0
+
+    expect(overflowEvents).toHaveLength(1);
+    expect(overflowEvents[0]).toBeInstanceOf(QueueOverflowError);
+    expect(overflowEvents[0].offset).toBe(0n);
+    expect(overflowEvents[0].subject).toBe("s-0");
+  });
+
+  it("'error' policy emits typed error and does NOT enqueue the new record", async () => {
+    const { QueueOverflowError } = await import("../src/errors.js");
+    const sub = new Subscription("c", "s-id", { maxQueueSize: 1, overflowPolicy: "error" });
+
+    const errs: any[] = [];
+    sub.on("error", (e) => errs.push(e));
+
+    const mk = (off: bigint) => ({
+      consumerName: "c", offset: off, timestamp: 0n, subject: "s",
+      deliveryAttempt: 1, value: Buffer.from(""), headers: [] as [string, string][],
+    });
+    const noop = () => Promise.resolve();
+
+    sub.push(mk(0n), noop, noop);
+    sub.push(mk(1n), noop, noop); // overflow
+
+    expect(errs).toHaveLength(1);
+    expect(errs[0]).toBeInstanceOf(QueueOverflowError);
+    expect(errs[0].offset).toBe(1n); // the rejected one is the incoming
+
+    sub.close();
+    const collected: bigint[] = [];
+    for await (const m of sub) collected.push(m.offset);
+    expect(collected).toEqual([0n]);
+  });
+
+  it("pause() blocks iterator; resume() unblocks", async () => {
+    const sub = new Subscription("c", "s-id", { maxQueueSize: 10 });
+    const mk = (off: bigint) => ({
+      consumerName: "c", offset: off, timestamp: 0n, subject: "s",
+      deliveryAttempt: 1, value: Buffer.from(""), headers: [] as [string, string][],
+    });
+    const noop = () => Promise.resolve();
+
+    sub.push(mk(0n), noop, noop);
+    sub.pause();
+
+    const iter = sub[Symbol.asyncIterator]();
+    const racer = iter.next();
+    const winner = await Promise.race([
+      racer.then(() => "iter-resolved"),
+      new Promise((r) => setTimeout(() => r("timed-out"), 50)),
+    ]);
+    expect(winner).toBe("timed-out"); // paused — iterator did not resolve
+
+    sub.resume();
+    const result = await racer;
+    expect(result.done).toBe(false);
+    expect(result.value!.offset).toBe(0n);
   });
 });
