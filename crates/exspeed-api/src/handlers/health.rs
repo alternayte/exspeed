@@ -64,6 +64,6 @@ async fn probe_data_dir(data_dir: &std::path::Path) -> std::io::Result<()> {
         std::fs::remove_file(&probe)
     })
     .await
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))??;
+    .map_err(std::io::Error::other)??;
     Ok(())
 }

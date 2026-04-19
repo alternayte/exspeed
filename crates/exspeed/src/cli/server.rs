@@ -657,6 +657,7 @@ where
 
                         match parsed {
                             Ok(ClientMessage::Connect(req)) => {
+                                #[allow(clippy::if_same_then_else)]
                                 let result = if let Some(expected) = &auth_token {
                                     if req.auth_type != exspeed_protocol::messages::connect::AuthType::Token {
                                         Err("unauthorized")

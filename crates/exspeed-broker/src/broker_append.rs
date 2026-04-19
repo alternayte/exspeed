@@ -3,7 +3,7 @@ use std::hash::Hasher;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use twox_hash::XxHash64;
 
 use exspeed_common::{Metrics, Offset, StreamName};
@@ -127,6 +127,12 @@ const IDEMPOTENCY_HEADER: &str = "x-idempotency-key";
 pub struct BrokerAppend {
     storage: Arc<dyn StorageEngine>,
     dedup_maps: RwLock<HashMap<StreamName, DedupMap>>,
+    /// One `tokio::sync::Mutex` per stream, held across Phases 2–4 for msg_id
+    /// publishes so that two concurrent first-time publishes with the same key
+    /// are serialized: the second racer blocks on `mutex.lock()` until the
+    /// first has completed Phase 4's insert, guaranteeing the second call sees
+    /// the entry at Phase 1 and returns `Duplicate`.
+    per_stream_locks: RwLock<HashMap<StreamName, Arc<Mutex<()>>>>,
     default_window: Duration,
     default_max_entries: u64,
     metrics: Option<Arc<Metrics>>,
@@ -145,10 +151,26 @@ impl BrokerAppend {
         Self {
             storage,
             dedup_maps: RwLock::new(HashMap::new()),
+            per_stream_locks: RwLock::new(HashMap::new()),
             default_window: Duration::from_secs(default_window_secs),
             default_max_entries,
             metrics: None,
         }
+    }
+
+    /// Return (creating if absent) the per-stream `Mutex` used to serialize
+    /// concurrent msg_id publishes to the same stream.
+    async fn per_stream_lock(&self, stream: &StreamName) -> Arc<Mutex<()>> {
+        {
+            let map = self.per_stream_locks.read().await;
+            if let Some(m) = map.get(stream) {
+                return m.clone();
+            }
+        }
+        let mut map = self.per_stream_locks.write().await;
+        map.entry(stream.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// Attach a Metrics handle so storage write failures bump
@@ -197,11 +219,23 @@ impl BrokerAppend {
 
     /// Append a record with idempotency dedup.
     ///
-    /// Three-phase protocol to avoid holding any lock across `.await`:
-    ///   Phase 1 — optimistic read-lock check (fast path for duplicates).
-    ///   Phase 2 — write-lock re-check + cap enforcement (no await inside).
-    ///   Phase 3 — storage write (no lock held).
-    ///   Phase 4 — write-lock insert into dedup map.
+    /// **No-msg_id path** (no `x-idempotency-key` header): pass-through to
+    /// storage with no dedup overhead.
+    ///
+    /// **msg_id path**: four-phase protocol that serializes concurrent publishes
+    /// for the same stream via a per-stream `tokio::Mutex` held across Phases 2–4.
+    /// This closes the double-write window that the Phase 2 write-lock re-check
+    /// alone cannot close: two concurrent first-time publishes with the same key
+    /// would both see Miss at Phase 2 (neither has reached Phase 4's insert yet)
+    /// without the per-stream mutex, causing two durable records with the same
+    /// msg_id. With the mutex, the second racer blocks on `mutex.lock()` until
+    /// the first completes Phase 4's insert, so the second call sees the entry
+    /// at Phase 1 and returns `Duplicate` with the same offset.
+    ///
+    ///   Phase 1 — optimistic read-lock check (fast path for already-known keys).
+    ///   Phase 2 — write-lock re-check + cap enforcement under the per-stream mutex.
+    ///   Phase 3 — storage write (per-stream mutex held, no dedup_maps lock).
+    ///   Phase 4 — write-lock insert into dedup map; mutex released on return.
     pub async fn append(
         &self,
         stream: &StreamName,
@@ -215,17 +249,26 @@ impl BrokerAppend {
             .map(|(_, v)| v.clone());
 
         let Some(key) = idemp_key else {
-            // No msg_id — pass-through directly.
-            let offset = self.storage.append(stream, record).await.map_err(|e| {
-                self.record_write_error(stream, &e);
-                e
-            })?;
+            // No msg_id — pass-through directly; no dedup or locking overhead.
+            let offset = self
+                .storage
+                .append(stream, record)
+                .await
+                .inspect_err(|e| self.record_write_error(stream, e))?;
             return Ok(AppendResult::Written(offset));
         };
 
         let body_hash = hash_body(&record.value);
 
-        // Phase 1: optimistic read-only check.
+        // === msg_id path: acquire per-stream append mutex ===
+        // Held across Phases 2–4 so concurrent first-time publishes with the
+        // same key are serialized and the second sees the Phase 4 insert.
+        let mutex = self.per_stream_lock(stream).await;
+        let _guard = mutex.lock().await;
+
+        // Phase 1: optimistic read-only check (fast path under the mutex).
+        // Under the per-stream mutex this is now strictly redundant with Phase 2,
+        // but it avoids acquiring the write lock on the common duplicate path.
         {
             let maps = self.dedup_maps.read().await;
             if let Some(map) = maps.get(stream) {
@@ -241,9 +284,7 @@ impl BrokerAppend {
             }
         }
 
-        // Phase 2: re-check + cap enforcement (under write lock, no await inside).
-        // The re-check is load-bearing: two concurrent publishes with the same key
-        // that both pass Phase 1 would both try to write without it.
+        // Phase 2: re-check + cap enforcement under write lock (no await inside).
         {
             let mut maps = self.dedup_maps.write().await;
             let map = maps
@@ -269,13 +310,14 @@ impl BrokerAppend {
             }
         }
 
-        // Phase 3: storage write (no lock held).
-        let offset = self.storage.append(stream, record).await.map_err(|e| {
-            self.record_write_error(stream, &e);
-            e
-        })?;
+        // Phase 3: storage write — per-stream mutex still held, no dedup lock.
+        let offset = self
+            .storage
+            .append(stream, record)
+            .await
+            .inspect_err(|e| self.record_write_error(stream, e))?;
 
-        // Phase 4: insert into dedup map.
+        // Phase 4: insert into dedup map; _guard drops at end of this scope.
         {
             let mut maps = self.dedup_maps.write().await;
             let map = maps
@@ -599,5 +641,47 @@ mod tests {
     async fn append_result_offset_helper() {
         assert_eq!(AppendResult::Written(Offset(5)).offset(), Offset(5));
         assert_eq!(AppendResult::Duplicate(Offset(3)).offset(), Offset(3));
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_key_serializes() {
+        // Two concurrent publishes with the same msg_id must produce
+        // exactly one Written + one Duplicate, never two Writtens.
+        use std::sync::Arc;
+        let ba = Arc::new(make_broker_append().await);
+        let stream = StreamName::try_from("events").unwrap();
+        ba.configure_stream(&stream, 300, 500_000).await;
+
+        let ba1 = ba.clone();
+        let ba2 = ba.clone();
+        let s1 = stream.clone();
+        let s2 = stream.clone();
+
+        let (r1, r2) = tokio::join!(
+            tokio::spawn(async move {
+                ba1.append(&s1, &make_record(Some("race-key"), Bytes::from_static(b"body"))).await
+            }),
+            tokio::spawn(async move {
+                ba2.append(&s2, &make_record(Some("race-key"), Bytes::from_static(b"body"))).await
+            }),
+        );
+
+        let r1 = r1.unwrap().unwrap();
+        let r2 = r2.unwrap().unwrap();
+
+        // Exactly one Written, one Duplicate — offsets must match.
+        let (written_count, duplicate_count) = match (&r1, &r2) {
+            (AppendResult::Written(_), AppendResult::Duplicate(_))
+            | (AppendResult::Duplicate(_), AppendResult::Written(_)) => (1, 1),
+            _ => (
+                matches!(r1, AppendResult::Written(_)) as u32
+                    + matches!(r2, AppendResult::Written(_)) as u32,
+                matches!(r1, AppendResult::Duplicate(_)) as u32
+                    + matches!(r2, AppendResult::Duplicate(_)) as u32,
+            ),
+        };
+        assert_eq!(written_count, 1, "expected exactly 1 Written; got r1={r1:?}, r2={r2:?}");
+        assert_eq!(duplicate_count, 1, "expected exactly 1 Duplicate; got r1={r1:?}, r2={r2:?}");
+        assert_eq!(r1.offset(), r2.offset(), "offsets must agree");
     }
 }
