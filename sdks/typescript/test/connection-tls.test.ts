@@ -47,8 +47,7 @@ describe("Connection TLS", () => {
     netCreateConnectionMock.mockClear();
 
     const conn = new Connection({
-      host: "127.0.0.1",
-      port: 5933,
+      endpoints: [{ host: "127.0.0.1", port: 5933 }],
       clientId: "tls-unit",
       reconnect: false,
       requestTimeout: 1000,
@@ -85,8 +84,7 @@ describe("Connection TLS", () => {
     const port = (server.address() as net.AddressInfo).port;
 
     const conn = new Connection({
-      host: "127.0.0.1",
-      port,
+      endpoints: [{ host: "127.0.0.1", port }],
       clientId: "plain-unit",
       reconnect: false,
       requestTimeout: 100,
@@ -113,8 +111,7 @@ describe("Connection TLS", () => {
     netCreateConnectionMock.mockClear();
 
     const conn = new Connection({
-      host: "127.0.0.1",
-      port: 5933,
+      endpoints: [{ host: "127.0.0.1", port: 5933 }],
       clientId: "tls-unit",
       reconnect: false,
       requestTimeout: 1000,
@@ -142,8 +139,7 @@ describe("Connection TLS", () => {
     tlsConnectMock.mockClear();
 
     const conn = new Connection({
-      host: "127.0.0.1",
-      port: 5933,
+      endpoints: [{ host: "127.0.0.1", port: 5933 }],
       clientId: "tls-unit",
       reconnect: false,
       requestTimeout: 1000,

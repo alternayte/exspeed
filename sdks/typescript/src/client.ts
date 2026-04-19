@@ -220,8 +220,7 @@ export class ExspeedClient extends EventEmitter {
 
   private createConnection(): Connection {
     const connOpts: ConnectionOptions = {
-      host: this.opts.host ?? "localhost",
-      port: this.opts.port ?? DEFAULT_PORT,
+      endpoints: [{ host: this.opts.host ?? "localhost", port: this.opts.port ?? DEFAULT_PORT }],
       clientId: this.opts.clientId,
       auth: this.opts.auth,
       reconnect: this.opts.reconnect ?? true,

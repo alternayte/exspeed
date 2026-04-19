@@ -4,6 +4,7 @@ import * as tls from "node:tls";
 import {
   OpCode,
   PROTOCOL_VERSION,
+  DEFAULT_PORT,
   encodeFrame,
   decodeFrame,
   type Frame,
@@ -16,10 +17,10 @@ import {
   TimeoutError,
 } from "./errors.js";
 import { AUTH_NONE, AUTH_TOKEN } from "./protocol/types.js";
+import type { BrokerEndpoint } from "./types.js";
 
 export interface ConnectionOptions {
-  host: string;
-  port: number;
+  endpoints: BrokerEndpoint[];
   clientId: string;
   auth?: { type: "token"; token: string };
   reconnect: boolean;
@@ -50,6 +51,7 @@ export class Connection extends EventEmitter {
   private socketReady = false;
   private reconnecting = false;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
+  private currentEndpointIndex = 0;
 
   private readonly opts: Required<Omit<ConnectionOptions, "auth" | "tls">> & {
     auth?: ConnectionOptions["auth"];
@@ -66,12 +68,34 @@ export class Connection extends EventEmitter {
     };
   }
 
+  currentEndpoint(): BrokerEndpoint {
+    return this.opts.endpoints[this.currentEndpointIndex]!;
+  }
+
   async connect(): Promise<void> {
-    await this.openSocket();
-    await this.handshake();
-    this.connected = true;
-    this.startPing();
-    this.emit("connected");
+    const totalEndpoints = this.opts.endpoints.length;
+    if (totalEndpoints === 0) {
+      throw new ConnectionError("No broker endpoints configured");
+    }
+
+    let lastError: unknown;
+    for (let attempt = 0; attempt < totalEndpoints; attempt++) {
+      try {
+        await this.openSocket();
+        await this.handshake();
+        this.connected = true;
+        this.startPing();
+        this.emit("connected", this.currentEndpoint());
+        return;
+      } catch (err) {
+        lastError = err;
+        // openSocket advanced the index; try the next one.
+      }
+    }
+
+    throw new ConnectionError(
+      `Failed to connect to any of ${totalEndpoints} endpoints: ${(lastError as Error)?.message ?? "unknown"}`,
+    );
   }
 
   async close(): Promise<void> {
@@ -130,15 +154,22 @@ export class Connection extends EventEmitter {
 
   private openSocket(): Promise<void> {
     return new Promise((resolve, reject) => {
+      const endpoint = this.currentEndpoint();
+      const port = endpoint.port ?? DEFAULT_PORT;
       const useTls = this.opts.tls !== undefined && this.opts.tls !== false;
-      const baseOpts = { host: this.opts.host, port: this.opts.port };
+      const baseOpts = { host: endpoint.host, port };
 
       // onReady fires on 'connect' for plain TCP, 'secureConnect' for TLS —
       // both mean the socket is ready for application I/O.
       const onReady = () => {
-        socket.removeListener("error", reject);
+        socket.removeListener("error", onInitialError);
         this.socketReady = true;
         resolve();
+      };
+
+      const onInitialError = (err: Error) => {
+        this.currentEndpointIndex = (this.currentEndpointIndex + 1) % this.opts.endpoints.length;
+        reject(err);
       };
 
       let socket: net.Socket;
@@ -162,7 +193,7 @@ export class Connection extends EventEmitter {
       // Register error listener BEFORE other listeners so synchronous errors
       // during socket setup properly reject the promise instead of being
       // absorbed by onSocketError with no listener.
-      socket.once("error", reject);
+      socket.once("error", onInitialError);
       socket.setKeepAlive(true, 10000);
       socket.on("data", (data) => this.onData(data));
       socket.on("error", (err) => this.onSocketError(err));
@@ -272,6 +303,8 @@ export class Connection extends EventEmitter {
 
       if (this.closed) break;
 
+      const before = this.currentEndpoint();
+
       try {
         if (this.socket) {
           this.socket.removeAllListeners();
@@ -282,8 +315,12 @@ export class Connection extends EventEmitter {
         this.connected = true;
         this.reconnecting = false;
         this.startPing();
+        const after = this.currentEndpoint();
         this.emit("reconnected", { attempt });
-        this.emit("connected");
+        this.emit("connected", after);
+        if (after.host !== before.host || after.port !== before.port) {
+          this.emit("endpoint_changed", { from: before, to: after });
+        }
         return;
       } catch {
         // Try again

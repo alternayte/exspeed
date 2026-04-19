@@ -65,8 +65,7 @@ describe("Connection", () => {
     });
 
     const conn = new Connection({
-      host: "127.0.0.1",
-      port: mock.port,
+      endpoints: [{ host: "127.0.0.1", port: mock.port }],
       clientId: "test",
       reconnect: false,
       requestTimeout: 2000,
@@ -99,8 +98,7 @@ describe("Connection", () => {
     });
 
     const conn = new Connection({
-      host: "127.0.0.1",
-      port: mock.port,
+      endpoints: [{ host: "127.0.0.1", port: mock.port }],
       clientId: "test",
       reconnect: false,
       requestTimeout: 2000,
@@ -135,8 +133,7 @@ describe("Connection", () => {
     });
 
     const conn = new Connection({
-      host: "127.0.0.1",
-      port: mock.port,
+      endpoints: [{ host: "127.0.0.1", port: mock.port }],
       clientId: "test",
       reconnect: false,
       requestTimeout: 200,
@@ -174,8 +171,7 @@ describe("Connection", () => {
     });
 
     const conn = new Connection({
-      host: "127.0.0.1",
-      port: mock.port,
+      endpoints: [{ host: "127.0.0.1", port: mock.port }],
       clientId: "test",
       reconnect: false,
       requestTimeout: 2000,
@@ -214,8 +210,7 @@ describe("Connection", () => {
     });
 
     const conn = new Connection({
-      host: "127.0.0.1",
-      port: mock.port,
+      endpoints: [{ host: "127.0.0.1", port: mock.port }],
       clientId: "test",
       reconnect: false,
       requestTimeout: 5000,
@@ -225,5 +220,78 @@ describe("Connection", () => {
 
     await new Promise((r) => setTimeout(r, 100));
     await expect(conn.request(OpCode.Ping, Buffer.alloc(0))).rejects.toThrow(ConnectionError);
+  });
+});
+
+describe("Connection failover", () => {
+  async function pickPort(): Promise<number> {
+    return new Promise((resolve) => {
+      const srv = net.createServer();
+      srv.listen(0, "127.0.0.1", () => {
+        const p = (srv.address() as net.AddressInfo).port;
+        srv.close(() => resolve(p));
+      });
+    });
+  }
+
+  function startEchoServer(port: number): Promise<net.Server> {
+    return new Promise((resolve) => {
+      const srv = net.createServer((socket) => {
+        let buf = Buffer.alloc(0);
+        socket.on("data", (data) => {
+          buf = Buffer.concat([buf, data]);
+          const result = decodeFrame(buf, 0);
+          if (result && result.frame.opcode === OpCode.Connect) {
+            socket.write(encodeFrame({
+              version: PROTOCOL_VERSION,
+              opcode: OpCode.Ok,
+              correlationId: result.frame.correlationId,
+              payload: Buffer.alloc(0),
+            }));
+          }
+        });
+      });
+      srv.listen(port, "127.0.0.1", () => resolve(srv));
+    });
+  }
+
+  it("falls through to the second endpoint when the first refuses", async () => {
+    const deadPort = await pickPort();
+    const livePort = await pickPort();
+    const liveSrv = await startEchoServer(livePort);
+
+    const conn = new Connection({
+      endpoints: [
+        { host: "127.0.0.1", port: deadPort },
+        { host: "127.0.0.1", port: livePort },
+      ],
+      clientId: "failover-test",
+      reconnect: false,
+      requestTimeout: 1000,
+      pingInterval: 0,
+    });
+
+    await conn.connect();
+    expect(conn.currentEndpoint()).toEqual({ host: "127.0.0.1", port: livePort });
+
+    await conn.close();
+    await new Promise<void>((r) => liveSrv.close(() => r()));
+  });
+
+  it("rejects when no endpoints are reachable", async () => {
+    const p1 = await pickPort();
+    const p2 = await pickPort();
+    const conn = new Connection({
+      endpoints: [
+        { host: "127.0.0.1", port: p1 },
+        { host: "127.0.0.1", port: p2 },
+      ],
+      clientId: "all-dead-test",
+      reconnect: false,
+      requestTimeout: 500,
+      pingInterval: 0,
+    });
+
+    await expect(conn.connect()).rejects.toThrow();
   });
 });
