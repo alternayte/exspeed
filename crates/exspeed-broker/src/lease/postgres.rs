@@ -102,7 +102,7 @@ impl LeaderLease for PostgresLeaseBackend {
         ttl: Duration,
     ) -> Result<Option<LeaseGuard>, LeaseError> {
         let holder_id = Uuid::new_v4();
-        let ttl_secs = ttl.as_secs() as f64;
+        let ttl_secs = ttl.as_secs_f64();
 
         let sql = format!(
             "INSERT INTO {schema}.exspeed_leases (name, holder, expires_at)
@@ -246,7 +246,7 @@ async fn refresh(
     holder_id: &Uuid,
     ttl: Duration,
 ) -> Result<bool, LeaseError> {
-    let ttl_secs = ttl.as_secs() as f64;
+    let ttl_secs = ttl.as_secs_f64();
     let sql = format!(
         "UPDATE {}.exspeed_leases
          SET expires_at = now() + make_interval(secs => $3)

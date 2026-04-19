@@ -27,7 +27,7 @@ static SETUP_LOCK: Mutex<()> = Mutex::new(());
 async fn make_backend() -> (PostgresLeaseBackend, String) {
     let schema = format!("lease_test_{}", uuid::Uuid::new_v4().simple());
     let b = {
-        let _guard = SETUP_LOCK.lock().unwrap();
+        let _guard = SETUP_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::set_var("EXSPEED_OFFSET_STORE_POSTGRES_SCHEMA", &schema);
         PostgresLeaseBackend::from_env().await.unwrap()
     };
@@ -37,7 +37,7 @@ async fn make_backend() -> (PostgresLeaseBackend, String) {
 /// Build a second backend pointing at the same schema. Used to simulate a
 /// second pod sharing the same Postgres schema.
 async fn make_backend_for_schema(schema: &str) -> PostgresLeaseBackend {
-    let _guard = SETUP_LOCK.lock().unwrap();
+    let _guard = SETUP_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     std::env::set_var("EXSPEED_OFFSET_STORE_POSTGRES_SCHEMA", schema);
     PostgresLeaseBackend::from_env().await.unwrap()
 }
