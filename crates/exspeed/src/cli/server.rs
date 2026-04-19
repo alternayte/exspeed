@@ -6,7 +6,7 @@ use anyhow::Result;
 use clap::Args;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::{error, info, warn};
 
@@ -383,8 +383,27 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     info!("exspeed TCP listening on {}", tcp_addr);
     info!("exspeed HTTP API listening on {}", api_addr);
 
+    // Bound concurrent connections. Each accepted connection holds one permit
+    // for its lifetime; the OS-level accept queue absorbs short bursts.
+    let max_conns: usize = std::env::var("EXSPEED_MAX_CONNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024);
+    let conn_sem = Arc::new(Semaphore::new(max_conns));
+    info!(max_conns, "connection cap configured");
+
     loop {
         let (socket, peer) = listener.accept().await?;
+
+        let permit = match conn_sem.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                warn!(%peer, "connection rejected: max_conns reached");
+                drop(socket);
+                continue;
+            }
+        };
+
         info!(%peer, "new connection");
         metrics.connection_opened();
 
@@ -393,6 +412,7 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         let auth_token_clone = auth_token.clone();
         let tls_config_clone = tls_config.clone();
         tokio::spawn(async move {
+            let _permit = permit; // released when this task ends
             let result: Result<()> = async move {
                 if let Some(tls_cfg) = tls_config_clone {
                     let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
