@@ -50,6 +50,7 @@ export class Connection extends EventEmitter {
   private connected = false;
   private socketReady = false;
   private reconnecting = false;
+  private connecting = false;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private currentEndpointIndex = 0;
 
@@ -78,19 +79,36 @@ export class Connection extends EventEmitter {
       throw new ConnectionError("No broker endpoints configured");
     }
 
+    this.connecting = true;
     let lastError: unknown;
-    for (let attempt = 0; attempt < totalEndpoints; attempt++) {
-      try {
-        await this.openSocket();
-        await this.handshake();
-        this.connected = true;
-        this.startPing();
-        this.emit("connected", this.currentEndpoint());
-        return;
-      } catch (err) {
-        lastError = err;
-        // openSocket advanced the index; try the next one.
+    try {
+      for (let attempt = 0; attempt < totalEndpoints; attempt++) {
+        const tried = this.currentEndpoint();
+        try {
+          await this.openSocket();
+          await this.handshake();
+          this.connected = true;
+          this.startPing();
+          // Clear connecting BEFORE emit so listeners see consistent state.
+          this.connecting = false;
+          this.emit("connected", this.currentEndpoint());
+          return;
+        } catch (err) {
+          lastError = err;
+          // openSocket advances the index on socket error.  If handshake
+          // failed, the index still points at `tried` — advance it now.
+          if (
+            this.currentEndpoint().host === tried.host &&
+            this.currentEndpoint().port === tried.port
+          ) {
+            this.currentEndpointIndex =
+              (this.currentEndpointIndex + 1) % this.opts.endpoints.length;
+          }
+        }
       }
+    } finally {
+      // Ensure connecting is cleared even on the throw path below.
+      this.connecting = false;
     }
 
     throw new ConnectionError(
@@ -275,6 +293,10 @@ export class Connection extends EventEmitter {
 
   private onSocketClose(): void {
     if (this.closed) return;
+    // During the initial connect() loop a failed openSocket() triggers a close
+    // event before we've ever emitted "connected".  Suppress the disconnected
+    // emit and any reconnect scheduling until connect() finishes.
+    if (this.connecting) return;
     this.connected = false;
     this.socketReady = false;
     this.stopPing();
@@ -290,6 +312,11 @@ export class Connection extends EventEmitter {
   private async attemptReconnect(): Promise<void> {
     this.reconnecting = true;
     const max = this.opts.maxReconnectAttempts;
+    // Capture the endpoint we were on when the connection dropped.
+    // Must be captured before the loop because openSocket() advances the
+    // index on socket error, so by attempt 2 currentEndpoint() may already
+    // reflect the next endpoint.
+    const before = this.currentEndpoint();
 
     for (let attempt = 1; attempt <= max; attempt++) {
       const delay = Math.min(
@@ -302,8 +329,6 @@ export class Connection extends EventEmitter {
       await new Promise((r) => setTimeout(r, delay));
 
       if (this.closed) break;
-
-      const before = this.currentEndpoint();
 
       try {
         if (this.socket) {

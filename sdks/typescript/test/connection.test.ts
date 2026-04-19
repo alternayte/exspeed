@@ -234,9 +234,20 @@ describe("Connection failover", () => {
     });
   }
 
-  function startEchoServer(port: number): Promise<net.Server> {
+  interface EchoServer {
+    server: net.Server;
+    /** All sockets currently connected to this server. */
+    sockets: Set<net.Socket>;
+    /** Destroy all connected sockets and close the listening server. */
+    kill(): Promise<void>;
+  }
+
+  function startEchoServer(port: number): Promise<EchoServer> {
     return new Promise((resolve) => {
+      const sockets = new Set<net.Socket>();
       const srv = net.createServer((socket) => {
+        sockets.add(socket);
+        socket.once("close", () => sockets.delete(socket));
         let buf = Buffer.alloc(0);
         socket.on("data", (data) => {
           buf = Buffer.concat([buf, data]);
@@ -251,7 +262,16 @@ describe("Connection failover", () => {
           }
         });
       });
-      srv.listen(port, "127.0.0.1", () => resolve(srv));
+      srv.listen(port, "127.0.0.1", () =>
+        resolve({
+          server: srv,
+          sockets,
+          kill(): Promise<void> {
+            for (const s of sockets) s.destroy();
+            return new Promise<void>((r) => srv.close(() => r()));
+          },
+        }),
+      );
     });
   }
 
@@ -275,7 +295,7 @@ describe("Connection failover", () => {
     expect(conn.currentEndpoint()).toEqual({ host: "127.0.0.1", port: livePort });
 
     await conn.close();
-    await new Promise<void>((r) => liveSrv.close(() => r()));
+    await liveSrv.kill();
   });
 
   it("rejects when no endpoints are reachable", async () => {
@@ -292,6 +312,59 @@ describe("Connection failover", () => {
       pingInterval: 0,
     });
 
-    await expect(conn.connect()).rejects.toThrow();
+    await expect(conn.connect()).rejects.toThrow(ConnectionError);
+  });
+
+  it("emits endpoint_changed when reconnect rotates to next endpoint", async () => {
+    const p1 = await pickPort();
+    const p2 = await pickPort();
+
+    // Start both echo servers (srv2 stays up so reconnect can land there).
+    const srv1 = await startEchoServer(p1);
+    const srv2 = await startEchoServer(p2);
+
+    const conn = new Connection({
+      endpoints: [
+        { host: "127.0.0.1", port: p1 },
+        { host: "127.0.0.1", port: p2 },
+      ],
+      clientId: "endpoint-changed-test",
+      reconnect: true,
+      maxReconnectAttempts: 5,
+      reconnectBaseDelay: 10,
+      reconnectMaxDelay: 100,
+      requestTimeout: 1000,
+      pingInterval: 0,
+    });
+
+    // Connect — should land on p1.
+    await conn.connect();
+    expect(conn.currentEndpoint().port).toBe(p1);
+
+    // Arm the listener before killing so we don't miss the event.
+    const endpointChangedPromise = new Promise<{
+      from: { host: string; port: number };
+      to: { host: string; port: number };
+    }>((resolve) => {
+      conn.once("endpoint_changed", (payload: any) => resolve(payload));
+    });
+
+    // Kill srv1: destroy all connected sockets (so the client socket gets a
+    // close event immediately) then stop accepting.
+    await srv1.kill();
+
+    // Wait up to 2 s for the endpoint_changed event.
+    const changed = await Promise.race([
+      endpointChangedPromise,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("timeout waiting for endpoint_changed")), 2000),
+      ),
+    ]);
+
+    expect(changed.from.port).toBe(p1);
+    expect(changed.to.port).toBe(p2);
+
+    await conn.close();
+    await srv2.kill();
   });
 });
