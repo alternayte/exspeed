@@ -64,10 +64,25 @@ pub async fn create_stream(
         .create_stream(&stream_name, body.max_age_secs, body.max_bytes)
         .await
     {
-        Ok(()) => (
-            StatusCode::CREATED,
-            Json(json!({"name": body.name, "status": "created"})),
-        ),
+        Ok(()) => {
+            // Load the stream config written by create_stream and wire per-stream
+            // dedup parameters into BrokerAppend so new publishes honour them.
+            let stream_dir = state
+                .storage
+                .data_dir()
+                .join("streams")
+                .join(stream_name.as_str());
+            let cfg = StreamConfig::load(&stream_dir).unwrap_or_default();
+            state
+                .broker
+                .broker_append
+                .configure_stream(&stream_name, cfg.dedup_window_secs, cfg.dedup_max_entries)
+                .await;
+            (
+                StatusCode::CREATED,
+                Json(json!({"name": body.name, "status": "created"})),
+            )
+        }
         Err(exspeed_streams::StorageError::StreamAlreadyExists(_)) => (
             StatusCode::CONFLICT,
             Json(json!({"error": format!("stream '{}' already exists", body.name)})),

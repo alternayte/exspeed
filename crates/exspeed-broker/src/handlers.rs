@@ -25,7 +25,21 @@ pub async fn handle_create_stream(broker: &Broker, req: CreateStreamRequest) -> 
         .create_stream(&stream_name, req.max_age_secs, req.max_bytes)
         .await
     {
-        Ok(()) => ServerMessage::Ok,
+        Ok(()) => {
+            // Load the stream config that was just persisted (uses defaults for dedup
+            // fields since CreateStreamRequest doesn't carry dedup params yet).
+            let stream_dir = broker
+                .data_dir
+                .join("streams")
+                .join(stream_name.as_str());
+            let cfg = exspeed_storage::file::stream_config::StreamConfig::load(&stream_dir)
+                .unwrap_or_default();
+            broker
+                .broker_append
+                .configure_stream(&stream_name, cfg.dedup_window_secs, cfg.dedup_max_entries)
+                .await;
+            ServerMessage::Ok
+        }
         Err(e) => ServerMessage::Error {
             code: 409,
             message: format!("create_stream failed: {e}"),

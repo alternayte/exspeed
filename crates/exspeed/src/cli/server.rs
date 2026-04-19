@@ -180,6 +180,22 @@ where
         warn!("failed to rebuild dedup state from log: {}", e);
     });
 
+    // Apply per-stream dedup config from persisted stream.json files.
+    // Use file_storage (concrete FileStorage) to access list_streams() + data_dir().
+    for stream_name_str in file_storage.list_streams() {
+        if let Ok(stream_name) = exspeed_common::StreamName::try_from(stream_name_str.as_str()) {
+            let stream_dir = file_storage
+                .data_dir()
+                .join("streams")
+                .join(stream_name_str.as_str());
+            let cfg = exspeed_storage::file::stream_config::StreamConfig::load(&stream_dir)
+                .unwrap_or_default();
+            broker_append
+                .configure_stream(&stream_name, cfg.dedup_window_secs, cfg.dedup_max_entries)
+                .await;
+        }
+    }
+
     // Build consumer store (selects backend from EXSPEED_CONSUMER_STORE or EXSPEED_OFFSET_STORE)
     let consumer_backend = std::env::var("EXSPEED_CONSUMER_STORE")
         .or_else(|_| std::env::var("EXSPEED_OFFSET_STORE"))

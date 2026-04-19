@@ -9,6 +9,8 @@ exspeed-streams = { path = "../exspeed-streams" }
 exspeed-protocol = { path = "../exspeed-protocol" }
 exspeed-storage = { path = "../exspeed-storage" }
 bytes = { workspace = true }
+twox-hash = "1.6"
+crc32c = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
