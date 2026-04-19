@@ -47,9 +47,10 @@ pub async fn readyz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }
 
     if let Err(e) = probe_data_dir(&state.data_dir).await {
+        tracing::warn!(error = %e, data_dir = %state.data_dir.display(), "/readyz probe failed");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"status": "data_dir_unwritable", "error": e.to_string()})),
+            Json(json!({"status": "data_dir_unwritable"})),
         );
     }
 
@@ -58,13 +59,11 @@ pub async fn readyz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 async fn probe_data_dir(data_dir: &std::path::Path) -> std::io::Result<()> {
     let probe = data_dir.join(".readyz-probe");
-    let probe_clone = probe.clone();
     tokio::task::spawn_blocking(move || {
-        std::fs::write(&probe_clone, b"ok")?;
-        std::fs::remove_file(&probe_clone)
+        std::fs::write(&probe, b"ok")?;
+        std::fs::remove_file(&probe)
     })
     .await
     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))??;
-    let _ = probe;
     Ok(())
 }

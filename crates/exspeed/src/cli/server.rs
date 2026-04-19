@@ -456,17 +456,18 @@ where
     // Spawn HTTP API server
     let api_addr: SocketAddr = args.api_bind.parse()?;
     let http_tls = tls_paths.clone();
+
+    // Mark ready: all eager startup work (storage open, broker.load_consumers,
+    // connector load, ExQL load) completed above; the API task is about to
+    // run. /readyz now performs the per-request data_dir writability check
+    // on top of this gate.
+    ready.store(true, std::sync::atomic::Ordering::Release);
+
     tokio::spawn(async move {
         if let Err(e) = exspeed_api::serve(state, api_addr, http_tls).await {
             error!("HTTP API exited: {}", e);
         }
     });
-
-    // Mark ready: API server has been spawned; the startup pipeline
-    // (storage open, broker.load_consumers, connector load, ExQL load)
-    // completed above. /readyz now performs the per-request data_dir
-    // writability check on top of this gate.
-    ready.store(true, std::sync::atomic::Ordering::Release);
 
     // Load TLS config if enabled.
     let tls_config = match &tls_paths {
