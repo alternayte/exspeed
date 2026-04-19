@@ -48,3 +48,26 @@ pub async fn require_bearer(
 
     next.run(req).await
 }
+
+/// Axum middleware that returns 503 when this pod is not the cluster
+/// leader. Apply AFTER `require_bearer` so standby pods don't leak
+/// "who's the leader" discovery to unauthenticated callers. The
+/// `/api/v1/leases` route is routed OUTSIDE this middleware so operators
+/// can discover the current leader from any pod.
+pub async fn leader_gate(
+    State(state): State<Arc<AppState>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    if state.leadership.is_currently_leader() {
+        return next.run(req).await;
+    }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": "not leader",
+            "hint": "this pod is a standby. GET /api/v1/leases on any pod to discover the current leader.",
+        })),
+    )
+        .into_response()
+}

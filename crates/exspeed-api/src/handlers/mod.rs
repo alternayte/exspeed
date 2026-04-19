@@ -28,7 +28,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/webhooks/{*path}", post(webhooks::handle_webhook))
         .with_state(state.clone());
 
-    // Authenticated routes: all /api/v1/*.
+    // Leases endpoint: bearer-gated but NOT leader-gated. Any pod can
+    // answer "who's the leader?".
+    let leases_router = Router::new()
+        .route("/api/v1/leases", get(leases::list_leases))
+        .layer(from_fn_with_state(state.clone(), crate::middleware::require_bearer))
+        .with_state(state.clone());
+
+    // Main authenticated router: bearer-gated AND leader-gated.
+    // Layer order: `.layer(outer).layer(inner)` means outer runs first.
+    // We want: require_bearer → leader_gate → handler, so leader_gate is
+    // the inner layer and require_bearer is the outer layer.
     let authed = Router::new()
         .route(
             "/api/v1/streams",
@@ -81,9 +91,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/v1/connections/{name}",
             delete(connections::delete_connection),
         )
-        .route("/api/v1/leases", get(leases::list_leases))
+        .layer(from_fn_with_state(state.clone(), crate::middleware::leader_gate))
         .layer(from_fn_with_state(state.clone(), crate::middleware::require_bearer))
         .with_state(state);
 
-    unauth.merge(authed)
+    unauth.merge(leases_router).merge(authed)
 }
