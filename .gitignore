@@ -10,3 +10,6 @@
 
 # Local planning / design docs
 /docs/
+
+# Git worktrees used during subagent-driven development
+/.worktrees/
