@@ -34,7 +34,7 @@ RUN find crates -name "*.rs" -exec touch {} +
 RUN cargo build --release
 
 # Runtime image
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update \
  && apt-get install -y ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
