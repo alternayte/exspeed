@@ -241,7 +241,7 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         args.data_dir.clone(),
         metrics.clone(),
         offset_store,
-        lease.clone(),
+        leadership.clone(),
     ));
 
     // Ensure connectors.d directory exists
@@ -270,13 +270,11 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     exql.resume_all();
 
     // Spawn the lease retrier (ticks every TTL/3). Only needed on coordinated
-    // backends — Noop always acquires so the initial start_connector /
-    // resume_all calls already claimed everything. Include both connectors
-    // and continuous queries as retrier targets so a failed peer's leases
-    // get picked up on the next tick.
+    // backends — Noop always acquires so the initial resume_all call already
+    // claimed everything. Targets only the continuous-query engine; connector
+    // failover is handled by the cluster-leader supervisor (Task 9).
     if lease.supports_coordination() {
         exspeed_broker::spawn_lease_retrier(vec![
-            connector_manager.clone() as Arc<dyn exspeed_broker::LeaseRetrierTarget>,
             exql.clone() as Arc<dyn exspeed_broker::LeaseRetrierTarget>,
         ]);
         info!("lease retrier spawned");
