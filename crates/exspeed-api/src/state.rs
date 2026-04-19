@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use exspeed_broker::leadership::ClusterLeadership;
 use exspeed_broker::Broker;
 use exspeed_broker::LeaderLease;
 use exspeed_common::Metrics;
@@ -24,4 +25,8 @@ pub struct AppState {
     /// execution of connectors and continuous queries across pods. Exposed
     /// for `/api/v1/leases` (Task 7).
     pub lease: Arc<dyn LeaderLease>,
+    /// Cluster-leader lease handle. Used by `/healthz` and the
+    /// `leader_gate` middleware (added in Task 5) to decide whether to
+    /// accept client traffic.
+    pub leadership: Arc<ClusterLeadership>,
 }

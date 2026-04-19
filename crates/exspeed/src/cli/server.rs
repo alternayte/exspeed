@@ -151,6 +151,15 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         );
     }
 
+    // Spawn cluster-leader leadership state machine.
+    let leadership = Arc::new(
+        exspeed_broker::leadership::ClusterLeadership::spawn(
+            lease.clone(),
+            metrics.clone(),
+        )
+        .await,
+    );
+
     // Validate heartbeat vs TTL — heartbeat must be well under TTL or the
     // first heartbeat fires after the lease has already expired and the
     // cluster will thrash.
@@ -284,6 +293,7 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         exql,
         auth_token: auth_token.clone(),
         lease: lease.clone(),
+        leadership: leadership.clone(),
     });
 
     // Spawn retention task
