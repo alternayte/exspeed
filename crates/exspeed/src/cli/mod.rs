@@ -7,6 +7,7 @@ pub mod query;
 pub mod server;
 pub mod server_lock;
 pub mod server_tls;
+pub mod snapshot;
 pub mod stream;
 pub mod tail;
 pub mod view;
@@ -116,4 +117,6 @@ pub enum Command {
     },
     /// List all connectors
     Connectors,
+    /// Snapshot an offline data directory to a .tar.gz file
+    Snapshot(snapshot::SnapshotArgs),
 }

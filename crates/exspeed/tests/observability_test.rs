@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -183,5 +184,59 @@ async fn publish_latency_histogram_reported_via_metrics() {
     assert!(
         metrics.contains("stream=\"lat-test\""),
         "metrics body did not include stream=lat-test label; got:\n{metrics}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot tests (Task 7)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn snapshot_creates_tar_gz_of_data_dir() {
+    let tmp = tempdir().unwrap();
+    let data_dir: PathBuf = tmp.path().to_path_buf();
+
+    std::fs::create_dir_all(data_dir.join("streams/example/partitions/0")).unwrap();
+    std::fs::write(
+        data_dir.join("streams/example/partitions/0/dummy"),
+        b"hello",
+    )
+    .unwrap();
+
+    let out = tmp.path().join("snap.tar.gz");
+
+    exspeed::cli::snapshot::run(exspeed::cli::snapshot::SnapshotArgs {
+        data_dir: data_dir.clone(),
+        output: out.clone(),
+    })
+    .await
+    .expect("snapshot should succeed against unlocked data_dir");
+
+    let metadata = std::fs::metadata(&out).unwrap();
+    assert!(metadata.len() > 0, "snapshot file should not be empty");
+    assert!(metadata.is_file());
+}
+
+#[tokio::test]
+async fn snapshot_refuses_when_server_holds_lock() {
+    let tmp = tempdir().unwrap();
+    let data_dir: PathBuf = tmp.path().to_path_buf();
+
+    // Take the lock as if we were a running server.
+    let _lock = exspeed::cli::server_lock::acquire_data_dir_lock(&data_dir)
+        .expect("first lock should succeed");
+
+    let out = tmp.path().join("snap.tar.gz");
+    let err = exspeed::cli::snapshot::run(exspeed::cli::snapshot::SnapshotArgs {
+        data_dir,
+        output: out,
+    })
+    .await
+    .expect_err("snapshot should fail while data_dir is locked");
+
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("already in use") || msg.contains("in use"),
+        "unexpected error: {msg}"
     );
 }
