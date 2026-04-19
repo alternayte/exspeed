@@ -217,6 +217,7 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         args.data_dir.clone(),
         metrics.clone(),
         offset_store,
+        lease.clone(),
     ));
 
     // Ensure connectors.d directory exists
@@ -225,6 +226,16 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     // Load persisted + TOML connector configs on startup
     if let Err(e) = connector_manager.load_all().await {
         warn!("failed to load connector configs: {}", e);
+    }
+
+    // Spawn the lease retrier (ticks every TTL/3). Only needed on coordinated
+    // backends — Noop always acquires so the initial start_connector call
+    // already claimed everything.
+    if lease.supports_coordination() {
+        exspeed_broker::spawn_lease_retrier(vec![
+            connector_manager.clone() as Arc<dyn exspeed_broker::LeaseRetrierTarget>,
+        ]);
+        info!("lease retrier spawned");
     }
 
     // Spawn TOML file watcher for hot-reload of connectors.d/
