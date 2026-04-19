@@ -1,16 +1,11 @@
 use clap::Parser;
-use tracing_subscriber::EnvFilter;
 
 use exspeed::cli;
 use exspeed::cli::client::CliClient;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
-        )
-        .init();
+    exspeed::log_format::init_logging();
 
     let args = cli::Cli::parse();
     let client = CliClient::new(&args.server);
