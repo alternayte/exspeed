@@ -124,7 +124,14 @@ export class Subscription extends EventEmitter implements AsyncIterable<Message>
     }
   }
 
-  /** Pause iteration. While paused, `next()` awaits a `resume()` call. */
+  /**
+   * Pause iteration. While paused, `next()` awaits a `resume()` call even if
+   * the queue has items. Records continue to enqueue in the background up to
+   * `maxQueueSize`, after which `overflowPolicy` kicks in.
+   *
+   * If `close()` is called while paused, any queued records are discarded
+   * without delivery — the broker will redeliver unacked records on reconnect.
+   */
   pause(): void {
     this._paused = true;
   }

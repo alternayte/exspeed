@@ -71,8 +71,10 @@ export interface SubscribeOptions {
    * What to do when the subscription's local buffer fills up.
    * - 'drop-oldest' (default): drop the oldest queued record and emit a
    *   typed `QueueOverflowError` via the "overflow" event.
-   * - 'error': reject the incoming push by throwing `QueueOverflowError`,
-   *   which propagates to the caller as a Subscription "error" event.
+   * - 'error': reject the incoming push; emit `QueueOverflowError` on the
+   *   subscription's "error" event. The incoming record is NOT enqueued.
+   *   Callers MUST attach an "error" listener — Node's default behavior on
+   *   an un-listened EventEmitter "error" event is to crash the process.
    */
   overflowPolicy?: "drop-oldest" | "error";
 }
