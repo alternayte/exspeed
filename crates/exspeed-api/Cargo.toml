@@ -20,3 +20,18 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 prometheus = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+tempfile = "3"
+exspeed-storage = { path = "../exspeed-storage" }
+exspeed-broker = { path = "../exspeed-broker" }
+exspeed-connectors = { path = "../exspeed-connectors" }
+exspeed-processing = { path = "../exspeed-processing" }
+exspeed-streams = { path = "../exspeed-streams" }
+exspeed-common = { path = "../exspeed-common" }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+serde_json = { workspace = true }
