@@ -28,6 +28,13 @@ impl TryFrom<String> for StreamName {
         if s.is_empty() {
             return Err(InvalidName("stream name cannot be empty".into()));
         }
+        if s.len() > MAX_NAME_LEN {
+            return Err(InvalidName(format!(
+                "stream name length {} exceeds max {}",
+                s.len(),
+                MAX_NAME_LEN
+            )));
+        }
         if !s
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
@@ -75,6 +82,26 @@ pub const MAX_PAYLOAD_SIZE: u32 = 16 * 1024 * 1024;
 /// Frame header size in bytes.
 pub const FRAME_HEADER_SIZE: usize = 10;
 
+/// Maximum length, in bytes, for any user-provided resource name
+/// (stream, consumer, view, group, subject filter).
+pub const MAX_NAME_LEN: usize = 255;
+
+/// Validate a resource name (consumer/view/group). Less restrictive than
+/// `StreamName` (used for subject filters, group names, etc).
+pub fn validate_resource_name(name: &str, kind: &str) -> Result<(), InvalidName> {
+    if name.is_empty() {
+        return Err(InvalidName(format!("{kind} cannot be empty")));
+    }
+    if name.len() > MAX_NAME_LEN {
+        return Err(InvalidName(format!(
+            "{kind} length {} exceeds max {}",
+            name.len(),
+            MAX_NAME_LEN
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,5 +140,33 @@ mod tests {
     fn stream_name_display() {
         let name = StreamName::try_from("my-stream").unwrap();
         assert_eq!(format!("{}", name), "my-stream");
+    }
+
+    #[test]
+    fn stream_name_over_max_len_rejected() {
+        let too_long = "a".repeat(MAX_NAME_LEN + 1);
+        assert!(StreamName::try_from(too_long).is_err());
+    }
+
+    #[test]
+    fn stream_name_at_max_len_accepted() {
+        let exactly_max = "a".repeat(MAX_NAME_LEN);
+        assert!(StreamName::try_from(exactly_max).is_ok());
+    }
+
+    #[test]
+    fn validate_resource_name_rejects_empty() {
+        assert!(validate_resource_name("", "consumer").is_err());
+    }
+
+    #[test]
+    fn validate_resource_name_accepts_normal() {
+        assert!(validate_resource_name("my-consumer", "consumer").is_ok());
+    }
+
+    #[test]
+    fn validate_resource_name_rejects_too_long() {
+        let too_long = "x".repeat(MAX_NAME_LEN + 1);
+        assert!(validate_resource_name(&too_long, "consumer").is_err());
     }
 }

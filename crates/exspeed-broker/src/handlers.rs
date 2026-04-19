@@ -114,6 +114,34 @@ pub async fn handle_fetch(broker: &Broker, req: FetchRequest) -> ServerMessage {
 }
 
 pub async fn handle_create_consumer(broker: &Broker, req: CreateConsumerRequest) -> ServerMessage {
+    use exspeed_common::validate_resource_name;
+
+    if let Err(e) = validate_resource_name(&req.name, "consumer name") {
+        return ServerMessage::Error {
+            code: 400,
+            message: e.to_string(),
+        };
+    }
+    // group can be empty (means "no group"); only validate length if non-empty
+    if !req.group.is_empty() {
+        if let Err(e) = validate_resource_name(&req.group, "group name") {
+            return ServerMessage::Error {
+                code: 400,
+                message: e.to_string(),
+            };
+        }
+    }
+    if !req.subject_filter.is_empty() && req.subject_filter.len() > exspeed_common::MAX_NAME_LEN {
+        return ServerMessage::Error {
+            code: 400,
+            message: format!(
+                "subject filter length {} exceeds max {}",
+                req.subject_filter.len(),
+                exspeed_common::MAX_NAME_LEN
+            ),
+        };
+    }
+
     // Validate stream name
     let stream_name = match StreamName::try_from(req.stream.clone()) {
         Ok(n) => n,
