@@ -76,6 +76,11 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         warn!("TLS disabled — do not expose broker ports to the public internet");
     }
 
+    // Acquire exclusive data-dir lock — held for the lifetime of this process.
+    // Leaks intentionally; the OS releases the flock on process exit.
+    let lock = crate::cli::server_lock::acquire_data_dir_lock(&args.data_dir)?;
+    Box::leak(Box::new(lock));
+
     // Create storage
     let file_storage = Arc::new(FileStorage::open(&args.data_dir)?);
     // Check for S3 tiered storage
