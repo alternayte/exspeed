@@ -591,11 +591,20 @@ where
                 }
             } => {
                 if let Some(delivery_record) = delivery {
-                    let consumer_name = active_subscription
-                        .as_ref()
-                        .expect("delivery_rx is Some but active_subscription is None")
-                        .0
-                        .clone();
+                    let consumer_name = match active_subscription.as_ref() {
+                        Some((name, _)) => name.clone(),
+                        None => {
+                            warn!(
+                                %peer,
+                                offset = delivery_record.record.offset.0,
+                                "received delivery after subscription was cleared; \
+                                 dropping record and tearing down delivery channel"
+                            );
+                            delivery_rx = None;
+                            drop(cancel_tx.take());
+                            continue;
+                        }
+                    };
                     let record_delivery = RecordDelivery {
                         consumer_name,
                         offset: delivery_record.record.offset.0,
