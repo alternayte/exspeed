@@ -28,6 +28,9 @@ tokio-util = { version = "0.7", features = ["codec"] }
 # Byte buffers (zero-copy, reference-counted)
 bytes = "1"
 
+# Date/time types for LeaseInfo.expires_at
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -82,7 +85,7 @@ pgwire-replication = { version = "0.3", default-features = false, features = ["s
 notify = "7"
 
 # UUIDs
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 
 # Constant-time byte comparison (defends against timing oracles)
 constant_time_eq = "0.3"
