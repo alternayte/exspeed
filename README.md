@@ -12,6 +12,7 @@ A lightweight streaming platform built in Rust. One binary, zero partitions, ord
 - [HTTP API Reference](#http-api-reference)
 - [Configuration](#configuration)
 - [Securing Exspeed](#securing-exspeed)
+- [Multi-pod deployment](#multi-pod-deployment)
 - [Docker Deployment](#docker-deployment)
 - [Architecture](#architecture)
 - [Building from Source](#building-from-source)
@@ -731,6 +732,74 @@ roadmap but not in v1.
 Anyone with the token has full admin on the broker. The target deployment
 model is "trust the network boundary" (VPC, service mesh, Hetzner private
 network, k8s namespace).
+
+## Multi-pod deployment
+
+Exspeed supports **hot-standby multi-pod** via a shared coordination backend.
+Running N broker pods means N pods with identical configuration — exactly
+one at a time holds the leases for each source connector, ungrouped sink,
+and continuous query. If the leader crashes, the survivor takes over within
+the lease TTL.
+
+### Requirements
+
+1. **Shared consumer store.** `EXSPEED_CONSUMER_STORE=postgres` or `=redis`.
+   The `file` backend does NOT support multi-pod coordination; the server
+   warns loudly on every boot when file-backed.
+
+2. **One `data_dir` per pod.** Plan A's `flock` guarantees exclusive access
+   to each data directory. Multi-pod does NOT mean shared storage in v1 —
+   each pod owns its own streams. Typical deployment: N identical pods,
+   each with its own PV / local disk, serving identical config. Only the
+   lease-holding pod runs background tasks; other pods are hot standbys.
+
+3. **Reachable coordination backend.** Postgres or Redis must be reachable
+   from every pod. Use the same URL env vars as the consumer store:
+   `EXSPEED_OFFSET_STORE_POSTGRES_URL` or `EXSPEED_OFFSET_STORE_REDIS_URL`.
+
+### Failover timing
+
+| Scenario | Time to failover |
+|---|---|
+| Leader pod crashes (SIGKILL, OOM) | ≤ TTL + retry interval (default ~40s) |
+| Leader pod shuts down gracefully (SIGTERM) | ≤ retry interval (default ~10s) |
+| Heartbeat partitioned from backend | Lease released after 2 consecutive heartbeat failures (~20s), then failover per above |
+
+### Tuning
+
+```bash
+EXSPEED_LEASE_TTL_SECS=30         # default 30
+EXSPEED_LEASE_HEARTBEAT_SECS=10   # default 10 (~TTL/3)
+```
+
+Shorter TTL = faster failover + more chatty backend traffic. Longer TTL =
+slower failover + less traffic. The defaults are fine for most deployments.
+
+### Operator visibility
+
+- `GET /api/v1/leases` returns the current lease table (bearer-authed if
+  auth is on).
+- Prometheus metrics: `exspeed_lease_held{name}`,
+  `exspeed_lease_acquire_total{name,result}`, `exspeed_lease_lost_total{name}`.
+  **Note:** the metric series include a sentinel `name="__init__"` value-0
+  observation (emitted at startup so descriptors appear in scrapes before
+  any real lease is acquired). Filter it out in dashboard queries:
+  `exspeed_lease_held{name!="__init__"}`.
+- The Postgres backend stores leases in a table you can query directly:
+  `SELECT * FROM exspeed_leases`.
+
+### What's not in v1
+
+- **Replicated stream storage.** Pods have independent data dirs; a stream
+  created on pod A is not visible from pod B. Horizontal scale for stream
+  traffic is a later plan.
+- **Cross-pod query/connector routing.** A continuous query that reads
+  stream-X must be lease-held by the pod that owns stream-X's data dir.
+  With hot-standby this is automatic; with more complex topologies
+  operators are responsible.
+- **mTLS or encrypted inter-pod coordination.** Shared Postgres/Redis
+  coordination traffic rides on whatever security those services provide.
+  Run them on a private network / VPC.
 
 ## Docker Deployment
 

@@ -47,3 +47,4 @@ rustls-pemfile = { workspace = true }
 portpicker = "0.1"
 tempfile = "3"
 rcgen = { workspace = true }
+tokio-postgres = { workspace = true }
