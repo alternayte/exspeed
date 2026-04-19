@@ -32,6 +32,14 @@ npm run typecheck    # tsc --noEmit
 docker-compose up -d   # Postgres (5432), RabbitMQ (5672/15672), MinIO (9000/9001)
 ```
 
+### Operator env vars (Plan A hardening)
+- `LOG_FORMAT=json|text` — tracing output format (default `text`).
+- `EXSPEED_MAX_CONNS` — concurrent TCP connection cap (default `1024`); rejections logged + counted in `exspeed_connections_rejected_total`.
+- Server takes an exclusive `flock` on `{data_dir}/.exspeed.lock` at startup; a second process on the same dir fails fast.
+- `SIGTERM`/`SIGINT` triggers graceful shutdown with a 10s drain.
+- `/healthz` = leader-only (Plan E); `/readyz` = startup-complete + `data_dir` writable.
+- Docker image runs as `uid 1000` — k8s pods need `fsGroup: 1000` for PV writes.
+
 ## Architecture
 
 ### Crate Dependency Graph (bottom-up)
