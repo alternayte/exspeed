@@ -463,8 +463,12 @@ where
     // on top of this gate.
     ready.store(true, std::sync::atomic::Ordering::Release);
 
+    let api_cancel = cancel_token.clone();
     tokio::spawn(async move {
-        if let Err(e) = exspeed_api::serve(state, api_addr, http_tls).await {
+        let shutdown = async move { api_cancel.cancelled().await };
+        if let Err(e) =
+            exspeed_api::serve_with_shutdown(state, api_addr, http_tls, shutdown).await
+        {
             error!("HTTP API exited: {}", e);
         }
     });
