@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import * as net from "node:net";
 import { ExspeedClient } from "../src/client.js";
 import {
@@ -7,6 +7,7 @@ import {
 import { decodePublish } from "../src/protocol/publish.js";
 import { decodeCreateStream } from "../src/protocol/stream.js";
 import { encodeRecord } from "../src/protocol/record.js";
+import { Connection } from "../src/connection.js";
 
 function createTestServer(
   handler: (frame: { opcode: OpCode; correlationId: number; payload: Buffer }, socket: net.Socket) => void,
@@ -209,5 +210,98 @@ describe("ExspeedClient", () => {
     expect(latency).toBeGreaterThanOrEqual(0);
 
     await client.close();
+  });
+});
+
+describe("subscribe() ack/nack routing", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("ackFn binds to subscription's own connection (not mainConn)", async () => {
+    const { QueueOverflowError: _ } = await import("../src/errors.js"); // side-effect-free import just to ensure module loads
+    const client = new ExspeedClient({
+      brokers: [{ host: "127.0.0.1", port: 9 }], // discard port — we stub connect
+      clientId: "ack-routing-test",
+      reconnect: false,
+    });
+
+    // Stub Connection so we don't actually touch the network.
+    vi.spyOn(Connection.prototype as any, "connect").mockResolvedValue(undefined);
+    vi.spyOn(Connection.prototype as any, "request").mockResolvedValue({
+      opcode: 0x10, payload: Buffer.alloc(0), correlationId: 0, version: 1,
+    });
+
+    const sub = await client.subscribe("c");
+    const entry = (client as any).subscriptions.get("c");
+    expect(entry).toBeDefined();
+    expect(entry.conn).not.toBe((client as any).mainConn);
+
+    // Push a synthetic record via the subscription's "push" event pipeline.
+    const { encodeRecord: encRec } = await import("../src/protocol/record.js");
+    const { OpCode } = await import("../src/protocol/index.js");
+    const frame = {
+      opcode: OpCode.Record,
+      correlationId: 0,
+      payload: encRec({
+        consumerName: "c", offset: 5n, timestamp: 0n,
+        subject: "s", deliveryAttempt: 1, key: undefined,
+        value: Buffer.from(""), headers: [],
+      }),
+      version: 1,
+    };
+    entry.conn.emit("push", frame);
+
+    // Pull from the iterator and ack.
+    const iter = entry.sub[Symbol.asyncIterator]();
+    const next = await iter.next();
+    expect(next.done).toBe(false);
+
+    // Reset the request spy so we only observe the ack call.
+    const reqSpy = vi.spyOn(Connection.prototype as any, "request");
+    reqSpy.mockClear();
+    // Re-mock after clearing (spyOn restores to original, so re-spy with mock)
+    reqSpy.mockResolvedValue({
+      opcode: 0x10, payload: Buffer.alloc(0), correlationId: 0, version: 1,
+    });
+
+    await next.value!.ack();
+
+    // The ack should have called request on entry.conn (subscription's own),
+    // NOT on mainConn. We inspect mock.instances to verify the `this` binding.
+    expect(reqSpy).toHaveBeenCalledTimes(1);
+    const ackThis = reqSpy.mock.instances[0];
+    expect(ackThis).toBe(entry.conn);
+    expect(ackThis).not.toBe((client as any).mainConn);
+
+    await client.close(100);
+  });
+
+  it("legacy host/port still works", () => {
+    const client = new ExspeedClient({
+      host: "broker.example.com",
+      port: 6000,
+      clientId: "legacy-test",
+    });
+    const endpoints = (client as any).resolveEndpoints();
+    expect(endpoints).toEqual([{ host: "broker.example.com", port: 6000 }]);
+  });
+
+  it("brokers wins when both host/port and brokers are provided", () => {
+    const client = new ExspeedClient({
+      host: "old.example.com",
+      port: 5000,
+      brokers: [{ host: "new.example.com", port: 5933 }],
+      clientId: "both-test",
+    });
+    const endpoints = (client as any).resolveEndpoints();
+    expect(endpoints).toEqual([{ host: "new.example.com", port: 5933 }]);
+  });
+
+  it("brokers entry without port uses DEFAULT_PORT", () => {
+    const client = new ExspeedClient({
+      brokers: [{ host: "broker.example.com" }],
+      clientId: "default-port-test",
+    });
+    const endpoints = (client as any).resolveEndpoints();
+    expect(endpoints).toEqual([{ host: "broker.example.com", port: 5933 }]);
   });
 });

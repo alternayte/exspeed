@@ -65,6 +65,8 @@ export class Message {
 
 export interface SubscriptionOptions {
   maxQueueSize: number;
+  /** Accepted but behavior is implemented in Task 4. */
+  overflowPolicy?: "drop-oldest" | "error";
 }
 
 export class Subscription extends EventEmitter implements AsyncIterable<Message> {

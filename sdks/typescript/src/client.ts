@@ -10,7 +10,7 @@ import {
 import { Subscription } from "./subscription.js";
 import { ServerError, ValidationError } from "./errors.js";
 import type {
-  ClientOptions, PublishOptions, PublishResult, CreateStreamOptions,
+  BrokerEndpoint, ClientOptions, PublishOptions, PublishResult, CreateStreamOptions,
   CreateConsumerOptions, SubscribeOptions, FetchOptions, FetchRecord,
   SeekOptions, SeekResult,
 } from "./types.js";
@@ -86,15 +86,16 @@ export class ExspeedClient extends EventEmitter {
 
     const sub = new Subscription(consumerName, subscriberId, {
       maxQueueSize: options?.maxQueueSize ?? 1000,
+      overflowPolicy: options?.overflowPolicy ?? "drop-oldest",
     });
 
     const ackFn = async (cn: string, offset: bigint) => {
       const payload = encodeAck({ consumerName: cn, offset });
-      await this.mainConn.request(OpCode.Ack, payload);
+      await conn.request(OpCode.Ack, payload);
     };
     const nackFn = async (cn: string, offset: bigint) => {
       const payload = encodeAck({ consumerName: cn, offset });
-      await this.mainConn.request(OpCode.Nack, payload);
+      await conn.request(OpCode.Nack, payload);
     };
 
     conn.on("push", (frame: Frame) => {
@@ -219,8 +220,9 @@ export class ExspeedClient extends EventEmitter {
   }
 
   private createConnection(): Connection {
+    const endpoints = this.resolveEndpoints();
     const connOpts: ConnectionOptions = {
-      endpoints: [{ host: this.opts.host ?? "localhost", port: this.opts.port ?? DEFAULT_PORT }],
+      endpoints,
       clientId: this.opts.clientId,
       auth: this.opts.auth,
       reconnect: this.opts.reconnect ?? true,
@@ -232,12 +234,26 @@ export class ExspeedClient extends EventEmitter {
       tls: this.opts.tls ?? false,
     };
     const conn = new Connection(connOpts);
-    conn.on("connected", () => this.emit("connected"));
+    conn.on("connected", (ep) => this.emit("connected", ep));
     conn.on("disconnected", (info) => this.emit("disconnected", info));
     conn.on("reconnecting", (info) => this.emit("reconnecting", info));
     conn.on("reconnected", (info) => this.emit("reconnected", info));
+    conn.on("endpoint_changed", (info) => this.emit("endpoint_changed", info));
     conn.on("close", (info) => this.emit("close", info));
     return conn;
+  }
+
+  private resolveEndpoints(): BrokerEndpoint[] {
+    if (this.opts.brokers && this.opts.brokers.length > 0) {
+      return this.opts.brokers.map((b) => ({
+        host: b.host,
+        port: b.port ?? DEFAULT_PORT,
+      }));
+    }
+    return [{
+      host: this.opts.host ?? "localhost",
+      port: this.opts.port ?? DEFAULT_PORT,
+    }];
   }
 
   private forceClose(): void {
