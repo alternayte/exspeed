@@ -6,6 +6,7 @@ pub mod delivery;
 pub mod handlers;
 pub mod lease;
 pub mod lease_retrier;
+pub mod leadership;
 pub mod persistence;
 pub mod retention_task;
 pub mod work_coordinator;
