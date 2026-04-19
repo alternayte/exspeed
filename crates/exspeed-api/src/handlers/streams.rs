@@ -1,16 +1,17 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::json;
 
+use exspeed_broker::broker_append::AppendResult;
 use exspeed_common::StreamName;
 use exspeed_storage::file::stream_config::StreamConfig;
-use exspeed_streams::{Record, StorageEngine};
+use exspeed_streams::{Record, StorageError, StorageEngine};
 
 use crate::state::AppState;
 
@@ -280,20 +281,23 @@ pub struct PublishBody {
     #[serde(default)]
     pub key: Option<String>,
     pub data: serde_json::Value,
+    #[serde(default)]
+    pub msg_id: Option<String>,
 }
 
 pub async fn publish_to_stream(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
     Json(body): Json<PublishBody>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let stream_name = match StreamName::try_from(name.as_str()) {
         Ok(n) => n,
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": e.to_string()})),
-            );
+            )
+                .into_response();
         }
     };
 
@@ -309,36 +313,80 @@ pub async fn publish_to_stream(
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": format!("failed to serialize data: {}", e)})),
-            );
+            )
+                .into_response();
         }
     };
 
     let key = body.key.map(|k| Bytes::from(k.into_bytes()));
 
+    // Translate msg_id → x-idempotency-key header.
+    let mut headers = vec![];
+    if let Some(ref id) = body.msg_id {
+        headers.push(("x-idempotency-key".to_string(), id.clone()));
+    }
+
     let record = Record {
         key,
         value,
         subject,
-        headers: vec![],
+        headers,
     };
 
     let start = std::time::Instant::now();
-    match state.storage.append(&stream_name, &record).await {
-        Ok(offset) => {
+    match state.broker.broker_append.append(&stream_name, &record).await {
+        Ok(AppendResult::Written(offset)) => {
             let elapsed_secs = start.elapsed().as_secs_f64();
             state
                 .metrics
                 .record_publish_latency(stream_name.as_str(), elapsed_secs);
             state.metrics.record_publish(stream_name.as_str());
-            (StatusCode::CREATED, Json(json!({"offset": offset.0})))
+            (
+                StatusCode::CREATED,
+                Json(json!({"offset": offset.0, "duplicate": false})),
+            )
+                .into_response()
         }
-        Err(exspeed_streams::StorageError::StreamNotFound(_)) => (
+        Ok(AppendResult::Duplicate(offset)) => {
+            let elapsed_secs = start.elapsed().as_secs_f64();
+            state
+                .metrics
+                .record_publish_latency(stream_name.as_str(), elapsed_secs);
+            state.metrics.record_publish(stream_name.as_str());
+            (
+                StatusCode::OK,
+                Json(json!({"offset": offset.0, "duplicate": true})),
+            )
+                .into_response()
+        }
+        Err(StorageError::StreamNotFound(_)) => (
             StatusCode::NOT_FOUND,
             Json(json!({"error": format!("stream '{}' not found", name)})),
-        ),
+        )
+            .into_response(),
+        Err(StorageError::KeyCollision { stored_offset }) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "msg_id already used for a different message body",
+                "stored_offset": stored_offset,
+            })),
+        )
+            .into_response(),
+        Err(StorageError::DedupMapFull { retry_after_secs }) => {
+            let mut resp_headers = HeaderMap::new();
+            if let Ok(val) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+                resp_headers.insert(axum::http::header::RETRY_AFTER, val);
+            }
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                resp_headers,
+                Json(json!({"error": "dedup map full, retry later", "retry_after_secs": retry_after_secs})),
+            )
+                .into_response()
+        }
         Err(e) => {
             let kind = match &e {
-                exspeed_streams::StorageError::Io(io_err)
+                StorageError::Io(io_err)
                     if exspeed_storage::file::io_errors::is_storage_full(io_err) =>
                 {
                     "storage_full"
@@ -352,6 +400,7 @@ pub async fn publish_to_stream(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": e.to_string()})),
             )
+                .into_response()
         }
     }
 }

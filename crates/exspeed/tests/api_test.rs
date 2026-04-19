@@ -295,3 +295,105 @@ async fn metrics_endpoint_returns_prometheus_text() {
         &body[..body.len().min(500)]
     );
 }
+
+// ---------------------------------------------------------------------------
+// HTTP publish with msg_id deduplication (Task 5)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn http_publish_with_msg_id_dedupes() {
+    let (_tcp, http) = start_server().await;
+
+    // Create stream.
+    reqwest::Client::new()
+        .post(format!("{}/api/v1/streams", http))
+        .json(&serde_json::json!({ "name": "dedup-http" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "data": {"x": 1},
+        "msg_id": "test-msg-1"
+    });
+
+    // First publish — should be written.
+    let r1: serde_json::Value = client
+        .post(format!("{}/api/v1/streams/dedup-http/publish", http))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        r1["duplicate"], false,
+        "first publish should not be a duplicate; body: {:?}",
+        r1
+    );
+
+    // Second publish with same msg_id and same data — should be deduplicated.
+    let r2: serde_json::Value = client
+        .post(format!("{}/api/v1/streams/dedup-http/publish", http))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        r2["duplicate"], true,
+        "second publish with same msg_id should be duplicate; body: {:?}",
+        r2
+    );
+    assert_eq!(
+        r1["offset"], r2["offset"],
+        "duplicate should return the same offset; r1={:?} r2={:?}",
+        r1, r2
+    );
+}
+
+#[tokio::test]
+async fn http_publish_msg_id_collision_returns_conflict() {
+    let (_tcp, http) = start_server().await;
+
+    // Create stream.
+    reqwest::Client::new()
+        .post(format!("{}/api/v1/streams", http))
+        .json(&serde_json::json!({ "name": "coll-http" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let client = reqwest::Client::new();
+
+    // First publish.
+    client
+        .post(format!("{}/api/v1/streams/coll-http/publish", http))
+        .json(&serde_json::json!({ "data": {"body": "one"}, "msg_id": "coll-key" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    // Second publish with same msg_id but different data — should return 409.
+    let r = client
+        .post(format!("{}/api/v1/streams/coll-http/publish", http))
+        .json(&serde_json::json!({ "data": {"body": "two"}, "msg_id": "coll-key" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        409,
+        "same msg_id with different body should return 409 Conflict"
+    );
+}
