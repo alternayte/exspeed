@@ -422,4 +422,57 @@ describe("version negotiation", () => {
 
     await client.close();
   });
+
+  it("v1 fallback: explicit msgId replaces any existing x-idempotency-key header", async () => {
+    let capturedPublish: any;
+    testServer = createTestServer((frame, socket) => {
+      if (frame.opcode === OpCode.Connect) {
+        // v1 broker replies with Ok (0x80)
+        socket.write(encodeFrame({
+          version: PROTOCOL_VERSION,
+          opcode: OpCode.Ok,
+          correlationId: frame.correlationId,
+          payload: Buffer.alloc(0),
+        }));
+      } else if (frame.opcode === OpCode.Publish) {
+        capturedPublish = decodePublish(frame.payload);
+        const payload = Buffer.alloc(8);
+        payload.writeBigUInt64LE(2n, 0);
+        socket.write(encodeFrame({
+          version: PROTOCOL_VERSION,
+          opcode: OpCode.Ok,
+          correlationId: frame.correlationId,
+          payload,
+        }));
+      }
+    });
+    const port = await testServer.start();
+
+    const client = new ExspeedClient({ host: "127.0.0.1", port, clientId: "test-v1-replace", reconnect: false });
+    await client.connect();
+
+    const conn: Connection = (client as any).mainConn;
+    expect(conn.getServerVersion()).toBe(1);
+
+    // Publish with a pre-existing x-idempotency-key header and a msgId that should override it
+    await client.publish("s", {
+      subject: "s",
+      data: {},
+      msgId: "new-id",
+      headers: [["x-idempotency-key", "old-id"], ["other-header", "value"]],
+    });
+
+    // Assert there is exactly one x-idempotency-key header with the new value
+    const headers: [string, string][] = capturedPublish.headers;
+    const idempotencyHeaders = headers.filter(([k]) => k === "x-idempotency-key");
+    expect(idempotencyHeaders.length).toBe(1);
+    expect(idempotencyHeaders[0][1]).toBe("new-id");
+
+    // Other headers should be preserved
+    const otherHeaders = headers.filter(([k]) => k === "other-header");
+    expect(otherHeaders.length).toBe(1);
+    expect(otherHeaders[0][1]).toBe("value");
+
+    await client.close();
+  });
 });

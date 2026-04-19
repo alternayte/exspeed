@@ -76,8 +76,8 @@ export class ExspeedClient extends EventEmitter {
       if (this.mainConn.getServerVersion() >= 2) {
         msgId = options.msgId;
       } else {
-        headers = { ...(headers ?? []) } as unknown as [string, string][];
-        headers = [...(options.headers ?? []), ["x-idempotency-key", options.msgId]] as [string, string][];
+        const filtered = (headers ?? []).filter(([k]) => k.toLowerCase() !== 'x-idempotency-key');
+        headers = [...filtered, ["x-idempotency-key", options.msgId]];
       }
     }
 
