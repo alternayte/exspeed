@@ -10,6 +10,7 @@ exspeed-protocol = { path = "../exspeed-protocol" }
 exspeed-storage = { path = "../exspeed-storage" }
 bytes = { workspace = true }
 bincode = { workspace = true }
+parking_lot = "0.12"
 twox-hash = "1.6"
 # Used in Task 3 (snapshot CRCs); declared here now so Task 3 has no Cargo.toml churn.
 crc32c = { workspace = true }
