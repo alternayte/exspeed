@@ -1,0 +1,40 @@
+[package]
+name = "exspeed-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "exspeed-bench"
+path = "src/main.rs"
+
+[dependencies]
+exspeed-common = { path = "../exspeed-common" }
+exspeed-protocol = { path = "../exspeed-protocol" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+hdrhistogram = { workspace = true }
+sysinfo = { workspace = true }
+reqwest = { workspace = true }
+chrono = { workspace = true }
+rdkafka = { workspace = true, optional = true }
+
+[features]
+default = []
+comparison = ["dep:rdkafka"]
+
+[dev-dependencies]
+exspeed = { path = "../exspeed" }
+portpicker = "0.1"
+tempfile = "3"
