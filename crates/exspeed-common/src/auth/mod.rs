@@ -2,5 +2,7 @@
 //! `docs/superpowers/specs/2026-04-20-multi-tenant-auth-design.md`.
 
 pub mod compare;
+pub mod error;
 
 pub use compare::verify_token;
+pub use error::AuthError;
