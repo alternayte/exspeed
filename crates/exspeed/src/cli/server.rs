@@ -548,6 +548,10 @@ where
         leadership: leadership.clone(),
         ready: ready.clone(),
         data_dir: args.data_dir.clone(),
+        // Multi-pod plumbing lives in Commit 4 (Plan Task 20). Single-pod
+        // pods hit the 503 branch of GET /api/v1/cluster/followers, which
+        // is the correct signal — that endpoint is meaningless here.
+        replication_coordinator: None,
     });
 
     // Spawn the leader supervisor: waits for is_leader=true, then runs

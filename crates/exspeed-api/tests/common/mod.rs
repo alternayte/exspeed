@@ -137,5 +137,6 @@ pub async fn make_state_with_leader(leader: bool) -> Arc<exspeed_api::AppState> 
         // /readyz directly should set this themselves.
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         data_dir,
+        replication_coordinator: None,
     })
 }
