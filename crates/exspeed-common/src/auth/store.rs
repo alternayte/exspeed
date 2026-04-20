@@ -193,3 +193,219 @@ pub fn sha256_hex(raw: &[u8]) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_tmp(content: &str) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f
+    }
+
+    fn hash_of(raw: &str) -> String {
+        sha256_hex(raw.as_bytes())
+    }
+
+    #[test]
+    fn build_from_env_only_injects_legacy_admin() {
+        let store = CredentialStore::build(None, Some("raw-secret")).unwrap();
+        assert_eq!(store.len(), 1);
+        let (file_count, legacy) = store.source_breakdown();
+        assert_eq!(file_count, 0);
+        assert!(legacy);
+        let digest: [u8; 32] = sha2::Sha256::digest(b"raw-secret").into();
+        let id = store.lookup(&digest).expect("legacy-admin should resolve");
+        assert_eq!(id.name, LEGACY_ADMIN_NAME);
+        assert!(id.has_global_admin());
+    }
+
+    #[test]
+    fn build_from_file_only() {
+        let file = write_tmp(&format!(
+            r#"
+[[credentials]]
+name = "orders-service"
+token_sha256 = "{}"
+permissions = [
+  {{ streams = "orders-*", actions = ["publish", "subscribe"] }},
+]
+"#,
+            hash_of("tok-orders")
+        ));
+        let store = CredentialStore::build(Some(file.path()), None).unwrap();
+        assert_eq!(store.len(), 1);
+        let digest: [u8; 32] = sha2::Sha256::digest(b"tok-orders").into();
+        let id = store.lookup(&digest).unwrap();
+        assert_eq!(id.name, "orders-service");
+        assert!(id.authorize(Action::Publish, &crate::types::StreamName::try_from("orders-placed").unwrap()));
+    }
+
+    #[test]
+    fn build_with_both_merges() {
+        let file = write_tmp(&format!(
+            r#"
+[[credentials]]
+name = "orders-service"
+token_sha256 = "{}"
+permissions = [{{ streams = "orders-*", actions = ["publish"] }}]
+"#,
+            hash_of("tok-orders")
+        ));
+        let store = CredentialStore::build(Some(file.path()), Some("legacy-token")).unwrap();
+        assert_eq!(store.len(), 2);
+        let (files, legacy) = store.source_breakdown();
+        assert_eq!(files, 1);
+        assert!(legacy);
+    }
+
+    #[test]
+    fn reject_reserved_legacy_admin_name_when_env_set() {
+        let file = write_tmp(&format!(
+            r#"
+[[credentials]]
+name = "legacy-admin"
+token_sha256 = "{}"
+permissions = [{{ streams = "*", actions = ["admin"] }}]
+"#,
+            hash_of("x")
+        ));
+        let err = CredentialStore::build(Some(file.path()), Some("anything")).unwrap_err();
+        assert!(matches!(err, AuthError::LegacyAdminReserved));
+    }
+
+    #[test]
+    fn allow_legacy_admin_name_when_env_not_set() {
+        let file = write_tmp(&format!(
+            r#"
+[[credentials]]
+name = "legacy-admin"
+token_sha256 = "{}"
+permissions = [{{ streams = "*", actions = ["admin"] }}]
+"#,
+            hash_of("x")
+        ));
+        let store = CredentialStore::build(Some(file.path()), None).unwrap();
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn reject_duplicate_name() {
+        let file = write_tmp(&format!(
+            r#"
+[[credentials]]
+name = "dup"
+token_sha256 = "{}"
+
+[[credentials]]
+name = "dup"
+token_sha256 = "{}"
+"#,
+            hash_of("a"),
+            hash_of("b"),
+        ));
+        let err = CredentialStore::build(Some(file.path()), None).unwrap_err();
+        assert!(matches!(err, AuthError::DuplicateName(ref n) if n == "dup"));
+    }
+
+    #[test]
+    fn reject_duplicate_token_hash() {
+        let file = write_tmp(&format!(
+            r#"
+[[credentials]]
+name = "a"
+token_sha256 = "{h}"
+
+[[credentials]]
+name = "b"
+token_sha256 = "{h}"
+"#,
+            h = hash_of("same-token"),
+        ));
+        let err = CredentialStore::build(Some(file.path()), None).unwrap_err();
+        assert!(matches!(err, AuthError::DuplicateTokenHash { .. }));
+    }
+
+    #[test]
+    fn reject_malformed_hex() {
+        let file = write_tmp(
+            r#"
+[[credentials]]
+name = "bad"
+token_sha256 = "NOTHEX"
+"#,
+        );
+        let err = CredentialStore::build(Some(file.path()), None).unwrap_err();
+        assert!(matches!(err, AuthError::InvalidTokenHash { ref name } if name == "bad"));
+    }
+
+    #[test]
+    fn reject_invalid_name() {
+        let file = write_tmp(&format!(
+            r#"
+[[credentials]]
+name = "has spaces"
+token_sha256 = "{}"
+"#,
+            hash_of("x"),
+        ));
+        let err = CredentialStore::build(Some(file.path()), None).unwrap_err();
+        assert!(matches!(err, AuthError::InvalidName { .. }));
+    }
+
+    #[test]
+    fn reject_unknown_action() {
+        let file = write_tmp(&format!(
+            r#"
+[[credentials]]
+name = "a"
+token_sha256 = "{}"
+permissions = [{{ streams = "*", actions = ["manage"] }}]
+"#,
+            hash_of("x"),
+        ));
+        let err = CredentialStore::build(Some(file.path()), None).unwrap_err();
+        assert!(matches!(err, AuthError::UnknownAction { ref action, .. } if action == "manage"));
+    }
+
+    #[test]
+    fn reject_invalid_glob_chars() {
+        let file = write_tmp(&format!(
+            r#"
+[[credentials]]
+name = "a"
+token_sha256 = "{}"
+permissions = [{{ streams = "orders.*", actions = ["publish"] }}]
+"#,
+            hash_of("x"),
+        ));
+        let err = CredentialStore::build(Some(file.path()), None).unwrap_err();
+        assert!(matches!(err, AuthError::InvalidGlob { .. }));
+    }
+
+    #[test]
+    fn lookup_miss_returns_none() {
+        let store = CredentialStore::build(None, Some("t")).unwrap();
+        assert!(store.lookup(&[0u8; 32]).is_none());
+    }
+
+    #[test]
+    fn empty_permissions_is_deny_all() {
+        let file = write_tmp(&format!(
+            r#"
+[[credentials]]
+name = "noop"
+token_sha256 = "{}"
+"#,
+            hash_of("x"),
+        ));
+        let store = CredentialStore::build(Some(file.path()), None).unwrap();
+        let id = store
+            .lookup(&sha2::Sha256::digest(b"x").into())
+            .unwrap();
+        assert!(!id.authorize(Action::Publish, &crate::types::StreamName::try_from("x").unwrap()));
+        assert!(!id.has_any_admin_permission());
+    }
+}
