@@ -13,10 +13,11 @@
 //!   5. `StreamReseedEvent` frames for every stream whose follower-cursor
 //!      is earlier than the leader's `earliest_offset`.
 //!   6. Catch-up: batched `RecordsAppended` frames up to each stream's tail.
-//!   7. Live fan-out: `tokio::select!` across the coordinator channel, a
-//!      heartbeat timer, and the server-wide cancel token. A closed channel
-//!      (e.g. coordinator dropped us because our queue was full) tears
-//!      the connection down cleanly.
+//!   7. Live fan-out: `tokio::select!` across the coordinator channel, an
+//!      idle-only heartbeat timer (fires only when no event has been sent
+//!      in the last `heartbeat_every`), and the server-wide cancel token.
+//!      A closed channel (e.g. coordinator dropped us because our queue
+//!      was full) tears the connection down cleanly.
 //!
 //! Invariant (bootstrap overlap): events buffered in the channel during
 //! catch-up MAY overlap offsets that catch-up also streams (e.g. an append
@@ -301,7 +302,14 @@ where
 }
 
 /// Steady-state loop: forward every `ReplicationEvent` from `rx` out as a
-/// frame, emit heartbeats on timer, exit cleanly on cancel or closed channel.
+/// frame, emit heartbeats *only when idle* (no event sent in the last
+/// `heartbeat_every`), exit cleanly on cancel or closed channel.
+///
+/// A `tokio::time::interval` would fire on a fixed wall-clock cadence
+/// regardless of event flow. By tracking `last_sent` and computing a
+/// per-iteration `sleep` we guarantee heartbeats only emit when the
+/// connection has genuinely been silent — matching the docstring and
+/// cutting noise on a busy leader.
 async fn fan_out_loop<W>(
     server: &ReplicationServer,
     framed_write: &mut FramedWrite<W, ExspeedCodec>,
@@ -312,12 +320,10 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let heartbeat_every = heartbeat_interval_from_env();
-    let mut heartbeat = tokio::time::interval(heartbeat_every);
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Skip the immediate tick so we don't emit a heartbeat at t=0.
-    heartbeat.tick().await;
+    let mut last_sent = tokio::time::Instant::now();
 
     loop {
+        let heartbeat_due_in = heartbeat_every.saturating_sub(last_sent.elapsed());
         tokio::select! {
             _ = cancel.cancelled() => {
                 return Ok(());
@@ -337,8 +343,9 @@ where
                     &server.metrics,
                 )
                 .await?;
+                last_sent = tokio::time::Instant::now();
             }
-            _ = heartbeat.tick() => {
+            _ = tokio::time::sleep(heartbeat_due_in) => {
                 write_frame(
                     framed_write,
                     OpCode::ReplicationHeartbeat,
@@ -347,6 +354,7 @@ where
                     &server.metrics,
                 )
                 .await?;
+                last_sent = tokio::time::Instant::now();
             }
         }
     }
