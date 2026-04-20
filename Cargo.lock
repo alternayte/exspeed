@@ -1287,6 +1287,7 @@ dependencies = [
  "futures-util",
  "opentelemetry",
  "parking_lot",
+ "prometheus",
  "redis",
  "rust-s3",
  "serde",

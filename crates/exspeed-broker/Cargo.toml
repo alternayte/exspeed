@@ -34,3 +34,4 @@ enumset = { version = "1" }
 [dev-dependencies]
 tempfile = "3"
 uuid = { workspace = true }
+prometheus = "0.13"

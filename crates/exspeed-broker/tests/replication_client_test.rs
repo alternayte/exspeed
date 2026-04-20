@@ -142,6 +142,49 @@ fn metrics() -> Arc<Metrics> {
     Arc::new(m)
 }
 
+/// Build `Metrics` + the prometheus `Registry` so a test can assert on
+/// specific counter/label-set values after the client emits them.
+fn metrics_with_registry() -> (Arc<Metrics>, prometheus::Registry) {
+    let (m, r) = Metrics::new();
+    (Arc::new(m), r)
+}
+
+/// Look up a counter by name + required label filters. Returns the
+/// summed value across matching series, or `0.0` if no series matched.
+/// Kept small rather than extracting to a helper crate — one metric,
+/// one test, per the reviewer's guidance.
+fn counter_value(
+    registry: &prometheus::Registry,
+    metric_name: &str,
+    required_labels: &[(&str, &str)],
+) -> f64 {
+    let mut total = 0.0;
+    for mf in registry.gather() {
+        if mf.get_name() != metric_name {
+            continue;
+        }
+        for m in mf.get_metric() {
+            let mut matches = true;
+            for (k, v) in required_labels {
+                let hit = m
+                    .get_label()
+                    .iter()
+                    .any(|lp: &prometheus::proto::LabelPair| {
+                        lp.get_name() == *k && lp.get_value() == *v
+                    });
+                if !hit {
+                    matches = false;
+                    break;
+                }
+            }
+            if matches {
+                total += m.get_counter().get_value();
+            }
+        }
+    }
+    total
+}
+
 /// Build a client with `MemoryStorage` and spawn its run loop at `addr`.
 /// The endpoint getter returns `addr` forever — the client dials, the
 /// handshake runs, and then the test controls the stream.
@@ -665,11 +708,12 @@ async fn divergent_history_truncation_on_manifest() {
     };
     let (addr, handshake_rx) = spawn_stub_leader(manifest).await;
 
+    let (metrics, registry) = metrics_with_registry();
     let handle = spawn_client(
         storage.clone() as Arc<dyn StorageEngine>,
         cursor_path.clone(),
         addr,
-        metrics(),
+        metrics,
         tmp,
     );
 
@@ -701,6 +745,80 @@ async fn divergent_history_truncation_on_manifest() {
         "cursor to be 30",
     )
     .await;
+
+    // Metric should record the 20 dropped records (50 → 30). Note the
+    // OTel-Prometheus exporter appends an extra `_total` suffix to any
+    // counter whose declared name already ends in `_total`, so the full
+    // series name becomes `exspeed_replication_truncated_records_total_total`.
+    let dropped = counter_value(
+        &registry,
+        "exspeed_replication_truncated_records_total_total",
+        &[("stream", "orders")],
+    );
+    assert!(
+        dropped >= 20.0,
+        "expected truncated_records_total_total ≥ 20 for stream=orders, got {dropped}"
+    );
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn manifest_creates_unknown_streams_with_retention() {
+    // Leader's manifest advertises `orders` with retention=(3600, 1_000_000)
+    // and offsets=(0, 0). Follower has no pre-existing stream. After the
+    // handshake completes — before any RecordsAppended arrives — the
+    // follower must have created `orders` locally and its bounds must
+    // report (0, 0).
+    let storage = Arc::new(MemoryStorage::new());
+    let tmp = TempDir::new().unwrap();
+    let cursor_path = tmp.path().join("cursor.json");
+
+    let manifest = ClusterManifest {
+        streams: vec![StreamSummary {
+            name: "orders".into(),
+            max_age_secs: 3600,
+            max_bytes: 1_000_000,
+            earliest_offset: 0,
+            latest_offset: 0,
+        }],
+        leader_holder_id: Uuid::new_v4(),
+    };
+    let (addr, handshake_rx) = spawn_stub_leader(manifest).await;
+
+    let handle = spawn_client(
+        storage.clone() as Arc<dyn StorageEngine>,
+        cursor_path,
+        addr,
+        metrics(),
+        tmp,
+    );
+
+    let _ = handshake_rx.await.expect("handshake");
+
+    let name = StreamName::try_from("orders").unwrap();
+    // Wait for the pre-create to land — the follower does it in
+    // `reconcile_manifest`, which runs after handshake but before the
+    // apply loop. `list_streams()` is the external signal.
+    wait_for(
+        || async {
+            storage
+                .list_streams()
+                .await
+                .map(|s| s.iter().any(|n| n.as_str() == "orders"))
+                .unwrap_or(false)
+        },
+        Duration::from_secs(3),
+        "manifest pre-create of 'orders'",
+    )
+    .await;
+
+    let (earliest, next) = storage.stream_bounds(&name).await.unwrap();
+    assert_eq!(
+        (earliest.0, next.0),
+        (0, 0),
+        "pre-created stream should report bounds (0, 0)"
+    );
 
     handle.shutdown().await;
 }
