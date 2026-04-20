@@ -599,6 +599,19 @@ impl ReplicationClient {
 
         let base = batch.base_offset;
         for (i, rec) in batch.records.into_iter().enumerate() {
+            // Test-only: inject an apply-time sleep to simulate a slow
+            // follower. Controlled via `EXSPEED_TEST_REPLICATION_APPLY_SLEEP_MS`;
+            // gated to debug assertions so a release build can't be
+            // accidentally poisoned. Reads are cheap (miss-cache + single
+            // var lookup) but happen per record — don't leave this set
+            // in production config.
+            #[cfg(any(test, debug_assertions))]
+            if let Ok(ms) = std::env::var("EXSPEED_TEST_REPLICATION_APPLY_SLEEP_MS") {
+                if let Ok(ms) = ms.parse::<u64>() {
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                }
+            }
+
             // Rehydrate msg_id back into headers so the follower's dedup
             // map matches the leader's. The leader's publish + catch-up
             // paths strip `x-idempotency-key` from headers into the
