@@ -23,6 +23,11 @@ pub enum OpCode {
     DeleteConsumer = 0x14,
     Query = 0x20,
     QueryCancel = 0x21,
+
+    // Cluster / replication — Follower -> Leader (0x30-0x3F)
+    ReplicateResume = 0x30,
+    ReplicationHeartbeat = 0x31, // classified as both client and server
+
     Ping = 0xF0,
 
     // Server -> Client
@@ -36,6 +41,16 @@ pub enum OpCode {
     Drain = 0x87,
     PublishOk = 0x88,
     ConnectOk = 0x89,
+
+    // Cluster / replication — Leader -> Follower (0xA0-0xAF)
+    ClusterManifest = 0xA0,
+    RecordsAppended = 0xA1,
+    StreamCreatedEvent = 0xA2,
+    StreamDeletedEvent = 0xA3,
+    RetentionUpdatedEvent = 0xA4,
+    RetentionTrimmedEvent = 0xA5,
+    StreamReseedEvent = 0xA6,
+
     Pong = 0xF1,
 }
 
@@ -60,6 +75,8 @@ impl OpCode {
                 | OpCode::Query
                 | OpCode::QueryCancel
                 | OpCode::Ping
+                | OpCode::ReplicateResume
+                | OpCode::ReplicationHeartbeat
         )
     }
 
@@ -77,6 +94,14 @@ impl OpCode {
                 | OpCode::PublishOk
                 | OpCode::ConnectOk
                 | OpCode::Pong
+                | OpCode::ReplicationHeartbeat
+                | OpCode::ClusterManifest
+                | OpCode::RecordsAppended
+                | OpCode::StreamCreatedEvent
+                | OpCode::StreamDeletedEvent
+                | OpCode::RetentionUpdatedEvent
+                | OpCode::RetentionTrimmedEvent
+                | OpCode::StreamReseedEvent
         )
     }
 
@@ -106,6 +131,8 @@ impl TryFrom<u8> for OpCode {
             0x14 => Ok(OpCode::DeleteConsumer),
             0x20 => Ok(OpCode::Query),
             0x21 => Ok(OpCode::QueryCancel),
+            0x30 => Ok(OpCode::ReplicateResume),
+            0x31 => Ok(OpCode::ReplicationHeartbeat),
             0xF0 => Ok(OpCode::Ping),
             0x80 => Ok(OpCode::Ok),
             0x81 => Ok(OpCode::Error),
@@ -117,6 +144,13 @@ impl TryFrom<u8> for OpCode {
             0x87 => Ok(OpCode::Drain),
             0x88 => Ok(OpCode::PublishOk),
             0x89 => Ok(OpCode::ConnectOk),
+            0xA0 => Ok(OpCode::ClusterManifest),
+            0xA1 => Ok(OpCode::RecordsAppended),
+            0xA2 => Ok(OpCode::StreamCreatedEvent),
+            0xA3 => Ok(OpCode::StreamDeletedEvent),
+            0xA4 => Ok(OpCode::RetentionUpdatedEvent),
+            0xA5 => Ok(OpCode::RetentionTrimmedEvent),
+            0xA6 => Ok(OpCode::StreamReseedEvent),
             0xF1 => Ok(OpCode::Pong),
             other => Err(ProtocolError::UnknownOpCode(other)),
         }
@@ -159,5 +193,39 @@ mod tests {
         assert!(OpCode::Ping.is_client_opcode());
         assert!(OpCode::Ok.is_server_opcode());
         assert!(OpCode::Pong.is_server_opcode());
+    }
+
+    #[test]
+    fn replication_opcodes_roundtrip() {
+        let codes = [
+            OpCode::ReplicateResume,
+            OpCode::ReplicationHeartbeat, // bidirectional — classified as client opcode for ergonomics
+            OpCode::ClusterManifest,
+            OpCode::RecordsAppended,
+            OpCode::StreamCreatedEvent,
+            OpCode::StreamDeletedEvent,
+            OpCode::RetentionUpdatedEvent,
+            OpCode::RetentionTrimmedEvent,
+            OpCode::StreamReseedEvent,
+        ];
+        for code in codes {
+            let byte = code.as_u8();
+            let back = OpCode::try_from(byte).unwrap();
+            assert_eq!(code, back);
+        }
+    }
+
+    #[test]
+    fn replication_client_server_classification() {
+        // Follower -> Leader
+        assert!(OpCode::ReplicateResume.is_client_opcode());
+        // Bidirectional — classified as both; test each discriminator returns true.
+        assert!(OpCode::ReplicationHeartbeat.is_client_opcode());
+        assert!(OpCode::ReplicationHeartbeat.is_server_opcode());
+        // Leader -> Follower
+        assert!(OpCode::ClusterManifest.is_server_opcode());
+        assert!(OpCode::RecordsAppended.is_server_opcode());
+        assert!(OpCode::StreamCreatedEvent.is_server_opcode());
+        assert!(OpCode::StreamReseedEvent.is_server_opcode());
     }
 }

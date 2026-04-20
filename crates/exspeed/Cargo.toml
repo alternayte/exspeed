@@ -54,3 +54,6 @@ tempfile = "3"
 rcgen = { workspace = true }
 tokio-postgres = { workspace = true }
 exspeed-protocol = { path = "../exspeed-protocol" }
+# Replication integration tests build ReplicateResume payloads directly;
+# bincode is the wire format the client/server use.
+bincode = { workspace = true }

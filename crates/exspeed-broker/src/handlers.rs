@@ -38,6 +38,16 @@ pub async fn handle_create_stream(broker: &Broker, req: CreateStreamRequest) -> 
                 .broker_append
                 .configure_stream(&stream_name, cfg.dedup_window_secs, cfg.dedup_max_entries)
                 .await;
+
+            // Fan out to replication followers (no-op if single-pod).
+            broker.emit_replication_event(|| {
+                use exspeed_protocol::messages::replicate::StreamCreatedEvent;
+                crate::replication::ReplicationEvent::StreamCreated(StreamCreatedEvent {
+                    name: stream_name.as_str().to_string(),
+                    max_age_secs: req.max_age_secs,
+                    max_bytes: req.max_bytes,
+                })
+            });
             ServerMessage::Ok
         }
         Err(e) => ServerMessage::Error {
@@ -80,16 +90,56 @@ pub async fn handle_publish(broker: &Broker, req: PublishRequest) -> ServerMessa
         value: req.value,
         subject: req.subject,
         headers,
+        timestamp_ns: None,
     };
 
     let start = std::time::Instant::now();
     match broker.broker_append.append(&stream_name, &record).await {
-        Ok(crate::broker_append::AppendResult::Written(offset)) => {
+        Ok(crate::broker_append::AppendResult::Written(offset, timestamp_ns)) => {
             let elapsed_secs = start.elapsed().as_secs_f64();
             broker
                 .metrics
                 .record_publish_latency(stream_name.as_str(), elapsed_secs);
             broker.metrics.record_publish(stream_name.as_str());
+
+            // Fan out to replication followers. Only on `Written` — a
+            // `Duplicate` means the record was persisted on an earlier
+            // publish, which was itself replicated at that time.
+            //
+            // Use the leader-assigned timestamp (converted from ns to ms)
+            // rather than a fresh wall-clock reading, so the follower's
+            // time-index matches the leader's for seek_by_time + windowed
+            // continuous queries.
+            broker.emit_replication_event(|| {
+                use exspeed_protocol::messages::replicate::{RecordsAppended, ReplicatedRecord};
+                // Translate `x-idempotency-key` out of the headers into
+                // the typed `msg_id` field. The follower's apply path
+                // rehydrates it back under the same header name, so this
+                // keeps the wire tight (no duplicated representation) and
+                // lets the follower skip a per-record header dedup pass.
+                let mut headers = record.headers.clone();
+                let mut msg_id = None;
+                headers.retain(|(k, v)| {
+                    if k.eq_ignore_ascii_case("x-idempotency-key") {
+                        msg_id = Some(v.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                crate::replication::ReplicationEvent::RecordsAppended(RecordsAppended {
+                    stream: stream_name.as_str().to_string(),
+                    base_offset: offset.0,
+                    records: vec![ReplicatedRecord {
+                        subject: record.subject.clone(),
+                        payload: record.value.to_vec(),
+                        headers,
+                        timestamp_ms: timestamp_ns / 1_000_000,
+                        msg_id,
+                    }],
+                })
+            });
+
             ServerMessage::PublishOk {
                 offset: offset.0,
                 duplicate: false,
@@ -526,6 +576,7 @@ pub async fn handle_nack(broker: &Broker, req: NackRequest) -> ServerMessage {
             value: record.value.clone(),
             subject: record.subject.clone(),
             headers: dlq_headers,
+            timestamp_ns: None,
         };
 
         if let Err(e) = broker.storage.append(&dlq_stream_name, &dlq_record).await {

@@ -94,6 +94,7 @@ impl StreamOffsetStore {
             value: Bytes::from(value),
             subject: format!("offsets.{}", connector),
             headers: vec![],
+            timestamp_ns: None,
         };
 
         storage

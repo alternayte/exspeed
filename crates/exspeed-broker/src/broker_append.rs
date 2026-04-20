@@ -18,14 +18,18 @@ use exspeed_streams::StorageError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppendResult {
-    Written(Offset),
+    /// A new record was persisted at the returned offset and timestamp
+    /// (nanoseconds since the UNIX epoch, as assigned by the storage engine).
+    Written(Offset, u64),
+    /// Idempotency hit: the record was already persisted at the returned
+    /// offset on an earlier publish. No new timestamp is meaningful here.
     Duplicate(Offset),
 }
 
 impl AppendResult {
     pub fn offset(&self) -> Offset {
         match self {
-            AppendResult::Written(o) | AppendResult::Duplicate(o) => *o,
+            AppendResult::Written(o, _) | AppendResult::Duplicate(o) => *o,
         }
     }
 }
@@ -253,12 +257,12 @@ impl BrokerAppend {
 
         let Some(key) = idemp_key else {
             // No msg_id — pass-through directly; no dedup or locking overhead.
-            let offset = self
+            let (offset, timestamp_ns) = self
                 .storage
                 .append(stream, record)
                 .await
                 .inspect_err(|e| self.record_write_error(stream, e))?;
-            return Ok(AppendResult::Written(offset));
+            return Ok(AppendResult::Written(offset, timestamp_ns));
         };
 
         let body_hash = hash_body(&record.value);
@@ -350,7 +354,7 @@ impl BrokerAppend {
         }
 
         // Phase 3: storage write — per-stream mutex still held, no dedup lock.
-        let offset = self
+        let (offset, timestamp_ns) = self
             .storage
             .append(stream, record)
             .await
@@ -369,7 +373,7 @@ impl BrokerAppend {
             m.record_dedup_write(stream.as_str(), "written");
         }
 
-        Ok(AppendResult::Written(offset))
+        Ok(AppendResult::Written(offset, timestamp_ns))
     }
 
     /// Run periodic eviction of expired dedup entries. Call from a background task.
@@ -686,6 +690,7 @@ mod tests {
             value,
             subject: "test.event".to_string(),
             headers,
+            timestamp_ns: None,
         }
     }
 
@@ -699,6 +704,7 @@ mod tests {
             value: Bytes::copy_from_slice(value),
             subject: subject.to_string(),
             headers,
+            timestamp_ns: None,
         }
     }
 
@@ -727,7 +733,7 @@ mod tests {
         let body = Bytes::from_static(b"hello");
         let r1 = ba.append(&stream, &make_record(Some("key-A"), body.clone())).await.unwrap();
         let r2 = ba.append(&stream, &make_record(Some("key-A"), body.clone())).await.unwrap();
-        assert!(matches!(r1, AppendResult::Written(_)));
+        assert!(matches!(r1, AppendResult::Written(_, _)));
         assert!(matches!(r2, AppendResult::Duplicate(_)));
         assert_eq!(r1.offset(), r2.offset());
     }
@@ -764,7 +770,7 @@ mod tests {
         ba.configure_stream(&stream, 300, 1).await;
         ba.append(&stream, &make_record(Some("k1"), Bytes::from_static(b"a"))).await.unwrap();
         let res = ba.append(&stream, &make_record(None, Bytes::from_static(b"b"))).await.unwrap();
-        assert!(matches!(res, AppendResult::Written(_)));
+        assert!(matches!(res, AppendResult::Written(..)));
     }
 
     #[tokio::test]
@@ -792,8 +798,8 @@ mod tests {
         let res1 = ba.append(&stream, &r1).await.unwrap();
         let res2 = ba.append(&stream, &r2).await.unwrap();
 
-        assert!(matches!(res1, AppendResult::Written(Offset(0))));
-        assert!(matches!(res2, AppendResult::Written(Offset(1)))); // both written
+        assert!(matches!(res1, AppendResult::Written(Offset(0), _)));
+        assert!(matches!(res2, AppendResult::Written(Offset(1), _))); // both written
     }
 
     #[tokio::test]
@@ -806,7 +812,7 @@ mod tests {
         let res1 = ba.append(&stream, &r1).await.unwrap();
         let res2 = ba.append(&stream, &r2).await.unwrap();
 
-        assert!(matches!(res1, AppendResult::Written(Offset(0))));
+        assert!(matches!(res1, AppendResult::Written(Offset(0), _)));
         assert!(matches!(res2, AppendResult::Duplicate(Offset(0)))); // deduped
     }
 
@@ -820,8 +826,8 @@ mod tests {
         let res1 = ba.append(&stream, &r1).await.unwrap();
         let res2 = ba.append(&stream, &r2).await.unwrap();
 
-        assert!(matches!(res1, AppendResult::Written(Offset(0))));
-        assert!(matches!(res2, AppendResult::Written(Offset(1))));
+        assert!(matches!(res1, AppendResult::Written(Offset(0), _)));
+        assert!(matches!(res2, AppendResult::Written(Offset(1), _)));
     }
 
     #[tokio::test]
@@ -836,8 +842,8 @@ mod tests {
         let res1 = ba.append(&s1, &r).await.unwrap();
         let res2 = ba.append(&s2, &r).await.unwrap();
 
-        assert!(matches!(res1, AppendResult::Written(Offset(0))));
-        assert!(matches!(res2, AppendResult::Written(Offset(0))));
+        assert!(matches!(res1, AppendResult::Written(Offset(0), _)));
+        assert!(matches!(res2, AppendResult::Written(Offset(0), _)));
     }
 
     #[tokio::test]
@@ -852,12 +858,14 @@ mod tests {
             value: Bytes::from_static(b"data1"),
             subject: "evt".to_string(),
             headers: vec![("x-idempotency-key".to_string(), "key-A".to_string())],
+            timestamp_ns: None,
         };
         let r2 = Record {
             key: None,
             value: Bytes::from_static(b"data2"),
             subject: "evt".to_string(),
             headers: vec![("x-idempotency-key".to_string(), "key-B".to_string())],
+            timestamp_ns: None,
         };
         storage.append(&stream, &r1).await.unwrap();
         storage.append(&stream, &r2).await.unwrap();
@@ -878,12 +886,12 @@ mod tests {
         // New key should still work.
         let new = make_record(Some("key-C"), Bytes::from_static(b"data3"));
         let res = ba.append(&stream, &new).await.unwrap();
-        assert!(matches!(res, AppendResult::Written(Offset(2))));
+        assert!(matches!(res, AppendResult::Written(Offset(2), _)));
     }
 
     #[tokio::test]
     async fn append_result_offset_helper() {
-        assert_eq!(AppendResult::Written(Offset(5)).offset(), Offset(5));
+        assert_eq!(AppendResult::Written(Offset(5), 0).offset(), Offset(5));
         assert_eq!(AppendResult::Duplicate(Offset(3)).offset(), Offset(3));
     }
 
@@ -915,11 +923,11 @@ mod tests {
 
         // Exactly one Written, one Duplicate — offsets must match.
         let (written_count, duplicate_count) = match (&r1, &r2) {
-            (AppendResult::Written(_), AppendResult::Duplicate(_))
-            | (AppendResult::Duplicate(_), AppendResult::Written(_)) => (1, 1),
+            (AppendResult::Written(..), AppendResult::Duplicate(_))
+            | (AppendResult::Duplicate(_), AppendResult::Written(..)) => (1, 1),
             _ => (
-                matches!(r1, AppendResult::Written(_)) as u32
-                    + matches!(r2, AppendResult::Written(_)) as u32,
+                matches!(r1, AppendResult::Written(..)) as u32
+                    + matches!(r2, AppendResult::Written(..)) as u32,
                 matches!(r1, AppendResult::Duplicate(_)) as u32
                     + matches!(r2, AppendResult::Duplicate(_)) as u32,
             ),

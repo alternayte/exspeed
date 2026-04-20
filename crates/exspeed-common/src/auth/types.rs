@@ -14,6 +14,9 @@ pub enum Action {
     Publish,
     Subscribe,
     Admin,
+    /// Cluster-internal: allows a follower pod to receive replication events
+    /// from the leader via the cluster port. Orthogonal to all other verbs.
+    Replicate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +125,19 @@ mod tests {
         let non_admin = ident(vec![("*", &[Action::Publish, Action::Subscribe])]);
         assert!(!non_admin.has_any_admin_permission());
         assert!(!non_admin.has_global_admin());
+    }
+
+    #[test]
+    fn authorize_replicate_verb_separate_from_admin() {
+        // A pure replicator identity: can replicate but not admin.
+        let rep_only = ident(vec![("*", &[Action::Replicate])]);
+        assert!(rep_only.authorize(Action::Replicate, &n("any-stream")));
+        assert!(!rep_only.authorize(Action::Admin, &n("any-stream")));
+
+        // An admin identity without Replicate cannot replicate — admin is not
+        // a superset.
+        let admin_only = ident(vec![("*", &[Action::Admin])]);
+        assert!(!admin_only.authorize(Action::Replicate, &n("any-stream")));
     }
 
     #[test]

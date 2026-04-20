@@ -9,6 +9,8 @@ exspeed-streams = { path = "../exspeed-streams" }
 exspeed-protocol = { path = "../exspeed-protocol" }
 exspeed-storage = { path = "../exspeed-storage" }
 bytes = { workspace = true }
+bincode = { workspace = true }
+parking_lot = "0.12"
 twox-hash = "1.6"
 # Used in Task 3 (snapshot CRCs); declared here now so Task 3 has no Cargo.toml churn.
 crc32c = { workspace = true }
@@ -24,7 +26,12 @@ redis = { workspace = true }
 tokio-postgres = { workspace = true }
 rust-s3 = { workspace = true }
 uuid = { workspace = true }
+futures-util = { workspace = true }
+sha2 = "0.10"
+opentelemetry = { workspace = true }
+enumset = { version = "1" }
 
 [dev-dependencies]
 tempfile = "3"
 uuid = { workspace = true }
+prometheus = "0.13"

@@ -3,9 +3,20 @@
 //! under `EXSPEED_LEASE_REDIS_KEY_PREFIX` (default `exspeed:lease:`).
 //!
 //! This is the canonical Redlock single-instance pattern: SET-NX wins the
-//! lease atomically, and the value (a UUID) is checked before refresh/release
-//! so a process whose lease has been stolen cannot accidentally clobber the
-//! new holder's entry.
+//! lease atomically; the stored value is checked on refresh/release so a
+//! process whose lease has been stolen cannot clobber the new holder's entry.
+//!
+//! Value format (Plan G+): JSON blob
+//! `{"holder":"<uuid>","replication_endpoint":"<addr>"}`.
+//! `replication_endpoint` is optional (serialized only when `Some`). The
+//! heartbeat task refreshes TTL only — it never rewrites the value — so the
+//! blob is byte-stable for the tenure, which is what the Lua CAS compares.
+//!
+//! NOT backward-compatible with pre-Plan-G deployments that stored a bare
+//! UUID. A rolling upgrade will see CAS failures on old keys; those keys
+//! expire via TTL and the new scheme takes over on the first post-upgrade
+//! acquire. No operator action required — just expect a brief leadership
+//! re-election at the upgrade boundary.
 
 use std::env;
 use std::sync::Arc;
@@ -13,11 +24,35 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use redis::AsyncCommands;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{oneshot, watch, Mutex};
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
 use super::{LeaderLease, LeaseError, LeaseGuard, LeaseInfo};
+
+/// Value stored under each lease key. `serde(skip_serializing_if = "Option::is_none")`
+/// keeps the key absent from the JSON when `None`, so the on-the-wire bytes
+/// are identical across two acquires with the same UUID and no endpoint —
+/// this is what lets the heartbeat CAS remain exact-match on the stored value.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct StoredValue {
+    holder: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    replication_endpoint: Option<String>,
+}
+
+impl StoredValue {
+    fn encode(&self) -> String {
+        // serde_json is deterministic for a fixed struct + field order, so the
+        // output is byte-stable and safe to pass to the CAS.
+        serde_json::to_string(self).expect("StoredValue serialization is infallible")
+    }
+
+    fn decode(raw: &str) -> Option<Self> {
+        serde_json::from_str(raw).ok()
+    }
+}
 
 /// Lua script: refresh TTL only if the stored value still matches our
 /// holder UUID. Returns 1 if refreshed, 0 if not (lost or deleted).
@@ -89,10 +124,15 @@ impl LeaderLease for RedisLeaseBackend {
         &self,
         name: &str,
         ttl: Duration,
+        replication_endpoint: Option<&str>,
     ) -> Result<Option<LeaseGuard>, LeaseError> {
         let holder_id = Uuid::new_v4();
         let k = key(&self.inner.prefix, name);
-        let value = holder_id.to_string();
+        let stored = StoredValue {
+            holder: holder_id.to_string(),
+            replication_endpoint: replication_endpoint.map(|s| s.to_string()),
+        };
+        let value = stored.encode();
         let ttl_ms = ttl.as_millis() as u64;
 
         let mut conn = self.inner.conn.lock().await;
@@ -113,6 +153,7 @@ impl LeaderLease for RedisLeaseBackend {
                 self.inner.clone(),
                 name.to_string(),
                 holder_id,
+                value,
                 ttl,
             )))
         } else {
@@ -139,7 +180,7 @@ impl LeaderLease for RedisLeaseBackend {
 
         let mut out = Vec::with_capacity(keys.len());
         for k in keys {
-            let holder_str: Option<String> = conn
+            let raw: Option<String> = conn
                 .get(&k)
                 .await
                 .map_err(|e| LeaseError::Backend(format!("get: {e}")))?;
@@ -147,7 +188,7 @@ impl LeaderLease for RedisLeaseBackend {
                 .pttl(&k)
                 .await
                 .map_err(|e| LeaseError::Backend(format!("pttl: {e}")))?;
-            if let Some(hs) = holder_str {
+            if let Some(raw) = raw {
                 if pttl_ms <= 0 {
                     continue; // expired or no-TTL key
                 }
@@ -155,7 +196,16 @@ impl LeaderLease for RedisLeaseBackend {
                     .strip_prefix(&self.inner.prefix)
                     .unwrap_or(&k)
                     .to_string();
-                let holder = match Uuid::parse_str(&hs) {
+                // Tolerate pre-Plan-G bare-UUID values by falling back to
+                // parsing the raw string as a UUID. This is observability
+                // only — the refresh/release CAS still fails against the
+                // old value, which is how the rolling-upgrade failover
+                // actually happens.
+                let (holder, endpoint) = match StoredValue::decode(&raw) {
+                    Some(v) => (Uuid::parse_str(&v.holder), v.replication_endpoint),
+                    None => (Uuid::parse_str(&raw), None),
+                };
+                let holder = match holder {
                     Ok(u) => u,
                     Err(_) => continue,
                 };
@@ -164,6 +214,7 @@ impl LeaderLease for RedisLeaseBackend {
                     name,
                     holder,
                     expires_at,
+                    replication_endpoint: endpoint,
                 });
             }
         }
@@ -174,10 +225,16 @@ impl LeaderLease for RedisLeaseBackend {
 
 /// Spawn a heartbeat task that refreshes the lease every
 /// `heartbeat_interval` and CAS-releases on drop. Returns the LeaseGuard.
+///
+/// `stored_value` is the exact JSON blob written by `try_acquire` — we pass
+/// it here so the CAS can be an exact string match. The value never changes
+/// during a tenure (heartbeat only refreshes TTL), so stashing it once is
+/// sound and keeps the CAS one Redis round-trip instead of two.
 fn spawn_heartbeat(
     inner: Arc<Inner>,
     name: String,
     holder_id: Uuid,
+    stored_value: String,
     ttl: Duration,
 ) -> LeaseGuard {
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
@@ -185,7 +242,7 @@ fn spawn_heartbeat(
 
     let inner_hb = inner.clone();
     let name_hb = name.clone();
-    let holder_str = holder_id.to_string();
+    let cas_value = stored_value;
     tokio::spawn(async move {
         let mut consecutive_failures = 0u32;
         let mut interval = tokio::time::interval(inner_hb.heartbeat_interval);
@@ -205,7 +262,7 @@ fn spawn_heartbeat(
                     let mut conn = inner_hb.conn.lock().await;
                     let r: redis::RedisResult<i32> = redis::Script::new(RELEASE_LUA)
                         .key(&k)
-                        .arg(&holder_str)
+                        .arg(&cas_value)
                         .invoke_async(&mut *conn)
                         .await;
                     if let Err(e) = r {
@@ -219,7 +276,7 @@ fn spawn_heartbeat(
                     let mut conn = inner_hb.conn.lock().await;
                     let r: redis::RedisResult<i32> = redis::Script::new(REFRESH_LUA)
                         .key(&k)
-                        .arg(&holder_str)
+                        .arg(&cas_value)
                         .arg(ttl.as_millis() as u64)
                         .invoke_async(&mut *conn)
                         .await;

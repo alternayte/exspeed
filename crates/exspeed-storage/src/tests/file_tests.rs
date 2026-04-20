@@ -19,6 +19,7 @@ fn record(value: &[u8]) -> Record {
         value: Bytes::copy_from_slice(value),
         subject: "test.subject".into(),
         headers: vec![],
+        timestamp_ns: None,
     }
 }
 
@@ -34,7 +35,7 @@ async fn crash_recovery_replays_wal() {
         storage.create_stream(&stream("crash"), 0, 0).await.unwrap();
         for i in 0u64..10 {
             let val = format!("val-{}", i);
-            let offset = storage
+            let (offset, _) = storage
                 .append(&stream("crash"), &record(val.as_bytes()))
                 .await
                 .unwrap();
@@ -91,7 +92,7 @@ async fn segment_rolling() {
 
     for i in 0u64..1000 {
         let val = format!("rec-{:04}", i);
-        let offset = storage
+        let (offset, _) = storage
             .append(&stream("rolling"), &record(val.as_bytes()))
             .await
             .unwrap();
@@ -118,7 +119,7 @@ async fn milestone_10k_records_crash_recover() {
 
         for i in 0u64..10_000 {
             let val = format!("record-{:05}", i);
-            let offset = storage
+            let (offset, _) = storage
                 .append(&stream("milestone"), &record(val.as_bytes()))
                 .await
                 .unwrap();
@@ -175,6 +176,7 @@ fn retention_deletes_old_segments_by_age() {
                 value: Bytes::from(val),
                 subject: "test.subject".into(),
                 headers: vec![],
+                timestamp_ns: None,
             })
             .unwrap();
     }
@@ -225,6 +227,7 @@ fn retention_deletes_oldest_segments_by_size() {
                 value: Bytes::from(val),
                 subject: "test.subject".into(),
                 headers: vec![],
+                timestamp_ns: None,
             })
             .unwrap();
     }
@@ -291,6 +294,187 @@ async fn nonexistent_stream_query_returns_none() {
     assert!(storage.stream_head_offset("nope").is_none());
 }
 
+/// `truncate_from` with `drop_from` inside a sealed segment: the
+/// straddling sealed segment is rewritten, later sealed segments + the
+/// old active are deleted, and subsequent appends resume at `drop_from`.
+#[test]
+fn truncate_from_inside_sealed_segment() {
+    let dir = TempDir::new().unwrap();
+    let part_dir = dir.path().join("part0");
+
+    let mut partition = Partition::create(&part_dir, "test-stream", 0).unwrap();
+    partition.set_segment_max_bytes(64);
+
+    // Write enough records to produce several sealed segments + an active.
+    for i in 0u64..20 {
+        let val = format!("seg-{:04}", i);
+        partition
+            .append(&Record {
+                key: None,
+                value: Bytes::from(val),
+                subject: "test.subject".into(),
+                headers: vec![],
+                timestamp_ns: None,
+            })
+            .unwrap();
+    }
+    assert_eq!(partition.next_offset(), 20);
+
+    // Truncate at offset 7 — somewhere inside a sealed segment.
+    partition.truncate_from(7).unwrap();
+    assert_eq!(partition.next_offset(), 7);
+
+    // All surviving records should read back cleanly.
+    let records = partition.read(Offset(0), 100).unwrap();
+    assert_eq!(records.len(), 7);
+    for (i, r) in records.iter().enumerate() {
+        assert_eq!(r.offset, Offset(i as u64));
+        let expected = format!("seg-{:04}", i);
+        assert_eq!(r.value, Bytes::from(expected));
+    }
+
+    // Next append assigns exactly 7.
+    let (new_off, _) = partition
+        .append(&Record {
+            key: None,
+            value: Bytes::from_static(b"post-truncate"),
+            subject: "test.subject".into(),
+            headers: vec![],
+            timestamp_ns: None,
+        })
+        .unwrap();
+    assert_eq!(new_off, Offset(7));
+
+    // read_from(Offset(7)) returns the newly-appended record.
+    let tail = partition.read(Offset(7), 10).unwrap();
+    assert_eq!(tail.len(), 1);
+    assert_eq!(tail[0].offset, Offset(7));
+    assert_eq!(tail[0].value, Bytes::from_static(b"post-truncate"));
+}
+
+/// `truncate_from` with `drop_from` inside the active segment: old active
+/// is rewritten in place (same base_offset, records `< drop_from`
+/// preserved); next append resumes at `drop_from`.
+#[test]
+fn truncate_from_inside_active_segment() {
+    let dir = TempDir::new().unwrap();
+    let part_dir = dir.path().join("part0");
+
+    let mut partition = Partition::create(&part_dir, "test-stream", 0).unwrap();
+    // Large enough that all 10 records land in the active segment.
+    for i in 0u64..10 {
+        let val = format!("act-{:04}", i);
+        partition
+            .append(&Record {
+                key: None,
+                value: Bytes::from(val),
+                subject: "test.subject".into(),
+                headers: vec![],
+                timestamp_ns: None,
+            })
+            .unwrap();
+    }
+
+    partition.truncate_from(4).unwrap();
+    assert_eq!(partition.next_offset(), 4);
+
+    let records = partition.read(Offset(0), 100).unwrap();
+    assert_eq!(records.len(), 4);
+    assert_eq!(records[3].offset, Offset(3));
+
+    // Appending resumes at 4.
+    let (new_off, _) = partition
+        .append(&Record {
+            key: None,
+            value: Bytes::from_static(b"tail"),
+            subject: "test.subject".into(),
+            headers: vec![],
+            timestamp_ns: None,
+        })
+        .unwrap();
+    assert_eq!(new_off, Offset(4));
+}
+
+/// `truncate_from(0)` with sealed segments: all segments are rebuilt
+/// empty and the next append starts at 0.
+#[test]
+fn truncate_from_zero_wipes_all_segments() {
+    let dir = TempDir::new().unwrap();
+    let part_dir = dir.path().join("part0");
+
+    let mut partition = Partition::create(&part_dir, "test-stream", 0).unwrap();
+    partition.set_segment_max_bytes(64);
+
+    for i in 0u64..20 {
+        let val = format!("wipe-{:04}", i);
+        partition
+            .append(&Record {
+                key: None,
+                value: Bytes::from(val),
+                subject: "test.subject".into(),
+                headers: vec![],
+                timestamp_ns: None,
+            })
+            .unwrap();
+    }
+
+    partition.truncate_from(0).unwrap();
+    assert_eq!(partition.next_offset(), 0);
+
+    let records = partition.read(Offset(0), 100).unwrap();
+    assert!(records.is_empty());
+
+    // Append resumes at 0.
+    let (new_off, _) = partition
+        .append(&Record {
+            key: None,
+            value: Bytes::from_static(b"fresh"),
+            subject: "test.subject".into(),
+            headers: vec![],
+            timestamp_ns: None,
+        })
+        .unwrap();
+    assert_eq!(new_off, Offset(0));
+}
+
+/// `truncate_from` is durable: after a rewrite, closing and re-opening
+/// the storage replays WAL (which has been truncated) and the stream
+/// bounds reflect `next == drop_from`.
+#[tokio::test]
+async fn truncate_from_survives_reopen() {
+    let dir = TempDir::new().unwrap();
+
+    {
+        let storage = FileStorage::new(dir.path()).unwrap();
+        storage.create_stream(&stream("trunc-reopen"), 0, 0).await.unwrap();
+        for i in 0u64..10 {
+            let val = format!("val-{}", i);
+            storage
+                .append(&stream("trunc-reopen"), &record(val.as_bytes()))
+                .await
+                .unwrap();
+        }
+        storage.truncate_from(&stream("trunc-reopen"), Offset(6)).await.unwrap();
+    }
+
+    {
+        let storage = FileStorage::open(dir.path()).unwrap();
+        let (earliest, next) = storage.stream_bounds(&stream("trunc-reopen")).await.unwrap();
+        assert_eq!(earliest, Offset(0));
+        assert_eq!(next, Offset(6));
+
+        let records = storage.read(&stream("trunc-reopen"), Offset(0), 100).await.unwrap();
+        assert_eq!(records.len(), 6);
+        assert_eq!(records.last().unwrap().offset, Offset(5));
+
+        let (new_off, _) = storage
+            .append(&stream("trunc-reopen"), &record(b"post-reopen"))
+            .await
+            .unwrap();
+        assert_eq!(new_off, Offset(6));
+    }
+}
+
 /// Test that retention never deletes the active segment.
 #[test]
 fn retention_never_deletes_active_segment() {
@@ -306,6 +490,7 @@ fn retention_never_deletes_active_segment() {
             value: Bytes::from("active-data"),
             subject: "test.subject".into(),
             headers: vec![],
+            timestamp_ns: None,
         })
         .unwrap();
 

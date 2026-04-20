@@ -10,6 +10,7 @@ use crate::consumer_state::{ConsumerGroup, ConsumerState, DeliveryRecord};
 use crate::delivery::{run_delivery, DeliveryConfig};
 use crate::handlers;
 use crate::lease::LeaderLease;
+use crate::replication::ReplicationCoordinator;
 use exspeed_common::Metrics;
 use exspeed_protocol::messages::{ClientMessage, ServerMessage};
 use exspeed_streams::StorageEngine;
@@ -28,6 +29,9 @@ pub struct Broker {
     pub metrics: Arc<Metrics>,
     /// Set to `true` once all startup dedup rebuild tasks complete.
     pub dedup_ready: Arc<AtomicBool>,
+    /// Leader-side replication coordinator. `None` on single-pod / file-
+    /// backed deployments; `Some(_)` when multi-pod mode is configured.
+    pub(crate) replication_coordinator: Option<Arc<ReplicationCoordinator>>,
 }
 
 impl Broker {
@@ -53,12 +57,61 @@ impl Broker {
             nack_attempts: RwLock::new(HashMap::new()),
             metrics,
             dedup_ready: Arc::new(AtomicBool::new(false)),
+            replication_coordinator: None,
+        }
+    }
+
+    /// Attach a `ReplicationCoordinator` so Broker mutation paths fan
+    /// out events to connected followers. Called by the multi-pod server
+    /// startup (Wave 5). Consumes and returns `self` for builder ergonomics.
+    pub fn with_replication_coordinator(
+        mut self,
+        coordinator: Arc<ReplicationCoordinator>,
+    ) -> Self {
+        self.replication_coordinator = Some(coordinator);
+        self
+    }
+
+    /// Access the attached replication coordinator, if any. Used by the
+    /// leader-side replication server to register connecting followers.
+    pub fn replication_coordinator(&self) -> Option<&Arc<ReplicationCoordinator>> {
+        self.replication_coordinator.as_ref()
+    }
+
+    /// Emit a replication event to any attached coordinator. The event is
+    /// constructed lazily — the `FnOnce` is only invoked when a coordinator
+    /// is present, so single-pod deployments pay no event-construction cost.
+    pub(crate) fn emit_replication_event(
+        &self,
+        make_event: impl FnOnce() -> crate::replication::ReplicationEvent,
+    ) {
+        if let Some(coord) = &self.replication_coordinator {
+            coord.emit(make_event());
         }
     }
 
     /// Returns `true` once all startup dedup rebuild tasks have completed.
     pub fn is_dedup_ready(&self) -> bool {
         self.dedup_ready.load(Ordering::Acquire)
+    }
+
+    /// Delete a stream and emit a `StreamDeleted` replication event. Thin
+    /// wrapper around the storage trait that exists so multi-pod leaders
+    /// can fan the deletion out to followers. Returns `Err` if storage
+    /// says the stream does not exist (or any other I/O error).
+    pub async fn delete_stream(
+        &self,
+        stream: &exspeed_common::StreamName,
+    ) -> Result<(), exspeed_streams::StorageError> {
+        self.storage.delete_stream(stream).await?;
+        self.emit_replication_event(|| {
+            use crate::replication::ReplicationEvent;
+            use exspeed_protocol::messages::replicate::StreamDeletedEvent;
+            ReplicationEvent::StreamDeleted(StreamDeletedEvent {
+                name: stream.as_str().to_string(),
+            })
+        });
+        Ok(())
     }
 
     /// Load all persisted consumers from the configured ConsumerStore and

@@ -52,13 +52,30 @@ struct Inner {
     // `ClusterLeadership::current_child_token()`.
     current_token: Mutex<CancellationToken>,
     holder_id: Uuid,
+    /// The `host:port` followers dial to replicate from this pod. Written
+    /// into the `cluster:leader` lease row on each acquire so a standby can
+    /// discover it via `list_all()` without a separate registry. `None`
+    /// when the server was started without a cluster-bind endpoint (single-pod
+    /// deployments, or Wave-5 not-yet-wired paths).
+    replication_endpoint: Option<String>,
 }
 
 impl ClusterLeadership {
     /// Spawn the leadership state machine and return a handle. The retry
     /// task runs in the background for the lifetime of the returned value
     /// (kept alive via `Arc`).
-    pub async fn spawn(lease: Arc<dyn LeaderLease>, metrics: Arc<Metrics>) -> Self {
+    ///
+    /// `replication_endpoint` is the `host:port` advertised to followers
+    /// via the `cluster:leader` lease row. Pass `None` when this pod has
+    /// no cluster-bind listener (single-pod deployments, or tests that
+    /// don't exercise replication). Only the cluster-leader lease carries
+    /// this value; other leases (connector groups, etc.) always pass
+    /// `None` through the underlying `LeaderLease::try_acquire`.
+    pub async fn spawn(
+        lease: Arc<dyn LeaderLease>,
+        metrics: Arc<Metrics>,
+        replication_endpoint: Option<String>,
+    ) -> Self {
         let holder_id = Uuid::new_v4();
         let (is_leader_tx, is_leader_rx) = watch::channel(false);
 
@@ -75,6 +92,7 @@ impl ClusterLeadership {
                 t
             }),
             holder_id,
+            replication_endpoint,
         });
 
         // Spawn the retry loop.
@@ -104,6 +122,28 @@ impl ClusterLeadership {
         let tok = self.inner.current_token.lock().await;
         tok.child_token()
     }
+
+    /// Returns the replication endpoint the current `cluster:leader` holder
+    /// advertised on acquire, as read from the lease backend. `None` when:
+    ///   - the backend has no active `cluster:leader` row (standby period),
+    ///   - the leader was started without a cluster-bind endpoint, or
+    ///   - the backend is Noop (which never returns rows).
+    ///
+    /// Backend errors are logged at WARN and collapsed to `None` so the
+    /// follower's discovery path degrades to "retry later" rather than
+    /// surfacing a transient failure up the stack.
+    pub async fn leader_replication_endpoint(&self) -> Option<String> {
+        match self.inner.lease.list_all().await {
+            Ok(entries) => entries
+                .into_iter()
+                .find(|e| e.name == LEASE_NAME)
+                .and_then(|e| e.replication_endpoint),
+            Err(e) => {
+                warn!(error = %e, "leader_replication_endpoint: lease backend list_all failed");
+                None
+            }
+        }
+    }
 }
 
 /// Periodic acquire + heartbeat-observation loop. Ticks every `TTL/3`.
@@ -127,8 +167,14 @@ async fn run_retry_loop(inner: Arc<Inner>) {
             }
         }
 
-        // Not currently leader — attempt to acquire.
-        match inner.lease.try_acquire(LEASE_NAME, ttl).await {
+        // Not currently leader — attempt to acquire. Pass the advertised
+        // endpoint (may be None) so followers can discover it via
+        // `list_all()` without a separate registry.
+        match inner
+            .lease
+            .try_acquire(LEASE_NAME, ttl, inner.replication_endpoint.as_deref())
+            .await
+        {
             Ok(Some(lg)) => {
                 // Install fresh token BEFORE signalling is_leader, so
                 // subscribers that wake up on is_leader=true and call

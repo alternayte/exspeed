@@ -171,6 +171,13 @@ fn compile_credential(wc: &WireCredential) -> Result<Identity, AuthError> {
                 "publish" => { actions |= Action::Publish; }
                 "subscribe" => { actions |= Action::Subscribe; }
                 "admin" => { actions |= Action::Admin; }
+                // `replicate` is the cluster-replication verb
+                // (`Action::Replicate`, added in Plan G Wave 1). Follower
+                // pods dial the leader's cluster port and the leader-side
+                // server enforces this permission on Connect. A credential
+                // with `actions = ["replicate"]` is the usual way to gate
+                // replication access on a shared credentials.toml.
+                "replicate" => { actions |= Action::Replicate; }
                 other => {
                     return Err(AuthError::UnknownAction {
                         name: wc.name.clone(),
@@ -404,6 +411,34 @@ permissions = [{{ streams = "orders.*", actions = ["publish"] }}]
     fn lookup_miss_returns_none() {
         let store = CredentialStore::build(None, Some("t")).unwrap();
         assert!(store.lookup(&[0u8; 32]).is_none());
+    }
+
+    #[test]
+    fn replicate_action_compiles_from_toml() {
+        // Regression test for Plan G Wave 5: the `replicate` string maps to
+        // `Action::Replicate` and survives a round-trip through the TOML
+        // loader. Followers rely on this verb to pass the leader-side
+        // handshake gate in `replication/server.rs`; silently dropping the
+        // mapping would make every replication session fail with 403.
+        let file = write_tmp(&format!(
+            r#"
+[[credentials]]
+name = "rep"
+token_sha256 = "{}"
+permissions = [{{ streams = "*", actions = ["replicate"] }}]
+"#,
+            hash_of("rep-token"),
+        ));
+        let store = CredentialStore::build(Some(file.path()), None).unwrap();
+        let digest: [u8; 32] = sha2::Sha256::digest(b"rep-token").into();
+        let id = store.lookup(&digest).expect("replicate credential resolves");
+        assert!(
+            id.permissions
+                .iter()
+                .any(|p| p.actions.contains(Action::Replicate)),
+            "expected Replicate in action set; got {:?}",
+            id.permissions,
+        );
     }
 
     #[test]

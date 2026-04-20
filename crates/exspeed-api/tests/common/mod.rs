@@ -21,6 +21,7 @@ impl LeaderLease for AlwaysRejectLease {
         &self,
         _name: &str,
         _ttl: Duration,
+        _replication_endpoint: Option<&str>,
     ) -> Result<Option<LeaseGuard>, LeaseError> {
         Ok(None)
     }
@@ -51,7 +52,8 @@ pub async fn make_state_with_leader(leader: bool) -> Arc<exspeed_api::AppState> 
         Arc::new(AlwaysRejectLease)
     };
 
-    let leadership = Arc::new(ClusterLeadership::spawn(lease.clone(), metrics.clone()).await);
+    let leadership =
+        Arc::new(ClusterLeadership::spawn(lease.clone(), metrics.clone(), None).await);
 
     if leader {
         // Wait for Noop promotion (~1 tick = max(TTL/3, 1s)). Default
@@ -135,5 +137,6 @@ pub async fn make_state_with_leader(leader: bool) -> Arc<exspeed_api::AppState> 
         // /readyz directly should set this themselves.
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         data_dir,
+        replication_coordinator: None,
     })
 }

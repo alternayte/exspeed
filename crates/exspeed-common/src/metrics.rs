@@ -78,6 +78,38 @@ pub struct Metrics {
     /// - `op`: opcode name on TCP (e.g. `"Publish"`) or request path on HTTP
     ///   (e.g. `"/api/v1/streams"`).
     pub auth_denied_total: Counter<u64>,
+
+    // -- replication observability ------------------------------------------
+    /// Labeled {role=leader|follower|standalone}. Exactly one label is 1 at
+    /// a time.
+    pub replication_role: Gauge<i64>,
+    /// Leader-only: number of followers currently holding live replication
+    /// connections.
+    pub replication_connected_followers: Gauge<i64>,
+    /// Wall-clock lag observed by each follower, labeled by `follower_id`.
+    pub replication_lag_seconds: Gauge<f64>,
+    /// Offset lag observed by each follower, labeled by `follower_id`.
+    pub replication_lag_records: Gauge<i64>,
+    /// Follower-side: records successfully applied to local storage.
+    pub replication_records_applied_total: Counter<u64>,
+    /// Replication wire bytes, labeled `direction=in|out`.
+    pub replication_bytes_total: Counter<u64>,
+    /// Records truncated on a follower due to divergent-history recovery,
+    /// labeled by `stream`.
+    pub replication_truncated_records_total: Counter<u64>,
+    /// Stream-reseed events (follower cursor earlier than leader's
+    /// `earliest_offset`), labeled by `stream`.
+    pub replication_reseed_total: Counter<u64>,
+    /// Leader-side: followers dropped because their send queue overflowed,
+    /// labeled by `follower_id`.
+    pub replication_follower_queue_drops_total: Counter<u64>,
+    /// Replication protocol / decode errors.
+    pub replication_protocol_errors_total: Counter<u64>,
+    /// Follower-side errors applying a replicated record to storage.
+    pub replication_apply_errors_total: Counter<u64>,
+    /// Follower dial attempts to the leader's cluster port, labeled
+    /// `result=ok|err`.
+    pub replication_connect_attempts_total: Counter<u64>,
 }
 
 impl Metrics {
@@ -206,6 +238,46 @@ impl Metrics {
             ],
         );
 
+        // -- replication instruments -----------------------------------------
+
+        let replication_role = meter.i64_gauge("exspeed_replication_role").build();
+        let replication_connected_followers = meter
+            .i64_gauge("exspeed_replication_connected_followers")
+            .build();
+        let replication_lag_seconds = meter.f64_gauge("exspeed_replication_lag_seconds").build();
+        let replication_lag_records = meter.i64_gauge("exspeed_replication_lag_records").build();
+        let replication_records_applied_total = meter
+            .u64_counter("exspeed_replication_records_applied_total")
+            .build();
+        let replication_bytes_total = meter.u64_counter("exspeed_replication_bytes_total").build();
+        let replication_truncated_records_total = meter
+            .u64_counter("exspeed_replication_truncated_records_total")
+            .build();
+        let replication_reseed_total = meter.u64_counter("exspeed_replication_reseed_total").build();
+        let replication_follower_queue_drops_total = meter
+            .u64_counter("exspeed_replication_follower_queue_drops_total")
+            .build();
+        let replication_protocol_errors_total = meter
+            .u64_counter("exspeed_replication_protocol_errors_total")
+            .build();
+        let replication_apply_errors_total = meter
+            .u64_counter("exspeed_replication_apply_errors_total")
+            .build();
+        let replication_connect_attempts_total = meter
+            .u64_counter("exspeed_replication_connect_attempts_total")
+            .build();
+
+        // Descriptor-visibility zero-init: ensures `/metrics` always lists each
+        // series even before any replication events.
+        replication_role.record(1, &[KeyValue::new("role", "standalone")]);
+        replication_role.record(0, &[KeyValue::new("role", "leader")]);
+        replication_role.record(0, &[KeyValue::new("role", "follower")]);
+        replication_connected_followers.record(0, &[]);
+        replication_bytes_total.add(0, &[KeyValue::new("direction", "in")]);
+        replication_bytes_total.add(0, &[KeyValue::new("direction", "out")]);
+        replication_connect_attempts_total.add(0, &[KeyValue::new("result", "ok")]);
+        replication_connect_attempts_total.add(0, &[KeyValue::new("result", "err")]);
+
         // Keep the provider alive — dropping it shuts down the metrics pipeline.
         std::mem::forget(provider);
 
@@ -234,6 +306,18 @@ impl Metrics {
             dedup_rebuild_duration_seconds,
             dedup_window_secs,
             auth_denied_total,
+            replication_role,
+            replication_connected_followers,
+            replication_lag_seconds,
+            replication_lag_records,
+            replication_records_applied_total,
+            replication_bytes_total,
+            replication_truncated_records_total,
+            replication_reseed_total,
+            replication_follower_queue_drops_total,
+            replication_protocol_errors_total,
+            replication_apply_errors_total,
+            replication_connect_attempts_total,
         };
 
         (metrics, registry)
@@ -451,5 +535,72 @@ impl Metrics {
                 KeyValue::new("op", op.to_owned()),
             ],
         );
+    }
+
+    // -- replication helpers ------------------------------------------------
+
+    /// Set the current replication role. Exactly one label is 1 at a time;
+    /// the previous two are reset to 0.
+    pub fn set_replication_role(&self, role: &'static str) {
+        for candidate in ["leader", "follower", "standalone"] {
+            self.replication_role.record(
+                if candidate == role { 1 } else { 0 },
+                &[KeyValue::new("role", candidate)],
+            );
+        }
+    }
+
+    pub fn inc_replication_follower_queue_drop(&self, follower_id: &str) {
+        self.replication_follower_queue_drops_total.add(
+            1,
+            &[KeyValue::new("follower_id", follower_id.to_string())],
+        );
+    }
+
+    pub fn inc_replication_truncated_records(&self, stream: &str, count: u64) {
+        self.replication_truncated_records_total
+            .add(count, &[KeyValue::new("stream", stream.to_string())]);
+    }
+
+    pub fn inc_replication_reseed(&self, stream: &str) {
+        self.replication_reseed_total
+            .add(1, &[KeyValue::new("stream", stream.to_string())]);
+    }
+
+    pub fn record_replication_connect_attempt(&self, ok: bool) {
+        self.replication_connect_attempts_total.add(
+            1,
+            &[KeyValue::new("result", if ok { "ok" } else { "err" })],
+        );
+    }
+
+    /// Increment `exspeed_replication_records_applied_total` by `count` for
+    /// the given stream. Called from the follower's apply path after each
+    /// successful `storage.append`. Label cardinality is bounded by the
+    /// number of streams (same precedent as `truncated_records_total` and
+    /// `reseed_total`).
+    pub fn inc_replication_records_applied(&self, stream: &str, count: u64) {
+        self.replication_records_applied_total
+            .add(count, &[KeyValue::new("stream", stream.to_string())]);
+    }
+
+    /// Set the follower's observed wall-clock lag, in seconds, for a stream.
+    /// Computed as `now_ms - last_applied_record_ms`. Negative inputs can
+    /// arise from clock skew between leader and follower — clamp to 0 so
+    /// the README recipe `rate(exspeed_replication_lag_seconds[...]) > 10`
+    /// behaves the way operators expect.
+    pub fn set_replication_lag_seconds(&self, stream: &str, secs: f64) {
+        self.replication_lag_seconds
+            .record(secs.max(0.0), &[KeyValue::new("stream", stream.to_string())]);
+    }
+
+    /// Set the follower's observed offset-lag (`leader_latest - follower_next`)
+    /// for a stream. This is a best-effort signal derived from the leader's
+    /// manifest + batch deltas — it reflects offset-lag at the moment of the
+    /// last applied batch, not the live tail. See `lag_seconds` for the
+    /// primary indicator.
+    pub fn set_replication_lag_records(&self, stream: &str, records: i64) {
+        self.replication_lag_records
+            .record(records, &[KeyValue::new("stream", stream.to_string())]);
     }
 }

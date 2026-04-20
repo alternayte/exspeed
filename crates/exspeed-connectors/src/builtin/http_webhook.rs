@@ -52,13 +52,14 @@ pub async fn handle_webhook_post(
             ("x-exspeed-source".to_string(), "http_webhook".to_string()),
             ("x-exspeed-connector".to_string(), config.name.clone()),
         ],
+        timestamp_ns: None,
     };
 
     // 4. Resolve stream name and append
     let stream = StreamName::try_from(config.stream.as_str())
         .map_err(|e| format!("invalid stream name: {e}"))?;
 
-    let offset = storage
+    let (offset, _timestamp) = storage
         .append(&stream, &record)
         .await
         .map_err(|e| format!("storage error: {e}"))?;

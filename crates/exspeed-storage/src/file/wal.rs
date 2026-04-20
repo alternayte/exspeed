@@ -209,6 +209,7 @@ fn stored_to_record(stored: &StoredRecord) -> Record {
         value: stored.value.clone(),
         subject: stored.subject.clone(),
         headers: stored.headers.clone(),
+        timestamp_ns: None,
     }
 }
 
@@ -227,6 +228,7 @@ mod tests {
             value: Bytes::from_static(value),
             subject: "test.subject".to_string(),
             headers: vec![],
+            timestamp_ns: None,
         }
     }
 

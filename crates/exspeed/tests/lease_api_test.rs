@@ -126,6 +126,19 @@ async fn leases_endpoint_postgres_backend_returns_single_cluster_leader_row() {
     assert_eq!(body[0]["name"], "cluster:leader");
     assert!(body[0]["holder"].is_string(), "holder should be a UUID string");
     assert!(body[0]["expires_at"].is_string(), "expires_at should be a timestamp string");
+    // `replication_endpoint` is serialized unconditionally. The test
+    // server is started without a cluster-bind listener, so this row
+    // carries `null`. A real leader with a bound cluster listener would
+    // surface its advertised host:port string here instead.
+    assert!(
+        body[0].get("replication_endpoint").is_some(),
+        "replication_endpoint key must always be present (as null when absent)"
+    );
+    assert!(
+        body[0]["replication_endpoint"].is_null(),
+        "replication_endpoint should be null when no cluster listener is bound; got {:?}",
+        body[0]["replication_endpoint"]
+    );
 
     // Clean up env vars.
     std::env::remove_var("EXSPEED_CONSUMER_STORE");

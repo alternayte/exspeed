@@ -34,6 +34,18 @@ pub struct LeaseInfo {
     pub name: String,
     pub holder: Uuid,
     pub expires_at: chrono::DateTime<chrono::Utc>,
+    /// Where followers should dial this holder for replication. `None` for
+    /// leases that do not carry a replication state (Noop backend; a leader
+    /// that was started without a cluster-bind endpoint; or any non-cluster
+    /// lease such as connector-group holders). Emitted alongside `holder` so
+    /// followers can discover the leader without a separate registry.
+    ///
+    /// Serialized unconditionally (as `null` when absent) so operator
+    /// tooling pinned to the JSON shape can reliably distinguish "no
+    /// replication endpoint advertised" from "field missing due to schema
+    /// change". See `GET /api/v1/leases`.
+    #[serde(default)]
+    pub replication_endpoint: Option<String>,
 }
 
 /// Held by the lease owner. While this struct is alive, an internal
@@ -54,7 +66,9 @@ pub struct LeaseGuard {
     /// into their heartbeat task and set this to `None`.
     pub _lost_tx: Option<watch::Sender<bool>>,
     /// Dropping the guard sends on this, stopping the heartbeat task.
-    _cancel_heartbeat: oneshot::Sender<()>,
+    /// Exposed (but underscore-prefixed) so external test backends can
+    /// construct a guard. Production callers should not touch this field.
+    pub _cancel_heartbeat: oneshot::Sender<()>,
 }
 
 #[async_trait]
@@ -63,6 +77,13 @@ pub trait LeaderLease: Send + Sync {
     fn supports_coordination(&self) -> bool;
 
     /// Try to acquire the named lease with the given TTL.
+    ///
+    /// `replication_endpoint` is written into the lease row so followers can
+    /// discover the leader via `list_all()` without a separate registry.
+    /// Pass `None` for leases that do not expose a replication endpoint
+    /// (anything other than `cluster:leader`, or the cluster-leader lease
+    /// itself when the server is started without a cluster-bind endpoint).
+    /// Backends that don't support coordination (Noop) ignore it.
     ///
     /// Returns:
     /// - `Ok(Some(LeaseGuard))` — this caller is now the holder. The guard
@@ -73,6 +94,7 @@ pub trait LeaderLease: Send + Sync {
         &self,
         name: &str,
         ttl: Duration,
+        replication_endpoint: Option<&str>,
     ) -> Result<Option<LeaseGuard>, LeaseError>;
 
     /// List all currently-held leases for operator visibility. Returns an

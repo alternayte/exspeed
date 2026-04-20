@@ -609,12 +609,13 @@ impl ConnectorManager {
                         value: record.value.clone(),
                         subject: record.subject.clone(),
                         headers: record.headers.clone(),
+                        timestamp_ns: None,
                     };
 
                     let result = broker_append.append(&stream_name, &storage_record).await;
 
                     match result {
-                        Ok(exspeed_broker::broker_append::AppendResult::Written(_)) => {
+                        Ok(exspeed_broker::broker_append::AppendResult::Written(..)) => {
                             metrics.record_publish(stream_str.as_str());
                         }
                         Ok(exspeed_broker::broker_append::AppendResult::Duplicate(_)) => {

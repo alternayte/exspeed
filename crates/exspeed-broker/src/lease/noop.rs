@@ -33,6 +33,10 @@ impl LeaderLease for NoopLeaderLease {
         &self,
         name: &str,
         _ttl: Duration,
+        // Noop is stateless — `list_all` always returns `[]`, so whatever
+        // endpoint the caller passes is thrown away. Spec only requires
+        // observability via `list_all`, which Noop intentionally skips.
+        _replication_endpoint: Option<&str>,
     ) -> Result<Option<LeaseGuard>, LeaseError> {
         let (cancel_tx, _cancel_rx) = oneshot::channel::<()>();
         let (lost_tx, lost_rx) = watch::channel(false);
@@ -62,16 +66,25 @@ mod tests {
     #[tokio::test]
     async fn noop_always_acquires() {
         let b = NoopLeaderLease::new();
-        let guard = b.try_acquire("foo", Duration::from_secs(30)).await.unwrap();
+        let guard = b
+            .try_acquire("foo", Duration::from_secs(30), None)
+            .await
+            .unwrap();
         assert!(guard.is_some());
-        let g2 = b.try_acquire("foo", Duration::from_secs(30)).await.unwrap();
+        let g2 = b
+            .try_acquire("foo", Duration::from_secs(30), None)
+            .await
+            .unwrap();
         assert!(g2.is_some(), "noop never rejects");
     }
 
     #[tokio::test]
     async fn noop_list_is_empty() {
         let b = NoopLeaderLease::new();
-        let _g = b.try_acquire("x", Duration::from_secs(30)).await.unwrap();
+        let _g = b
+            .try_acquire("x", Duration::from_secs(30), None)
+            .await
+            .unwrap();
         assert!(b.list_all().await.unwrap().is_empty());
     }
 
@@ -79,7 +92,7 @@ mod tests {
     async fn noop_on_lost_never_fires() {
         let b = NoopLeaderLease::new();
         let guard = b
-            .try_acquire("x", Duration::from_secs(30))
+            .try_acquire("x", Duration::from_secs(30), None)
             .await
             .unwrap()
             .unwrap();

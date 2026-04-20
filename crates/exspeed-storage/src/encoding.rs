@@ -196,6 +196,7 @@ mod tests {
                 ("content-type".to_string(), "application/json".to_string()),
                 ("trace-id".to_string(), "abc123".to_string()),
             ],
+            timestamp_ns: None,
         }
     }
 
@@ -205,6 +206,7 @@ mod tests {
             value: Bytes::from_static(b"no key here"),
             subject: "events.misc".to_string(),
             headers: vec![],
+            timestamp_ns: None,
         }
     }
 

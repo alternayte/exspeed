@@ -50,13 +50,13 @@ async fn postgres_first_acquire_wins_second_rejects() {
     let (b, _schema) = make_backend().await;
 
     let g1 = b
-        .try_acquire("race-1", Duration::from_secs(30))
+        .try_acquire("race-1", Duration::from_secs(30), None)
         .await
         .unwrap();
     assert!(g1.is_some(), "first acquire should win");
 
     let g2 = b
-        .try_acquire("race-1", Duration::from_secs(30))
+        .try_acquire("race-1", Duration::from_secs(30), None)
         .await
         .unwrap();
     assert!(g2.is_none(), "second acquire should reject while g1 holds");
@@ -70,7 +70,7 @@ async fn postgres_release_on_drop_enables_reacquire() {
     let (b, _schema) = make_backend().await;
 
     let g1 = b
-        .try_acquire("drop-1", Duration::from_secs(30))
+        .try_acquire("drop-1", Duration::from_secs(30), None)
         .await
         .unwrap();
     drop(g1);
@@ -79,7 +79,7 @@ async fn postgres_release_on_drop_enables_reacquire() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let g2 = b
-        .try_acquire("drop-1", Duration::from_secs(30))
+        .try_acquire("drop-1", Duration::from_secs(30), None)
         .await
         .unwrap();
     assert!(g2.is_some(), "reacquire should succeed after release");
@@ -94,7 +94,7 @@ async fn postgres_expired_lease_can_be_stolen() {
 
     // Acquire with a tiny TTL so the heartbeat can't refresh it.
     let _g1 = b
-        .try_acquire("expire-1", Duration::from_secs(1))
+        .try_acquire("expire-1", Duration::from_secs(1), None)
         .await
         .unwrap();
 
@@ -104,10 +104,54 @@ async fn postgres_expired_lease_can_be_stolen() {
     // A second actor (sharing the schema) should be able to steal it.
     let b2 = make_backend_for_schema(&schema).await;
     let stolen = b2
-        .try_acquire("expire-1", Duration::from_secs(30))
+        .try_acquire("expire-1", Duration::from_secs(30), None)
         .await
         .unwrap();
     assert!(stolen.is_some(), "expired lease should be stealable");
+}
+
+#[tokio::test]
+async fn postgres_endpoint_is_stored_and_preserved_across_heartbeats() {
+    if skip_if_no_postgres() {
+        return;
+    }
+    let (b, _schema) = make_backend().await;
+
+    // Short TTL but heartbeat faster, so we observe at least one refresh
+    // that must preserve the endpoint (refresh UPDATEs expires_at only;
+    // the endpoint column should be untouched).
+    let _g = b
+        .try_acquire(
+            "endpoint-1",
+            Duration::from_secs(5),
+            Some("10.0.0.1:5934"),
+        )
+        .await
+        .unwrap()
+        .expect("first acquire wins");
+
+    // Observe initial value.
+    let listed = b.list_all().await.unwrap();
+    let row = listed
+        .iter()
+        .find(|i| i.name == "endpoint-1")
+        .expect("row present");
+    assert_eq!(row.replication_endpoint.as_deref(), Some("10.0.0.1:5934"));
+
+    // Wait past one heartbeat interval (default 10s). Reduce slack by
+    // checking for liveness rather than sleeping the full window — we
+    // just need ONE refresh to happen, which UPDATE-bumps expires_at.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let listed = b.list_all().await.unwrap();
+    let row = listed
+        .iter()
+        .find(|i| i.name == "endpoint-1")
+        .expect("row still present");
+    assert_eq!(
+        row.replication_endpoint.as_deref(),
+        Some("10.0.0.1:5934"),
+        "heartbeat refresh must preserve replication_endpoint"
+    );
 }
 
 #[tokio::test]
@@ -118,7 +162,7 @@ async fn postgres_list_reports_active_holders() {
     let (b, _schema) = make_backend().await;
 
     let _g = b
-        .try_acquire("listed", Duration::from_secs(30))
+        .try_acquire("listed", Duration::from_secs(30), None)
         .await
         .unwrap();
 

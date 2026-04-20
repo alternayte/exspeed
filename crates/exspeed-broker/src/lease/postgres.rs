@@ -66,9 +66,10 @@ async fn ensure_schema(inner: &Inner) -> Result<(), LeaseError> {
 
     let create_table = format!(
         "CREATE TABLE IF NOT EXISTS {}.exspeed_leases (
-            name        TEXT PRIMARY KEY,
-            holder      UUID NOT NULL,
-            expires_at  TIMESTAMPTZ NOT NULL
+            name                 TEXT PRIMARY KEY,
+            holder               UUID NOT NULL,
+            expires_at           TIMESTAMPTZ NOT NULL,
+            replication_endpoint TEXT
          )",
         inner.schema
     );
@@ -76,6 +77,19 @@ async fn ensure_schema(inner: &Inner) -> Result<(), LeaseError> {
         .execute(&create_table, &[])
         .await
         .map_err(|e| LeaseError::Connection(format!("create table: {e}")))?;
+
+    // Live upgrade: pre-Plan-G tables don't have `replication_endpoint`.
+    // `ADD COLUMN IF NOT EXISTS` is PG 9.6+; existing rows land on NULL,
+    // which matches the "not configured" semantics we want.
+    let add_column = format!(
+        "ALTER TABLE {}.exspeed_leases \
+             ADD COLUMN IF NOT EXISTS replication_endpoint TEXT",
+        inner.schema
+    );
+    client
+        .execute(&add_column, &[])
+        .await
+        .map_err(|e| LeaseError::Connection(format!("add column: {e}")))?;
 
     let create_idx = format!(
         "CREATE INDEX IF NOT EXISTS exspeed_leases_expires_idx
@@ -100,24 +114,33 @@ impl LeaderLease for PostgresLeaseBackend {
         &self,
         name: &str,
         ttl: Duration,
+        replication_endpoint: Option<&str>,
     ) -> Result<Option<LeaseGuard>, LeaseError> {
         let holder_id = Uuid::new_v4();
         let ttl_secs = ttl.as_secs_f64();
 
+        // On acquire we overwrite `replication_endpoint` with whatever the
+        // caller passed — the new holder is always the authoritative source
+        // for its own endpoint. A `None` here clears a stale endpoint from
+        // a prior tenure, which is the right thing for a leader restarted
+        // without a cluster-bind.
         let sql = format!(
-            "INSERT INTO {schema}.exspeed_leases (name, holder, expires_at)
-             VALUES ($1, $2, now() + make_interval(secs => $3))
+            "INSERT INTO {schema}.exspeed_leases \
+                 (name, holder, expires_at, replication_endpoint)
+             VALUES ($1, $2, now() + make_interval(secs => $3), $4)
              ON CONFLICT (name) DO UPDATE
-             SET holder     = EXCLUDED.holder,
-                 expires_at = EXCLUDED.expires_at
+             SET holder               = EXCLUDED.holder,
+                 expires_at           = EXCLUDED.expires_at,
+                 replication_endpoint = EXCLUDED.replication_endpoint
              WHERE {schema}.exspeed_leases.expires_at < now()
              RETURNING holder",
             schema = self.inner.schema
         );
 
+        let endpoint_owned: Option<String> = replication_endpoint.map(|s| s.to_string());
         let client = self.inner.client.lock().await;
         let row = client
-            .query_opt(&sql, &[&name, &holder_id, &ttl_secs])
+            .query_opt(&sql, &[&name, &holder_id, &ttl_secs, &endpoint_owned])
             .await
             .map_err(|e| LeaseError::Backend(format!("acquire query: {e}")))?;
         drop(client);
@@ -138,7 +161,8 @@ impl LeaderLease for PostgresLeaseBackend {
 
     async fn list_all(&self) -> Result<Vec<LeaseInfo>, LeaseError> {
         let sql = format!(
-            "SELECT name, holder, expires_at FROM {}.exspeed_leases
+            "SELECT name, holder, expires_at, replication_endpoint \
+             FROM {}.exspeed_leases \
              WHERE expires_at > now() ORDER BY name",
             self.inner.schema
         );
@@ -155,6 +179,7 @@ impl LeaderLease for PostgresLeaseBackend {
                 name: r.get(0),
                 holder: r.get(1),
                 expires_at: r.get(2),
+                replication_endpoint: r.get(3),
             })
             .collect())
     }
