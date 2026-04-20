@@ -771,7 +771,11 @@ where
     let mut active_subscription: Option<(String, String)> = None;
     // Stream bound to the active subscription (captured on Subscribe OK).
     // Authz for Fetch/Ack/Nack uses this because those ops don't carry a
-    // stream name on the wire.
+    // stream name on the wire. Intentionally frozen at Subscribe-time — a
+    // mid-subscription consumer rebind (rare: delete + recreate with a
+    // different stream under the same name) would authorize against the
+    // old stream, but the broker tears down the delivery task in that
+    // case so the invariant holds end-to-end.
     let mut active_sub_stream: Option<StreamName> = None;
     let mut delivery_rx: Option<mpsc::Receiver<DeliveryRecord>> = None;
     let mut cancel_tx: Option<oneshot::Sender<()>> = None;
@@ -1223,10 +1227,11 @@ where
                                     continue;
                                 }
 
-                                // Resolve consumer → stream before subscribing
-                                // so we can authorize. Unknown consumer → let
-                                // broker emit the canonical 404; don't deny
-                                // just because authz couldn't resolve.
+                                // Resolve consumer → stream before subscribing so
+                                // we can authorize. Unknown consumer → let the
+                                // broker emit its own error (today: 400); don't
+                                // deny via 403 just because authz couldn't
+                                // resolve, or we'd leak consumer existence.
                                 let maybe_stream = {
                                     let consumers = broker.consumers.read().unwrap();
                                     consumers
