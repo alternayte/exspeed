@@ -145,6 +145,7 @@ fn publish_frame(stream: &str, subject: &str, value: &[u8], corr: u32) -> Frame 
         stream: stream.into(),
         subject: subject.into(),
         key: None,
+        msg_id: None,
         value: Bytes::copy_from_slice(value),
         headers: vec![],
     };
@@ -234,7 +235,7 @@ async fn seek_repositions_consumer() {
 
     // 1. Connect
     let resp = send_recv(&mut writer, &mut reader, connect_frame(1)).await;
-    assert_eq!(resp.opcode, OpCode::Ok, "CONNECT should return Ok");
+    assert_eq!(resp.opcode, OpCode::ConnectOk, "CONNECT should return ConnectOk");
 
     // 2. Create stream "events"
     let resp = send_recv(&mut writer, &mut reader, create_stream_frame("events", 2)).await;
@@ -249,7 +250,7 @@ async fn seek_repositions_consumer() {
             publish_frame("events", "evt.data", value.as_bytes(), 10 + i),
         )
         .await;
-        assert_eq!(resp.opcode, OpCode::Ok, "PUBLISH {} should return Ok", i);
+        assert_eq!(resp.opcode, OpCode::PublishOk, "PUBLISH {} should return PublishOk", i);
         // Brief sleep to ensure distinct timestamps from the server
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -296,7 +297,7 @@ async fn seek_repositions_consumer() {
         seek_frame("seeker", seek_timestamp, 203),
     )
     .await;
-    assert_eq!(resp.opcode, OpCode::Ok, "SEEK should return Ok");
+    assert_eq!(resp.opcode, OpCode::PublishOk, "SEEK should return PublishOk");
 
     // The payload contains the new offset (u64 LE)
     let mut payload = resp.payload;
@@ -347,7 +348,7 @@ async fn seek_to_beginning_returns_offset_zero() {
 
     // Connect
     let resp = send_recv(&mut writer, &mut reader, connect_frame(1)).await;
-    assert_eq!(resp.opcode, OpCode::Ok);
+    assert_eq!(resp.opcode, OpCode::ConnectOk);
 
     // Create stream
     let resp = send_recv(&mut writer, &mut reader, create_stream_frame("logs", 2)).await;
@@ -362,7 +363,7 @@ async fn seek_to_beginning_returns_offset_zero() {
             publish_frame("logs", "log.info", value.as_bytes(), 10 + i),
         )
         .await;
-        assert_eq!(resp.opcode, OpCode::Ok);
+        assert_eq!(resp.opcode, OpCode::PublishOk);
     }
 
     // Create consumer
@@ -378,8 +379,8 @@ async fn seek_to_beginning_returns_offset_zero() {
     let resp = send_recv(&mut writer, &mut reader, seek_frame("log-reader", 0, 201)).await;
     assert_eq!(
         resp.opcode,
-        OpCode::Ok,
-        "SEEK to timestamp=0 should return Ok"
+        OpCode::PublishOk,
+        "SEEK to timestamp=0 should return PublishOk"
     );
 
     let mut payload = resp.payload;
@@ -395,7 +396,7 @@ async fn create_stream_with_retention() {
 
     // 1. Connect
     let resp = send_recv(&mut writer, &mut reader, connect_frame(1)).await;
-    assert_eq!(resp.opcode, OpCode::Ok, "CONNECT should return Ok");
+    assert_eq!(resp.opcode, OpCode::ConnectOk, "CONNECT should return ConnectOk");
 
     // 2. Create stream "short-lived" with max_age_secs=1, max_bytes=0
     let resp = send_recv(
@@ -419,7 +420,7 @@ async fn create_stream_with_retention() {
             publish_frame("short-lived", "data.tick", value.as_bytes(), 10 + i),
         )
         .await;
-        assert_eq!(resp.opcode, OpCode::Ok, "PUBLISH {} should return Ok", i);
+        assert_eq!(resp.opcode, OpCode::PublishOk, "PUBLISH {} should return PublishOk", i);
     }
 
     // 4. FETCH from offset 0 -- records should be there

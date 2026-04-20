@@ -176,9 +176,28 @@ where
     let broker_append = Arc::new(
         BrokerAppend::new(storage.clone(), dedup_window_secs).with_metrics(metrics.clone()),
     );
-    broker_append.rebuild_from_log().await.unwrap_or_else(|e| {
-        warn!("failed to rebuild dedup state from log: {}", e);
-    });
+
+    // Apply per-stream dedup config from persisted stream.json files, then
+    // spawn parallel per-stream rebuild tasks (snapshot path + tail scan).
+    // Use file_storage (concrete FileStorage) to access list_streams() + data_dir().
+    let mut rebuild_set = tokio::task::JoinSet::new();
+    for stream_name_str in file_storage.list_streams() {
+        if let Ok(stream_name) = exspeed_common::StreamName::try_from(stream_name_str.as_str()) {
+            let stream_dir = file_storage
+                .data_dir()
+                .join("streams")
+                .join(stream_name_str.as_str());
+            let cfg = exspeed_storage::file::stream_config::StreamConfig::load(&stream_dir)
+                .unwrap_or_default();
+            broker_append
+                .configure_stream(&stream_name, cfg.dedup_window_secs, cfg.dedup_max_entries)
+                .await;
+            let ba = broker_append.clone();
+            let s = stream_name.clone();
+            let sd = stream_dir.clone();
+            rebuild_set.spawn(async move { ba.rebuild_stream(&s, &sd).await });
+        }
+    }
 
     // Build consumer store (selects backend from EXSPEED_CONSUMER_STORE or EXSPEED_OFFSET_STORE)
     let consumer_backend = std::env::var("EXSPEED_CONSUMER_STORE")
@@ -294,6 +313,29 @@ where
         metrics.clone(),
     ));
     broker.load_consumers().await.map_err(|e| anyhow::anyhow!(e))?;
+
+    // Spawn watcher that flips `dedup_ready` once all per-stream rebuild tasks finish.
+    {
+        let dedup_ready = broker.dedup_ready.clone();
+        tokio::spawn(async move {
+            while let Some(r) = rebuild_set.join_next().await {
+                match r {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::error!(error = %e, "dedup rebuild returned error"),
+                    Err(e) => tracing::error!(error = ?e, "dedup rebuild task panicked"),
+                }
+            }
+            dedup_ready.store(true, std::sync::atomic::Ordering::Release);
+            info!("all dedup maps ready");
+        });
+    }
+
+    // Spawn periodic dedup snapshot task (runs every 60s, final snapshot on shutdown).
+    let _snapshot_handle = exspeed_broker::snapshot_task::spawn_dedup_snapshot_task(
+        broker.broker_append.clone(),
+        args.data_dir.clone(),
+        cancel_token.clone(),
+    );
 
     // Spawn queue-depth sampler (5s interval) — reports per-subscription
     // delivery channel fill ratio to `subscription_queue_fill_ratio`.
@@ -641,6 +683,7 @@ where
 
                         match parsed {
                             Ok(ClientMessage::Connect(req)) => {
+                                #[allow(clippy::if_same_then_else)]
                                 let result = if let Some(expected) = &auth_token {
                                     if req.auth_type != exspeed_protocol::messages::connect::AuthType::Token {
                                         Err("unauthorized")
@@ -659,7 +702,12 @@ where
                                     Ok(()) => {
                                         authenticated = true;
                                         info!(%peer, client_id = %req.client_id, "CONNECT authenticated");
-                                        let response = ServerMessage::Ok.into_frame(correlation_id);
+                                        let response = ServerMessage::ConnectOk(
+                                            exspeed_protocol::messages::ConnectResponse {
+                                                server_version: exspeed_protocol::messages::WIRE_VERSION,
+                                            },
+                                        )
+                                        .into_frame(correlation_id);
                                         framed_write.send(response).await?;
                                     }
                                     Err(msg) => {

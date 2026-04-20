@@ -9,11 +9,13 @@ import {
   decodeFrame,
   type Frame,
 } from "./protocol/index.js";
-import { encodeConnect } from "./protocol/connect.js";
-import { decodeErrorFrame } from "./protocol/error-frame.js";
+import { encodeConnect, decodeConnectResponse } from "./protocol/connect.js";
+import { decodeErrorFrame, ERR_KEY_COLLISION, ERR_DEDUP_MAP_FULL } from "./protocol/error-frame.js";
 import {
   ConnectionError,
   ServerError,
+  KeyCollisionError,
+  DedupMapFullError,
   TimeoutError,
 } from "./errors.js";
 import { AUTH_NONE, AUTH_TOKEN } from "./protocol/types.js";
@@ -53,6 +55,8 @@ export class Connection extends EventEmitter {
   private connecting = false;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private currentEndpointIndex = 0;
+  private _serverVersion = 1;
+  private _warnedV1 = false;
 
   private readonly opts: Required<Omit<ConnectionOptions, "auth" | "tls">> & {
     auth?: ConnectionOptions["auth"];
@@ -71,6 +75,16 @@ export class Connection extends EventEmitter {
 
   currentEndpoint(): BrokerEndpoint {
     return this.opts.endpoints[this.currentEndpointIndex]!;
+  }
+
+  getServerVersion(): number {
+    return this._serverVersion;
+  }
+
+  /** Test-only: override server version without a real handshake. */
+  _setServerVersionForTest(v: number): void {
+    this._serverVersion = v;
+    this._warnedV1 = true; // suppress warning in tests
   }
 
   async connect(): Promise<void> {
@@ -237,6 +251,21 @@ export class Connection extends EventEmitter {
       const err = decodeErrorFrame(response.payload);
       throw new ServerError(err.code, err.message);
     }
+
+    if (response.opcode === OpCode.ConnectOk) {
+      const { serverVersion } = decodeConnectResponse(response.payload);
+      this._serverVersion = serverVersion;
+    } else {
+      // Legacy Ok from v1 broker — leave _serverVersion at 1
+      this._serverVersion = 1;
+    }
+
+    if (this._serverVersion < 2 && !this._warnedV1) {
+      this._warnedV1 = true;
+      console.warn(
+        "[exspeed] connected to broker wire v1 — msgId publishes will use x-idempotency-key header (upgrade broker for full feature)",
+      );
+    }
   }
 
   private onData(data: Buffer): void {
@@ -275,8 +304,16 @@ export class Connection extends EventEmitter {
     clearTimeout(pending.timer);
 
     if (frame.opcode === OpCode.Error) {
-      const err = decodeErrorFrame(frame.payload);
-      pending.reject(new ServerError(err.code, err.message));
+      const parsed = decodeErrorFrame(frame.payload);
+      if (parsed.code === ERR_KEY_COLLISION && parsed.storedOffset !== undefined) {
+        // Enrich with msgId/stream context at the call site (client.ts).
+        // Use a sentinel so client.ts can distinguish and re-throw with context.
+        pending.reject(new KeyCollisionError("", parsed.storedOffset));
+      } else if (parsed.code === ERR_DEDUP_MAP_FULL && parsed.retryAfterSecs !== undefined) {
+        pending.reject(new DedupMapFullError("", parsed.retryAfterSecs));
+      } else {
+        pending.reject(new ServerError(parsed.code, parsed.message));
+      }
     } else {
       pending.resolve(frame);
     }

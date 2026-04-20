@@ -8,7 +8,7 @@ import {
   type Frame, DEFAULT_PORT, START_FROM_EARLIEST, START_FROM_LATEST, START_FROM_OFFSET,
 } from "./protocol/index.js";
 import { Subscription } from "./subscription.js";
-import { ServerError, ValidationError } from "./errors.js";
+import { ServerError, ValidationError, KeyCollisionError, DedupMapFullError } from "./errors.js";
 import type {
   BrokerEndpoint, ClientOptions, PublishOptions, PublishResult, CreateStreamOptions,
   CreateConsumerOptions, SubscribeOptions, FetchOptions, FetchRecord,
@@ -55,6 +55,33 @@ export class ExspeedClient extends EventEmitter {
     if (!stream) throw new ValidationError("Stream name is required");
     if (!options.subject) throw new ValidationError("Subject is required");
 
+    const maxDedupRetries = 3;
+    let dedupAttempts = 0;
+
+    while (true) {
+      try {
+        return await this.publishOnce(stream, options);
+      } catch (err) {
+        // KeyCollisionError: same msgId with a different body — this is a bug, never retry.
+        if (err instanceof KeyCollisionError) {
+          throw err;
+        }
+        // DedupMapFullError: broker dedup map at capacity. Retry up to maxDedupRetries
+        // times, sleeping retryAfterSecs between each attempt.
+        if (err instanceof DedupMapFullError) {
+          dedupAttempts++;
+          if (dedupAttempts > maxDedupRetries) {
+            throw err;
+          }
+          await new Promise((r) => setTimeout(r, err.retryAfterSecs * 1000));
+          continue;
+        }
+        throw err;
+      }
+    }
+  }
+
+  private async publishOnce(stream: string, options: PublishOptions): Promise<PublishResult> {
     let value: Buffer;
     if ("data" in options && options.data !== undefined) {
       value = Buffer.from(JSON.stringify(options.data), "utf8");
@@ -69,10 +96,36 @@ export class ExspeedClient extends EventEmitter {
       key = typeof options.key === "string" ? Buffer.from(options.key, "utf8") : options.key;
     }
 
-    const payload = encodePublish({ stream, subject: options.subject, value, key, headers: options.headers });
-    const response = await this.mainConn.request(OpCode.Publish, payload);
-    const { offset } = decodePublishOk(response.payload);
-    return { offset, toJSON: () => ({ offset: offset.toString() }) };
+    let headers = options.headers;
+    let msgId: string | undefined;
+
+    if (options.msgId) {
+      if (this.mainConn.getServerVersion() >= 2) {
+        msgId = options.msgId;
+      } else {
+        const filtered = (headers ?? []).filter(([k]) => k.toLowerCase() !== 'x-idempotency-key');
+        headers = [...filtered, ["x-idempotency-key", options.msgId]];
+      }
+    }
+
+    const payload = encodePublish({ stream, subject: options.subject, value, key, headers, msgId });
+
+    let response;
+    try {
+      response = await this.mainConn.request(OpCode.Publish, payload);
+    } catch (err) {
+      // Re-throw typed errors with the current publish's context.
+      if (err instanceof KeyCollisionError) {
+        throw new KeyCollisionError(msgId ?? "", err.storedOffset);
+      }
+      if (err instanceof DedupMapFullError) {
+        throw new DedupMapFullError(stream, err.retryAfterSecs);
+      }
+      throw err;
+    }
+
+    const { offset, duplicate } = decodePublishOk(response.payload);
+    return { offset, duplicate, toJSON: () => ({ offset: offset.toString() }) };
   }
 
   async subscribe(consumerName: string, options?: SubscribeOptions): Promise<Subscription & { unsubscribe(): Promise<void> }> {

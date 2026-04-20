@@ -7,9 +7,10 @@ export interface ConnectRequest {
 export interface PublishRequest {
   stream: string;
   subject: string;
-  value: Buffer;
+  value: Buffer | Uint8Array;
   key?: Buffer;
   headers?: [string, string][];
+  msgId?: string;
 }
 
 export interface AckRequest {
@@ -79,3 +80,5 @@ export const START_FROM_LATEST = 1;
 export const START_FROM_OFFSET = 2;
 
 export const FLAG_HAS_KEY = 0x01;
+export const FLAG_HAS_MSG_ID = 0x02;
+export const MAX_MSG_ID_BYTES = 256;

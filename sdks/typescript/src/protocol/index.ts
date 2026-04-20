@@ -1,8 +1,8 @@
 export { OpCode, PROTOCOL_VERSION, FRAME_HEADER_SIZE, MAX_PAYLOAD_SIZE, DEFAULT_PORT } from "./opcodes.js";
 export { encodeFrame, decodeFrame, type Frame, type DecodeResult } from "./codec.js";
 export * from "./types.js";
-export { encodeConnect, decodeConnect } from "./connect.js";
-export { encodePublish, decodePublish, decodePublishOk } from "./publish.js";
+export { encodeConnect, decodeConnect, decodeConnectResponse, type ConnectResponse } from "./connect.js";
+export { encodePublish, encodePublishRequest, decodePublish, decodePublishOk } from "./publish.js";
 export { encodeAck, decodeAck } from "./ack.js";
 export { encodeSubscribe, encodeUnsubscribe, decodeSubscribe } from "./subscribe.js";
 export { encodeFetch, decodeFetch } from "./fetch.js";

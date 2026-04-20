@@ -8,15 +8,31 @@ use crate::cli::format;
 ///
 /// `retention` is a human duration like "7d", "24h", "30m".
 /// `max_size` is a human size like "10gb", "256mb".
-pub async fn create(client: &CliClient, name: &str, retention: &str, max_size: &str) -> Result<()> {
+/// `dedup_window` is an optional human duration like "10m", "1h".
+/// `dedup_max_entries` is an optional count like "2M", "500k".
+pub async fn create(
+    client: &CliClient,
+    name: &str,
+    retention: &str,
+    max_size: &str,
+    dedup_window: Option<&str>,
+    dedup_max_entries: Option<&str>,
+) -> Result<()> {
     let retention_secs = parse_duration_secs(retention)?;
     let max_bytes = parse_size_bytes(max_size)?;
 
-    let body = json!({
+    let mut body = json!({
         "name": name,
-        "retention_secs": retention_secs,
-        "max_size_bytes": max_bytes,
+        "max_age_secs": retention_secs,
+        "max_bytes": max_bytes,
     });
+
+    if let Some(w) = dedup_window {
+        body["dedup_window_secs"] = json!(parse_duration_secs(w)?);
+    }
+    if let Some(e) = dedup_max_entries {
+        body["dedup_max_entries"] = json!(parse_count_suffix(e)?);
+    }
 
     let (status, resp) = client.post("/api/v1/streams", &body).await?;
 
@@ -28,6 +44,49 @@ pub async fn create(client: &CliClient, name: &str, retention: &str, max_size: &
             .unwrap_or("unknown error")
             .to_string();
         return Err(anyhow!("failed to create stream: {msg}"));
+    }
+
+    Ok(())
+}
+
+/// Update an existing stream's config via PATCH.
+///
+/// Only the provided fields are updated; unset fields are left unchanged.
+pub async fn update(
+    client: &CliClient,
+    name: &str,
+    retention: Option<&str>,
+    max_size: Option<&str>,
+    dedup_window: Option<&str>,
+    dedup_max_entries: Option<&str>,
+) -> Result<()> {
+    let mut body = serde_json::Map::new();
+
+    if let Some(r) = retention {
+        body.insert("max_age_secs".into(), json!(parse_duration_secs(r)?));
+    }
+    if let Some(s) = max_size {
+        body.insert("max_bytes".into(), json!(parse_size_bytes(s)?));
+    }
+    if let Some(w) = dedup_window {
+        body.insert("dedup_window_secs".into(), json!(parse_duration_secs(w)?));
+    }
+    if let Some(e) = dedup_max_entries {
+        body.insert("dedup_max_entries".into(), json!(parse_count_suffix(e)?));
+    }
+
+    let body_val = serde_json::Value::Object(body);
+    let path = format!("/api/v1/streams/{name}");
+    let (status, resp) = client.patch(&path, &body_val).await?;
+
+    if (200..300).contains(&status) {
+        println!("Stream '{}' updated", name);
+    } else {
+        let msg = resp["error"]
+            .as_str()
+            .unwrap_or("unknown error")
+            .to_string();
+        return Err(anyhow!("failed to update stream: {msg}"));
     }
 
     Ok(())
@@ -95,11 +154,17 @@ pub async fn info(client: &CliClient, name: &str, json_output: bool) -> Result<(
     if let Some(offset) = resp["head_offset"].as_u64() {
         println!("  Head offset: {}", offset);
     }
-    if let Some(retention) = resp["retention_secs"].as_u64() {
+    if let Some(retention) = resp["max_age_secs"].as_u64() {
         println!("  Retention: {}s", retention);
     }
-    if let Some(max_size) = resp["max_size_bytes"].as_u64() {
+    if let Some(max_size) = resp["max_bytes"].as_u64() {
         println!("  Max size: {}", format_bytes(max_size));
+    }
+    if let Some(dw) = resp["dedup_window_secs"].as_u64() {
+        println!("  Dedup window: {}s", dw);
+    }
+    if let Some(de) = resp["dedup_max_entries"].as_u64() {
+        println!("  Dedup max entries: {}", de);
     }
 
     Ok(())
@@ -228,6 +293,32 @@ pub fn parse_size_bytes(s: &str) -> Result<u64> {
     Ok(num * multiplier)
 }
 
+/// Parse a human-readable count string (e.g. "2M", "500k") to a `u64`.
+///
+/// Supported suffixes: `M`/`m` (millions), `K`/`k` (thousands).
+/// No suffix: parsed as a raw integer.
+pub fn parse_count_suffix(s: &str) -> Result<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err(anyhow!("empty count string"));
+    }
+
+    let s_lower = s.to_lowercase();
+    let (num_str, multiplier): (&str, u64) = if let Some(n) = s_lower.strip_suffix('m') {
+        (n, 1_000_000)
+    } else if let Some(n) = s_lower.strip_suffix('k') {
+        (n, 1_000)
+    } else {
+        (s, 1)
+    };
+
+    let num: u64 = num_str
+        .parse()
+        .map_err(|_| anyhow!("invalid count: '{s}' (use e.g. 2M, 500k, 1000)"))?;
+
+    Ok(num * multiplier)
+}
+
 /// Format a byte count as a human-readable string.
 ///
 /// Examples: 10737418240 -> "10.0 GB", 268435456 -> "256.0 MB".
@@ -277,5 +368,16 @@ mod tests {
         assert_eq!(format_bytes(1048576), "1.0 MB");
         assert_eq!(format_bytes(1024), "1.0 KB");
         assert_eq!(format_bytes(500), "500 B");
+    }
+
+    #[test]
+    fn test_parse_count_suffix() {
+        assert_eq!(parse_count_suffix("2M").unwrap(), 2_000_000);
+        assert_eq!(parse_count_suffix("500k").unwrap(), 500_000);
+        assert_eq!(parse_count_suffix("500K").unwrap(), 500_000);
+        assert_eq!(parse_count_suffix("1000").unwrap(), 1_000);
+        assert_eq!(parse_count_suffix("1m").unwrap(), 1_000_000);
+        assert!(parse_count_suffix("").is_err());
+        assert!(parse_count_suffix("abc").is_err());
     }
 }

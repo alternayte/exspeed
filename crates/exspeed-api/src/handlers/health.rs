@@ -46,6 +46,13 @@ pub async fn readyz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         );
     }
 
+    if !state.broker.is_dedup_ready() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "dedup_rebuild_in_progress"})),
+        );
+    }
+
     if let Err(e) = probe_data_dir(&state.data_dir).await {
         tracing::warn!(error = %e, data_dir = %state.data_dir.display(), "/readyz probe failed");
         return (
@@ -64,6 +71,6 @@ async fn probe_data_dir(data_dir: &std::path::Path) -> std::io::Result<()> {
         std::fs::remove_file(&probe)
     })
     .await
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))??;
+    .map_err(std::io::Error::other)??;
     Ok(())
 }

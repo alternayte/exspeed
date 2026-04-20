@@ -61,7 +61,7 @@ async fn connect_and_ping_pong() {
         .unwrap()
         .unwrap();
 
-    assert_eq!(response.opcode, OpCode::Ok);
+    assert_eq!(response.opcode, OpCode::ConnectOk);
     assert_eq!(response.correlation_id, 1);
 
     // Send PING

@@ -41,11 +41,12 @@ export interface ClientOptions {
 }
 
 export type PublishOptions =
-  | { subject: string; data: unknown; key?: string | Buffer; headers?: [string, string][] }
-  | { subject: string; value: Buffer | Uint8Array; key?: string | Buffer; headers?: [string, string][] };
+  | { subject: string; data: unknown; key?: string | Buffer; headers?: [string, string][]; msgId?: string }
+  | { subject: string; value: Buffer | Uint8Array; key?: string | Buffer; headers?: [string, string][]; msgId?: string };
 
 export interface PublishResult {
   offset: bigint;
+  duplicate: boolean;
   toJSON(): { offset: string };
 }
 

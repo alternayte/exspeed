@@ -134,6 +134,148 @@ async fn get_stream_not_found() {
     assert_eq!(resp.status(), 404);
 }
 
+// ---------------------------------------------------------------------------
+// Dedup field tests (Task 5)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn create_stream_rejects_dedup_window_longer_than_retention() {
+    let (_tcp, http) = start_server().await;
+    let resp = reqwest::Client::new()
+        .post(format!("{}/api/v1/streams", http))
+        .json(&serde_json::json!({
+            "name": "bad-dedup",
+            "max_age_secs": 60,
+            "dedup_window_secs": 120
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "expected 400 for invalid dedup window");
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("dedup window"),
+        "expected 'dedup window' in error message, got: {}",
+        body
+    );
+}
+
+#[tokio::test]
+async fn create_stream_persists_dedup_fields() {
+    let (_tcp, http) = start_server().await;
+    // Create stream with explicit dedup fields.
+    reqwest::Client::new()
+        .post(format!("{}/api/v1/streams", http))
+        .json(&serde_json::json!({
+            "name": "dedup-good",
+            "dedup_window_secs": 600,
+            "dedup_max_entries": 100000
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    // GET should echo them back.
+    let info: serde_json::Value = reqwest::get(format!("{}/api/v1/streams/dedup-good", http))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        info["dedup_window_secs"], 600,
+        "dedup_window_secs mismatch; body: {:?}",
+        info
+    );
+    assert_eq!(
+        info["dedup_max_entries"], 100000,
+        "dedup_max_entries mismatch; body: {:?}",
+        info
+    );
+}
+
+#[tokio::test]
+async fn patch_updates_dedup_window_on_live_stream() {
+    let (_tcp, http) = start_server().await;
+    // Create stream.
+    reqwest::Client::new()
+        .post(format!("{}/api/v1/streams", http))
+        .json(&serde_json::json!({ "name": "live-patch" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    // PATCH to update dedup_window_secs.
+    let patch_resp = reqwest::Client::new()
+        .patch(format!("{}/api/v1/streams/live-patch", http))
+        .json(&serde_json::json!({ "dedup_window_secs": 900 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        patch_resp.status(),
+        200,
+        "PATCH failed: {}",
+        patch_resp.text().await.unwrap_or_default()
+    );
+
+    // GET should reflect the new value.
+    let info: serde_json::Value = reqwest::get(format!("{}/api/v1/streams/live-patch", http))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        info["dedup_window_secs"], 900,
+        "dedup_window_secs not updated; body: {:?}",
+        info
+    );
+}
+
+#[tokio::test]
+async fn patch_stream_not_found_returns_404() {
+    let (_tcp, http) = start_server().await;
+    let resp = reqwest::Client::new()
+        .patch(format!("{}/api/v1/streams/nonexistent-stream", http))
+        .json(&serde_json::json!({ "dedup_window_secs": 300 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn patch_rejects_invalid_dedup_config() {
+    let (_tcp, http) = start_server().await;
+    // Create stream with a short retention and matching short dedup window so create succeeds.
+    reqwest::Client::new()
+        .post(format!("{}/api/v1/streams", http))
+        .json(&serde_json::json!({
+            "name": "short-ret",
+            "max_age_secs": 3600,
+            "dedup_window_secs": 60
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    // PATCH to shrink retention so dedup window would exceed it — should fail.
+    let resp = reqwest::Client::new()
+        .patch(format!("{}/api/v1/streams/short-ret", http))
+        .json(&serde_json::json!({ "max_age_secs": 30 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "expected 400 for retention < dedup window");
+}
+
 #[tokio::test]
 async fn metrics_endpoint_returns_prometheus_text() {
     let (_tcp, http) = start_server().await;
@@ -151,5 +293,163 @@ async fn metrics_endpoint_returns_prometheus_text() {
         body.contains("uptime_seconds"),
         "expected prometheus metrics containing 'uptime_seconds', got: {}",
         &body[..body.len().min(500)]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// HTTP publish with msg_id deduplication (Task 5)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn http_publish_with_msg_id_dedupes() {
+    let (_tcp, http) = start_server().await;
+
+    // Create stream.
+    reqwest::Client::new()
+        .post(format!("{}/api/v1/streams", http))
+        .json(&serde_json::json!({ "name": "dedup-http" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "data": {"x": 1},
+        "msg_id": "test-msg-1"
+    });
+
+    // First publish — should be written.
+    let r1: serde_json::Value = client
+        .post(format!("{}/api/v1/streams/dedup-http/publish", http))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        r1["duplicate"], false,
+        "first publish should not be a duplicate; body: {:?}",
+        r1
+    );
+
+    // Second publish with same msg_id and same data — should be deduplicated.
+    let r2: serde_json::Value = client
+        .post(format!("{}/api/v1/streams/dedup-http/publish", http))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        r2["duplicate"], true,
+        "second publish with same msg_id should be duplicate; body: {:?}",
+        r2
+    );
+    assert_eq!(
+        r1["offset"], r2["offset"],
+        "duplicate should return the same offset; r1={:?} r2={:?}",
+        r1, r2
+    );
+}
+
+#[tokio::test]
+async fn http_publish_msg_id_header_dedupes_same_as_field() {
+    let (_tcp, http) = start_server().await;
+
+    // Create stream.
+    reqwest::Client::new()
+        .post(format!("{}/api/v1/streams", http))
+        .json(&serde_json::json!({ "name": "hdr-dedup" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let client = reqwest::Client::new();
+
+    // First publish via x-idempotency-key header only (no body msg_id field).
+    let r1: serde_json::Value = client
+        .post(format!("{}/api/v1/streams/hdr-dedup/publish", http))
+        .header("x-idempotency-key", "header-key-1")
+        .json(&serde_json::json!({ "data": {"x": 1} }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        r1["duplicate"], false,
+        "first publish via header should not be a duplicate; body: {:?}",
+        r1
+    );
+
+    // Second publish with same x-idempotency-key header — should be deduplicated.
+    let r2: serde_json::Value = client
+        .post(format!("{}/api/v1/streams/hdr-dedup/publish", http))
+        .header("x-idempotency-key", "header-key-1")
+        .json(&serde_json::json!({ "data": {"x": 1} }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        r2["duplicate"], true,
+        "second publish with same header key should be duplicate; body: {:?}",
+        r2
+    );
+    assert_eq!(
+        r1["offset"], r2["offset"],
+        "duplicate should return the same offset; r1={:?} r2={:?}",
+        r1, r2
+    );
+}
+
+#[tokio::test]
+async fn http_publish_msg_id_collision_returns_conflict() {
+    let (_tcp, http) = start_server().await;
+
+    // Create stream.
+    reqwest::Client::new()
+        .post(format!("{}/api/v1/streams", http))
+        .json(&serde_json::json!({ "name": "coll-http" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let client = reqwest::Client::new();
+
+    // First publish.
+    client
+        .post(format!("{}/api/v1/streams/coll-http/publish", http))
+        .json(&serde_json::json!({ "data": {"body": "one"}, "msg_id": "coll-key" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    // Second publish with same msg_id but different data — should return 409.
+    let r = client
+        .post(format!("{}/api/v1/streams/coll-http/publish", http))
+        .json(&serde_json::json!({ "data": {"body": "two"}, "msg_id": "coll-key" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        409,
+        "same msg_id with different body should return 409 Conflict"
     );
 }

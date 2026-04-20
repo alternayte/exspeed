@@ -1,6 +1,16 @@
 import { writeString, readString, stringByteLength } from "./primitives.js";
 import type { ConnectRequest } from "./types.js";
 
+export interface ConnectResponse {
+  serverVersion: number;
+}
+
+export function decodeConnectResponse(payload: Buffer): ConnectResponse {
+  // v2 payload: 1 byte server_version. Older servers send empty Ok — default to 1.
+  const serverVersion = payload.length >= 1 ? payload.readUInt8(0) : 1;
+  return { serverVersion };
+}
+
 export function encodeConnect(req: ConnectRequest): Buffer {
   const size = stringByteLength(req.clientId) + 1 + req.authPayload.length;
   const buf = Buffer.alloc(size);

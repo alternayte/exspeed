@@ -60,7 +60,7 @@ async fn auth_disabled_accepts_any_connect() {
         .await.unwrap();
     let resp = timeout(Duration::from_secs(1), fr.next())
         .await.unwrap().unwrap().unwrap();
-    assert_eq!(resp.opcode, OpCode::Ok);
+    assert_eq!(resp.opcode, OpCode::ConnectOk);
 }
 
 #[tokio::test]
@@ -102,7 +102,7 @@ async fn auth_enabled_accepts_correct_token() {
     fw.send(encode_connect("c", AuthType::Token, b"secret123")).await.unwrap();
     let resp = timeout(Duration::from_secs(1), fr.next())
         .await.unwrap().unwrap().unwrap();
-    assert_eq!(resp.opcode, OpCode::Ok);
+    assert_eq!(resp.opcode, OpCode::ConnectOk);
 
     // Can Ping now.
     fw.send(Frame::empty(OpCode::Ping, 99)).await.unwrap();

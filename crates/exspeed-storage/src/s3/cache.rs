@@ -53,6 +53,7 @@ impl CacheTracker {
 
     /// Update the last-accessed time for the given segment, preventing it from
     /// being chosen as the LRU victim in the near term.
+    #[allow(dead_code)]
     fn touch(&mut self, stream: &str, base_offset: u64) {
         if let Some(entry) = self.entries.get_mut(&(stream.to_string(), base_offset)) {
             entry.last_accessed = Instant::now();

@@ -4,13 +4,17 @@ use crate::error::ProtocolError;
 
 /// Flag bit: payload includes a key field.
 const FLAG_HAS_KEY: u8 = 0x01;
+/// Flag bit: payload includes a msg_id field.
+const FLAG_HAS_MSG_ID: u8 = 0x02;
+/// Maximum allowed byte length for a msg_id.
+const MAX_MSG_ID_BYTES: usize = 256;
 
 /// PUBLISH request payload.
 ///
 /// Wire format:
 /// ```text
-/// stream(u16+utf8) + subject(u16+utf8) + flags(u8, bit0=has_key)
-/// + [key(u32+bytes)] + value(u32+bytes)
+/// stream(u16+utf8) + subject(u16+utf8) + flags(u8, bit0=has_key, bit1=has_msg_id)
+/// + [key(u32+bytes)] + [msg_id(u16+utf8)] + value(u32+bytes)
 /// + header_count(u16) + headers(u16+utf8 key, u16+utf8 val each)
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +22,7 @@ pub struct PublishRequest {
     pub stream: String,
     pub subject: String,
     pub key: Option<Bytes>,
+    pub msg_id: Option<String>,
     pub value: Bytes,
     pub headers: Vec<(String, String)>,
 }
@@ -35,13 +40,26 @@ impl PublishRequest {
         dst.extend_from_slice(subject_bytes);
 
         // flags
-        let flags = if self.key.is_some() { FLAG_HAS_KEY } else { 0 };
+        let mut flags: u8 = 0;
+        if self.key.is_some() {
+            flags |= FLAG_HAS_KEY;
+        }
+        if self.msg_id.is_some() {
+            flags |= FLAG_HAS_MSG_ID;
+        }
         dst.put_u8(flags);
 
         // key (optional)
         if let Some(ref key) = self.key {
             dst.put_u32_le(key.len() as u32);
             dst.extend_from_slice(key);
+        }
+
+        // msg_id (optional)
+        if let Some(ref id) = self.msg_id {
+            let id_bytes = id.as_bytes();
+            dst.put_u16_le(id_bytes.len() as u16);
+            dst.extend_from_slice(id_bytes);
         }
 
         // value
@@ -109,6 +127,30 @@ impl PublishRequest {
             None
         };
 
+        // msg_id (optional, bit 1)
+        let msg_id = if flags & FLAG_HAS_MSG_ID != 0 {
+            if src.remaining() < 2 {
+                return Err(ProtocolError::Decode(
+                    "PUBLISH truncated before msg_id length".into(),
+                ));
+            }
+            let id_len = src.get_u16_le() as usize;
+            if id_len > MAX_MSG_ID_BYTES {
+                return Err(ProtocolError::Decode(format!(
+                    "msg_id length {id_len} exceeds max {MAX_MSG_ID_BYTES}"
+                )));
+            }
+            if src.remaining() < id_len {
+                return Err(ProtocolError::Decode("PUBLISH truncated at msg_id".into()));
+            }
+            Some(
+                String::from_utf8(src.split_to(id_len).to_vec())
+                    .map_err(|e| ProtocolError::Decode(format!("invalid msg_id UTF-8: {e}")))?,
+            )
+        } else {
+            None
+        };
+
         // value
         if src.remaining() < 4 {
             return Err(ProtocolError::Decode(
@@ -165,6 +207,7 @@ impl PublishRequest {
             stream,
             subject,
             key,
+            msg_id,
             value,
             headers,
         })
@@ -181,6 +224,7 @@ mod tests {
             stream: "orders".into(),
             subject: "orders.created".into(),
             key: Some(Bytes::from_static(b"order-123")),
+            msg_id: None,
             value: Bytes::from_static(b"{\"total\": 42.0}"),
             headers: vec![
                 ("content-type".into(), "application/json".into()),
@@ -208,6 +252,7 @@ mod tests {
             stream: "logs".into(),
             subject: "logs.info".into(),
             key: None,
+            msg_id: None,
             value: Bytes::from_static(b"hello world"),
             headers: vec![],
         };
@@ -220,5 +265,50 @@ mod tests {
         assert!(decoded.key.is_none());
         assert_eq!(decoded.value, Bytes::from_static(b"hello world"));
         assert!(decoded.headers.is_empty());
+    }
+
+    #[test]
+    fn publish_roundtrip_with_msg_id() {
+        let req = PublishRequest {
+            stream: "orders".into(),
+            subject: "orders.created".into(),
+            key: None,
+            msg_id: Some("ord-123".into()),
+            value: Bytes::from_static(b"body"),
+            headers: vec![],
+        };
+        let mut buf = BytesMut::new();
+        req.encode(&mut buf);
+        let decoded = PublishRequest::decode(buf.freeze()).unwrap();
+        assert_eq!(decoded.msg_id, Some("ord-123".into()));
+    }
+
+    #[test]
+    fn publish_msg_id_over_256_bytes_rejected() {
+        let mut buf = BytesMut::new();
+        buf.put_u16_le(0); // stream_len = 0
+        buf.put_u16_le(0); // subject_len = 0
+        buf.put_u8(0x02); // flags: has_msg_id
+        buf.put_u16_le(257); // msg_id_len exceeds max
+        buf.extend_from_slice(&vec![b'x'; 257]);
+        buf.put_u32_le(0); // value_len
+        buf.put_u16_le(0); // 0 headers
+        let err = PublishRequest::decode(buf.freeze()).unwrap_err();
+        assert!(err.to_string().contains("msg_id"));
+    }
+
+    #[test]
+    fn publish_no_msg_id_roundtrip_unchanged() {
+        let req = PublishRequest {
+            stream: "logs".into(),
+            subject: "logs.info".into(),
+            key: None,
+            msg_id: None,
+            value: Bytes::from_static(b"hello"),
+            headers: vec![],
+        };
+        let mut buf = BytesMut::new();
+        req.encode(&mut buf);
+        assert_eq!(PublishRequest::decode(buf.freeze()).unwrap().msg_id, None);
     }
 }

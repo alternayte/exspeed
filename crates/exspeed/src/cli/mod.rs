@@ -50,6 +50,29 @@ pub enum Command {
         /// Max storage size (e.g. 10gb, 256mb)
         #[arg(long, default_value = "10gb")]
         max_size: String,
+        /// Dedup window duration (e.g. 10m, 1h, 300s)
+        #[arg(long)]
+        dedup_window: Option<String>,
+        /// Dedup max entries (e.g. 2M, 500k, 100000)
+        #[arg(long)]
+        dedup_max_entries: Option<String>,
+    },
+    /// Update an existing stream's configuration
+    UpdateStream {
+        /// Stream name
+        name: String,
+        /// Retention period (e.g. 7d, 24h, 30m)
+        #[arg(long)]
+        retention: Option<String>,
+        /// Max storage size (e.g. 10gb, 256mb)
+        #[arg(long)]
+        max_size: Option<String>,
+        /// Dedup window duration (e.g. 10m, 1h, 300s)
+        #[arg(long)]
+        dedup_window: Option<String>,
+        /// Dedup max entries (e.g. 2M, 500k, 100000)
+        #[arg(long)]
+        dedup_max_entries: Option<String>,
     },
     /// Delete a stream
     Delete {
@@ -75,6 +98,9 @@ pub enum Command {
         /// Partition key
         #[arg(long)]
         key: Option<String>,
+        /// Idempotency message ID for deduplication
+        #[arg(long = "msg-id")]
+        msg_id: Option<String>,
     },
     /// Tail records from a stream
     Tail {

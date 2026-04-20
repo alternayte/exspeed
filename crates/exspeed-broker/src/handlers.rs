@@ -25,7 +25,21 @@ pub async fn handle_create_stream(broker: &Broker, req: CreateStreamRequest) -> 
         .create_stream(&stream_name, req.max_age_secs, req.max_bytes)
         .await
     {
-        Ok(()) => ServerMessage::Ok,
+        Ok(()) => {
+            // Load the stream config that was just persisted (uses defaults for dedup
+            // fields since CreateStreamRequest doesn't carry dedup params yet).
+            let stream_dir = broker
+                .data_dir
+                .join("streams")
+                .join(stream_name.as_str());
+            let cfg = exspeed_storage::file::stream_config::StreamConfig::load(&stream_dir)
+                .unwrap_or_default();
+            broker
+                .broker_append
+                .configure_stream(&stream_name, cfg.dedup_window_secs, cfg.dedup_max_entries)
+                .await;
+            ServerMessage::Ok
+        }
         Err(e) => ServerMessage::Error {
             code: 409,
             message: format!("create_stream failed: {e}"),
@@ -44,27 +58,62 @@ pub async fn handle_publish(broker: &Broker, req: PublishRequest) -> ServerMessa
         }
     };
 
+    // Translate msg_id field → x-idempotency-key header.
+    let mut headers = req.headers;
+    if let Some(ref id) = req.msg_id {
+        // Log at DEBUG when both explicit msg_id and x-idempotency-key header are
+        // present but disagree, so operators can detect misconfigured callers.
+        if let Some((_, existing)) = headers.iter().find(|(k, _)| k == "x-idempotency-key") {
+            if existing != id {
+                tracing::debug!(
+                    stream = %stream_name,
+                    "publish has both explicit msg_id and x-idempotency-key header; using explicit field"
+                );
+            }
+        }
+        headers.retain(|(k, _)| k != "x-idempotency-key");
+        headers.push(("x-idempotency-key".to_string(), id.clone()));
+    }
+
     let record = Record {
         key: req.key,
         value: req.value,
         subject: req.subject,
-        headers: req.headers,
+        headers,
     };
 
     let start = std::time::Instant::now();
     match broker.broker_append.append(&stream_name, &record).await {
-        Ok(result) => {
+        Ok(crate::broker_append::AppendResult::Written(offset)) => {
             let elapsed_secs = start.elapsed().as_secs_f64();
             broker
                 .metrics
                 .record_publish_latency(stream_name.as_str(), elapsed_secs);
             broker.metrics.record_publish(stream_name.as_str());
             ServerMessage::PublishOk {
-                offset: result.offset().0,
+                offset: offset.0,
+                duplicate: false,
             }
         }
+        Ok(crate::broker_append::AppendResult::Duplicate(offset)) => {
+            let elapsed_secs = start.elapsed().as_secs_f64();
+            broker
+                .metrics
+                .record_publish_latency(stream_name.as_str(), elapsed_secs);
+            broker.metrics.record_publish(stream_name.as_str());
+            ServerMessage::PublishOk {
+                offset: offset.0,
+                duplicate: true,
+            }
+        }
+        Err(StorageError::KeyCollision { stored_offset }) => {
+            ServerMessage::KeyCollision { stored_offset }
+        }
+        Err(StorageError::DedupMapFull { retry_after_secs }) => {
+            ServerMessage::DedupMapFull { retry_after_secs }
+        }
         Err(e) => ServerMessage::Error {
-            code: 404,
+            code: 500,
             message: format!("append failed: {e}"),
         },
     }
@@ -556,7 +605,10 @@ pub async fn handle_seek(broker: &Broker, req: SeekRequest) -> ServerMessage {
                     };
                 }
             }
-            ServerMessage::PublishOk { offset: offset.0 } // reuse PublishOk for offset response
+            ServerMessage::PublishOk {
+                offset: offset.0,
+                duplicate: false,
+            } // reuse PublishOk for offset response
         }
         Err(e) => ServerMessage::Error {
             code: 500,

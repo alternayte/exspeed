@@ -2,6 +2,30 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::error::ProtocolError;
 
+/// Wire protocol version this server implements.
+pub const WIRE_VERSION: u8 = 2;
+
+/// CONNECT_OK response payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectResponse {
+    pub server_version: u8,
+}
+
+impl ConnectResponse {
+    pub fn encode(&self, dst: &mut BytesMut) {
+        dst.put_u8(self.server_version);
+    }
+
+    pub fn decode(mut src: Bytes) -> Result<Self, ProtocolError> {
+        if src.remaining() < 1 {
+            return Err(ProtocolError::Decode("ConnectResponse too short".into()));
+        }
+        Ok(ConnectResponse {
+            server_version: src.get_u8(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum AuthType {
@@ -112,5 +136,22 @@ mod tests {
     fn connect_empty_payload_rejected() {
         let result = ConnectRequest::decode(Bytes::new());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn connect_response_roundtrip() {
+        let resp = ConnectResponse { server_version: 2 };
+        let mut buf = BytesMut::new();
+        resp.encode(&mut buf);
+        assert_eq!(
+            ConnectResponse::decode(buf.freeze()).unwrap().server_version,
+            2
+        );
+    }
+
+    #[test]
+    fn connect_response_empty_rejected() {
+        let err = ConnectResponse::decode(Bytes::new()).unwrap_err();
+        assert!(err.to_string().contains("too short"));
     }
 }
