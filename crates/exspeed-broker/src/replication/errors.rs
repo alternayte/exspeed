@@ -27,4 +27,10 @@ pub enum ReplicationError {
     /// String fallback for anything without a direct `From` impl.
     #[error("serialization: {0}")]
     Serde(String),
+    /// Follower was asked to shut down (cancel token fired) while partway
+    /// through a session. This is an expected path — log INFO at most,
+    /// never WARN/ERROR; do not count it as a transient error or bump
+    /// backoff. The outer loop will observe the cancel and exit.
+    #[error("replication cancelled")]
+    Cancelled,
 }

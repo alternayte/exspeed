@@ -90,6 +90,23 @@ fn idle_timeout_from_env() -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Outcome of a single replication session, recording whether the
+/// session reached the post-handshake manifest boundary. The outer loop
+/// reads this to decide backoff: errors after the manifest are treated
+/// as transient (handshake succeeded, so no point compounding backoff
+/// against a flapping leader); errors before the manifest back off
+/// harder (dial/auth/version errors that justify slowing retries).
+enum SessionOutcome {
+    /// EOF or cancel — no error, reset backoff.
+    Clean,
+    /// Error after `ClusterManifest` was successfully received. Handshake
+    /// worked; treat as a transient mid-session failure and reset backoff.
+    ErrAfterManifest(ReplicationError),
+    /// Error during dial / Connect / ReplicateResume / manifest-read.
+    /// Doubles backoff so we don't tight-loop against a bad leader.
+    ErrBeforeManifest(ReplicationError),
+}
+
 /// Follower-side replication client. Holds the local storage handle and
 /// the persistent cursor; loops dialing the leader and applying events.
 pub struct ReplicationClient {
@@ -160,24 +177,39 @@ impl ReplicationClient {
             };
 
             // ---- Step 2–7: Run one session --------------------------------
+            //
+            // Backoff rules:
+            //   * Clean exit (EOF, cancel)            → reset to INITIAL.
+            //   * Error AFTER manifest received       → reset to INITIAL —
+            //     handshake succeeded, so a flapping leader won't compound
+            //     backoff across sessions.
+            //   * Error BEFORE manifest received      → double (transient
+            //     network / dial path — real backoff pressure is useful).
+            //   * Auth denied / version skew          → pin at MAX_BACKOFF.
             match self
                 .run_session(&endpoint, &connect_bearer, cancel.clone())
                 .await
             {
-                Ok(()) => {
+                SessionOutcome::Clean => {
                     info!(endpoint = %endpoint, "replication session ended cleanly");
-                    // Reset backoff on a clean exit so the next reconnect
-                    // happens promptly; transient errors still back off.
                     backoff = INITIAL_BACKOFF;
                 }
-                Err(ReplicationError::AuthDenied(msg)) => {
-                    // Auth failures are not transient — log loudly but keep
-                    // trying (an operator may rotate credentials). Back off
-                    // hard so we don't tight-loop on a misconfigured token.
+                SessionOutcome::ErrAfterManifest(e) => {
+                    warn!(
+                        endpoint = %endpoint,
+                        error = %e,
+                        "replication session ended post-manifest — resetting backoff"
+                    );
+                    backoff = INITIAL_BACKOFF;
+                }
+                SessionOutcome::ErrBeforeManifest(ReplicationError::AuthDenied(msg)) => {
                     error!(endpoint = %endpoint, error = %msg, "replication auth denied");
                     backoff = MAX_BACKOFF;
                 }
-                Err(ReplicationError::VersionSkew { leader, follower }) => {
+                SessionOutcome::ErrBeforeManifest(ReplicationError::VersionSkew {
+                    leader,
+                    follower,
+                }) => {
                     error!(
                         endpoint = %endpoint,
                         leader,
@@ -186,7 +218,7 @@ impl ReplicationClient {
                     );
                     backoff = MAX_BACKOFF;
                 }
-                Err(e) => {
+                SessionOutcome::ErrBeforeManifest(e) => {
                     warn!(endpoint = %endpoint, error = %e, "replication session ended with error");
                 }
             }
@@ -199,13 +231,24 @@ impl ReplicationClient {
     }
 
     /// One session: dial, handshake, manifest, divergent-history check,
-    /// apply event loop. Returns on any error or when the session ends.
+    /// apply event loop. Returns a `SessionOutcome` describing whether
+    /// the session reached the manifest boundary — the outer loop uses
+    /// that to decide whether a transient error should reset backoff.
+    ///
+    /// Cancellation is checked at every major handshake boundary. A
+    /// cancel mid-handshake returns `SessionOutcome::Clean`, not an
+    /// error — the process is shutting down as intended, not failing.
     async fn run_session(
         &self,
         endpoint: &str,
         connect_bearer: &str,
         cancel: CancellationToken,
-    ) -> Result<(), ReplicationError> {
+    ) -> SessionOutcome {
+        // ── Boundary: pre-dial. ────────────────────────────────────────
+        if cancel.is_cancelled() {
+            return SessionOutcome::Clean;
+        }
+
         // Dial.
         let socket = match TcpStream::connect(endpoint).await {
             Ok(s) => {
@@ -215,7 +258,7 @@ impl ReplicationClient {
             }
             Err(e) => {
                 self.metrics.record_replication_connect_attempt(false);
-                return Err(ReplicationError::Io(e));
+                return SessionOutcome::ErrBeforeManifest(ReplicationError::Io(e));
             }
         };
 
@@ -223,24 +266,55 @@ impl ReplicationClient {
         let mut framed_read = FramedRead::new(reader, ExspeedCodec::new());
         let mut framed_write = FramedWrite::new(writer, ExspeedCodec::new());
 
-        // Handshake: Connect + ConnectOk, then ReplicateResume.
-        send_connect(&mut framed_write, connect_bearer).await?;
-        read_connect_ok(&mut framed_read).await?;
-        send_replicate_resume(&mut framed_write, self.follower_id, &self.cursor).await?;
+        // ── Boundary: pre-Connect. ────────────────────────────────────
+        if cancel.is_cancelled() {
+            return SessionOutcome::Clean;
+        }
 
-        // ClusterManifest as first post-handshake frame.
-        let manifest = read_cluster_manifest(&mut framed_read, &self.metrics).await?;
+        // Handshake: Connect + ConnectOk, then ReplicateResume.
+        if let Err(e) = send_connect(&mut framed_write, connect_bearer).await {
+            return SessionOutcome::ErrBeforeManifest(e);
+        }
+        if let Err(e) = read_connect_ok(&mut framed_read).await {
+            return SessionOutcome::ErrBeforeManifest(e);
+        }
+
+        // ── Boundary: pre-ReplicateResume. ────────────────────────────
+        if cancel.is_cancelled() {
+            return SessionOutcome::Clean;
+        }
+
+        if let Err(e) = send_replicate_resume(&mut framed_write, self.follower_id, &self.cursor).await {
+            return SessionOutcome::ErrBeforeManifest(e);
+        }
+
+        // ── Boundary: pre-ClusterManifest wait. ───────────────────────
+        // The manifest read blocks on the leader; race it against cancel
+        // so shutdown isn't held up by a leader that never responds.
+        let manifest = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return SessionOutcome::Clean,
+            res = read_cluster_manifest(&mut framed_read, &self.metrics) => match res {
+                Ok(m) => m,
+                Err(e) => return SessionOutcome::ErrBeforeManifest(e),
+            },
+        };
         info!(
             streams = manifest.streams.len(),
             leader_holder_id = %manifest.leader_holder_id,
             "cluster manifest received"
         );
 
-        // Divergent-history + pre-create missing streams.
-        self.reconcile_manifest(&manifest).await?;
+        // From here on, any error is "post-manifest" — the handshake
+        // succeeded, so the outer loop resets backoff.
+        if let Err(e) = self.reconcile_manifest(&manifest).await {
+            return SessionOutcome::ErrAfterManifest(e);
+        }
 
-        // Apply event loop.
-        self.apply_loop(&mut framed_read, cancel).await
+        match self.apply_loop(&mut framed_read, cancel).await {
+            Ok(()) => SessionOutcome::Clean,
+            Err(e) => SessionOutcome::ErrAfterManifest(e),
+        }
     }
 
     /// For every stream in the manifest:
