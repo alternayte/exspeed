@@ -753,6 +753,72 @@ they're designed to be reachable by probes, scrapers, and webhook senders:
 If you need to authenticate `/metrics` as well, run a reverse-proxy sidecar
 that adds Basic auth. Broker-wide bearer tokens aren't a good fit for scrapers.
 
+### Managing credentials (multiple named identities)
+
+`EXSPEED_AUTH_TOKEN` gives one shared admin token. For more than one app
+sharing the broker, point `EXSPEED_CREDENTIALS_FILE` at a TOML file with
+one entry per app. Each entry stores `sha256(token)` — never the token
+itself — and a list of per-stream permissions (`publish`, `subscribe`,
+`admin`).
+
+**Generate a credential:**
+
+```bash
+$ exspeed auth gen-token
+a3f7...                    # stdout: raw token — give this to the app, ONCE
+b29c...                    # stderr: sha256(token) — paste into the TOML
+```
+
+**Example `credentials.toml`:**
+
+```toml
+[[credentials]]
+name = "orders-service"
+token_sha256 = "<the stderr output from gen-token>"
+permissions = [
+  { streams = "orders-*", actions = ["publish", "subscribe"] },
+]
+
+[[credentials]]
+name = "ops-admin"
+token_sha256 = "<another sha256>"
+permissions = [
+  { streams = "*", actions = ["publish", "subscribe", "admin"] },
+]
+```
+
+**Run the server:**
+
+```bash
+EXSPEED_CREDENTIALS_FILE=/etc/exspeed/credentials.toml \
+EXSPEED_TLS_CERT=/etc/exspeed/cert.pem \
+EXSPEED_TLS_KEY=/etc/exspeed/key.pem \
+  exspeed server
+```
+
+**Migration from single `EXSPEED_AUTH_TOKEN`:** the env var keeps working
+as a synthetic `legacy-admin` identity (full global admin). Add scoped
+credentials to the file; migrate one app at a time; unset the env var
+when done. You can set both at once — the server registers `legacy-admin`
+from the env var plus every entry in the TOML. (Reserved: an entry named
+`legacy-admin` while the env var is set refuses to start; rename the
+entry or unset the env var.)
+
+**Rotation:** add a new credential, point the client at its new token,
+remove the old entry, restart the server. Restart is required —
+credentials are loaded once at boot (v1).
+
+**Multi-pod:** each pod reads its own `EXSPEED_CREDENTIALS_FILE`.
+Distribute the same file to every pod via a k8s Secret mount, Coolify
+file mount, Ansible, etc. Divergent files produce inconsistent authz
+across the cluster.
+
+**Verify what your token grants:** `exspeed auth whoami` calls
+`GET /api/v1/whoami` and prints the identity + permissions JSON.
+
+**Validate the file offline (CI):** `exspeed auth lint /path/to/credentials.toml`
+exits non-zero with a specific error on any parse or validation failure.
+
 ### TLS
 
 ```bash
@@ -801,13 +867,12 @@ roadmap but not in v1.
 
 - mTLS (no client-cert verification)
 - SASL / JWT / OAuth2
-- Per-stream ACLs or RBAC
-- Multiple tokens / named client identities
+- Live SIGHUP reload of `credentials.toml` — changes need a restart
 - Rate limiting on failed auth attempts — use an ingress WAF or fail2ban
 
-Anyone with the token has full admin on the broker. The target deployment
-model is "trust the network boundary" (VPC, service mesh, Hetzner private
-network, k8s namespace).
+The target deployment model is "trust the network boundary" (VPC, service
+mesh, Hetzner private network, k8s namespace) with per-app scoped
+credentials on top.
 
 ## Operations & deployment
 
