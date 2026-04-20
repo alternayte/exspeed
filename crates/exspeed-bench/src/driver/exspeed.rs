@@ -180,7 +180,7 @@ pub async fn run_producer(
             while Instant::now() < deadline {
                 client.publish_once(&stream, &payload, origin).await?;
                 local += 1;
-                if local % 256 == 0 {
+                if local.is_multiple_of(256) {
                     shared_count.fetch_add(256, Ordering::Relaxed);
                 }
             }

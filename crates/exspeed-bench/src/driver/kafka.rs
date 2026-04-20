@@ -87,7 +87,7 @@ pub async fn run_producer(
                     .map_err(|(e, _)| anyhow::anyhow!("producer send: {e}"))?;
 
                 local += 1;
-                if local % 256 == 0 {
+                if local.is_multiple_of(256) {
                     shared_count.fetch_add(256, Ordering::Relaxed);
                 }
             }

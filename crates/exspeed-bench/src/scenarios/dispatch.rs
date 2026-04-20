@@ -18,6 +18,9 @@ pub async fn ensure_stream(target: Target, addr: &str, stream: &str) -> Result<(
     }
 }
 
+// dispatch layer: parameters mirror the underlying driver APIs; bundling
+// them into a struct would only add ceremony for the routing match below.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_producer(
     target: Target,
     addr: &str,
