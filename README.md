@@ -1085,7 +1085,8 @@ leader starts accepting writes as soon as `/healthz` returns 200.
 Writes are acknowledged when they hit the leader's local disk — the
 leader does not wait for a follower to apply the record before
 responding. The window between "leader acks" and "follower applies" is
-reported as `exspeed_replication_lag_seconds` + `exspeed_replication_lag_records`.
+reported as `exspeed_replication_lag_seconds` + `exspeed_replication_lag_records`
+(the latter is best-effort; `lag_seconds` is the primary signal).
 If the leader crashes with `lag > 0` at the moment of death, those
 records can be lost on promotion. Mitigations:
 
@@ -1126,8 +1127,8 @@ follower cannot authenticate without it.
 |---|---|---|
 | `EXSPEED_CLUSTER_BIND` | `0.0.0.0:5934` | Leader-side listener for follower sessions. |
 | `EXSPEED_CLUSTER_ADVERTISE` | same as bind | What the leader writes into the `cluster:leader` lease row as its replication endpoint. Set when the listen address differs from what peers should dial (NAT / k8s pod-IP vs service-IP). |
-| `EXSPEED_REPLICATION_BATCH_RECORDS` | 1024 | Max records per `RecordsAppended` frame. Smaller = lower latency, larger = better throughput. |
-| `EXSPEED_REPLICATION_HEARTBEAT_SECS` | 10 | Leader-side keepalive cadence when no records are flowing. |
+| `EXSPEED_REPLICATION_BATCH_RECORDS` | 1000 | Max records per `RecordsAppended` frame. Smaller = lower latency, larger = better throughput. |
+| `EXSPEED_REPLICATION_HEARTBEAT_SECS` | 5 | Leader-side keepalive cadence when no records are flowing. Paired with the 30s follower idle timeout (6× ratio) — a single dropped heartbeat does not tear a session down. |
 | `EXSPEED_REPLICATION_IDLE_TIMEOUT_SECS` | 30 | Follower tears the session down if it receives nothing for this long. |
 | `EXSPEED_REPLICATION_FOLLOWER_QUEUE_RECORDS` | 100000 | Leader's per-follower mpsc queue capacity. Bigger = more memory per stuck follower, smaller = earlier drops under backpressure. |
 
@@ -1145,14 +1146,26 @@ is authoritative about where it left off.
 
 - `exspeed_replication_role{role="leader|follower|standalone"}` — gauge set to 1 for the current role, 0 otherwise.
 - `exspeed_replication_connected_followers` — gauge; count of active follower sessions on the leader.
-- `exspeed_replication_lag_seconds{stream}` — gauge; seconds between leader's latest write and follower's last-applied record.
-- `exspeed_replication_lag_records{stream}` — gauge; same idea, in records.
+- `exspeed_replication_lag_seconds{stream}` — gauge; seconds between leader's latest write and follower's last-applied record. **Primary indicator** — alert on `exspeed_replication_lag_seconds{stream=~".*"} > 10`.
+- `exspeed_replication_lag_records{stream}` — gauge; same idea, in records. Best-effort — reflects offset-lag at the moment of the last applied batch, not the live tail; `lag_seconds` is the more reliable signal.
 - `exspeed_replication_records_applied_total{stream}` — counter; records applied on the follower.
 - `exspeed_replication_bytes_total{direction="in|out"}` — counter; bytes over the replication socket.
 - `exspeed_replication_truncated_records_total{stream}` — counter; records truncated from the follower's local storage during divergent-history reconciliation.
 - `exspeed_replication_reseed_total{stream}` — counter; streams wiped + rebuilt because the follower fell behind the leader's retention window.
 - `exspeed_replication_follower_queue_drops_total` — counter; records dropped by the leader when a follower's queue was full.
 - `exspeed_auth_denied_total{action="replicate"}` — counter; replication handshakes rejected for missing `Action::Replicate`.
+
+> **Prometheus suffix quirk.** Scrapers observe counters here with a doubled `_total` suffix (e.g. `exspeed_replication_truncated_records_total_total`, `exspeed_replication_records_applied_total_total`). This is a known OTel-to-Prometheus exporter behaviour — it appends `_total` to counter names, including ones that already end in `_total`. Write PromQL and alert rules against the doubled name.
+
+#### Running the ignored replication integration tests
+
+The five Postgres-backed replication tests are `#[ignore]`d by default because they require a live Postgres. To run them locally:
+
+```bash
+docker compose up -d postgres
+EXSPEED_OFFSET_STORE_POSTGRES_URL=postgres://exspeed:exspeed@localhost:5432/exspeed \
+  cargo test -p exspeed --ignored -- --nocapture
+```
 
 #### Operator endpoints
 
