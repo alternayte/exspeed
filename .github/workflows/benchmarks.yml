@@ -1,0 +1,52 @@
+name: Benchmarks (manual smoke)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    name: exspeed-bench all --profile local
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release -p exspeed -p exspeed-bench
+
+      - name: Start Exspeed server
+        run: |
+          mkdir -p /tmp/exspeed-bench
+          ./target/release/exspeed server --data-dir /tmp/exspeed-bench &
+          echo "SERVER_PID=$!" >> $GITHUB_ENV
+          sleep 2
+
+      - name: Run benchmark smoke (local profile)
+        run: |
+          ./target/release/exspeed-bench all \
+            --server localhost:5933 \
+            --api http://localhost:8080 \
+            --profile local \
+            --output bench-smoke.json
+
+      - name: Render BENCHMARKS
+        run: ./target/release/exspeed-bench render bench-smoke.json --out rendered.md
+
+      - name: Stop Exspeed server
+        if: always()
+        run: kill ${{ env.SERVER_PID }} || true
+
+      - name: Upload result artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-smoke-output
+          path: |
+            bench-smoke.json
+            rendered.md
