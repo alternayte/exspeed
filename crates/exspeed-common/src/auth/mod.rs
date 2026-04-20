@@ -3,6 +3,8 @@
 
 pub mod compare;
 pub mod error;
+pub mod glob;
 
 pub use compare::verify_token;
 pub use error::AuthError;
+pub use glob::StreamGlob;
