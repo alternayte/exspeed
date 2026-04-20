@@ -38,6 +38,18 @@ pub async fn handle_create_stream(broker: &Broker, req: CreateStreamRequest) -> 
                 .broker_append
                 .configure_stream(&stream_name, cfg.dedup_window_secs, cfg.dedup_max_entries)
                 .await;
+
+            // Fan out to replication followers (no-op if single-pod).
+            if let Some(coord) = &broker.replication_coordinator {
+                use exspeed_protocol::messages::replicate::StreamCreatedEvent;
+                coord.emit(crate::replication::ReplicationEvent::StreamCreated(
+                    StreamCreatedEvent {
+                        name: stream_name.as_str().to_string(),
+                        max_age_secs: req.max_age_secs,
+                        max_bytes: req.max_bytes,
+                    },
+                ));
+            }
             ServerMessage::Ok
         }
         Err(e) => ServerMessage::Error {
@@ -90,6 +102,38 @@ pub async fn handle_publish(broker: &Broker, req: PublishRequest) -> ServerMessa
                 .metrics
                 .record_publish_latency(stream_name.as_str(), elapsed_secs);
             broker.metrics.record_publish(stream_name.as_str());
+
+            // Fan out to replication followers. Only on `Written` — a
+            // `Duplicate` means the record was persisted on an earlier
+            // publish, which was itself replicated at that time.
+            if let Some(coord) = &broker.replication_coordinator {
+                use exspeed_protocol::messages::replicate::{RecordsAppended, ReplicatedRecord};
+                // Extract msg_id from the idempotency header if present, so the
+                // follower's dedup map stays synchronized with the leader's.
+                let msg_id = record
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k == "x-idempotency-key")
+                    .map(|(_, v)| v.clone());
+                let timestamp_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                coord.emit(crate::replication::ReplicationEvent::RecordsAppended(
+                    RecordsAppended {
+                        stream: stream_name.as_str().to_string(),
+                        base_offset: offset.0,
+                        records: vec![ReplicatedRecord {
+                            subject: record.subject.clone(),
+                            payload: record.value.to_vec(),
+                            headers: record.headers.clone(),
+                            timestamp_ms,
+                            msg_id,
+                        }],
+                    },
+                ));
+            }
+
             ServerMessage::PublishOk {
                 offset: offset.0,
                 duplicate: false,
