@@ -372,6 +372,120 @@ impl Partition {
         self.next_offset
     }
 
+    /// Return the earliest retained offset across sealed and active segments.
+    ///
+    /// Returns 0 when no records have ever been written (or `next_offset == 0`).
+    /// Returns `next_offset` when the stream exists but all records have been
+    /// trimmed — callers treat `earliest == next` as empty.
+    pub fn earliest_offset(&self) -> u64 {
+        if let Some(first) = self.sealed_readers.first() {
+            return first.base_offset();
+        }
+        self.active_writer.base_offset()
+    }
+
+    /// Delete sealed segments whose records are entirely below `keep_from`.
+    ///
+    /// The segment containing `keep_from` is preserved intact (sub-segment
+    /// rewrite is out of scope). Safe to call with `keep_from` at or before
+    /// the current earliest offset — such calls are no-ops.
+    pub fn trim_up_to(&mut self, keep_from: u64) -> io::Result<RetentionStats> {
+        let mut stats = RetentionStats::default();
+        if keep_from == 0 {
+            return Ok(stats);
+        }
+
+        // Remove any sealed segment whose last offset is strictly less than
+        // `keep_from`. We walk from oldest to newest and stop at the first
+        // segment that might contain `keep_from`.
+        let mut to_remove: Vec<usize> = Vec::new();
+        for (i, reader) in self.sealed_readers.iter().enumerate() {
+            let last = match reader.last_offset()? {
+                Some(o) => o,
+                None => {
+                    // Empty sealed segment — safe to drop.
+                    to_remove.push(i);
+                    continue;
+                }
+            };
+            if last < keep_from {
+                to_remove.push(i);
+            } else {
+                break;
+            }
+        }
+
+        for &i in to_remove.iter().rev() {
+            let reader = self.sealed_readers.remove(i);
+            let seg_path = reader.path().to_path_buf();
+            let size = reader.file_size();
+            let _ = fs::remove_file(&seg_path);
+            let _ = fs::remove_file(seg_path.with_extension("idx"));
+            let _ = fs::remove_file(seg_path.with_extension("tix"));
+            stats.segments_deleted += 1;
+            stats.bytes_reclaimed += size;
+        }
+
+        Ok(stats)
+    }
+
+    /// Drop records at offsets `>= drop_from` at segment granularity.
+    ///
+    /// Sealed segments whose `base_offset >= drop_from` are deleted. The
+    /// active segment is preserved when `drop_from` falls inside it; a
+    /// future iteration may rewrite the active segment to strip the tail.
+    /// After truncation, `next_offset` is lowered to the new high-water
+    /// mark so subsequent appends resume at the correct offset.
+    pub fn truncate_from(&mut self, drop_from: u64) -> io::Result<RetentionStats> {
+        let mut stats = RetentionStats::default();
+        if drop_from >= self.next_offset {
+            return Ok(stats);
+        }
+
+        // Drop sealed segments whose base_offset >= drop_from.
+        let mut to_remove: Vec<usize> = Vec::new();
+        for (i, reader) in self.sealed_readers.iter().enumerate() {
+            if reader.base_offset() >= drop_from {
+                to_remove.push(i);
+            }
+        }
+        for &i in to_remove.iter().rev() {
+            let reader = self.sealed_readers.remove(i);
+            let seg_path = reader.path().to_path_buf();
+            let size = reader.file_size();
+            let _ = fs::remove_file(&seg_path);
+            let _ = fs::remove_file(seg_path.with_extension("idx"));
+            let _ = fs::remove_file(seg_path.with_extension("tix"));
+            stats.segments_deleted += 1;
+            stats.bytes_reclaimed += size;
+        }
+
+        // Recompute next_offset from the remaining segments.
+        let mut new_next: u64 = 0;
+        for reader in &self.sealed_readers {
+            if let Some(last) = reader.last_offset()? {
+                new_next = new_next.max(last + 1);
+            }
+        }
+        // If the active segment survives and it contains records at or past
+        // `drop_from`, sub-segment truncation would require a rewrite. For
+        // the trait contract we accept this as best-effort: leave the active
+        // segment alone unless its base_offset is past drop_from, in which
+        // case it's a fresh empty segment the next append will reuse.
+        if self.active_writer.base_offset() >= drop_from {
+            // Segment created but no records written: reset next_offset to
+            // drop_from.
+            new_next = drop_from;
+        } else if let Some(last) = SegmentReader::open(self.active_writer.path())?.last_offset()? {
+            new_next = new_next.max(last + 1);
+        }
+
+        self.next_offset = new_next.max(drop_from.min(self.next_offset));
+        // Truncate WAL — its contents may reference offsets we just deleted.
+        self.wal.truncate()?;
+        Ok(stats)
+    }
+
     /// Total bytes across all segments (sealed + active).
     pub fn total_bytes(&self) -> u64 {
         let sealed: u64 = self.sealed_readers.iter().map(|r| r.file_size()).sum();

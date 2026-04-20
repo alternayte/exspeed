@@ -218,4 +218,87 @@ impl StorageEngine for S3TieredStorage {
         streams.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         Ok(streams)
     }
+
+    async fn trim_up_to(
+        &self,
+        stream: &StreamName,
+        keep_from: Offset,
+    ) -> Result<(), StorageError> {
+        // Drop local segments below `keep_from`.
+        self.local.trim_up_to(stream, keep_from).await?;
+        // Drop manifest entries whose last offset is strictly below the
+        // new earliest. The segment containing `keep_from` stays; older
+        // entries are removed. Leaving the S3 objects in place is cheap
+        // and harmless — a future GC pass can reclaim them, and a follower
+        // promoted later simply ignores them (the manifest no longer
+        // references them).
+        let mut manifests = self.manifests.write().await;
+        if let Some(m) = manifests.get_mut(stream.as_str()) {
+            m.segments.retain(|entry| entry.end_offset >= keep_from.0);
+        }
+        Ok(())
+    }
+
+    async fn delete_stream(&self, stream: &StreamName) -> Result<(), StorageError> {
+        self.local.delete_stream(stream).await?;
+        let mut manifests = self.manifests.write().await;
+        manifests.remove(stream.as_str());
+        Ok(())
+    }
+
+    async fn stream_bounds(
+        &self,
+        stream: &StreamName,
+    ) -> Result<(Offset, Offset), StorageError> {
+        // Local view of the bounds.
+        let local_result = self.local.stream_bounds(stream).await;
+
+        // Check S3 manifest for earlier segments.
+        let manifests = self.manifests.read().await;
+        let manifest = manifests.get(stream.as_str());
+
+        match (local_result, manifest) {
+            (Ok((local_earliest, local_next)), Some(m)) if !m.segments.is_empty() => {
+                let s3_earliest = m
+                    .segments
+                    .iter()
+                    .map(|e| e.base_offset)
+                    .min()
+                    .unwrap_or(local_earliest.0);
+                let s3_latest_end = m.segments.iter().map(|e| e.end_offset).max();
+                let next = match s3_latest_end {
+                    Some(end) => Offset(local_next.0.max(end + 1)),
+                    None => local_next,
+                };
+                let earliest = Offset(local_earliest.0.min(s3_earliest));
+                Ok((earliest, next))
+            }
+            (Ok(bounds), _) => Ok(bounds),
+            (Err(StorageError::StreamNotFound(name)), Some(m)) if !m.segments.is_empty() => {
+                let earliest = m.segments.iter().map(|e| e.base_offset).min().unwrap_or(0);
+                let latest_end = m.segments.iter().map(|e| e.end_offset).max().unwrap_or(0);
+                let _ = name; // keep for clippy; we're about to synthesize
+                Ok((Offset(earliest), Offset(latest_end + 1)))
+            }
+            (Err(e), _) => Err(e),
+        }
+    }
+
+    async fn truncate_from(
+        &self,
+        stream: &StreamName,
+        drop_from: Offset,
+    ) -> Result<(), StorageError> {
+        self.local.truncate_from(stream, drop_from).await?;
+        let mut manifests = self.manifests.write().await;
+        if let Some(m) = manifests.get_mut(stream.as_str()) {
+            // A segment whose `base_offset >= drop_from` is entirely past
+            // the truncation point — drop its manifest entry. A segment
+            // straddling `drop_from` keeps its entry (the S3 object stays
+            // intact); the logical truncation is expressed via the local
+            // partition's `next_offset`.
+            m.segments.retain(|e| e.base_offset < drop_from.0);
+        }
+        Ok(())
+    }
 }

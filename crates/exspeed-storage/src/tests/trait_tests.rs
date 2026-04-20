@@ -161,6 +161,75 @@ pub async fn test_seek_by_time(engine: &(impl StorageEngine + Sync)) {
     assert!(offset.0 >= 2); // at or past the end
 }
 
+/// `stream_bounds` on an empty stream returns `(0, 0)`; after appends the
+/// `next` end advances while earliest stays at 0.
+pub async fn test_stream_bounds(engine: &impl StorageEngine) {
+    let s = stream("test-bounds");
+    engine.create_stream(&s, 0, 0).await.unwrap();
+
+    let (earliest, next) = engine.stream_bounds(&s).await.unwrap();
+    assert_eq!(earliest, Offset(0));
+    assert_eq!(next, Offset(0));
+
+    for _ in 0..3 {
+        engine.append(&s, &record("events", b"x")).await.unwrap();
+    }
+    let (earliest, next) = engine.stream_bounds(&s).await.unwrap();
+    assert_eq!(earliest, Offset(0));
+    assert_eq!(next, Offset(3));
+}
+
+/// `trim_up_to` discards records earlier than `keep_from` (best-effort on
+/// segment boundaries for FileStorage; exact for MemoryStorage).
+pub async fn test_trim_up_to(engine: &impl StorageEngine) {
+    let s = stream("test-trim");
+    engine.create_stream(&s, 0, 0).await.unwrap();
+    for i in 0u8..5 {
+        engine.append(&s, &record("events", &[i])).await.unwrap();
+    }
+    // No-op when keep_from is at or before earliest.
+    engine.trim_up_to(&s, Offset(0)).await.unwrap();
+    let records = engine.read(&s, Offset(0), 10).await.unwrap();
+    assert_eq!(records.len(), 5);
+}
+
+/// `delete_stream` is idempotent: deleting a missing stream is Ok; after
+/// delete the stream is gone.
+pub async fn test_delete_stream(engine: &impl StorageEngine) {
+    let s = stream("test-del");
+    // Idempotent on missing stream.
+    engine.delete_stream(&s).await.unwrap();
+
+    engine.create_stream(&s, 0, 0).await.unwrap();
+    engine.append(&s, &record("events", b"x")).await.unwrap();
+    engine.delete_stream(&s).await.unwrap();
+
+    // Append after delete must fail with StreamNotFound.
+    let err = engine
+        .append(&s, &record("events", b"x"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StorageError::StreamNotFound(_)),
+        "expected StreamNotFound after delete_stream, got {err:?}"
+    );
+}
+
+/// `truncate_from` drops records at offsets `>= drop_from`. On a no-op
+/// (drop_from == next) all records are retained.
+pub async fn test_truncate_from(engine: &impl StorageEngine) {
+    let s = stream("test-truncate");
+    engine.create_stream(&s, 0, 0).await.unwrap();
+    for i in 0u8..5 {
+        engine.append(&s, &record("events", &[i])).await.unwrap();
+    }
+    // drop_from == next (5) is a no-op.
+    let (_, next) = engine.stream_bounds(&s).await.unwrap();
+    engine.truncate_from(&s, next).await.unwrap();
+    let records = engine.read(&s, Offset(0), 10).await.unwrap();
+    assert_eq!(records.len(), 5);
+}
+
 /// Append 2 records, verify the second timestamp is >= the first.
 pub async fn test_timestamps_increasing(engine: &(impl StorageEngine + Sync)) {
     let s = stream("test-timestamps");

@@ -56,6 +56,26 @@ mod memory_tests {
     async fn seek_by_time() {
         trait_tests::test_seek_by_time(&MemoryStorage::new()).await;
     }
+
+    #[tokio::test]
+    async fn stream_bounds() {
+        trait_tests::test_stream_bounds(&MemoryStorage::new()).await;
+    }
+
+    #[tokio::test]
+    async fn trim_up_to() {
+        trait_tests::test_trim_up_to(&MemoryStorage::new()).await;
+    }
+
+    #[tokio::test]
+    async fn delete_stream() {
+        trait_tests::test_delete_stream(&MemoryStorage::new()).await;
+    }
+
+    #[tokio::test]
+    async fn truncate_from() {
+        trait_tests::test_truncate_from(&MemoryStorage::new()).await;
+    }
 }
 
 mod file_trait_tests {
@@ -127,5 +147,29 @@ mod file_trait_tests {
     async fn seek_by_time() {
         let (s, _d) = make_storage();
         trait_tests::test_seek_by_time(&s).await;
+    }
+
+    #[tokio::test]
+    async fn stream_bounds() {
+        let (s, _d) = make_storage();
+        trait_tests::test_stream_bounds(&s).await;
+    }
+
+    #[tokio::test]
+    async fn trim_up_to() {
+        let (s, _d) = make_storage();
+        trait_tests::test_trim_up_to(&s).await;
+    }
+
+    #[tokio::test]
+    async fn delete_stream() {
+        let (s, _d) = make_storage();
+        trait_tests::test_delete_stream(&s).await;
+    }
+
+    #[tokio::test]
+    async fn truncate_from() {
+        let (s, _d) = make_storage();
+        trait_tests::test_truncate_from(&s).await;
     }
 }

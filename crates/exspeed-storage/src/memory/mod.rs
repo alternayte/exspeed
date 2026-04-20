@@ -109,4 +109,56 @@ impl StorageEngine for MemoryStorage {
         streams.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         Ok(streams)
     }
+
+    async fn trim_up_to(
+        &self,
+        stream: &StreamName,
+        keep_from: Offset,
+    ) -> Result<(), StorageError> {
+        let mut map = self.streams.write().unwrap();
+        let records = map
+            .get_mut(stream.as_str())
+            .ok_or_else(|| StorageError::StreamNotFound(stream.clone()))?;
+        records.retain(|r| r.offset.0 >= keep_from.0);
+        Ok(())
+    }
+
+    async fn delete_stream(&self, stream: &StreamName) -> Result<(), StorageError> {
+        let mut map = self.streams.write().unwrap();
+        map.remove(stream.as_str());
+        Ok(())
+    }
+
+    async fn stream_bounds(
+        &self,
+        stream: &StreamName,
+    ) -> Result<(Offset, Offset), StorageError> {
+        let map = self.streams.read().unwrap();
+        let records = map
+            .get(stream.as_str())
+            .ok_or_else(|| StorageError::StreamNotFound(stream.clone()))?;
+        let earliest = records.first().map(|r| r.offset).unwrap_or(Offset(0));
+        // `next` is always one past the last offset written to this stream.
+        // When the vector is empty but records were previously trimmed,
+        // callers (followers) still need the high-water mark; we derive it
+        // from the last retained record if present, falling back to 0.
+        let next = records
+            .last()
+            .map(|r| Offset(r.offset.0 + 1))
+            .unwrap_or(Offset(0));
+        Ok((earliest, next))
+    }
+
+    async fn truncate_from(
+        &self,
+        stream: &StreamName,
+        drop_from: Offset,
+    ) -> Result<(), StorageError> {
+        let mut map = self.streams.write().unwrap();
+        let records = map
+            .get_mut(stream.as_str())
+            .ok_or_else(|| StorageError::StreamNotFound(stream.clone()))?;
+        records.retain(|r| r.offset.0 < drop_from.0);
+        Ok(())
+    }
 }

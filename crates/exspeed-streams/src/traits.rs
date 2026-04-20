@@ -26,4 +26,43 @@ pub trait StorageEngine: Send + Sync {
 
     /// List all stream names known to this storage engine.
     async fn list_streams(&self) -> Result<Vec<StreamName>, StorageError>;
+
+    /// Delete all records in `stream` with offset strictly less than
+    /// `keep_from`. Safe to call with `keep_from` pointing mid-segment —
+    /// the segment containing `keep_from` is preserved; earlier segments
+    /// are removed. Also updates any offset / time indexes to reflect the
+    /// new earliest offset.
+    async fn trim_up_to(
+        &self,
+        stream: &StreamName,
+        keep_from: Offset,
+    ) -> Result<(), StorageError>;
+
+    /// Remove the stream entirely — all segments, indexes, and stream
+    /// configuration. Idempotent: deleting a non-existent stream returns
+    /// `Ok(())` (the caller's intent is "make sure it's gone").
+    async fn delete_stream(&self, stream: &StreamName) -> Result<(), StorageError>;
+
+    /// Return `(earliest, next)` for a stream — the offset of the first
+    /// retained record and the offset the NEXT append will write to.
+    /// `earliest == next` means the stream is empty.
+    async fn stream_bounds(
+        &self,
+        stream: &StreamName,
+    ) -> Result<(Offset, Offset), StorageError>;
+
+    /// Drop records at offsets `>= drop_from`. Complement to
+    /// [`StorageEngine::trim_up_to`]. Used by the follower's
+    /// divergent-history recovery path — after a leader failover the
+    /// follower may have records that the new leader's log does not
+    /// contain. This method removes those records and makes `drop_from`
+    /// the new `next` offset for the stream. A `drop_from` at or past the
+    /// current `next` offset is a no-op. Implementations SHOULD be
+    /// segment-aware where possible but MAY be best-effort at segment
+    /// boundaries.
+    async fn truncate_from(
+        &self,
+        stream: &StreamName,
+        drop_from: Offset,
+    ) -> Result<(), StorageError>;
 }

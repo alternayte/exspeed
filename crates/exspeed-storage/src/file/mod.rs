@@ -299,6 +299,60 @@ impl FileStorage {
         streams.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         Ok(streams)
     }
+
+    fn trim_up_to_sync(
+        &self,
+        stream: &StreamName,
+        keep_from: Offset,
+    ) -> Result<(), StorageError> {
+        let mut map = self.inner.partitions.write().unwrap();
+        let key = (stream.as_str().to_string(), 0u32);
+        let part = map
+            .get_mut(&key)
+            .ok_or_else(|| StorageError::StreamNotFound(stream.clone()))?;
+        part.trim_up_to(keep_from.0).map_err(StorageError::Io)?;
+        Ok(())
+    }
+
+    fn delete_stream_sync(&self, stream: &StreamName) -> Result<(), StorageError> {
+        // Idempotent: removing a non-existent stream is Ok.
+        let mut map = self.inner.partitions.write().unwrap();
+        let key_prefix = stream.as_str().to_string();
+        map.retain(|(name, _), _| name != &key_prefix);
+        drop(map);
+
+        let stream_dir = self.inner.data_dir.join("streams").join(stream.as_str());
+        if stream_dir.exists() {
+            fs::remove_dir_all(&stream_dir).map_err(StorageError::Io)?;
+        }
+        Ok(())
+    }
+
+    fn stream_bounds_sync(
+        &self,
+        stream: &StreamName,
+    ) -> Result<(Offset, Offset), StorageError> {
+        let map = self.inner.partitions.read().unwrap();
+        let key = (stream.as_str().to_string(), 0u32);
+        let part = map
+            .get(&key)
+            .ok_or_else(|| StorageError::StreamNotFound(stream.clone()))?;
+        Ok((Offset(part.earliest_offset()), Offset(part.next_offset())))
+    }
+
+    fn truncate_from_sync(
+        &self,
+        stream: &StreamName,
+        drop_from: Offset,
+    ) -> Result<(), StorageError> {
+        let mut map = self.inner.partitions.write().unwrap();
+        let key = (stream.as_str().to_string(), 0u32);
+        let part = map
+            .get_mut(&key)
+            .ok_or_else(|| StorageError::StreamNotFound(stream.clone()))?;
+        part.truncate_from(drop_from.0).map_err(StorageError::Io)?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -353,6 +407,49 @@ impl StorageEngine for FileStorage {
     async fn list_streams(&self) -> Result<Vec<StreamName>, StorageError> {
         let this = self.clone();
         tokio::task::spawn_blocking(move || this.list_streams_sync())
+            .await
+            .map_err(|e| StorageError::Io(std::io::Error::other(e)))?
+    }
+
+    async fn trim_up_to(
+        &self,
+        stream: &StreamName,
+        keep_from: Offset,
+    ) -> Result<(), StorageError> {
+        let this = self.clone();
+        let stream = stream.clone();
+        tokio::task::spawn_blocking(move || this.trim_up_to_sync(&stream, keep_from))
+            .await
+            .map_err(|e| StorageError::Io(std::io::Error::other(e)))?
+    }
+
+    async fn delete_stream(&self, stream: &StreamName) -> Result<(), StorageError> {
+        let this = self.clone();
+        let stream = stream.clone();
+        tokio::task::spawn_blocking(move || this.delete_stream_sync(&stream))
+            .await
+            .map_err(|e| StorageError::Io(std::io::Error::other(e)))?
+    }
+
+    async fn stream_bounds(
+        &self,
+        stream: &StreamName,
+    ) -> Result<(Offset, Offset), StorageError> {
+        let this = self.clone();
+        let stream = stream.clone();
+        tokio::task::spawn_blocking(move || this.stream_bounds_sync(&stream))
+            .await
+            .map_err(|e| StorageError::Io(std::io::Error::other(e)))?
+    }
+
+    async fn truncate_from(
+        &self,
+        stream: &StreamName,
+        drop_from: Offset,
+    ) -> Result<(), StorageError> {
+        let this = self.clone();
+        let stream = stream.clone();
+        tokio::task::spawn_blocking(move || this.truncate_from_sync(&stream, drop_from))
             .await
             .map_err(|e| StorageError::Io(std::io::Error::other(e)))?
     }
