@@ -8,6 +8,7 @@ pub mod queries;
 pub mod streams;
 pub mod views;
 pub mod webhooks;
+pub mod whoami;
 
 use std::sync::Arc;
 
@@ -68,6 +69,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let leases_router = Router::new()
         .route("/api/v1/leases", get(leases::list_leases))
         .layer(from_fn_with_state(state.clone(), crate::middleware::require_admin))
+        .with_state(state.clone());
+
+    // Whoami endpoint: the one non-admin HTTP surface. Any authenticated
+    // caller — including scoped publish/subscribe-only credentials — can
+    // call it to inspect their own identity + permissions. NOT leader-gated
+    // so any pod can answer "who am I?".
+    let whoami_router = Router::new()
+        .route("/api/v1/whoami", get(whoami::whoami))
+        .layer(from_fn_with_state(
+            state.clone(),
+            crate::middleware::require_authenticated,
+        ))
         .with_state(state.clone());
 
     // Main authenticated router: admin-gated AND leader-gated.
@@ -134,5 +147,5 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .layer(from_fn_with_state(state.clone(), crate::middleware::require_admin))
         .with_state(state);
 
-    unauth.merge(leases_router).merge(authed)
+    unauth.merge(leases_router).merge(whoami_router).merge(authed)
 }
