@@ -6,6 +6,7 @@ pub mod ping;
 pub mod publish;
 pub mod record_delivery;
 pub mod records_batch;
+pub mod replicate;
 pub mod seek;
 pub mod stream_mgmt;
 

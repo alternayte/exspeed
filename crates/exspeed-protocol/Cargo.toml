@@ -9,3 +9,8 @@ bytes = { workspace = true }
 thiserror = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+serde = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+bincode = { workspace = true }
