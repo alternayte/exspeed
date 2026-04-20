@@ -540,7 +540,14 @@ impl ReplicationClient {
                 value: Bytes::from(rec.payload),
                 subject: rec.subject,
                 headers,
-                timestamp_ns: None,
+                // Preserve the leader's persisted timestamp so that
+                // `seek_by_time` returns identical offsets on leader and
+                // follower. The wire format carries ms granularity
+                // (`ReplicatedRecord::timestamp_ms`); we round-trip it
+                // back to ns for storage. `saturating_mul` defends
+                // against pathological far-future values that could
+                // overflow (records > year 2554).
+                timestamp_ns: Some(rec.timestamp_ms.saturating_mul(1_000_000)),
             };
             let (assigned, _ts) = self.storage.append(&name, &record).await?;
 

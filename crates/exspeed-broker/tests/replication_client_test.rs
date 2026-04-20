@@ -562,6 +562,73 @@ async fn reseeds_on_stream_reseed_event() {
 }
 
 #[tokio::test]
+async fn follower_preserves_leader_timestamp() {
+    // Leader sends a RecordsAppended with an explicit ms timestamp; after
+    // apply, the follower's StoredRecord.timestamp (ns) must equal the
+    // leader's ms * 1_000_000 exactly. Without the `Record::timestamp_ns`
+    // override the follower would mint a fresh wall-clock ns and
+    // `seek_by_time` would diverge across the cluster.
+    let storage = Arc::new(MemoryStorage::new());
+    let tmp = TempDir::new().unwrap();
+    let cursor_path = tmp.path().join("cursor.json");
+
+    let manifest = ClusterManifest {
+        streams: vec![stream_summary("orders", 0, 1)],
+        leader_holder_id: Uuid::new_v4(),
+    };
+    let (addr, handshake_rx) = spawn_stub_leader(manifest).await;
+
+    let handle = spawn_client(
+        storage.clone() as Arc<dyn StorageEngine>,
+        cursor_path,
+        addr,
+        metrics(),
+        tmp,
+    );
+
+    let (_framed_read, mut framed_write, _resume) = handshake_rx.await.expect("handshake");
+
+    // Arbitrary known ms value; the exact number is what matters.
+    const LEADER_TS_MS: u64 = 1_700_000_000_000;
+    let batch = RecordsAppended {
+        stream: "orders".into(),
+        base_offset: 0,
+        records: vec![ReplicatedRecord {
+            subject: "orders.placed".into(),
+            payload: b"first-record".to_vec(),
+            headers: vec![],
+            timestamp_ms: LEADER_TS_MS,
+            msg_id: None,
+        }],
+    };
+    push_frame(&mut framed_write, OpCode::RecordsAppended, &batch).await;
+
+    let name = StreamName::try_from("orders").unwrap();
+    wait_for(
+        || async {
+            storage
+                .stream_bounds(&name)
+                .await
+                .map(|(_, next)| next.0 == 1)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(3),
+        "follower to apply 1 record",
+    )
+    .await;
+
+    let all = storage.read(&name, Offset(0), 10).await.unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(
+        all[0].timestamp,
+        LEADER_TS_MS * 1_000_000,
+        "follower must persist leader's timestamp exactly (ms → ns round-trip)"
+    );
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
 async fn divergent_history_truncation_on_manifest() {
     // Follower has cursor=50 for stream X; leader's manifest says
     // latest_offset=30. Must truncate_from(30) and reset cursor to 30.
