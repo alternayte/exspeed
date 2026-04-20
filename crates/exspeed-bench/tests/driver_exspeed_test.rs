@@ -1,6 +1,9 @@
 mod embedded_server;
 use embedded_server::start;
 use exspeed_bench::driver::exspeed::ExspeedClient;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 #[tokio::test]
 async fn connects_and_ensures_stream_is_idempotent() {
@@ -11,10 +14,6 @@ async fn connects_and_ensures_stream_is_idempotent() {
     // which ensure_stream should treat as success).
     client.ensure_stream("bench-stream").await.unwrap();
 }
-
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
 
 #[tokio::test]
 async fn producer_sends_at_least_some_records_in_2s() {

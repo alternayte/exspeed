@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -114,7 +114,21 @@ impl ExspeedClient {
         let resp = self.reader.next().await.ok_or_else(|| anyhow!("closed"))??;
         match resp.opcode {
             OpCode::PublishOk => Ok(()),
-            OpCode::Error => Err(anyhow!("publish error response")),
+            OpCode::Error => {
+                let mut p = resp.payload;
+                let code = if p.remaining() >= 2 { p.get_u16_le() } else { 0 };
+                let msg = if p.remaining() >= 2 {
+                    let len = p.get_u16_le() as usize;
+                    if p.remaining() >= len {
+                        String::from_utf8_lossy(&p.slice(..len)).into_owned()
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+                Err(anyhow!("publish error (code={code:#06x}): {msg}"))
+            }
             other => Err(anyhow!("publish: unexpected opcode {other:?}")),
         }
     }
@@ -142,6 +156,9 @@ pub async fn run_producer(
     // Pre-generate a random-ish payload once. Content is irrelevant; size matters.
     let payload: Bytes = Bytes::from(vec![b'x'; payload_bytes]);
     let stream = stream.to_owned();
+    // NOTE: start is captured before spawning so connection setup time counts
+    // against wall_secs. This consistently underreports throughput; acceptable
+    // for v1 and honest for comparisons.
     let start = Instant::now();
     let mut handles = Vec::with_capacity(tasks);
 
