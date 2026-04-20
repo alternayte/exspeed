@@ -63,8 +63,12 @@ impl Cursor {
         }
     }
 
-    /// Save atomically: write to `{path}.tmp`, fsync, then rename. If the
-    /// process crashes before rename, the old file is untouched.
+    /// Save atomically. Durable across a crash: fsync the temp file, rename it
+    /// into place, then fsync the parent directory — only then is the rename
+    /// itself durable. If the process crashes before the rename, the old file
+    /// is untouched. If it crashes after rename but before the parent fsync,
+    /// some filesystems may still reorder the rename; the parent fsync closes
+    /// that window.
     pub fn save(&self, path: &Path) -> Result<(), ReplicationError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -82,6 +86,20 @@ impl Cursor {
             f.sync_all()?;
         }
         std::fs::rename(&tmp_path, path)?;
+        // Best-effort parent-directory fsync: required on Linux for the rename
+        // to survive a power loss; no-op / unsupported on some platforms.
+        if let Some(parent) = path.parent() {
+            match std::fs::File::open(parent) {
+                Ok(dir) => {
+                    let _ = dir.sync_all();
+                }
+                Err(e) => warn!(
+                    dir = %parent.display(),
+                    err = %e,
+                    "cursor parent directory fsync skipped"
+                ),
+            }
+        }
         Ok(())
     }
 }
