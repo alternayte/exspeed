@@ -9,10 +9,15 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio_util::codec::{FramedRead, FramedWrite};
 
+use hdrhistogram::Histogram;
+
 use exspeed_protocol::codec::ExspeedCodec;
 use exspeed_protocol::frame::Frame;
+use exspeed_protocol::messages::ack::AckRequest;
 use exspeed_protocol::messages::connect::{AuthType, ConnectRequest};
+use exspeed_protocol::messages::consumer::{CreateConsumerRequest, StartFrom, SubscribeRequest};
 use exspeed_protocol::messages::publish::PublishRequest;
+use exspeed_protocol::messages::record_delivery::RecordDelivery;
 use exspeed_protocol::messages::stream_mgmt::CreateStreamRequest;
 use exspeed_protocol::opcodes::OpCode;
 
@@ -194,5 +199,106 @@ pub async fn run_producer(
         messages: total,
         bytes: total * payload_bytes as u64,
         wall_secs,
+    })
+}
+
+pub struct ConsumerStats {
+    pub messages: u64,
+    pub latency_histogram: Histogram<u64>,
+}
+
+/// Subscribe to `stream` as a new consumer, record end-to-end latency for each
+/// received record into an hdrhistogram keyed by microseconds, and return after
+/// `duration`. End-to-end latency is computed as `origin.elapsed() - publish_us`,
+/// so both sides must share the same `origin` instant (single-node benchmark).
+pub async fn run_consumer(
+    addr: &str,
+    stream: &str,
+    consumer_name: &str,
+    duration: Duration,
+    origin: Instant,
+) -> Result<ConsumerStats> {
+    let mut client = ExspeedClient::connect(addr).await?;
+
+    // Create consumer starting from latest (ok if it already exists on reruns).
+    let create_req = CreateConsumerRequest {
+        name: consumer_name.into(),
+        stream: stream.into(),
+        group: String::new(),
+        subject_filter: String::new(),
+        start_from: StartFrom::Latest,
+        start_offset: 0,
+    };
+    let mut buf = BytesMut::new();
+    create_req.encode(&mut buf);
+    let corr = client.alloc_corr();
+    client.writer.send(Frame::new(OpCode::CreateConsumer, corr, buf.freeze())).await?;
+    let _ = client.reader.next().await; // ignore duplicate-exists errors
+
+    // Subscribe
+    let sub_req = SubscribeRequest {
+        consumer_name: consumer_name.into(),
+        subscriber_id: String::new(),
+    };
+    let mut buf = BytesMut::new();
+    sub_req.encode(&mut buf);
+    let corr = client.alloc_corr();
+    client.writer.send(Frame::new(OpCode::Subscribe, corr, buf.freeze())).await?;
+    let resp = client.reader.next().await.ok_or_else(|| anyhow!("closed"))??;
+    if !matches!(resp.opcode, OpCode::Ok) {
+        return Err(anyhow!("subscribe: unexpected opcode {:?}", resp.opcode));
+    }
+
+    let mut hist = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3)
+        .expect("histogram bounds");
+    let mut messages: u64 = 0;
+    let deadline = Instant::now() + duration;
+
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let next = match tokio::time::timeout(remaining, client.reader.next()).await {
+            Ok(Some(Ok(f))) => f,
+            Ok(Some(Err(e))) => return Err(e.into()),
+            Ok(None) => break,
+            Err(_) => break, // deadline reached
+        };
+        if next.opcode != OpCode::Record {
+            continue;
+        }
+        let delivery = RecordDelivery::decode(next.payload)?;
+
+        // Find publish_us header; ignore records without it (shouldn't happen in bench runs).
+        if let Some(v) = delivery
+            .headers
+            .iter()
+            .find(|(k, _)| k == PUBLISH_TS_HEADER)
+            .map(|(_, v)| v)
+        {
+            let sent_us: u64 = v.parse().unwrap_or(0);
+            let now_us = origin.elapsed().as_micros() as u64;
+            if now_us > sent_us {
+                let _ = hist.record(now_us - sent_us);
+            }
+        }
+
+        // Ack so the broker keeps pushing.
+        let ack = AckRequest {
+            consumer_name: consumer_name.into(),
+            offset: delivery.offset,
+        };
+        let mut ack_buf = BytesMut::new();
+        ack.encode(&mut ack_buf);
+        let corr = client.alloc_corr();
+        client
+            .writer
+            .send(Frame::new(OpCode::Ack, corr, ack_buf.freeze()))
+            .await?;
+
+        messages += 1;
+    }
+
+    Ok(ConsumerStats {
+        messages,
+        latency_histogram: hist,
     })
 }
