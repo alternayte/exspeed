@@ -16,9 +16,7 @@ use uuid::Uuid;
 
 use exspeed_broker::replication::server::ReplicationServer;
 use exspeed_broker::replication::{ReplicationCoordinator, ReplicationEvent};
-use exspeed_common::auth::{
-    Action, CredentialStore, Identity, IdentityRef, Permission, StreamGlob,
-};
+use exspeed_common::auth::CredentialStore;
 use exspeed_common::types::StreamName;
 use exspeed_common::Metrics;
 use exspeed_protocol::codec::ExspeedCodec;
@@ -31,32 +29,6 @@ use exspeed_protocol::messages::replicate::{
 use exspeed_protocol::opcodes::OpCode;
 use exspeed_storage::memory::MemoryStorage;
 use exspeed_streams::{Record, StorageEngine};
-
-/// Crude credential store adapter. `CredentialStore::build` only accepts
-/// TOML files, but the credentials file format doesn't yet understand the
-/// Replicate action string. These tests need programmatic identities.
-///
-/// To keep things honest we use the production `CredentialStore` type when
-/// we can: the server's `lookup` path calls `sha256(token) → Identity`.
-/// We write a credentials-style TOML file limited to publish/subscribe
-/// verbs for the "non-replicator" test, and bypass the file path entirely
-/// for the "replicator" tests by running the server with `credential_store =
-/// None` (which exercises the anonymous-identity path that grants Replicate).
-///
-/// In Wave 6, the credentials wire format will learn the Replicate action
-/// string and these hoops disappear.
-fn make_replicator_only_store(token: &str) -> Arc<CredentialStore> {
-    // Write a temp TOML file with the token → publish-only permission,
-    // then patch the file to swap in a test-only Identity. Actually
-    // simpler: call CredentialStore with no file and no env, and reach
-    // into it — except we can't (fields are private). So for this test
-    // we go without a credential_store entirely.
-    //
-    // Kept as a stub so the call site reads cleanly if we ever re-add it.
-    let _ = token;
-    let store = CredentialStore::build(None, None).expect("empty store");
-    Arc::new(store)
-}
 
 /// Credential store that recognizes one token mapped to an identity with
 /// Publish/Subscribe but NOT Replicate. Used by the missing-permission
@@ -208,12 +180,14 @@ async fn handshake_rejects_wrong_version() {
     };
     let (mut rx, _tx) = open_and_handshake(addr, None, bogus).await;
 
-    // Server should close the socket — reading yields None (after maybe
-    // draining ConnectOk which the harness already consumed).
-    let remainder = rx.next().await;
+    // Server must close the socket promptly on version skew. Bound the
+    // wait so a hung server fails fast instead of making CI flaky.
+    let remainder = tokio::time::timeout(Duration::from_secs(2), rx.next())
+        .await
+        .expect("server did not close socket within 2s after version skew");
     assert!(
         remainder.is_none() || matches!(remainder, Some(Err(_))),
-        "expected close after version skew, got {:?}",
+        "expected EOF or decode error after version skew, got {:?}",
         remainder
     );
 
@@ -302,10 +276,21 @@ async fn fresh_follower_bootstrap_streams_records() {
     };
     let (mut rx, _tx) = open_and_handshake(addr, None, resume).await;
 
-    // First post-handshake frame is ClusterManifest.
-    let frame = rx.next().await.expect("frame").expect("ok");
-    assert_eq!(frame.opcode, OpCode::ClusterManifest);
-    let manifest: ClusterManifest = bincode::deserialize(&frame.payload).unwrap();
+    // First post-handshake frame MUST be ClusterManifest — the bootstrap
+    // contract requires the follower learn the stream set before seeing
+    // any records for those streams.
+    let first = tokio::time::timeout(Duration::from_secs(2), rx.next())
+        .await
+        .expect("first frame within 2s")
+        .expect("frame present")
+        .expect("decoded ok");
+    assert_eq!(
+        first.opcode,
+        OpCode::ClusterManifest,
+        "first post-handshake frame must be ClusterManifest, got {:?}",
+        first.opcode
+    );
+    let manifest: ClusterManifest = bincode::deserialize(&first.payload).unwrap();
     assert_eq!(manifest.streams.len(), 3);
     for s in &stream_names {
         let found = manifest
@@ -317,30 +302,56 @@ async fn fresh_follower_bootstrap_streams_records() {
         assert_eq!(found.latest_offset, 10);
     }
 
-    // Then 3 × 10 records across one-or-more RecordsAppended frames per
-    // stream. MemoryStorage `list_streams` returns in sorted order, and
-    // our default batch size is large enough to drain each 10-record
-    // stream in a single frame.
-    let mut per_stream_records: std::collections::HashMap<String, usize> =
+    // Drain frames with a per-frame timeout until every stream has been
+    // streamed up to its tail. For each stream, verify `base_offset`
+    // is strictly monotonic across batches (the leader must never emit
+    // an earlier offset after a later one for the same stream).
+    let mut records_by_stream: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
-    for _ in 0..stream_names.len() {
-        let frame = rx.next().await.expect("frame").expect("ok");
+    let mut last_base_by_stream: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
+    let overall_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while records_by_stream.values().copied().sum::<usize>() < stream_names.len() * 10 {
+        if std::time::Instant::now() > overall_deadline {
+            panic!(
+                "catch-up did not finish within 5s; got per-stream counts: {:?}",
+                records_by_stream
+            );
+        }
+        let next = tokio::time::timeout(Duration::from_millis(500), rx.next()).await;
+        let frame = match next {
+            Ok(Some(Ok(f))) => f,
+            Ok(Some(Err(e))) => panic!("decode error: {e}"),
+            Ok(None) => panic!("socket closed mid-catchup"),
+            Err(_) => continue, // brief stall; keep draining
+        };
         if frame.opcode == OpCode::ReplicationHeartbeat {
-            // Skip heartbeats that may sneak in on slow CI.
+            // Heartbeats are allowed interleaved; tighten-but-tolerate.
             continue;
         }
-        assert_eq!(frame.opcode, OpCode::RecordsAppended);
+        assert_eq!(
+            frame.opcode,
+            OpCode::RecordsAppended,
+            "only RecordsAppended / heartbeat expected during catch-up, got {:?}",
+            frame.opcode
+        );
         let batch: RecordsAppended = bincode::deserialize(&frame.payload).unwrap();
-        let entry = per_stream_records.entry(batch.stream.clone()).or_insert(0);
-        *entry += batch.records.len();
+        if let Some(prev) = last_base_by_stream.get(&batch.stream) {
+            assert!(
+                batch.base_offset > *prev,
+                "base_offset for {} must be strictly monotonic: saw {} after {}",
+                batch.stream,
+                batch.base_offset,
+                prev
+            );
+        }
+        last_base_by_stream.insert(batch.stream.clone(), batch.base_offset);
+        *records_by_stream.entry(batch.stream.clone()).or_insert(0) += batch.records.len();
     }
 
     // Ensure every seeded stream got fully catch-up-streamed.
     for s in &stream_names {
-        let count = per_stream_records
-            .get(*s)
-            .copied()
-            .unwrap_or(0);
+        let count = records_by_stream.get(*s).copied().unwrap_or(0);
         assert_eq!(count, 10, "stream {s} should stream all 10 records");
     }
 
@@ -619,30 +630,3 @@ async fn catchup_empty_read_with_stream_deleted_logs_and_continues() {
     cancel.cancel();
 }
 
-// The identity programmatic-constructor helper below is retained for
-// future tests that want to lean on a hand-rolled replicator identity
-// once the CredentialStore learns the Replicate action string.
-#[allow(dead_code)]
-fn replicator_identity() -> Identity {
-    let mut actions = enumset::EnumSet::<Action>::new();
-    actions |= Action::Replicate;
-    Identity {
-        name: "replicator".into(),
-        permissions: vec![Permission {
-            streams: StreamGlob::compile("*", "replicator").unwrap(),
-            actions,
-        }],
-    }
-}
-#[allow(dead_code)]
-fn replicator_identity_ref() -> IdentityRef {
-    Arc::new(replicator_identity())
-}
-#[allow(dead_code)]
-fn _sleep_helper(d: Duration) -> impl std::future::Future<Output = ()> {
-    tokio::time::sleep(d)
-}
-#[allow(dead_code)]
-fn _make_replicator_only_store_wrapper(token: &str) -> Arc<CredentialStore> {
-    make_replicator_only_store(token)
-}
