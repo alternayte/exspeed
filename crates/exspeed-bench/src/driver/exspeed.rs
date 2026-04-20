@@ -1,3 +1,7 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
 use anyhow::{anyhow, Context, Result};
 use bytes::{Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
@@ -8,8 +12,11 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use exspeed_protocol::codec::ExspeedCodec;
 use exspeed_protocol::frame::Frame;
 use exspeed_protocol::messages::connect::{AuthType, ConnectRequest};
+use exspeed_protocol::messages::publish::PublishRequest;
 use exspeed_protocol::messages::stream_mgmt::CreateStreamRequest;
 use exspeed_protocol::opcodes::OpCode;
+
+pub const PUBLISH_TS_HEADER: &str = "bench.publish_us";
 
 pub type Reader = FramedRead<OwnedReadHalf, ExspeedCodec>;
 pub type Writer = FramedWrite<OwnedWriteHalf, ExspeedCodec>;
@@ -88,4 +95,87 @@ impl ExspeedClient {
         };
         c
     }
+
+    /// Publishes a single record with the publish_us header encoded as ASCII decimal.
+    pub async fn publish_once(&mut self, stream: &str, value: &Bytes, origin: Instant) -> Result<()> {
+        let us = origin.elapsed().as_micros() as u64;
+        let req = PublishRequest {
+            stream: stream.into(),
+            subject: "bench".into(),
+            key: None,
+            msg_id: None,
+            value: value.clone(),
+            headers: vec![(PUBLISH_TS_HEADER.to_owned(), format!("{us}"))],
+        };
+        let mut buf = BytesMut::new();
+        req.encode(&mut buf);
+        let corr = self.alloc_corr();
+        self.writer.send(Frame::new(OpCode::Publish, corr, buf.freeze())).await?;
+        let resp = self.reader.next().await.ok_or_else(|| anyhow!("closed"))??;
+        match resp.opcode {
+            OpCode::PublishOk => Ok(()),
+            OpCode::Error => Err(anyhow!("publish error response")),
+            other => Err(anyhow!("publish: unexpected opcode {other:?}")),
+        }
+    }
+}
+
+pub struct ProducerStats {
+    pub messages: u64,
+    pub bytes: u64,
+    pub wall_secs: f64,
+}
+
+/// Spawn `tasks` producer tasks. Each owns one TCP connection and publishes
+/// `payload_bytes`-sized records at unlimited rate for `duration`. Returns
+/// aggregate stats. `origin` is the shared start instant for publish_us headers
+/// so the consumer can compute deltas with `now.duration_since(origin)`.
+pub async fn run_producer(
+    addr: &str,
+    stream: &str,
+    payload_bytes: usize,
+    duration: Duration,
+    tasks: usize,
+    origin: Instant,
+    shared_count: Arc<AtomicU64>,
+) -> Result<ProducerStats> {
+    // Pre-generate a random-ish payload once. Content is irrelevant; size matters.
+    let payload: Bytes = Bytes::from(vec![b'x'; payload_bytes]);
+    let stream = stream.to_owned();
+    let start = Instant::now();
+    let mut handles = Vec::with_capacity(tasks);
+
+    for _ in 0..tasks {
+        let addr = addr.to_owned();
+        let stream = stream.clone();
+        let payload = payload.clone();
+        let shared_count = shared_count.clone();
+
+        handles.push(tokio::spawn(async move {
+            let mut client = ExspeedClient::connect(&addr).await?;
+            let deadline = Instant::now() + duration;
+            let mut local: u64 = 0;
+            while Instant::now() < deadline {
+                client.publish_once(&stream, &payload, origin).await?;
+                local += 1;
+                if local % 256 == 0 {
+                    shared_count.fetch_add(256, Ordering::Relaxed);
+                }
+            }
+            shared_count.fetch_add(local % 256, Ordering::Relaxed);
+            Ok::<u64, anyhow::Error>(local)
+        }));
+    }
+
+    let mut total: u64 = 0;
+    for h in handles {
+        total += h.await??;
+    }
+    let wall_secs = start.elapsed().as_secs_f64();
+
+    Ok(ProducerStats {
+        messages: total,
+        bytes: total * payload_bytes as u64,
+        wall_secs,
+    })
 }
