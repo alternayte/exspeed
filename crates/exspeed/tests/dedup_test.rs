@@ -51,6 +51,7 @@ async fn start_server_temp() -> (String, String, PathBuf, CancellationToken) {
         api_bind: http_addr.clone(),
         data_dir: data_dir.clone(),
         auth_token: None,
+        credentials_file: None,
         tls_cert: None,
         tls_key: None,
     };
@@ -81,6 +82,7 @@ async fn start_server_at(data_dir: PathBuf) -> (String, String, CancellationToke
         api_bind: http_addr.clone(),
         data_dir,
         auth_token: None,
+        credentials_file: None,
         tls_cert: None,
         tls_key: None,
     };

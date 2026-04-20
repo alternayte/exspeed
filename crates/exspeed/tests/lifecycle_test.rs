@@ -44,6 +44,7 @@ async fn start_test_server(max_conns: u32) -> (String, tempfile::TempDir) {
             api_bind: api_clone,
             data_dir: data_clone,
             auth_token: None,
+            credentials_file: None,
             tls_cert: None,
             tls_key: None,
         })
@@ -104,6 +105,7 @@ async fn sigterm_signal_token_stops_accept_loop() {
                 api_bind,
                 data_dir,
                 auth_token: None,
+                credentials_file: None,
                 tls_cert: None,
                 tls_key: None,
             },
@@ -159,6 +161,7 @@ async fn readyz_returns_503_when_data_dir_unwritable() {
             api_bind,
             data_dir,
             auth_token: None,
+            credentials_file: None,
             tls_cert: None,
             tls_key: None,
         })

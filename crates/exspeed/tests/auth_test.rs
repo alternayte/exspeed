@@ -24,6 +24,7 @@ async fn start_server(auth_token: Option<String>) -> (String, TempDir) {
         api_bind,
         data_dir,
         auth_token,
+        credentials_file: None,
         tls_cert: None,
         tls_key: None,
     };
@@ -141,6 +142,7 @@ async fn start_server_with_api(
         api_bind,
         data_dir,
         auth_token,
+        credentials_file: None,
         tls_cert: None,
         tls_key: None,
     };

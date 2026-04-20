@@ -6,6 +6,7 @@ use std::time::Instant;
 use exspeed_broker::leadership::ClusterLeadership;
 use exspeed_broker::Broker;
 use exspeed_broker::LeaderLease;
+use exspeed_common::auth::CredentialStore;
 use exspeed_common::Metrics;
 use exspeed_connectors::ConnectorManager;
 use exspeed_processing::ExqlEngine;
@@ -20,9 +21,11 @@ pub struct AppState {
     pub prometheus_registry: Registry,
     pub connector_manager: Arc<ConnectorManager>,
     pub exql: Arc<ExqlEngine>,
-    /// Shared bearer token required on protected HTTP endpoints.
-    /// When None, all HTTP endpoints are unauthenticated.
-    pub auth_token: Option<Arc<String>>,
+    /// Multi-tenant credential store. When `Some`, HTTP middleware requires a
+    /// bearer token that hashes to a known identity; handlers then gate on
+    /// per-identity scoped-admin / global-admin checks. When `None`, auth is
+    /// globally disabled and every HTTP request passes through.
+    pub credential_store: Option<Arc<CredentialStore>>,
     /// Distributed leader-lease primitive. Used to coordinate exactly-one
     /// execution of connectors and continuous queries across pods. Exposed
     /// for `/api/v1/leases` (Task 7).

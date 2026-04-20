@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod client;
 pub mod connector;
 pub mod consumer_cmd;
@@ -145,4 +146,9 @@ pub enum Command {
     Connectors,
     /// Snapshot an offline data directory to a .tar.gz file
     Snapshot(snapshot::SnapshotArgs),
+    /// Credential management helpers (gen-token, hash, lint, whoami)
+    Auth {
+        #[command(subcommand)]
+        cmd: auth::AuthCmd,
+    },
 }

@@ -24,6 +24,7 @@ async fn tls_cert_without_key_refuses_to_start() {
         api_bind: "127.0.0.1:0".to_string(),
         data_dir: tmp.path().to_path_buf(),
         auth_token: None,
+        credentials_file: None,
         tls_cert: Some(fake_cert),
         tls_key: None,
     };
@@ -48,6 +49,7 @@ async fn tls_key_without_cert_refuses_to_start() {
         api_bind: "127.0.0.1:0".to_string(),
         data_dir: tmp.path().to_path_buf(),
         auth_token: None,
+        credentials_file: None,
         tls_cert: None,
         tls_key: Some(fake_key),
     };
@@ -91,6 +93,7 @@ async fn tls_enabled_tcp_handshakes_with_rustls() {
         api_bind: format!("127.0.0.1:{api_port}"),
         data_dir: data_tmp.path().to_path_buf(),
         auth_token: None,
+        credentials_file: None,
         tls_cert: Some(cert_path.clone()),
         tls_key: Some(key_path),
     };
@@ -152,6 +155,7 @@ async fn tls_enabled_http_responds_to_rustls_request() {
         api_bind: format!("127.0.0.1:{api_port}"),
         data_dir: data_tmp.path().to_path_buf(),
         auth_token: None,
+        credentials_file: None,
         tls_cert: Some(cert_path.clone()),
         tls_key: Some(key_path),
     };
@@ -186,6 +190,7 @@ async fn auth_and_tls_together_end_to_end() {
         api_bind: format!("127.0.0.1:{api_port}"),
         data_dir: data_tmp.path().to_path_buf(),
         auth_token: Some("e2e-secret".into()),
+        credentials_file: None,
         tls_cert: Some(cert_path.clone()),
         tls_key: Some(key_path),
     };

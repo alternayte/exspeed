@@ -83,6 +83,7 @@ async fn spawn_broker(schema: &str) -> BrokerHandle {
             api_bind,
             data_dir,
             auth_token: None,
+            credentials_file: None,
             tls_cert: None,
             tls_key: None,
         };

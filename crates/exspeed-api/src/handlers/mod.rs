@@ -8,13 +8,49 @@ pub mod queries;
 pub mod streams;
 pub mod views;
 pub mod webhooks;
+pub mod whoami;
 
 use std::sync::Arc;
 
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
+use axum::Json;
 use axum::Router;
+use exspeed_common::auth::{Action, Identity};
+use exspeed_common::types::StreamName;
+use serde_json::json;
 
 use crate::state::AppState;
+
+/// Standard 403 response body used by every scoped-admin and global-admin
+/// handler gate. Body is opaque to match the 401 convention: we don't
+/// leak which stream / action was denied.
+pub(crate) fn forbid() -> Response {
+    (StatusCode::FORBIDDEN, Json(json!({"error": "forbidden"}))).into_response()
+}
+
+/// Verify the authenticated identity holds `Admin` on the given stream.
+/// Returns `Some(403 response)` on deny so callers can early-return via
+/// `if let Some(r) = … { return r; }`. Returns `None` on allow.
+pub(crate) fn require_scoped_admin(id: &Identity, stream: &StreamName) -> Option<Response> {
+    if id.authorize(Action::Admin, stream) {
+        None
+    } else {
+        Some(forbid())
+    }
+}
+
+/// Verify the authenticated identity holds `Admin` with a wildcard-all
+/// glob (`streams = "*"`). Used for endpoints that span multiple streams
+/// (connectors, queries, views, connections).
+pub(crate) fn require_global_admin(id: &Identity) -> Option<Response> {
+    if id.has_global_admin() {
+        None
+    } else {
+        Some(forbid())
+    }
+}
 
 pub fn build_router(state: Arc<AppState>) -> Router {
     use axum::middleware::from_fn_with_state;
@@ -32,13 +68,25 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // answer "who's the leader?".
     let leases_router = Router::new()
         .route("/api/v1/leases", get(leases::list_leases))
-        .layer(from_fn_with_state(state.clone(), crate::middleware::require_bearer))
+        .layer(from_fn_with_state(state.clone(), crate::middleware::require_admin))
         .with_state(state.clone());
 
-    // Main authenticated router: bearer-gated AND leader-gated.
+    // Whoami endpoint: the one non-admin HTTP surface. Any authenticated
+    // caller — including scoped publish/subscribe-only credentials — can
+    // call it to inspect their own identity + permissions. NOT leader-gated
+    // so any pod can answer "who am I?".
+    let whoami_router = Router::new()
+        .route("/api/v1/whoami", get(whoami::whoami))
+        .layer(from_fn_with_state(
+            state.clone(),
+            crate::middleware::require_authenticated,
+        ))
+        .with_state(state.clone());
+
+    // Main authenticated router: admin-gated AND leader-gated.
     // Tower wrapping: `.layer(A).layer(B)` produces `B(A(handler))`, so
     // B (the LAST .layer() call) is the outermost wrapper and runs first.
-    // We want require_bearer -> leader_gate -> handler, so require_bearer
+    // We want require_admin -> leader_gate -> handler, so require_admin
     // must be the LAST .layer() call.
     let authed = Router::new()
         .route(
@@ -96,8 +144,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             delete(connections::delete_connection),
         )
         .layer(from_fn_with_state(state.clone(), crate::middleware::leader_gate))
-        .layer(from_fn_with_state(state.clone(), crate::middleware::require_bearer))
+        .layer(from_fn_with_state(state.clone(), crate::middleware::require_admin))
         .with_state(state);
 
-    unauth.merge(leases_router).merge(authed)
+    unauth.merge(leases_router).merge(whoami_router).merge(authed)
 }

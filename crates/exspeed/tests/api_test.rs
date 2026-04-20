@@ -16,6 +16,7 @@ async fn start_server() -> (String, String) {
         data_dir: dir.path().to_path_buf(),
         api_bind: http_addr.clone(),
         auth_token: None,
+        credentials_file: None,
         tls_cert: None,
         tls_key: None,
     };
