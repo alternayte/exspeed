@@ -107,7 +107,7 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 
 # Benchmarking
 hdrhistogram = "7"
-sysinfo = "0.32"
+sysinfo = "0.37"
 
 # Observability / Metrics
 opentelemetry = "0.28"
