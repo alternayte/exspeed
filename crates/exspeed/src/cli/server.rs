@@ -179,10 +179,6 @@ where
     let auth_token_raw: Option<String> =
         args.auth_token.as_ref().filter(|v| !v.is_empty()).cloned();
 
-    // HTTP middleware still consumes an Arc<String> (Task 4 swaps this for
-    // credential_store). Keep the Plan B binding alive for now.
-    let auth_token: Option<Arc<String>> = auth_token_raw.clone().map(Arc::new);
-
     // Resolve credentials file: explicit env var wins; otherwise fall back to
     // `{data_dir}/credentials.toml` only if it exists on disk. This preserves
     // Plan B's "no file, no env var → open broker" behavior.
@@ -525,7 +521,7 @@ where
         prometheus_registry,
         connector_manager,
         exql,
-        auth_token: auth_token.clone(),
+        credential_store: credential_store.clone(),
         lease: lease.clone(),
         leadership: leadership.clone(),
         ready: ready.clone(),

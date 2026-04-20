@@ -127,7 +127,7 @@ pub async fn make_state_with_leader(leader: bool) -> Arc<exspeed_api::AppState> 
         prometheus_registry: registry,
         connector_manager: cm,
         exql,
-        auth_token: None,
+        credential_store: None,
         lease,
         leadership,
         // Pre-flip ready=true: tests that exercise /healthz or other
