@@ -71,9 +71,9 @@ export class KeyCollisionError extends ExspeedError {
 }
 
 /**
- * Thrown when the broker's dedup map is full and cannot accept new msgIds
- * until space is freed. The SDK auto-retries after retryAfterSecs; you
- * only see this error if retries are exhausted.
+ * Thrown when the broker's per-stream dedup map is at capacity.
+ * The SDK auto-retries up to 3 times, waiting `retryAfterSecs` between attempts.
+ * If this error reaches the caller, retries were exhausted.
  */
 export class DedupMapFullError extends ExspeedError {
   readonly retryAfterSecs: number;

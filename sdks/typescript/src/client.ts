@@ -55,6 +55,33 @@ export class ExspeedClient extends EventEmitter {
     if (!stream) throw new ValidationError("Stream name is required");
     if (!options.subject) throw new ValidationError("Subject is required");
 
+    const maxDedupRetries = 3;
+    let dedupAttempts = 0;
+
+    while (true) {
+      try {
+        return await this.publishOnce(stream, options);
+      } catch (err) {
+        // KeyCollisionError: same msgId with a different body — this is a bug, never retry.
+        if (err instanceof KeyCollisionError) {
+          throw err;
+        }
+        // DedupMapFullError: broker dedup map at capacity. Retry up to maxDedupRetries
+        // times, sleeping retryAfterSecs between each attempt.
+        if (err instanceof DedupMapFullError) {
+          dedupAttempts++;
+          if (dedupAttempts > maxDedupRetries) {
+            throw err;
+          }
+          await new Promise((r) => setTimeout(r, err.retryAfterSecs * 1000));
+          continue;
+        }
+        throw err;
+      }
+    }
+  }
+
+  private async publishOnce(stream: string, options: PublishOptions): Promise<PublishResult> {
     let value: Buffer;
     if ("data" in options && options.data !== undefined) {
       value = Buffer.from(JSON.stringify(options.data), "utf8");
@@ -88,13 +115,9 @@ export class ExspeedClient extends EventEmitter {
       response = await this.mainConn.request(OpCode.Publish, payload);
     } catch (err) {
       // Re-throw typed errors with the current publish's context.
-      // KeyCollisionError: NOT retried — the same msgId with different body is a bug.
       if (err instanceof KeyCollisionError) {
         throw new KeyCollisionError(msgId ?? "", err.storedOffset);
       }
-      // DedupMapFullError: the SDK surfaces this to the caller. Auto-retry is
-      // intentionally NOT implemented here — the caller can inspect
-      // retryAfterSecs and decide whether to retry at the application layer.
       if (err instanceof DedupMapFullError) {
         throw new DedupMapFullError(stream, err.retryAfterSecs);
       }

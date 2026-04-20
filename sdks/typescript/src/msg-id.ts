@@ -16,29 +16,24 @@ export function newMsgId(): string {
   const rand = new Uint8Array(10);
   crypto.getRandomValues(rand);
 
-  // 48-bit timestamp → 12 hex chars
+  // Segments 1-2: 48-bit unix_ts_ms
   const tsHex = now.toString(16).padStart(12, "0");
+  const seg1 = tsHex.slice(0, 8);
+  const seg2 = tsHex.slice(8, 12);
 
-  // rand_a: 12 bits with version nibble 0x7 in the top 4 bits
-  const rawRandA = ((rand[0]! << 8) | rand[1]!) & 0x0fff;
-  const randA = rawRandA | 0x7000;
+  // Segment 3: version nibble 0x7 + 12 random bits (rand[0..1])
+  let randA = ((rand[0]! << 8) | rand[1]!) & 0x0fff;
+  randA |= 0x7000;
+  const seg3 = randA.toString(16).padStart(4, "0");
 
-  // rand_b high byte: 6 bits with variant 0b10 in the top 2 bits
-  const rawRandBHi = rand[2]! & 0x3f;
-  const randBHi = rawRandBHi | 0x80;
+  // Segment 4: variant 0b10 + 14 random bits (rand[2..3])
+  const randBHi = (rand[2]! & 0x3f) | 0x80;
+  const seg4 = randBHi.toString(16).padStart(2, "0") + rand[3]!.toString(16).padStart(2, "0");
 
-  // Remaining 8 bytes of rand_b
-  const tail = Array.from(rand.slice(3))
+  // Segment 5: 48 random bits (rand[4..9], 6 bytes = 12 hex chars)
+  const seg5 = Array.from(rand.slice(4, 10))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
 
-  const hex = (n: number, len: number) => n.toString(16).padStart(len, "0");
-
-  return [
-    tsHex.slice(0, 8),                                 // time_high
-    tsHex.slice(8, 12),                                // time_low
-    hex(randA, 4),                                     // ver + rand_a
-    hex(randBHi, 2) + rand[3]!.toString(16).padStart(2, "0"), // var + rand_b[0]
-    tail.slice(2, 14),                                 // rand_b[1..7]
-  ].join("-");
+  return [seg1, seg2, seg3, seg4, seg5].join("-");
 }

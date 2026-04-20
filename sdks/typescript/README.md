@@ -170,8 +170,8 @@ try {
     throw err
   }
   if (err instanceof DedupMapFullError) {
-    // SDK surfaces this when the broker's dedup map is full.
-    console.warn(`dedup map full, hint: retry after ${err.retryAfterSecs}s`)
+    // Retries exhausted. The broker is overloaded or misconfigured.
+    console.error(`dedup map full for ${err.stream}, retries exhausted; hint was ${err.retryAfterSecs}s`)
   }
   throw err
 }

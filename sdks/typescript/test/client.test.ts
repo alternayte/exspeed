@@ -549,7 +549,9 @@ describe("idempotent publish error handling", () => {
     await client.close();
   });
 
-  it("throws DedupMapFullError with retryAfterSecs when server returns 0x1002", async () => {
+  it("throws DedupMapFullError (after exhausting retries) when server always returns 0x1002", async () => {
+    // Use retryAfterSecs=0 so the retry loop completes instantly (no sleep).
+    let publishCount = 0;
     testServer = createTestServer((frame, socket) => {
       if (frame.opcode === OpCode.Connect) {
         const payload = Buffer.alloc(1);
@@ -561,7 +563,8 @@ describe("idempotent publish error handling", () => {
           payload,
         }));
       } else if (frame.opcode === OpCode.Publish) {
-        const errPayload = makeErrorPayload(0x1002, "dedup full", makeDedupMapFullExtras(5));
+        publishCount++;
+        const errPayload = makeErrorPayload(0x1002, "dedup full", makeDedupMapFullExtras(0));
         socket.write(encodeFrame({
           version: PROTOCOL_VERSION,
           opcode: OpCode.Error,
@@ -580,10 +583,14 @@ describe("idempotent publish error handling", () => {
       client.publish("orders", { subject: "o", data: {} }),
     ).rejects.toThrow(DedupMapFullError);
 
+    // 1 initial + 3 retries = 4 total attempts
+    expect(publishCount).toBe(4);
+
     await client.close();
   });
 
-  it("DedupMapFullError has correct retryAfterSecs", async () => {
+  it("DedupMapFullError has correct retryAfterSecs when retries are exhausted", async () => {
+    // Use retryAfterSecs=0 so the retry loop completes instantly (no sleep).
     testServer = createTestServer((frame, socket) => {
       if (frame.opcode === OpCode.Connect) {
         const payload = Buffer.alloc(1);
@@ -595,7 +602,8 @@ describe("idempotent publish error handling", () => {
           payload,
         }));
       } else if (frame.opcode === OpCode.Publish) {
-        const errPayload = makeErrorPayload(0x1002, "dedup full", makeDedupMapFullExtras(30));
+        // Use a distinctive value to verify it round-trips through the error
+        const errPayload = makeErrorPayload(0x1002, "dedup full", makeDedupMapFullExtras(0));
         socket.write(encodeFrame({
           version: PROTOCOL_VERSION,
           opcode: OpCode.Error,
@@ -618,8 +626,131 @@ describe("idempotent publish error handling", () => {
     }
 
     expect(caughtErr).toBeDefined();
-    expect(caughtErr!.retryAfterSecs).toBe(30);
+    expect(caughtErr!.retryAfterSecs).toBe(0);
     expect(caughtErr!.stream).toBe("orders");
+
+    await client.close();
+  });
+
+  it("retries DedupMapFullError up to maxDedupRetries times then succeeds", async () => {
+    let publishCount = 0;
+    // Return DedupMapFull twice then succeed on the 3rd attempt.
+    testServer = createTestServer((frame, socket) => {
+      if (frame.opcode === OpCode.Connect) {
+        const payload = Buffer.alloc(1);
+        payload.writeUInt8(2, 0);
+        socket.write(encodeFrame({
+          version: PROTOCOL_VERSION,
+          opcode: OpCode.ConnectOk,
+          correlationId: frame.correlationId,
+          payload,
+        }));
+      } else if (frame.opcode === OpCode.Publish) {
+        publishCount++;
+        if (publishCount < 3) {
+          const errPayload = makeErrorPayload(0x1002, "dedup full", makeDedupMapFullExtras(0));
+          socket.write(encodeFrame({
+            version: PROTOCOL_VERSION,
+            opcode: OpCode.Error,
+            correlationId: frame.correlationId,
+            payload: errPayload,
+          }));
+        } else {
+          // Success on 3rd attempt
+          const okPayload = Buffer.alloc(9);
+          okPayload.writeBigUInt64LE(77n, 0);
+          okPayload[8] = 0x00;
+          socket.write(encodeFrame({
+            version: PROTOCOL_VERSION,
+            opcode: OpCode.PublishOk,
+            correlationId: frame.correlationId,
+            payload: okPayload,
+          }));
+        }
+      }
+    });
+    const port = await testServer.start();
+    const client = new ExspeedClient({ host: "127.0.0.1", port, clientId: "test", reconnect: false });
+    await client.connect();
+
+    const result = await client.publish("orders", { subject: "o", data: {} });
+    expect(result.offset).toBe(77n);
+    // 2 failures + 1 success = 3 total publish calls
+    expect(publishCount).toBe(3);
+
+    await client.close();
+  });
+
+  it("throws DedupMapFullError after exhausting retries (4 total attempts)", async () => {
+    let publishCount = 0;
+    testServer = createTestServer((frame, socket) => {
+      if (frame.opcode === OpCode.Connect) {
+        const payload = Buffer.alloc(1);
+        payload.writeUInt8(2, 0);
+        socket.write(encodeFrame({
+          version: PROTOCOL_VERSION,
+          opcode: OpCode.ConnectOk,
+          correlationId: frame.correlationId,
+          payload,
+        }));
+      } else if (frame.opcode === OpCode.Publish) {
+        publishCount++;
+        const errPayload = makeErrorPayload(0x1002, "dedup full", makeDedupMapFullExtras(0));
+        socket.write(encodeFrame({
+          version: PROTOCOL_VERSION,
+          opcode: OpCode.Error,
+          correlationId: frame.correlationId,
+          payload: errPayload,
+        }));
+      }
+    });
+    const port = await testServer.start();
+    const client = new ExspeedClient({ host: "127.0.0.1", port, clientId: "test", reconnect: false });
+    await client.connect();
+
+    await expect(
+      client.publish("orders", { subject: "o", data: {} }),
+    ).rejects.toThrow(DedupMapFullError);
+
+    // 1 initial + 3 retries = 4 total attempts
+    expect(publishCount).toBe(4);
+
+    await client.close();
+  });
+
+  it("does NOT retry KeyCollisionError", async () => {
+    let publishCount = 0;
+    testServer = createTestServer((frame, socket) => {
+      if (frame.opcode === OpCode.Connect) {
+        const payload = Buffer.alloc(1);
+        payload.writeUInt8(2, 0);
+        socket.write(encodeFrame({
+          version: PROTOCOL_VERSION,
+          opcode: OpCode.ConnectOk,
+          correlationId: frame.correlationId,
+          payload,
+        }));
+      } else if (frame.opcode === OpCode.Publish) {
+        publishCount++;
+        const errPayload = makeErrorPayload(0x1001, "collision", makeKeyCollisionExtras(42n));
+        socket.write(encodeFrame({
+          version: PROTOCOL_VERSION,
+          opcode: OpCode.Error,
+          correlationId: frame.correlationId,
+          payload: errPayload,
+        }));
+      }
+    });
+    const port = await testServer.start();
+    const client = new ExspeedClient({ host: "127.0.0.1", port, clientId: "test", reconnect: false });
+    await client.connect();
+
+    await expect(
+      client.publish("orders", { subject: "o", data: {}, msgId: "test-id" }),
+    ).rejects.toThrow(KeyCollisionError);
+
+    // Must NOT retry — exactly one publish sent
+    expect(publishCount).toBe(1);
 
     await client.close();
   });

@@ -22,4 +22,16 @@ describe("newMsgId", () => {
     await new Promise((r) => setTimeout(r, 2));
     expect(a < newMsgId()).toBe(true);
   });
+
+  it("produces a 36-character string (standard UUID length)", () => {
+    const id = newMsgId();
+    expect(id.length).toBe(36);
+  });
+
+  it("fifth segment is exactly 12 hex chars", () => {
+    const id = newMsgId();
+    const parts = id.split("-");
+    expect(parts).toHaveLength(5);
+    expect(parts[4]).toHaveLength(12);
+  });
 });
