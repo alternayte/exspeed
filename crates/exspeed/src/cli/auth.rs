@@ -1,10 +1,10 @@
 //! `exspeed auth` — credential management helpers.
 //!
-//! - `gen-token`   Generate a random 32-byte hex token; token to stdout,
-//!                 sha256 digest to stderr.
-//! - `hash`        Read a raw token from stdin (trimmed), print sha256 to stdout.
-//! - `lint FILE`   Validate a credentials.toml file without starting the server.
-//! - `whoami`      GET /api/v1/whoami with the CLI's configured token.
+//! - `gen-token` Generate a random 32-byte hex token; token to stdout,
+//!   sha256 digest to stderr.
+//! - `hash` Read a raw token from stdin (trimmed), print sha256 to stdout.
+//! - `lint FILE` Validate a credentials.toml file without starting the server.
+//! - `whoami` GET /api/v1/whoami with the CLI's configured token.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};

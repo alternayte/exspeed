@@ -1157,8 +1157,7 @@ fn exspeed_auth_gen_token_outputs_64_hex_and_matching_hash() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     let hash = stderr
         .lines()
-        .filter(|l| !l.trim().is_empty())
-        .last()
+        .rfind(|l| !l.trim().is_empty())
         .unwrap_or("")
         .trim()
         .to_string();
