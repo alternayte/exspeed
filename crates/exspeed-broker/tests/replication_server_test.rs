@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use exspeed_broker::replication::server::ReplicationServer;
-use exspeed_broker::replication::ReplicationCoordinator;
+use exspeed_broker::replication::{ReplicationCoordinator, ReplicationEvent};
 use exspeed_common::auth::{
     Action, CredentialStore, Identity, IdentityRef, Permission, StreamGlob,
 };
@@ -25,7 +25,8 @@ use exspeed_protocol::codec::ExspeedCodec;
 use exspeed_protocol::frame::Frame;
 use exspeed_protocol::messages::connect::{AuthType, ConnectRequest};
 use exspeed_protocol::messages::replicate::{
-    ClusterManifest, RecordsAppended, ReplicateResume, StreamReseedEvent, REPLICATION_WIRE_VERSION,
+    ClusterManifest, RecordsAppended, ReplicateResume, StreamCreatedEvent, StreamDeletedEvent,
+    StreamReseedEvent, REPLICATION_WIRE_VERSION,
 };
 use exspeed_protocol::opcodes::OpCode;
 use exspeed_storage::memory::MemoryStorage;
@@ -94,13 +95,28 @@ async fn spawn_server(
     storage: Arc<dyn StorageEngine>,
     credential_store: Option<Arc<CredentialStore>>,
 ) -> (ReplicationServer, std::net::SocketAddr, CancellationToken) {
+    let (_coord, server, addr, cancel) = spawn_server_with_coord(storage, credential_store).await;
+    (server, addr, cancel)
+}
+
+/// Like `spawn_server` but also returns the coordinator so tests can
+/// inject `ReplicationEvent`s to exercise races.
+async fn spawn_server_with_coord(
+    storage: Arc<dyn StorageEngine>,
+    credential_store: Option<Arc<CredentialStore>>,
+) -> (
+    Arc<ReplicationCoordinator>,
+    ReplicationServer,
+    std::net::SocketAddr,
+    CancellationToken,
+) {
     let (metrics, _r) = Metrics::new();
     let metrics = Arc::new(metrics);
     let coordinator = ReplicationCoordinator::new(metrics.clone(), 64);
     let leader_id = Uuid::new_v4();
     let server = ReplicationServer::bind(
         "127.0.0.1:0".parse().unwrap(),
-        coordinator,
+        coordinator.clone(),
         storage,
         credential_store,
         leader_id,
@@ -115,7 +131,7 @@ async fn spawn_server(
     tokio::spawn(async move {
         s2.run(c2).await;
     });
-    (server, addr, cancel)
+    (coordinator, server, addr, cancel)
 }
 
 /// Send a Connect frame with the given auth payload (or none), then the
@@ -389,6 +405,160 @@ async fn reseed_detect_emits_streamreseed() {
     let batch: RecordsAppended = bincode::deserialize(&frame.payload).unwrap();
     assert_eq!(batch.stream, "orders");
     assert_eq!(batch.base_offset, 100);
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn bootstrap_does_not_lose_events_emitted_during_catchup() {
+    // Regression test for C1: events emitted between manifest snapshot and
+    // follower registration used to vanish. After the fix the server
+    // registers BEFORE snapshotting, so any event emitted after the
+    // handshake is queued in the follower's channel and delivered.
+    //
+    // We simulate the race by emitting an event through the coordinator as
+    // soon as the server has registered the follower (observable via
+    // `connected_followers()`). Even though catch-up for the existing
+    // stream is still running, the injected event must appear on the wire.
+    let storage = Arc::new(MemoryStorage::new());
+    let name = StreamName::try_from("alpha").unwrap();
+    storage.create_stream(&name, 0, 0).await.unwrap();
+    for i in 0..10u32 {
+        let rec = Record {
+            key: None,
+            value: Bytes::from(format!("v{i}").into_bytes()),
+            subject: "alpha.subj".into(),
+            headers: vec![],
+        };
+        storage.append(&name, &rec).await.unwrap();
+    }
+
+    let storage_dyn: Arc<dyn StorageEngine> = storage.clone();
+    let (coord, _server, addr, cancel) = spawn_server_with_coord(storage_dyn, None).await;
+
+    let resume = ReplicateResume {
+        follower_id: Uuid::new_v4(),
+        wire_version: REPLICATION_WIRE_VERSION,
+        cursor: BTreeMap::new(),
+    };
+    let (mut rx, _tx) = open_and_handshake(addr, None, resume).await;
+
+    // Busy-wait (bounded) until the server has registered our follower.
+    // This marks the moment after which live events must not be lost.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while coord.connected_followers() == 0 {
+        if std::time::Instant::now() > deadline {
+            panic!("server never registered the follower");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Inject a "live" event. Without the C1 fix this would race — if the
+    // manifest snapshot had already been taken but registration had not,
+    // the event would be silently lost. With registration-first the event
+    // lands in the follower channel and survives catch-up.
+    coord.emit(ReplicationEvent::StreamCreated(StreamCreatedEvent {
+        name: "zeta-new-stream".into(),
+        max_age_secs: 3600,
+        max_bytes: 0,
+    }));
+
+    // Drain frames with a bounded timeout, watching for our injected event.
+    let mut saw_injected = false;
+    let overall_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < overall_deadline {
+        let next = tokio::time::timeout(Duration::from_millis(500), rx.next()).await;
+        let frame = match next {
+            Ok(Some(Ok(f))) => f,
+            Ok(Some(Err(e))) => panic!("decode error: {e}"),
+            Ok(None) => panic!("socket closed before injected event arrived"),
+            Err(_) => continue, // brief stall; the server may still be catching up
+        };
+        if frame.opcode == OpCode::StreamCreatedEvent {
+            let ev: StreamCreatedEvent = bincode::deserialize(&frame.payload).unwrap();
+            if ev.name == "zeta-new-stream" {
+                saw_injected = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_injected,
+        "injected StreamCreated event was never delivered to the follower"
+    );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn catchup_empty_read_with_stream_deleted_logs_and_continues() {
+    // Regression test for C2: an empty read during catch-up used to
+    // `break` silently, betting on a future event to correct the cursor.
+    // With the C1 register-first fix + C2 observability, a stream
+    // deleted mid-catchup is handled: the server logs, moves on, and the
+    // follower eventually receives the `StreamDeleted` event via the
+    // live fan-out channel.
+    let storage = Arc::new(MemoryStorage::new());
+    let name = StreamName::try_from("about-to-be-deleted").unwrap();
+    storage.create_stream(&name, 0, 0).await.unwrap();
+    for i in 0..5u32 {
+        let rec = Record {
+            key: None,
+            value: Bytes::from(format!("v{i}").into_bytes()),
+            subject: "doomed.subj".into(),
+            headers: vec![],
+        };
+        storage.append(&name, &rec).await.unwrap();
+    }
+
+    let storage_dyn: Arc<dyn StorageEngine> = storage.clone();
+    let (coord, _server, addr, cancel) = spawn_server_with_coord(storage_dyn, None).await;
+
+    let resume = ReplicateResume {
+        follower_id: Uuid::new_v4(),
+        wire_version: REPLICATION_WIRE_VERSION,
+        cursor: BTreeMap::new(),
+    };
+    let (mut rx, _tx) = open_and_handshake(addr, None, resume).await;
+
+    // Wait for registration before emitting the StreamDeleted event.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while coord.connected_followers() == 0 {
+        if std::time::Instant::now() > deadline {
+            panic!("server never registered the follower");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Emit a StreamDeleted event as if the leader had dropped the stream
+    // mid-catchup. The server should NOT panic; it should continue to
+    // process frames and eventually forward the StreamDeleted event.
+    coord.emit(ReplicationEvent::StreamDeleted(StreamDeletedEvent {
+        name: "about-to-be-deleted".into(),
+    }));
+
+    let mut saw_deleted = false;
+    let overall_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < overall_deadline {
+        let next = tokio::time::timeout(Duration::from_millis(500), rx.next()).await;
+        let frame = match next {
+            Ok(Some(Ok(f))) => f,
+            Ok(Some(Err(e))) => panic!("decode error: {e}"),
+            Ok(None) => panic!("socket closed before StreamDeleted arrived"),
+            Err(_) => continue,
+        };
+        if frame.opcode == OpCode::StreamDeletedEvent {
+            let ev: StreamDeletedEvent = bincode::deserialize(&frame.payload).unwrap();
+            if ev.name == "about-to-be-deleted" {
+                saw_deleted = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_deleted,
+        "server never forwarded StreamDeleted event — catch-up may have panicked or stalled"
+    );
 
     cancel.cancel();
 }

@@ -4,18 +4,35 @@
 //!   1. `Connect` frame (reuse of the data-plane auth handshake), enforcing
 //!      `Action::Replicate` on the returned Identity.
 //!   2. `ReplicateResume` frame — follower's resume cursor.
-//!   3. `ClusterManifest` frame out — the leader's current stream bounds.
-//!   4. `StreamReseedEvent` frames for every stream whose follower-cursor
+//!   3. Register with the coordinator *first*, so any live event emitted
+//!      from this point on is buffered in our mpsc queue. Doing this before
+//!      building the manifest closes the "event lost during bootstrap"
+//!      race: an event emitted between manifest snapshot and registration
+//!      would otherwise be neither in the manifest's tail nor in the channel.
+//!   4. `ClusterManifest` frame out — the leader's current stream bounds.
+//!   5. `StreamReseedEvent` frames for every stream whose follower-cursor
 //!      is earlier than the leader's `earliest_offset`.
-//!   5. Catch-up: batched `RecordsAppended` frames up to each stream's tail.
-//!   6. Live fan-out: `tokio::select!` across the coordinator channel, a
+//!   6. Catch-up: batched `RecordsAppended` frames up to each stream's tail.
+//!   7. Live fan-out: `tokio::select!` across the coordinator channel, a
 //!      heartbeat timer, and the server-wide cancel token. A closed channel
 //!      (e.g. coordinator dropped us because our queue was full) tears
 //!      the connection down cleanly.
 //!
-//! Any I/O or protocol error at steps 2-6 closes the socket — a well-behaved
+//! Invariant (bootstrap overlap): events buffered in the channel during
+//! catch-up MAY overlap offsets that catch-up also streams (e.g. an append
+//! landed after the manifest snapshot but before catch-up for that stream
+//! started). This is fine — the follower's `append` path de-dupes via
+//! `msg_id`, and its storage rejects offsets it already has. Duplicates
+//! are not a correctness problem; losing events would be.
+//!
+//! Any I/O or protocol error at steps 2-7 closes the socket — a well-behaved
 //! follower reconnects and redrives from cursor. The coordinator's
 //! slow-follower drop (Wave 2) already covers the runtime backpressure case.
+//!
+//! NOTE: the Connect handshake here duplicates the data-plane handshake at
+//! `crates/exspeed/src/cli/server.rs:853-906`. Keep them in sync; a future
+//! ticket (TODO post-plan-g) should extract a shared helper in
+//! `exspeed-broker::auth`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -41,7 +58,7 @@ use exspeed_protocol::messages::replicate::{
 };
 use exspeed_protocol::messages::WIRE_VERSION;
 use exspeed_protocol::opcodes::OpCode;
-use exspeed_streams::StorageEngine;
+use exspeed_streams::{StorageEngine, StorageError};
 use opentelemetry::KeyValue;
 
 use crate::replication::errors::ReplicationError;
@@ -54,6 +71,11 @@ const DEFAULT_BATCH_RECORDS: usize = 1000;
 
 /// Default heartbeat interval when the connection is otherwise idle.
 /// Override via `EXSPEED_REPLICATION_HEARTBEAT_SECS`.
+///
+/// Follower invariant: the follower's `idle_timeout` MUST be at least
+/// `3 × DEFAULT_HEARTBEAT_SECS` so a single dropped heartbeat doesn't
+/// tear down a healthy connection. Wave 4's follower client is expected
+/// to read this constant.
 const DEFAULT_HEARTBEAT_SECS: u64 = 5;
 
 fn batch_records_from_env() -> usize {
@@ -179,19 +201,50 @@ async fn handle_follower(
         "follower handshake accepted"
     );
 
-    // ---- Step 3: ClusterManifest -------------------------------------------
+    // ---- Step 3: Register FIRST so live events buffer during bootstrap ----
+    // Any event emitted between manifest snapshot and this point would be
+    // silently dropped (not in the snapshot's tail offsets, not yet in any
+    // channel). Register up front so the channel catches everything; the
+    // catch-up range may overlap buffered events, which is harmless — see
+    // the "bootstrap overlap" invariant in the module docstring.
+    let (follower_id, mut rx) = server.coordinator.register_follower();
+
+    // Hoist the rest of bootstrap + fan-out into a helper so we can
+    // guarantee `deregister_follower` runs on every exit path (I/O error,
+    // cancel, version skew, channel close, happy path).
+    let result =
+        run_bootstrap_and_fanout(&server, &mut framed_write, &resume, &mut rx, cancel).await;
+
+    server.coordinator.deregister_follower(follower_id);
+    result
+}
+
+/// Everything after registration: build manifest, reseed-detect, catch up,
+/// then loop on the rx + heartbeat + cancel. Factored out so the caller can
+/// always `deregister_follower` regardless of how we exit.
+async fn run_bootstrap_and_fanout<W>(
+    server: &ReplicationServer,
+    framed_write: &mut FramedWrite<W, ExspeedCodec>,
+    resume: &ReplicateResume,
+    rx: &mut tokio::sync::mpsc::Receiver<crate::replication::ReplicationEvent>,
+    cancel: CancellationToken,
+) -> Result<(), ReplicationError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    // ---- Step 4: ClusterManifest -------------------------------------------
     let (manifest, manifest_bytes) =
         build_cluster_manifest(&server.storage, server.leader_holder_id).await?;
     write_frame(
-        &mut framed_write,
+        framed_write,
         OpCode::ClusterManifest,
         0,
-        manifest_bytes.clone(),
+        manifest_bytes,
         &server.metrics,
     )
     .await?;
 
-    // ---- Step 4: Reseed detect + Step 5: Catch-up --------------------------
+    // ---- Step 5: Reseed detect + Step 6: Catch-up --------------------------
     // Local cursor we'll advance as we stream; never mutates `resume`.
     let mut cursor = resume.cursor.clone();
     for summary in &manifest.streams {
@@ -205,7 +258,7 @@ async fn handle_follower(
             };
             let bytes = bincode::serialize(&ev)?;
             write_frame(
-                &mut framed_write,
+                framed_write,
                 OpCode::StreamReseedEvent,
                 0,
                 Bytes::from(bytes),
@@ -217,39 +270,67 @@ async fn handle_follower(
         }
 
         // Catch-up: pump records until we reach the current tail.
-        stream_catchup(
+        let final_next = stream_catchup(
             &server.storage,
-            &mut framed_write,
+            framed_write,
             &summary.name,
             &mut cursor,
             summary.latest_offset,
             &server.metrics,
         )
         .await?;
+        // Observability: if catch-up exited below the manifest tail, a
+        // retention trim / stream delete raced with us. That's recoverable
+        // — the buffered `RetentionTrimmed` / `StreamDeleted` event in the
+        // channel will correct the follower's cursor — but it's rare
+        // enough that we want it grep-able when it happens.
+        if final_next != summary.latest_offset {
+            warn!(
+                stream = %summary.name,
+                reached = final_next,
+                tail = summary.latest_offset,
+                gap = summary.latest_offset.saturating_sub(final_next),
+                follower = %resume.follower_id,
+                "catch-up exited below manifest tail — expecting live event to correct"
+            );
+        }
     }
 
-    // ---- Step 6: Live fan-out ----------------------------------------------
-    let (follower_id, mut rx) = server.coordinator.register_follower();
+    // ---- Step 7: Live fan-out ----------------------------------------------
+    fan_out_loop(server, framed_write, rx, cancel).await
+}
+
+/// Steady-state loop: forward every `ReplicationEvent` from `rx` out as a
+/// frame, emit heartbeats on timer, exit cleanly on cancel or closed channel.
+async fn fan_out_loop<W>(
+    server: &ReplicationServer,
+    framed_write: &mut FramedWrite<W, ExspeedCodec>,
+    rx: &mut tokio::sync::mpsc::Receiver<crate::replication::ReplicationEvent>,
+    cancel: CancellationToken,
+) -> Result<(), ReplicationError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let heartbeat_every = heartbeat_interval_from_env();
     let mut heartbeat = tokio::time::interval(heartbeat_every);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Skip the immediate tick so we don't emit a heartbeat at t=0.
     heartbeat.tick().await;
 
-    let result: Result<(), ReplicationError> = loop {
+    loop {
         tokio::select! {
             _ = cancel.cancelled() => {
-                break Ok(());
+                return Ok(());
             }
             maybe_ev = rx.recv() => {
                 let Some(ev) = maybe_ev else {
                     // Coordinator dropped us — slow-follower queue overflow,
                     // or we were deregistered externally. Close cleanly.
-                    break Ok(());
+                    return Ok(());
                 };
                 let encoded = encode_event(&ev)?;
                 write_frame(
-                    &mut framed_write,
+                    framed_write,
                     encoded.opcode,
                     0,
                     Bytes::from(encoded.bytes),
@@ -259,7 +340,7 @@ async fn handle_follower(
             }
             _ = heartbeat.tick() => {
                 write_frame(
-                    &mut framed_write,
+                    framed_write,
                     OpCode::ReplicationHeartbeat,
                     0,
                     Bytes::new(),
@@ -268,10 +349,7 @@ async fn handle_follower(
                 .await?;
             }
         }
-    };
-
-    server.coordinator.deregister_follower(follower_id);
-    result
+    }
 }
 
 /// Read first frame, expect Connect, authenticate, and enforce the
@@ -445,6 +523,8 @@ async fn build_cluster_manifest(
 
 /// Pump records from `cursor[stream]` up to `tail_offset`, writing one
 /// `RecordsAppended` frame per storage batch. Updates `cursor` in-place.
+/// Returns the final `next` offset we reached — callers compare it to
+/// `tail_offset` to detect and log catch-up gaps.
 async fn stream_catchup<W>(
     storage: &Arc<dyn StorageEngine>,
     framed_write: &mut FramedWrite<W, ExspeedCodec>,
@@ -452,7 +532,7 @@ async fn stream_catchup<W>(
     cursor: &mut std::collections::BTreeMap<String, u64>,
     tail_offset: u64,
     metrics: &Metrics,
-) -> Result<(), ReplicationError>
+) -> Result<u64, ReplicationError>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
@@ -461,7 +541,7 @@ where
         Ok(n) => n,
         Err(_) => {
             warn!(stream = %stream, "skipping catch-up for stream with invalid name");
-            return Ok(());
+            return Ok(cursor.get(stream).copied().unwrap_or(0));
         }
     };
 
@@ -472,9 +552,51 @@ where
             .await
             .map_err(ReplicationError::Apply)?;
         if records.is_empty() {
-            // Storage returned nothing even though tail_offset > next:
-            // possibly trimmed mid-catchup. Bail out; the next catch-up
-            // cycle (via ReplicationEvent push) will correct the cursor.
+            // Storage returned nothing even though tail_offset > next.
+            // Classify the race before giving up:
+            //   * stream deleted → log + exit; buffered StreamDeleted
+            //     event in the channel will land on the follower.
+            //   * stream trimmed past `next` (retention) → log + exit;
+            //     buffered RetentionTrimmed event will correct cursor.
+            //   * anything else → still safe to exit because, post-C1,
+            //     the follower channel was registered before manifest
+            //     snapshot, so any catch-up corrections are queued.
+            match storage.stream_bounds(&name).await {
+                Err(StorageError::StreamNotFound(_)) => {
+                    warn!(
+                        stream = %stream,
+                        next,
+                        tail = tail_offset,
+                        "catch-up empty read: stream deleted mid-bootstrap; \
+                         expecting StreamDeleted event via fan-out"
+                    );
+                }
+                Ok((earliest, tail)) if earliest.0 > next => {
+                    warn!(
+                        stream = %stream,
+                        next,
+                        earliest = earliest.0,
+                        tail = tail.0,
+                        "catch-up empty read: retention advanced past cursor; \
+                         expecting RetentionTrimmed event via fan-out"
+                    );
+                }
+                Ok((earliest, tail)) => {
+                    // Bounds unchanged but read returned nothing — unusual;
+                    // log with full context so it's easy to spot in logs.
+                    warn!(
+                        stream = %stream,
+                        next,
+                        earliest = earliest.0,
+                        tail = tail.0,
+                        manifest_tail = tail_offset,
+                        "catch-up empty read with bounds unchanged; bailing out"
+                    );
+                }
+                Err(e) => {
+                    warn!(stream = %stream, error = %e, "stream_bounds re-check failed");
+                }
+            }
             break;
         }
         let base_offset = records[0].offset.0;
@@ -518,7 +640,7 @@ where
         next = last_offset + 1;
         cursor.insert(stream.to_string(), next);
     }
-    Ok(())
+    Ok(next)
 }
 
 /// Build + send a Frame and bump outbound bytes counter.
