@@ -1,0 +1,33 @@
+[package]
+name = "exspeed-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+exspeed = { path = "../exspeed" }
+exspeed-common = { path = "../exspeed-common" }
+exspeed-protocol = { path = "../exspeed-protocol" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+hdrhistogram = { workspace = true }
+sysinfo = { workspace = true }
+reqwest = { workspace = true }
+chrono = { workspace = true }
+
+[features]
+default = []
+comparison = []                                   # enables Kafka driver in Task 12
+
+[dev-dependencies]
+portpicker = "0.1"
+tempfile = "3"

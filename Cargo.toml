@@ -10,6 +10,7 @@ members = [
     "crates/exspeed-api",
     "crates/exspeed-connectors",
     "crates/exspeed-processing",
+    "crates/exspeed-bench",
 ]
 
 [workspace.package]
@@ -103,6 +104,10 @@ tokio-rustls = "0.26"
 rustls-pemfile = "2"
 rcgen = "0.13"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
+
+# Benchmarking
+hdrhistogram = "7"
+sysinfo = "0.32"
 
 # Observability / Metrics
 opentelemetry = "0.28"
