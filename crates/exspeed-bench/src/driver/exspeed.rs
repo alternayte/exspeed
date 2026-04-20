@@ -233,7 +233,11 @@ pub async fn run_consumer(
     create_req.encode(&mut buf);
     let corr = client.alloc_corr();
     client.writer.send(Frame::new(OpCode::CreateConsumer, corr, buf.freeze())).await?;
-    let _ = client.reader.next().await; // ignore duplicate-exists errors
+    match client.reader.next().await {
+        Some(Ok(_)) => {} // Ok or Error(AlreadyExists) — either means we can proceed
+        Some(Err(e)) => return Err(e.into()),
+        None => return Err(anyhow!("connection closed during CreateConsumer")),
+    }
 
     // Subscribe
     let sub_req = SubscribeRequest {
@@ -274,13 +278,24 @@ pub async fn run_consumer(
             .find(|(k, _)| k == PUBLISH_TS_HEADER)
             .map(|(_, v)| v)
         {
-            let sent_us: u64 = v.parse().unwrap_or(0);
-            let now_us = origin.elapsed().as_micros() as u64;
-            if now_us > sent_us {
-                let _ = hist.record(now_us - sent_us);
+            match v.parse::<u64>() {
+                Ok(sent_us) => {
+                    let now_us = origin.elapsed().as_micros() as u64;
+                    if now_us > sent_us {
+                        let _ = hist.record(now_us - sent_us);
+                    }
+                }
+                Err(_) => {
+                    // Malformed header — skip rather than poison the histogram.
+                }
             }
         }
 
+        // The broker returns Ok for every Ack on this connection. At high msg/s rates
+        // those Ok frames interleave with incoming Record frames; the `continue`
+        // guard above discards them, so the histogram only accrues from real Records.
+        // This is acceptable for v1; if high-rate scenarios hit throughput issues,
+        // consider splitting the ack path onto a second task.
         // Ack so the broker keeps pushing.
         let ack = AckRequest {
             consumer_name: consumer_name.into(),
