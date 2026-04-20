@@ -78,6 +78,18 @@ impl Broker {
         self.replication_coordinator.as_ref()
     }
 
+    /// Emit a replication event to any attached coordinator. The event is
+    /// constructed lazily — the `FnOnce` is only invoked when a coordinator
+    /// is present, so single-pod deployments pay no event-construction cost.
+    pub(crate) fn emit_replication_event(
+        &self,
+        make_event: impl FnOnce() -> crate::replication::ReplicationEvent,
+    ) {
+        if let Some(coord) = &self.replication_coordinator {
+            coord.emit(make_event());
+        }
+    }
+
     /// Returns `true` once all startup dedup rebuild tasks have completed.
     pub fn is_dedup_ready(&self) -> bool {
         self.dedup_ready.load(Ordering::Acquire)
@@ -92,13 +104,13 @@ impl Broker {
         stream: &exspeed_common::StreamName,
     ) -> Result<(), exspeed_streams::StorageError> {
         self.storage.delete_stream(stream).await?;
-        if let Some(coord) = &self.replication_coordinator {
+        self.emit_replication_event(|| {
             use crate::replication::ReplicationEvent;
             use exspeed_protocol::messages::replicate::StreamDeletedEvent;
-            coord.emit(ReplicationEvent::StreamDeleted(StreamDeletedEvent {
+            ReplicationEvent::StreamDeleted(StreamDeletedEvent {
                 name: stream.as_str().to_string(),
-            }));
-        }
+            })
+        });
         Ok(())
     }
 

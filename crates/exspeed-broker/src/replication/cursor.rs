@@ -80,8 +80,7 @@ impl Cursor {
                 .truncate(true)
                 .write(true)
                 .open(&tmp_path)?;
-            let buf = serde_json::to_vec_pretty(self)
-                .map_err(|e| ReplicationError::Serde(e.to_string()))?;
+            let buf = serde_json::to_vec_pretty(self)?;
             f.write_all(&buf)?;
             f.sync_all()?;
         }

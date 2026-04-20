@@ -38,7 +38,7 @@ pub fn encode_event(event: &ReplicationEvent) -> Result<EncodedFrame, Replicatio
     Ok(EncodedFrame { opcode, bytes })
 }
 
-pub fn decode_frame(opcode: OpCode, bytes: &[u8]) -> Result<ReplicationEvent, ReplicationError> {
+pub fn decode_event(opcode: OpCode, bytes: &[u8]) -> Result<ReplicationEvent, ReplicationError> {
     match opcode {
         OpCode::StreamCreatedEvent => Ok(ReplicationEvent::StreamCreated(
             bincode::deserialize::<StreamCreatedEvent>(bytes)?,

@@ -15,14 +15,10 @@ use exspeed_common::Metrics;
 
 use crate::replication::ReplicationEvent;
 
-/// Per-follower state. The sender end lives here; the receiver end is
-/// owned by the per-connection task in `server.rs`.
-struct FollowerHandle {
-    tx: mpsc::Sender<ReplicationEvent>,
-}
-
 pub struct ReplicationCoordinator {
-    followers: RwLock<HashMap<Uuid, FollowerHandle>>,
+    /// Per-follower sender. The receiver end is owned by the per-connection
+    /// task in `server.rs` and is dropped when that task exits.
+    followers: RwLock<HashMap<Uuid, mpsc::Sender<ReplicationEvent>>>,
     metrics: Arc<Metrics>,
     queue_capacity: usize,
 }
@@ -44,7 +40,7 @@ impl ReplicationCoordinator {
         let (tx, rx) = mpsc::channel(self.queue_capacity);
         {
             let mut map = self.followers.write();
-            map.insert(id, FollowerHandle { tx });
+            map.insert(id, tx);
             self.metrics
                 .replication_connected_followers
                 .record(map.len() as i64, &[]);
@@ -75,8 +71,8 @@ impl ReplicationCoordinator {
         let mut to_drop: Vec<Uuid> = Vec::new();
         {
             let map = self.followers.read();
-            for (id, handle) in map.iter() {
-                match handle.tx.try_send(event.clone()) {
+            for (id, tx) in map.iter() {
+                match tx.try_send(event.clone()) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         warn!(follower_id = %id, "follower queue full — dropping connection");

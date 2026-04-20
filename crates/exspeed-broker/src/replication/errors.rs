@@ -18,12 +18,13 @@ pub enum ReplicationError {
     Apply(#[from] StorageError),
     #[error("auth denied: {0}")]
     AuthDenied(String),
+    /// Typed bincode errors preserve the source for debugging.
+    #[error("bincode error: {0}")]
+    Bincode(#[from] bincode::Error),
+    /// Typed serde_json errors preserve the source for debugging.
+    #[error("json error: {0}")]
+    SerdeJson(#[from] serde_json::Error),
+    /// String fallback for anything without a direct `From` impl.
     #[error("serialization: {0}")]
     Serde(String),
-}
-
-impl From<bincode::Error> for ReplicationError {
-    fn from(e: bincode::Error) -> Self {
-        ReplicationError::Serde(e.to_string())
-    }
 }

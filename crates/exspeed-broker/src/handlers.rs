@@ -40,16 +40,14 @@ pub async fn handle_create_stream(broker: &Broker, req: CreateStreamRequest) -> 
                 .await;
 
             // Fan out to replication followers (no-op if single-pod).
-            if let Some(coord) = &broker.replication_coordinator {
+            broker.emit_replication_event(|| {
                 use exspeed_protocol::messages::replicate::StreamCreatedEvent;
-                coord.emit(crate::replication::ReplicationEvent::StreamCreated(
-                    StreamCreatedEvent {
-                        name: stream_name.as_str().to_string(),
-                        max_age_secs: req.max_age_secs,
-                        max_bytes: req.max_bytes,
-                    },
-                ));
-            }
+                crate::replication::ReplicationEvent::StreamCreated(StreamCreatedEvent {
+                    name: stream_name.as_str().to_string(),
+                    max_age_secs: req.max_age_secs,
+                    max_bytes: req.max_bytes,
+                })
+            });
             ServerMessage::Ok
         }
         Err(e) => ServerMessage::Error {
@@ -111,27 +109,25 @@ pub async fn handle_publish(broker: &Broker, req: PublishRequest) -> ServerMessa
             // rather than a fresh wall-clock reading, so the follower's
             // time-index matches the leader's for seek_by_time + windowed
             // continuous queries.
-            if let Some(coord) = &broker.replication_coordinator {
+            broker.emit_replication_event(|| {
                 use exspeed_protocol::messages::replicate::{RecordsAppended, ReplicatedRecord};
                 let msg_id = record
                     .headers
                     .iter()
                     .find(|(k, _)| k == "x-idempotency-key")
                     .map(|(_, v)| v.clone());
-                coord.emit(crate::replication::ReplicationEvent::RecordsAppended(
-                    RecordsAppended {
-                        stream: stream_name.as_str().to_string(),
-                        base_offset: offset.0,
-                        records: vec![ReplicatedRecord {
-                            subject: record.subject.clone(),
-                            payload: record.value.to_vec(),
-                            headers: record.headers.clone(),
-                            timestamp_ms: timestamp_ns / 1_000_000,
-                            msg_id,
-                        }],
-                    },
-                ));
-            }
+                crate::replication::ReplicationEvent::RecordsAppended(RecordsAppended {
+                    stream: stream_name.as_str().to_string(),
+                    base_offset: offset.0,
+                    records: vec![ReplicatedRecord {
+                        subject: record.subject.clone(),
+                        payload: record.value.to_vec(),
+                        headers: record.headers.clone(),
+                        timestamp_ms: timestamp_ns / 1_000_000,
+                        msg_id,
+                    }],
+                })
+            });
 
             ServerMessage::PublishOk {
                 offset: offset.0,
