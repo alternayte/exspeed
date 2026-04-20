@@ -4,7 +4,9 @@
 pub mod compare;
 pub mod error;
 pub mod glob;
+pub mod types;
 
 pub use compare::verify_token;
 pub use error::AuthError;
 pub use glob::StreamGlob;
+pub use types::{Action, Identity, IdentityRef, Permission};
