@@ -25,21 +25,21 @@ pub fn readme_snippet(r: &BenchResult) -> String {
     let _ = writeln!(s, "| Workload              | Result                          |");
     let _ = writeln!(s, "|-----------------------|---------------------------------|");
     if let Some(p) = pub_1k {
+        let mb = p.mb_per_sec;
         let _ = writeln!(
             s,
-            "| Publish, 1 KB payload | ~{msg} msg/s (~{mb} MB/s)           |",
+            "| Publish, 1 KB payload | ~{msg} msg/s (~{mb:.0} MB/s)           |",
             msg = si(p.msg_per_sec),
-            mb = format!("{:.0}", p.mb_per_sec),
         );
     }
     if let Some(l) = lat {
+        let rate = si(l.target_rate as f64);
+        let p50 = l.latency_us.p50 as f64 / 1000.0;
+        let p99 = l.latency_us.p99 as f64 / 1000.0;
+        let p999 = l.latency_us.p999 as f64 / 1000.0;
         let _ = writeln!(
             s,
-            "| E2E latency @ {rate}/s | p50 {p50} ms / p99 {p99} ms / p99.9 {p999} ms |",
-            rate = si(l.target_rate as f64),
-            p50 = format!("{:.1}", l.latency_us.p50 as f64 / 1000.0),
-            p99 = format!("{:.1}", l.latency_us.p99 as f64 / 1000.0),
-            p999 = format!("{:.1}", l.latency_us.p999 as f64 / 1000.0),
+            "| E2E latency @ {rate}/s | p50 {p50:.1} ms / p99 {p99:.1} ms / p99.9 {p999:.1} ms |",
         );
     }
     if let Some(f) = fan_hi {

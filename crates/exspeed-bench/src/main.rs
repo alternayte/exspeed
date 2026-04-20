@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use exspeed_bench::host::Host;
-use exspeed_bench::profile::{Profile, ProfileKind};
+use exspeed_bench::profile::Profile;
 use exspeed_bench::report::*;
 use exspeed_bench::{renderer, scenarios};
 
@@ -72,6 +72,10 @@ struct ExqlArgs {
     api: String,
     #[arg(long, value_enum, default_value_t = ProfileArg::Local)]
     profile: ProfileArg,
+    #[arg(long)]
+    sku: Option<String>,
+    #[arg(long)]
+    storage: Option<String>,
     #[arg(long, default_value_t = 5_000)]
     low: u64,
     #[arg(long, default_value_t = 500_000)]
@@ -161,7 +165,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Exql(a) => {
             let profile = a.profile.to_profile();
-            let mut result = new_result(&profile, None, None);
+            let mut result = new_result(&profile, a.sku, a.storage);
             result.scenarios.exql = Some(
                 scenarios::exql::run(&a.server, &a.api, &profile, a.low, a.high, a.iterations)
                     .await?,
@@ -188,16 +192,22 @@ async fn main() -> Result<()> {
                     let body = renderer::benchmarks_md(&r);
                     std::fs::write(&path, body)?;
                     println!("wrote {}", path.display());
-                    if r.profile == ProfileKind::Reference {
-                        println!("\n---\n");
-                        println!("{}", renderer::readme_snippet_strict(&r)?);
-                    } else {
-                        eprintln!("note: profile is {:?}; skipping README snippet", r.profile);
+                    match renderer::readme_snippet_strict(&r) {
+                        Ok(snippet) => {
+                            println!("\n---\n");
+                            println!("{}", snippet);
+                        }
+                        Err(e) => eprintln!("note: {e}"),
                     }
                     Ok(())
                 }
                 None => {
                     println!("{}", renderer::benchmarks_md(&r));
+                    // Local profile: skip silently when streaming to stdout
+                    if let Ok(snippet) = renderer::readme_snippet_strict(&r) {
+                        println!("\n---\n");
+                        println!("{}", snippet);
+                    }
                     Ok(())
                 }
             }
