@@ -410,6 +410,62 @@ async fn reseed_detect_emits_streamreseed() {
 }
 
 #[tokio::test]
+async fn connection_close_always_deregisters_follower() {
+    // Regression for I3: prior to the fan-out helper refactor, an I/O error
+    // in the steady-state loop skipped the explicit `deregister_follower`
+    // call, so `connected_followers()` reported stale 1+ counts until the
+    // next emit discovered the closed channel. With the helper structure,
+    // every exit path — including abrupt client disconnect mid-fan-out —
+    // runs `deregister_follower` exactly once.
+    let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+    let (coord, _server, addr, cancel) = spawn_server_with_coord(storage, None).await;
+
+    let resume = ReplicateResume {
+        follower_id: Uuid::new_v4(),
+        wire_version: REPLICATION_WIRE_VERSION,
+        cursor: BTreeMap::new(),
+    };
+    let (rx, tx) = open_and_handshake(addr, None, resume).await;
+
+    // Wait for registration.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while coord.connected_followers() == 0 {
+        if std::time::Instant::now() > deadline {
+            panic!("server never registered the follower");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(coord.connected_followers(), 1);
+
+    // Abruptly drop the client side of the socket. The server's next
+    // write (heartbeat or fan-out) will hit EPIPE and must still run
+    // `deregister_follower` on its way out.
+    drop(rx);
+    drop(tx);
+
+    // Provoke a write so the server sees the socket close. A heartbeat
+    // would eventually do it, but emit() is synchronous and deterministic.
+    coord.emit(ReplicationEvent::StreamDeleted(StreamDeletedEvent {
+        name: "trigger-write-after-close".into(),
+    }));
+
+    // Wait until the count returns to 0 (bounded — the server task should
+    // run within a few ms).
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while coord.connected_followers() != 0 {
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "deregister_follower was skipped on I/O-error exit; count = {}",
+                coord.connected_followers()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    cancel.cancel();
+}
+
+#[tokio::test]
 async fn bootstrap_does_not_lose_events_emitted_during_catchup() {
     // Regression test for C1: events emitted between manifest snapshot and
     // follower registration used to vanish. After the fix the server
