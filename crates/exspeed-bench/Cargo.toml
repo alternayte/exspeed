@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "exspeed-bench"
+path = "src/main.rs"
+
 [dependencies]
 exspeed = { path = "../exspeed" }
 exspeed-common = { path = "../exspeed-common" }
