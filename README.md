@@ -6,6 +6,7 @@ A lightweight streaming platform built in Rust. One binary, zero partitions, ord
 
 - [Key Features](#key-features)
 - [Quick Start](#quick-start)
+- [Benchmarks](#benchmarks)
 - [CLI Reference](#cli-reference)
 - [ExQL (SQL Engine)](#exql-sql-engine)
 - [Connectors](#connectors)
@@ -49,6 +50,21 @@ exspeed pub orders '{"total": 42, "region": "us"}' --subject order.us.created --
 exspeed tail orders --last 5
 exspeed query "SELECT payload->>'region' AS region, COUNT(*) FROM orders GROUP BY payload->>'region'"
 ```
+
+## Benchmarks
+
+_Reference numbers pending the first Hetzner CCX33 refresh run — check back after the next tagged release, or run the harness locally:_
+
+```bash
+cargo run --release -p exspeed -- server --data-dir /tmp/exspeed-bench
+# in another terminal
+cargo run --release -p exspeed-bench -- all --profile local --output bench/results/local.json
+cargo run --release -p exspeed-bench -- render bench/results/local.json --out /tmp/BENCHMARKS.md
+```
+
+Full methodology, per-scenario tables, and reproduction steps in [BENCHMARKS.md](BENCHMARKS.md).
+
+A reproducible comparison kit (docker-compose + drivers for other brokers) lives in [`bench/README.md`](bench/README.md).
 
 ## CLI Reference
 
