@@ -202,6 +202,36 @@ pub async fn run_producer(
     })
 }
 
+pub async fn run_producer_at_rate(
+    addr: &str,
+    stream: &str,
+    payload_bytes: usize,
+    duration: Duration,
+    rate_per_sec: u64,
+    origin: Instant,
+) -> Result<ProducerStats> {
+    let payload: Bytes = Bytes::from(vec![b'x'; payload_bytes]);
+    let mut client = ExspeedClient::connect(addr).await?;
+    let interval_ns = 1_000_000_000u64 / rate_per_sec.max(1);
+    let mut ticker = tokio::time::interval(Duration::from_nanos(interval_ns));
+    // We want ticks to "catch up" rather than bunch when a publish takes longer
+    // than the interval — this gives us accurate coordinated-omission correction.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
+    let start = Instant::now();
+    let deadline = start + duration;
+    let mut sent: u64 = 0;
+    while Instant::now() < deadline {
+        ticker.tick().await;
+        client.publish_once(stream, &payload, origin).await?;
+        sent += 1;
+    }
+    Ok(ProducerStats {
+        messages: sent,
+        bytes: sent * payload_bytes as u64,
+        wall_secs: start.elapsed().as_secs_f64(),
+    })
+}
+
 pub struct ConsumerStats {
     pub messages: u64,
     pub latency_histogram: Histogram<u64>,

@@ -16,3 +16,16 @@ async fn publish_scenario_returns_nonzero_throughput_for_each_payload() {
         assert!(r.mb_per_sec > 0.0);
     }
 }
+
+#[tokio::test]
+async fn latency_scenario_reports_sensible_percentiles() {
+    let srv = start().await;
+    let mut profile = Profile::local();
+    profile.latency_duration = std::time::Duration::from_secs(3);
+    profile.latency_target_rate = 2_000;
+    let r = exspeed_bench::scenarios::latency::run(&srv.tcp_addr, &profile).await.unwrap();
+    assert!(r.latency_us.p50 > 0);
+    assert!(r.latency_us.p99 >= r.latency_us.p50);
+    assert!(r.latency_us.max >= r.latency_us.p99);
+    assert!(r.latency_us.p50 < 1_000_000, "p50 should be < 1s in an embedded test");
+}
