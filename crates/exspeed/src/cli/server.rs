@@ -75,10 +75,17 @@ fn multi_pod_mode() -> bool {
 /// Per-follower mpsc capacity. 100k records is ~100MB at 1KB records —
 /// generous enough that bursty writes don't drop a healthy follower, small
 /// enough that a permanently-stuck follower doesn't balloon leader memory.
+///
+/// Defense-in-depth cap at 10_000_000: a misconfigured env var that
+/// reads `100000000` (extra zero) would otherwise reserve ~10GB of
+/// heap per follower the moment a session registers. Above that the
+/// disk-based follower-seed flow is a better answer than heap.
 fn replication_follower_queue_records() -> usize {
+    const MAX: usize = 10_000_000;
     std::env::var("EXSPEED_REPLICATION_FOLLOWER_QUEUE_RECORDS")
         .ok()
-        .and_then(|v| v.parse().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.min(MAX))
         .unwrap_or(100_000)
 }
 
@@ -820,6 +827,21 @@ where
                 // `apply` writes to the same storage the leader serves
                 // from. Cancel-then-await gives us a strict role-swap
                 // boundary.
+                //
+                // Caveat: `ReplicationServer::handle_follower` spawns a
+                // child task per connected follower. We cancel the
+                // parent `server.run(...)` via `role_cancel` above, and
+                // `ReplicationServer::run` exits promptly, but the
+                // per-follower child tasks detect the cancel through
+                // their own borrow of the same token and unwind
+                // independently. In practice this unwind completes
+                // well before the new role's task sends a meaningful
+                // frame, but there's no explicit "drain all children"
+                // step here — the overlap window, if any, is bounded
+                // by how long it takes the kernel to deliver the
+                // CancellationToken flip, not by any blocking I/O.
+                // Tracked for a possible tighter drain if it shows up
+                // in failover race tests.
                 if let Some(tok) = previous_cancel.take() {
                     tok.cancel();
                 }
