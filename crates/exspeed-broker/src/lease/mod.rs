@@ -39,7 +39,12 @@ pub struct LeaseInfo {
     /// that was started without a cluster-bind endpoint; or any non-cluster
     /// lease such as connector-group holders). Emitted alongside `holder` so
     /// followers can discover the leader without a separate registry.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// Serialized unconditionally (as `null` when absent) so operator
+    /// tooling pinned to the JSON shape can reliably distinguish "no
+    /// replication endpoint advertised" from "field missing due to schema
+    /// change". See `GET /api/v1/leases`.
+    #[serde(default)]
     pub replication_endpoint: Option<String>,
 }
 
