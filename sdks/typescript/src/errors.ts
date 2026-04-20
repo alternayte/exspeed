@@ -51,6 +51,43 @@ export class BufferFullError extends ExspeedError {
 }
 
 /**
+ * Thrown when a publish with a msgId is rejected because the broker already
+ * has a record with the same msgId but a different body. This indicates a
+ * bug — the same msgId must always carry the same payload.
+ * The SDK does NOT retry this error.
+ */
+export class KeyCollisionError extends ExspeedError {
+  readonly storedOffset: bigint;
+  readonly msgId: string;
+
+  constructor(msgId: string, storedOffset: bigint) {
+    super(
+      `key collision for msgId=${msgId}: body differs from stored record at offset ${storedOffset}`,
+    );
+    this.name = "KeyCollisionError";
+    this.msgId = msgId;
+    this.storedOffset = storedOffset;
+  }
+}
+
+/**
+ * Thrown when the broker's dedup map is full and cannot accept new msgIds
+ * until space is freed. The SDK auto-retries after retryAfterSecs; you
+ * only see this error if retries are exhausted.
+ */
+export class DedupMapFullError extends ExspeedError {
+  readonly retryAfterSecs: number;
+  readonly stream: string;
+
+  constructor(stream: string, retryAfterSecs: number) {
+    super(`dedup map full for stream=${stream}: retry after ${retryAfterSecs}s`);
+    this.name = "DedupMapFullError";
+    this.stream = stream;
+    this.retryAfterSecs = retryAfterSecs;
+  }
+}
+
+/**
  * Thrown by Subscription.push (when overflowPolicy === 'error') and emitted
  * as the "overflow" event payload (when overflowPolicy === 'drop-oldest')
  * to surface that a record was dropped.

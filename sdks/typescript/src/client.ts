@@ -8,7 +8,7 @@ import {
   type Frame, DEFAULT_PORT, START_FROM_EARLIEST, START_FROM_LATEST, START_FROM_OFFSET,
 } from "./protocol/index.js";
 import { Subscription } from "./subscription.js";
-import { ServerError, ValidationError } from "./errors.js";
+import { ServerError, ValidationError, KeyCollisionError, DedupMapFullError } from "./errors.js";
 import type {
   BrokerEndpoint, ClientOptions, PublishOptions, PublishResult, CreateStreamOptions,
   CreateConsumerOptions, SubscribeOptions, FetchOptions, FetchRecord,
@@ -82,7 +82,25 @@ export class ExspeedClient extends EventEmitter {
     }
 
     const payload = encodePublish({ stream, subject: options.subject, value, key, headers, msgId });
-    const response = await this.mainConn.request(OpCode.Publish, payload);
+
+    let response;
+    try {
+      response = await this.mainConn.request(OpCode.Publish, payload);
+    } catch (err) {
+      // Re-throw typed errors with the current publish's context.
+      // KeyCollisionError: NOT retried — the same msgId with different body is a bug.
+      if (err instanceof KeyCollisionError) {
+        throw new KeyCollisionError(msgId ?? "", err.storedOffset);
+      }
+      // DedupMapFullError: the SDK surfaces this to the caller. Auto-retry is
+      // intentionally NOT implemented here — the caller can inspect
+      // retryAfterSecs and decide whether to retry at the application layer.
+      if (err instanceof DedupMapFullError) {
+        throw new DedupMapFullError(stream, err.retryAfterSecs);
+      }
+      throw err;
+    }
+
     const { offset, duplicate } = decodePublishOk(response.payload);
     return { offset, duplicate, toJSON: () => ({ offset: offset.toString() }) };
   }

@@ -10,10 +10,12 @@ import {
   type Frame,
 } from "./protocol/index.js";
 import { encodeConnect, decodeConnectResponse } from "./protocol/connect.js";
-import { decodeErrorFrame } from "./protocol/error-frame.js";
+import { decodeErrorFrame, ERR_KEY_COLLISION, ERR_DEDUP_MAP_FULL } from "./protocol/error-frame.js";
 import {
   ConnectionError,
   ServerError,
+  KeyCollisionError,
+  DedupMapFullError,
   TimeoutError,
 } from "./errors.js";
 import { AUTH_NONE, AUTH_TOKEN } from "./protocol/types.js";
@@ -302,8 +304,16 @@ export class Connection extends EventEmitter {
     clearTimeout(pending.timer);
 
     if (frame.opcode === OpCode.Error) {
-      const err = decodeErrorFrame(frame.payload);
-      pending.reject(new ServerError(err.code, err.message));
+      const parsed = decodeErrorFrame(frame.payload);
+      if (parsed.code === ERR_KEY_COLLISION && parsed.storedOffset !== undefined) {
+        // Enrich with msgId/stream context at the call site (client.ts).
+        // Use a sentinel so client.ts can distinguish and re-throw with context.
+        pending.reject(new KeyCollisionError("", parsed.storedOffset));
+      } else if (parsed.code === ERR_DEDUP_MAP_FULL && parsed.retryAfterSecs !== undefined) {
+        pending.reject(new DedupMapFullError("", parsed.retryAfterSecs));
+      } else {
+        pending.reject(new ServerError(parsed.code, parsed.message));
+      }
     } else {
       pending.resolve(frame);
     }

@@ -8,6 +8,8 @@ import { decodePublish } from "../src/protocol/publish.js";
 import { decodeCreateStream } from "../src/protocol/stream.js";
 import { encodeRecord } from "../src/protocol/record.js";
 import { Connection } from "../src/connection.js";
+import { encodeErrorFrame } from "../src/protocol/error-frame.js";
+import { KeyCollisionError, DedupMapFullError } from "../src/errors.js";
 
 function createTestServer(
   handler: (frame: { opcode: OpCode; correlationId: number; payload: Buffer }, socket: net.Socket) => void,
@@ -472,6 +474,193 @@ describe("version negotiation", () => {
     const otherHeaders = headers.filter(([k]) => k === "other-header");
     expect(otherHeaders.length).toBe(1);
     expect(otherHeaders[0][1]).toBe("value");
+
+    await client.close();
+  });
+});
+
+describe("idempotent publish error handling", () => {
+  let testServer: ReturnType<typeof createTestServer>;
+
+  afterEach(async () => {
+    if (testServer) await testServer.stop();
+  });
+
+  function makeErrorPayload(code: number, msg: string, extras?: Buffer): Buffer {
+    const msgBytes = Buffer.from(msg, "utf8");
+    const extrasLen = extras ? extras.length : 0;
+    const buf = Buffer.alloc(2 + 2 + msgBytes.length + extrasLen);
+    buf.writeUInt16LE(code, 0);
+    buf.writeUInt16LE(msgBytes.length, 2);
+    msgBytes.copy(buf, 4);
+    if (extras) extras.copy(buf, 4 + msgBytes.length);
+    return buf;
+  }
+
+  function makeKeyCollisionExtras(storedOffset: bigint): Buffer {
+    const extras = Buffer.alloc(1 + 8);
+    extras[0] = 0x01;
+    extras.writeBigUInt64LE(storedOffset, 1);
+    return extras;
+  }
+
+  function makeDedupMapFullExtras(retryAfterSecs: number): Buffer {
+    const extras = Buffer.alloc(1 + 4);
+    extras[0] = 0x02;
+    extras.writeUInt32LE(retryAfterSecs, 1);
+    return extras;
+  }
+
+  it("throws KeyCollisionError (not retried) when server returns 0x1001", async () => {
+    let publishCount = 0;
+    testServer = createTestServer((frame, socket) => {
+      if (frame.opcode === OpCode.Connect) {
+        // v2 broker
+        const payload = Buffer.alloc(1);
+        payload.writeUInt8(2, 0);
+        socket.write(encodeFrame({
+          version: PROTOCOL_VERSION,
+          opcode: OpCode.ConnectOk,
+          correlationId: frame.correlationId,
+          payload,
+        }));
+      } else if (frame.opcode === OpCode.Publish) {
+        publishCount++;
+        const errPayload = makeErrorPayload(0x1001, "collision", makeKeyCollisionExtras(42n));
+        socket.write(encodeFrame({
+          version: PROTOCOL_VERSION,
+          opcode: OpCode.Error,
+          correlationId: frame.correlationId,
+          payload: errPayload,
+        }));
+      }
+    });
+    const port = await testServer.start();
+    const client = new ExspeedClient({ host: "127.0.0.1", port, clientId: "test", reconnect: false });
+    await client.connect();
+
+    await expect(
+      client.publish("orders", { subject: "o", data: {}, msgId: "test-id" }),
+    ).rejects.toThrow(KeyCollisionError);
+
+    // Must NOT retry — exactly one publish sent
+    expect(publishCount).toBe(1);
+
+    await client.close();
+  });
+
+  it("throws DedupMapFullError with retryAfterSecs when server returns 0x1002", async () => {
+    testServer = createTestServer((frame, socket) => {
+      if (frame.opcode === OpCode.Connect) {
+        const payload = Buffer.alloc(1);
+        payload.writeUInt8(2, 0);
+        socket.write(encodeFrame({
+          version: PROTOCOL_VERSION,
+          opcode: OpCode.ConnectOk,
+          correlationId: frame.correlationId,
+          payload,
+        }));
+      } else if (frame.opcode === OpCode.Publish) {
+        const errPayload = makeErrorPayload(0x1002, "dedup full", makeDedupMapFullExtras(5));
+        socket.write(encodeFrame({
+          version: PROTOCOL_VERSION,
+          opcode: OpCode.Error,
+          correlationId: frame.correlationId,
+          payload: errPayload,
+        }));
+      }
+    });
+    const port = await testServer.start();
+    const client = new ExspeedClient({
+      host: "127.0.0.1", port, clientId: "test", reconnect: false,
+    });
+    await client.connect();
+
+    await expect(
+      client.publish("orders", { subject: "o", data: {} }),
+    ).rejects.toThrow(DedupMapFullError);
+
+    await client.close();
+  });
+
+  it("DedupMapFullError has correct retryAfterSecs", async () => {
+    testServer = createTestServer((frame, socket) => {
+      if (frame.opcode === OpCode.Connect) {
+        const payload = Buffer.alloc(1);
+        payload.writeUInt8(2, 0);
+        socket.write(encodeFrame({
+          version: PROTOCOL_VERSION,
+          opcode: OpCode.ConnectOk,
+          correlationId: frame.correlationId,
+          payload,
+        }));
+      } else if (frame.opcode === OpCode.Publish) {
+        const errPayload = makeErrorPayload(0x1002, "dedup full", makeDedupMapFullExtras(30));
+        socket.write(encodeFrame({
+          version: PROTOCOL_VERSION,
+          opcode: OpCode.Error,
+          correlationId: frame.correlationId,
+          payload: errPayload,
+        }));
+      }
+    });
+    const port = await testServer.start();
+    const client = new ExspeedClient({ host: "127.0.0.1", port, clientId: "test", reconnect: false });
+    await client.connect();
+
+    let caughtErr: DedupMapFullError | undefined;
+    try {
+      await client.publish("orders", { subject: "o", data: {} });
+    } catch (err) {
+      if (err instanceof DedupMapFullError) {
+        caughtErr = err;
+      }
+    }
+
+    expect(caughtErr).toBeDefined();
+    expect(caughtErr!.retryAfterSecs).toBe(30);
+    expect(caughtErr!.stream).toBe("orders");
+
+    await client.close();
+  });
+
+  it("KeyCollisionError has correct storedOffset and msgId", async () => {
+    testServer = createTestServer((frame, socket) => {
+      if (frame.opcode === OpCode.Connect) {
+        const payload = Buffer.alloc(1);
+        payload.writeUInt8(2, 0);
+        socket.write(encodeFrame({
+          version: PROTOCOL_VERSION,
+          opcode: OpCode.ConnectOk,
+          correlationId: frame.correlationId,
+          payload,
+        }));
+      } else if (frame.opcode === OpCode.Publish) {
+        const errPayload = makeErrorPayload(0x1001, "collision", makeKeyCollisionExtras(99n));
+        socket.write(encodeFrame({
+          version: PROTOCOL_VERSION,
+          opcode: OpCode.Error,
+          correlationId: frame.correlationId,
+          payload: errPayload,
+        }));
+      }
+    });
+    const port = await testServer.start();
+    const client = new ExspeedClient({ host: "127.0.0.1", port, clientId: "test", reconnect: false });
+    await client.connect();
+
+    let caughtErr: KeyCollisionError | undefined;
+    try {
+      await client.publish("orders", { subject: "o", data: {}, msgId: "my-msg-id" });
+    } catch (err) {
+      if (err instanceof KeyCollisionError) {
+        caughtErr = err;
+      }
+    }
+
+    expect(caughtErr).toBeDefined();
+    expect(caughtErr!.storedOffset).toBe(99n);
+    expect(caughtErr!.msgId).toBe("my-msg-id");
 
     await client.close();
   });
