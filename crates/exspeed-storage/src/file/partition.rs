@@ -53,15 +53,21 @@ fn now_nanos() -> u64 {
 }
 
 /// Pick a base_offset for a throw-away placeholder segment whose filename
-/// is guaranteed not to collide with any doomed segment or any file the
-/// truncate rewrite is about to create. We walk down from `u64::MAX` —
-/// real segments never reach that range.
-fn pick_placeholder_base(dir: &Path, doomed: &[(PathBuf, u64, bool)]) -> io::Result<u64> {
+/// is guaranteed not to collide with the old active segment, any doomed
+/// sealed segment, or any file the truncate rewrite is about to create.
+/// We walk down from `u64::MAX` — real segments never reach that range.
+fn pick_placeholder_base(
+    dir: &Path,
+    active_path: &Path,
+    doomed_sealed: &[PathBuf],
+) -> io::Result<u64> {
     let mut candidate: u64 = u64::MAX;
     loop {
         let filename = format!("{:020}.seg", candidate);
         let path = dir.join(&filename);
-        let collides = doomed.iter().any(|(p, _, _)| p == &path) || path.exists();
+        let collides = path == active_path
+            || doomed_sealed.iter().any(|p| p == &path)
+            || path.exists();
         if !collides {
             return Ok(candidate);
         }
@@ -321,6 +327,23 @@ impl Partition {
         Ok(Offset(self.next_offset))
     }
 
+    /// Remove the sealed segment at `i` from `self.sealed_readers`, delete
+    /// its `.seg` / `.idx` / `.tix` files on disk, and account for the
+    /// reclaimed space in `stats`. Errors from the file deletes are swallowed
+    /// (they're best-effort) — the in-memory state is always updated.
+    fn remove_sealed_segment(&mut self, i: usize, stats: &mut RetentionStats) {
+        let reader = self.sealed_readers.remove(i);
+        let seg_path = reader.path().to_path_buf();
+        let size = reader.file_size();
+
+        let _ = fs::remove_file(&seg_path);
+        let _ = fs::remove_file(seg_path.with_extension("idx"));
+        let _ = fs::remove_file(seg_path.with_extension("tix"));
+
+        stats.segments_deleted += 1;
+        stats.bytes_reclaimed += size;
+    }
+
     /// Enforce retention: delete old sealed segments based on age and size limits.
     /// Never deletes the active segment.
     pub fn enforce_retention(
@@ -352,17 +375,7 @@ impl Partition {
 
         // Remove in reverse order so indices stay valid
         for &i in indices_to_remove.iter().rev() {
-            let reader = self.sealed_readers.remove(i);
-            let seg_path = reader.path().to_path_buf();
-            let size = reader.file_size();
-
-            // Delete segment + index files
-            let _ = fs::remove_file(&seg_path);
-            let _ = fs::remove_file(seg_path.with_extension("idx"));
-            let _ = fs::remove_file(seg_path.with_extension("tix"));
-
-            stats.segments_deleted += 1;
-            stats.bytes_reclaimed += size;
+            self.remove_sealed_segment(i, &mut stats);
         }
 
         // Size-based deletion: remove oldest sealed segments until under limit
@@ -371,16 +384,7 @@ impl Partition {
             if total_size <= max_bytes || self.sealed_readers.is_empty() {
                 break;
             }
-            let reader = self.sealed_readers.remove(0); // remove oldest
-            let seg_path = reader.path().to_path_buf();
-            let size = reader.file_size();
-
-            let _ = fs::remove_file(&seg_path);
-            let _ = fs::remove_file(seg_path.with_extension("idx"));
-            let _ = fs::remove_file(seg_path.with_extension("tix"));
-
-            stats.segments_deleted += 1;
-            stats.bytes_reclaimed += size;
+            self.remove_sealed_segment(0, &mut stats);
         }
 
         Ok(stats)
@@ -435,14 +439,7 @@ impl Partition {
         }
 
         for &i in to_remove.iter().rev() {
-            let reader = self.sealed_readers.remove(i);
-            let seg_path = reader.path().to_path_buf();
-            let size = reader.file_size();
-            let _ = fs::remove_file(&seg_path);
-            let _ = fs::remove_file(seg_path.with_extension("idx"));
-            let _ = fs::remove_file(seg_path.with_extension("tix"));
-            stats.segments_deleted += 1;
-            stats.bytes_reclaimed += size;
+            self.remove_sealed_segment(i, &mut stats);
         }
 
         Ok(stats)
@@ -562,39 +559,37 @@ impl Partition {
             }
         };
 
-        // Paths of segments to delete, gathered from:
-        //   a) sealed segments at index >= kept_sealed_count (straddle + past)
-        //   b) the active segment
-        let mut doomed_paths: Vec<(PathBuf, u64, bool)> = Vec::new();
-        //   ^ (path, size, counts_as_sealed_for_stats)
-        while self.sealed_readers.len() > kept_sealed_count {
-            let reader = self.sealed_readers.pop().unwrap();
-            doomed_paths.push((reader.path().to_path_buf(), reader.file_size(), true));
-        }
-        // The active segment is always replaced. If it's the straddle,
-        // we've already captured its surviving records; if not, it's
-        // entirely past drop_from and has nothing to replay.
-        doomed_paths.push((active_path.clone(), self.active_writer.bytes_written(), false));
-
         // ── Step 4: Close and delete doomed segments. ─────────────────────
         //
         // Close the active writer first by replacing it with a placeholder.
-        // The placeholder lives at a base_offset guaranteed not to collide
-        // with any retained or new segment.
-        let placeholder_base = pick_placeholder_base(&self.dir, &doomed_paths)?;
+        // The placeholder's base_offset is picked to avoid colliding with
+        // any retained or doomed segment filename.
+        let sealed_doomed_paths: Vec<PathBuf> = self
+            .sealed_readers
+            .iter()
+            .skip(kept_sealed_count)
+            .map(|r| r.path().to_path_buf())
+            .collect();
+        let placeholder_base =
+            pick_placeholder_base(&self.dir, &active_path, &sealed_doomed_paths)?;
         let placeholder = SegmentWriter::create(&self.dir, placeholder_base)?;
         let placeholder_path = placeholder.path().to_path_buf();
+        let old_active_size = self.active_writer.bytes_written();
         drop(std::mem::replace(&mut self.active_writer, placeholder));
 
-        for (path, size, counts_sealed) in &doomed_paths {
-            let _ = fs::remove_file(path);
-            let _ = fs::remove_file(path.with_extension("idx"));
-            let _ = fs::remove_file(path.with_extension("tix"));
-            if *counts_sealed {
-                stats.segments_deleted += 1;
-            }
-            stats.bytes_reclaimed += size;
+        // Drop doomed sealed segments (straddle + everything past it) via
+        // the shared helper. Walk in reverse so indices stay valid.
+        while self.sealed_readers.len() > kept_sealed_count {
+            self.remove_sealed_segment(self.sealed_readers.len() - 1, &mut stats);
         }
+
+        // Drop the old active segment's files. It isn't a "sealed" segment
+        // for stats purposes (no increment to `segments_deleted`), but its
+        // bytes are reclaimed.
+        let _ = fs::remove_file(&active_path);
+        let _ = fs::remove_file(active_path.with_extension("idx"));
+        let _ = fs::remove_file(active_path.with_extension("tix"));
+        stats.bytes_reclaimed += old_active_size;
 
         // ── Step 5: Build the new active segment and replay. ──────────────
         let new_active = SegmentWriter::create(&self.dir, replay_base_offset)?;
