@@ -5,12 +5,63 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use exspeed_broker::lease::postgres::PostgresLeaseBackend;
 use exspeed_broker::lease::redis::RedisLeaseBackend;
 use exspeed_broker::lease::LeaderLease;
 use exspeed_broker::lease::NoopLeaderLease;
+use exspeed_broker::lease::{LeaseError, LeaseGuard, LeaseInfo};
 use exspeed_broker::leadership::ClusterLeadership;
 use exspeed_common::Metrics;
+
+/// In-memory fake backend for exercising the endpoint round-trip. Unlike
+/// `NoopLeaderLease` (which is stateless and returns `[]` from `list_all`),
+/// this records every successful acquire so `leader_replication_endpoint`
+/// has something to read back. Single-holder semantics only — good enough
+/// for the single-`spawn` tests that need it.
+#[derive(Default)]
+struct RecordingLease {
+    rows: parking_lot::Mutex<Vec<LeaseInfo>>,
+}
+
+#[async_trait]
+impl LeaderLease for RecordingLease {
+    fn supports_coordination(&self) -> bool {
+        true
+    }
+
+    async fn try_acquire(
+        &self,
+        name: &str,
+        ttl: Duration,
+        replication_endpoint: Option<&str>,
+    ) -> Result<Option<LeaseGuard>, LeaseError> {
+        let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let (lost_tx, lost_rx) = tokio::sync::watch::channel(false);
+        let holder_id = uuid::Uuid::new_v4();
+        {
+            let mut rows = self.rows.lock();
+            rows.retain(|r| r.name != name);
+            rows.push(LeaseInfo {
+                name: name.to_string(),
+                holder: holder_id,
+                expires_at: chrono::Utc::now() + chrono::Duration::from_std(ttl).unwrap(),
+                replication_endpoint: replication_endpoint.map(|s| s.to_string()),
+            });
+        }
+        Ok(Some(LeaseGuard {
+            name: name.to_string(),
+            holder_id,
+            on_lost: lost_rx,
+            _lost_tx: Some(lost_tx),
+            _cancel_heartbeat: cancel_tx,
+        }))
+    }
+
+    async fn list_all(&self) -> Result<Vec<LeaseInfo>, LeaseError> {
+        Ok(self.rows.lock().clone())
+    }
+}
 
 fn skip_if_no_postgres() -> bool {
     std::env::var("EXSPEED_OFFSET_STORE_POSTGRES_URL").is_err()
@@ -63,7 +114,7 @@ async fn noop_becomes_leader_immediately() {
     let (metrics, _registry) = Metrics::new();
     let metrics = Arc::new(metrics);
 
-    let leadership = ClusterLeadership::spawn(lease, metrics).await;
+    let leadership = ClusterLeadership::spawn(lease, metrics, None).await;
 
     // Noop always grants -> is_leader flips true within ~1 tick (bounded
     // generously to avoid flakes).
@@ -102,8 +153,8 @@ async fn postgres_two_leaderships_race_exactly_one_wins() {
     let (metrics, _r) = Metrics::new();
     let metrics = Arc::new(metrics);
 
-    let a = ClusterLeadership::spawn(a_lease, metrics.clone()).await;
-    let b = ClusterLeadership::spawn(b_lease, metrics.clone()).await;
+    let a = ClusterLeadership::spawn(a_lease, metrics.clone(), None).await;
+    let b = ClusterLeadership::spawn(b_lease, metrics.clone(), None).await;
 
     // Give both retry loops a full tick. Default TTL=30s, tick=TTL/3=10s;
     // 12s is enough for at least one full acquire attempt from each.
@@ -129,7 +180,7 @@ async fn postgres_heartbeat_loss_cancels_leader_token() {
     let (metrics, _r) = Metrics::new();
     let metrics = Arc::new(metrics);
 
-    let leadership = ClusterLeadership::spawn(lease, metrics).await;
+    let leadership = ClusterLeadership::spawn(lease, metrics, None).await;
 
     // Wait to become leader (the schema was pre-created by make_pg_backend_isolated
     // via from_env/ensure_schema, so the table already exists).
@@ -200,8 +251,8 @@ async fn redis_two_leaderships_race_exactly_one_wins() {
     let (metrics, _r) = Metrics::new();
     let metrics = Arc::new(metrics);
 
-    let a = ClusterLeadership::spawn(a_lease, metrics.clone()).await;
-    let b = ClusterLeadership::spawn(b_lease, metrics.clone()).await;
+    let a = ClusterLeadership::spawn(a_lease, metrics.clone(), None).await;
+    let b = ClusterLeadership::spawn(b_lease, metrics.clone(), None).await;
 
     tokio::time::sleep(Duration::from_secs(12)).await;
 
@@ -210,5 +261,61 @@ async fn redis_two_leaderships_race_exactly_one_wins() {
     assert!(
         a_leader ^ b_leader,
         "exactly one should be leader; got a={a_leader} b={b_leader}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// replication_endpoint advertisement
+// ---------------------------------------------------------------------------
+
+/// `spawn` with `Some("…")` writes the endpoint into the lease row on acquire,
+/// and `leader_replication_endpoint` reads it back. Uses `RecordingLease`
+/// rather than Noop because Noop's `list_all` is intentionally empty.
+#[tokio::test]
+async fn spawn_with_endpoint_advertises_via_list_all() {
+    let lease: Arc<dyn LeaderLease> = Arc::new(RecordingLease::default());
+    let (metrics, _r) = Metrics::new();
+    let metrics = Arc::new(metrics);
+    let endpoint = "10.0.0.42:5934";
+
+    let leadership =
+        ClusterLeadership::spawn(lease, metrics, Some(endpoint.to_string())).await;
+
+    // Wait for the retry loop to acquire. Default TTL=30s tick=TTL/3≈10s;
+    // the first tick fires immediately, so ~50ms is plenty on RecordingLease.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while !leadership.is_currently_leader() {
+        if tokio::time::Instant::now() > deadline {
+            panic!("leadership never acquired on RecordingLease");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let got = leadership
+        .leader_replication_endpoint()
+        .await
+        .expect("endpoint should be advertised");
+    assert_eq!(got, endpoint);
+}
+
+#[tokio::test]
+async fn spawn_without_endpoint_reports_none() {
+    let lease: Arc<dyn LeaderLease> = Arc::new(RecordingLease::default());
+    let (metrics, _r) = Metrics::new();
+    let metrics = Arc::new(metrics);
+
+    let leadership = ClusterLeadership::spawn(lease, metrics, None).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while !leadership.is_currently_leader() {
+        if tokio::time::Instant::now() > deadline {
+            panic!("leadership never acquired on RecordingLease");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert!(
+        leadership.leader_replication_endpoint().await.is_none(),
+        "no endpoint was advertised"
     );
 }

@@ -317,7 +317,7 @@ mod tests {
         let (metrics, _r) = exspeed_common::Metrics::new();
         let metrics = Arc::new(metrics);
         let leadership = Arc::new(
-            ClusterLeadership::spawn(lease, metrics.clone()).await,
+            ClusterLeadership::spawn(lease, metrics.clone(), None).await,
         );
         // Wait for Noop to grant leadership.
         for _ in 0..40 {

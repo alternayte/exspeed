@@ -339,8 +339,19 @@ where
     }
 
     // Spawn cluster-leader leadership state machine.
+    //
+    // `replication_endpoint = None` until Wave 5 wires up the cluster-bind
+    // listener and derives the advertised address. Passing `None` today is
+    // equivalent to today's single-pod behavior: the lease row carries no
+    // endpoint, `leader_replication_endpoint()` returns `None`, and
+    // followers (which don't exist yet) have nothing to dial.
     let leadership = Arc::new(
-        exspeed_broker::leadership::ClusterLeadership::spawn(lease.clone(), metrics.clone()).await,
+        exspeed_broker::leadership::ClusterLeadership::spawn(
+            lease.clone(),
+            metrics.clone(),
+            None,
+        )
+        .await,
     );
 
     // Validate heartbeat vs TTL — heartbeat must be well under TTL or the
