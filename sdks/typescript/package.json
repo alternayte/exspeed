@@ -1,6 +1,6 @@
 {
   "name": "@exspeed/sdk",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "TypeScript client SDK for Exspeed — a stream processing platform with an integrated SQL-like query engine",
   "type": "module",
   "main": "./dist/index.cjs",

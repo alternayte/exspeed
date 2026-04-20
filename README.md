@@ -907,6 +907,18 @@ On `SIGTERM` or `SIGINT` the server stops accepting new TCP connections, waits u
 
 For Kubernetes, set `terminationGracePeriodSeconds: 30` (or higher) on the pod so the kubelet doesn't `SIGKILL` the process before the drain completes.
 
+### Consumers vs. retention
+
+If a consumer's offset falls behind the retention window (age or size), the broker returns `StorageError::OffsetOutOfRange` on its next read and **terminates the subscription** — it does not silently jump forward to the first surviving record, which would look like successful consumption of data that was actually lost.
+
+The delivery task logs a warning with `requested` and `earliest` offsets so operators can spot it in log aggregation. To recover, the application must explicitly re-seek — typically to the earliest available offset, or to a business-meaningful point. Naïve auto-reconnect from the lost offset will hit the same error; clients should treat this signal as "your position is gone, choose where to resume."
+
+Operationally: size your retention with your slowest expected consumer in mind. Metrics of interest are `exspeed_consumer_lag_records` and per-stream storage bytes.
+
+### Consumer state durability
+
+Consumer offsets are persisted atomically (tempfile + rename + parent-dir fsync). A crash at any point during a save leaves either the previous offset intact or the new offset fully durable — never a truncated file. If you see stray `*.json.tmp` files in `{data_dir}/consumers/` at startup, they're the remnants of a crashed save and are safely ignored by the loader.
+
 ### `/healthz` vs `/readyz`
 
 | Endpoint | Returns 200 when | Recommended use |

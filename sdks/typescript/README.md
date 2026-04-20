@@ -91,6 +91,8 @@ for await (const msg of sub) {
 }
 ```
 
+If a consumer falls behind retention (its stored offset is below the stream's earliest surviving offset), the server terminates the subscription rather than silently jumping forward. The SDK surfaces this as a subscription-closed event — re-seek explicitly (e.g. `seek` to `"earliest"` or a business-meaningful time) before re-subscribing. Auto-reconnecting with the same offset will just hit the same error.
+
 ### Batch Fetch
 
 ```ts
