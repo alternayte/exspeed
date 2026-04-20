@@ -33,6 +33,7 @@ async fn start_server() -> (String, u16, tempfile::TempDir) {
         api_bind: api_addr,
         data_dir,
         auth_token: None,
+        credentials_file: None,
         tls_cert: None,
         tls_key: None,
     };

@@ -13,6 +13,7 @@ async fn start_server(auth_token: Option<String>) -> (u16, TempDir) {
         api_bind: format!("127.0.0.1:{api_port}"),
         data_dir: tmp.path().to_path_buf(),
         auth_token,
+        credentials_file: None,
         tls_cert: None,
         tls_key: None,
     };

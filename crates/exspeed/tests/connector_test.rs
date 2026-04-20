@@ -24,6 +24,7 @@ async fn start_server() -> (String, String) {
             api_bind: http_addr_clone,
             data_dir,
             auth_token: None,
+            credentials_file: None,
             tls_cert: None,
             tls_key: None,
         })

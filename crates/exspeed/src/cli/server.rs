@@ -100,6 +100,13 @@ pub struct ServerArgs {
     #[arg(long, env = "EXSPEED_AUTH_TOKEN", hide_env_values = true)]
     pub auth_token: Option<String>,
 
+    /// Path to a TOML credentials file. When unset here, falls back to
+    /// `EXSPEED_CREDENTIALS_FILE` and then to `{data_dir}/credentials.toml`.
+    /// Having a first-class field lets integration tests point at a per-test
+    /// tempfile without mutating process-global env vars.
+    #[arg(long, env = "EXSPEED_CREDENTIALS_FILE")]
+    pub credentials_file: Option<PathBuf>,
+
     /// Path to PEM-encoded server certificate (full chain). Must be set with --tls-key.
     #[arg(long, env = "EXSPEED_TLS_CERT")]
     pub tls_cert: Option<PathBuf>,
@@ -179,13 +186,17 @@ where
     let auth_token_raw: Option<String> =
         args.auth_token.as_ref().filter(|v| !v.is_empty()).cloned();
 
-    // Resolve credentials file: explicit env var wins; otherwise fall back to
-    // `{data_dir}/credentials.toml` only if it exists on disk. This preserves
-    // Plan B's "no file, no env var → open broker" behavior.
-    let credentials_path: Option<PathBuf> = std::env::var("EXSPEED_CREDENTIALS_FILE")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
+    // Resolve credentials file. Precedence: explicit `--credentials-file` /
+    // `EXSPEED_CREDENTIALS_FILE` (clap folds both into `args.credentials_file`)
+    // → `{data_dir}/credentials.toml` when it exists on disk.
+    // Holding the path in `ServerArgs` instead of reading env at this point
+    // lets integration tests point a single in-process server at a per-test
+    // tempfile without racing on process-global state.
+    let credentials_path: Option<PathBuf> = args
+        .credentials_file
+        .as_ref()
+        .filter(|p| !p.as_os_str().is_empty())
+        .cloned()
         .or_else(|| {
             let default = args.data_dir.join("credentials.toml");
             default.exists().then_some(default)
