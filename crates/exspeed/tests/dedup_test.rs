@@ -97,7 +97,19 @@ async fn start_server_at(data_dir: PathBuf) -> (String, String, CancellationToke
             break;
         }
     }
-    (tcp_addr, http_addr, cancel)
+
+    // After TCP is open, also poll /readyz to ensure the dedup rebuild is complete.
+    // This gates on broker.is_dedup_ready() and mirrors the production LB pattern.
+    let readyz_url = format!("http://{}/readyz", http_addr);
+    for _ in 0..50 {
+        if let Ok(resp) = reqwest::get(&readyz_url).await {
+            if resp.status().is_success() {
+                return (tcp_addr, http_addr, cancel);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("server /readyz did not become ready in 5s");
 }
 
 /// Gracefully shut down a server by cancelling its token.
