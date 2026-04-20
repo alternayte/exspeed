@@ -13,3 +13,6 @@ opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-prometheus = { workspace = true }
 prometheus = { workspace = true }
+sha2 = "0.10"
+enumset = { version = "1", features = ["serde"] }
+toml = "0.8"
