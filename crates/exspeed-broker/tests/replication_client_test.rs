@@ -185,6 +185,41 @@ fn counter_value(
     total
 }
 
+/// Look up a gauge by name + required label filters. Returns the last
+/// series value that matched the required labels, or `None` if no series
+/// matched. OTel exports gauges as Prometheus gauges — a single sample
+/// per label-set, so "last match wins" is equivalent to "the value".
+fn gauge_value(
+    registry: &prometheus::Registry,
+    metric_name: &str,
+    required_labels: &[(&str, &str)],
+) -> Option<f64> {
+    for mf in registry.gather() {
+        if mf.get_name() != metric_name {
+            continue;
+        }
+        for m in mf.get_metric() {
+            let mut matches = true;
+            for (k, v) in required_labels {
+                let hit = m
+                    .get_label()
+                    .iter()
+                    .any(|lp: &prometheus::proto::LabelPair| {
+                        lp.get_name() == *k && lp.get_value() == *v
+                    });
+                if !hit {
+                    matches = false;
+                    break;
+                }
+            }
+            if matches {
+                return Some(m.get_gauge().get_value());
+            }
+        }
+    }
+    None
+}
+
 /// Build a client with `MemoryStorage` and spawn its run loop at `addr`.
 /// The endpoint getter returns `addr` forever — the client dials, the
 /// handshake runs, and then the test controls the stream.
@@ -916,5 +951,106 @@ async fn idle_timeout_drops_connection() {
     }
 
     std::env::remove_var("EXSPEED_REPLICATION_IDLE_TIMEOUT_SECS");
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn apply_path_moves_records_applied_and_lag_seconds() {
+    // After a RecordsAppended batch lands on the follower, the
+    // `records_applied_total{stream}` counter must reflect the batch size
+    // and the `lag_seconds{stream}` gauge must be observable (i.e. the
+    // series exists with a numeric value; the exact magnitude is
+    // wall-clock-dependent). This is the blocker alert-path: without these
+    // metrics moving, `rate(exspeed_replication_lag_seconds[1m]) > 10`
+    // alerts would never fire on a live follower.
+    let storage = Arc::new(MemoryStorage::new());
+    let tmp = TempDir::new().unwrap();
+    let cursor_path = tmp.path().join("cursor.json");
+
+    let manifest = ClusterManifest {
+        streams: vec![stream_summary("orders", 0, 5)],
+        leader_holder_id: Uuid::new_v4(),
+    };
+    let (addr, handshake_rx) = spawn_stub_leader(manifest).await;
+
+    let (metrics, registry) = metrics_with_registry();
+    let handle = spawn_client(
+        storage.clone() as Arc<dyn StorageEngine>,
+        cursor_path,
+        addr,
+        metrics,
+        tmp,
+    );
+
+    let (_r, mut w, _) = handshake_rx.await.expect("handshake");
+
+    // Choose a leader timestamp strictly in the past so `lag_seconds`
+    // observably > 0 — proves the gauge is not just descriptor-only.
+    let leader_ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        - 10_000; // 10 seconds behind
+
+    let records: Vec<ReplicatedRecord> = (0..5u64)
+        .map(|i| ReplicatedRecord {
+            subject: "orders.placed".into(),
+            payload: format!("rec-{i}").into_bytes(),
+            headers: vec![],
+            timestamp_ms: leader_ts_ms + i,
+            msg_id: None,
+        })
+        .collect();
+    let batch = RecordsAppended {
+        stream: "orders".into(),
+        base_offset: 0,
+        records,
+    };
+    push_frame(&mut w, OpCode::RecordsAppended, &batch).await;
+
+    // Wait for the batch to land.
+    let name = StreamName::try_from("orders").unwrap();
+    wait_for(
+        || async {
+            storage
+                .stream_bounds(&name)
+                .await
+                .map(|(_, next)| next.0 == 5)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(3),
+        "follower to apply 5 records",
+    )
+    .await;
+
+    // Counter: `exspeed_replication_records_applied_total_total{stream="orders"}`
+    // should be exactly 5. Note the `_total_total` suffix — the
+    // OTel-to-Prometheus exporter appends `_total` to counters whose
+    // declared name already ends in `_total`.
+    let applied = counter_value(
+        &registry,
+        "exspeed_replication_records_applied_total_total",
+        &[("stream", "orders")],
+    );
+    assert!(
+        applied >= 5.0,
+        "expected records_applied_total_total >= 5 for stream=orders, got {applied}"
+    );
+
+    // Gauge: `exspeed_replication_lag_seconds{stream="orders"}` must be
+    // present with a non-zero, roughly-plausible value. The leader ts was
+    // 10s in the past; after batch apply the gauge should be ≥ 9.0 and
+    // ≤ some generous ceiling to tolerate slow CI.
+    let lag_secs = gauge_value(
+        &registry,
+        "exspeed_replication_lag_seconds",
+        &[("stream", "orders")],
+    )
+    .expect("lag_seconds series must exist after apply");
+    assert!(
+        (9.0..=120.0).contains(&lag_secs),
+        "expected lag_seconds in [9.0, 120.0] for stream=orders, got {lag_secs}"
+    );
+
     handle.shutdown().await;
 }
