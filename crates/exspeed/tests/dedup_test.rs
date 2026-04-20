@@ -8,7 +8,7 @@
 /// so the server can be stopped gracefully, then restarted on the same `data_dir`.
 use bytes::{Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
 use tokio_util::codec::{FramedRead, FramedWrite};
@@ -109,7 +109,7 @@ async fn start_server_at(data_dir: PathBuf) -> (String, String, CancellationToke
 /// cancellation.  On unix the old (now-deleted) inode keeps its flock on the
 /// in-memory fd, but a new `create` of the same path creates a fresh inode
 /// the second server can lock successfully.
-async fn shutdown(cancel: CancellationToken, data_dir: &PathBuf) {
+async fn shutdown(cancel: CancellationToken, data_dir: &Path) {
     cancel.cancel();
 
     // Give the server's TCP drain + snapshot task time to finish.
