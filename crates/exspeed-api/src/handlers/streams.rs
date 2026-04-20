@@ -1,14 +1,15 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::json;
 
 use exspeed_broker::broker_append::AppendResult;
+use exspeed_common::auth::Identity;
 use exspeed_common::StreamName;
 use exspeed_storage::file::stream_config::StreamConfig;
 use exspeed_streams::{Record, StorageError, StorageEngine};
@@ -62,17 +63,28 @@ pub async fn list_streams(State(state): State<Arc<AppState>>) -> impl IntoRespon
 
 pub async fn create_stream(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<Arc<Identity>>>,
     Json(body): Json<CreateStreamRequest>,
-) -> impl IntoResponse {
+) -> Response {
     let stream_name = match StreamName::try_from(body.name.as_str()) {
         Ok(name) => name,
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": e.to_string()})),
-            );
+            )
+                .into_response();
         }
     };
+
+    // Scoped-admin gate: the proposed stream name is the target. When auth
+    // is globally off (no credential_store), `identity` is None and we
+    // allow — the middleware already skipped the bearer check.
+    if let Some(Extension(id)) = identity {
+        if let Some(resp) = super::require_scoped_admin(&id, &stream_name) {
+            return resp;
+        }
+    }
 
     // Build a full config with defaults applied for any missing dedup fields.
     let cfg = StreamConfig::from_request(
@@ -89,7 +101,7 @@ pub async fn create_stream(
         cfg.dedup_window_secs,
         cfg.dedup_max_entries,
     ) {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": msg})));
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
     }
 
     match state
@@ -109,7 +121,8 @@ pub async fn create_stream(
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({"error": format!("failed to save stream config: {e}")})),
-                );
+                )
+                    .into_response();
             }
             state
                 .broker
@@ -120,29 +133,54 @@ pub async fn create_stream(
                 StatusCode::CREATED,
                 Json(json!({"name": body.name, "status": "created"})),
             )
+                .into_response()
         }
         Err(exspeed_streams::StorageError::StreamAlreadyExists(_)) => (
             StatusCode::CONFLICT,
             Json(json!({"error": format!("stream '{}' already exists", body.name)})),
-        ),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
-        ),
+        )
+            .into_response(),
     }
 }
 
 pub async fn get_stream(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-) -> impl IntoResponse {
+    identity: Option<Extension<Arc<Identity>>>,
+) -> Response {
+    // Validate the path param into a StreamName first so the authz check has
+    // something to glob-match against. An invalid stream name can't match any
+    // permission, so this also doubles as a 400 guard.
+    let stream_name = match StreamName::try_from(name.as_str()) {
+        Ok(n) => n,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    if let Some(Extension(id)) = identity {
+        if let Some(resp) = super::require_scoped_admin(&id, &stream_name) {
+            return resp;
+        }
+    }
+
     let storage_bytes = match state.storage.stream_storage_bytes(&name) {
         Some(b) => b,
         None => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": format!("stream '{}' not found", name)})),
-            );
+            )
+                .into_response();
         }
     };
 
@@ -154,6 +192,7 @@ pub async fn get_stream(
         StatusCode::OK,
         Json(stream_info_json(&name, &config, storage_bytes, head_offset)),
     )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -171,17 +210,25 @@ pub struct UpdateStreamRequest {
 pub async fn patch_stream(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    identity: Option<Extension<Arc<Identity>>>,
     Json(req): Json<UpdateStreamRequest>,
-) -> impl IntoResponse {
+) -> Response {
     let stream_name = match StreamName::try_from(name.as_str()) {
         Ok(n) => n,
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": e.to_string()})),
-            );
+            )
+                .into_response();
         }
     };
+
+    if let Some(Extension(id)) = identity {
+        if let Some(resp) = super::require_scoped_admin(&id, &stream_name) {
+            return resp;
+        }
+    }
 
     let stream_dir = state.storage.data_dir().join("streams").join(&name);
 
@@ -190,7 +237,8 @@ pub async fn patch_stream(
         return (
             StatusCode::NOT_FOUND,
             Json(json!({"error": format!("stream '{}' not found", name)})),
-        );
+        )
+            .into_response();
     }
 
     let mut cfg = match StreamConfig::load(&stream_dir) {
@@ -199,7 +247,8 @@ pub async fn patch_stream(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("failed to load stream config: {e}")})),
-            );
+            )
+                .into_response();
         }
     };
 
@@ -224,7 +273,7 @@ pub async fn patch_stream(
         cfg.dedup_window_secs,
         cfg.dedup_max_entries,
     ) {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": msg})));
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
     }
 
     // Guard against shrinking dedup_max_entries below the current live count.
@@ -242,7 +291,8 @@ pub async fn patch_stream(
                         "cannot shrink dedup_max_entries below current entry count ({current})"
                     )
                 })),
-            );
+            )
+                .into_response();
         }
     }
 
@@ -251,7 +301,8 @@ pub async fn patch_stream(
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("failed to save stream config: {e}")})),
-        );
+        )
+            .into_response();
     }
 
     // Hot-reconfigure the in-memory dedup map.
@@ -268,6 +319,7 @@ pub async fn patch_stream(
         StatusCode::OK,
         Json(stream_info_json(&name, &cfg, storage_bytes, head_offset)),
     )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -288,9 +340,10 @@ pub struct PublishBody {
 pub async fn publish_to_stream(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    identity: Option<Extension<Arc<Identity>>>,
     headers_in: HeaderMap,
     Json(body): Json<PublishBody>,
-) -> axum::response::Response {
+) -> Response {
     let stream_name = match StreamName::try_from(name.as_str()) {
         Ok(n) => n,
         Err(e) => {
@@ -301,6 +354,14 @@ pub async fn publish_to_stream(
                 .into_response();
         }
     };
+
+    // HTTP publish is an admin surface (not Action::Publish): it lives under
+    // the admin-bearer router, and scope is enforced per-stream.
+    if let Some(Extension(id)) = identity {
+        if let Some(resp) = super::require_scoped_admin(&id, &stream_name) {
+            return resp;
+        }
+    }
 
     let subject = if body.subject.is_empty() {
         name.clone()

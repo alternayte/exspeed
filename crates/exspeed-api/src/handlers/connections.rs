@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
+use exspeed_common::auth::Identity;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -23,8 +24,14 @@ pub struct CreateConnectionRequest {
 /// Add a new external database connection.
 pub async fn create_connection(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<Arc<Identity>>>,
     Json(body): Json<CreateConnectionRequest>,
-) -> impl IntoResponse {
+) -> Response {
+    if let Some(Extension(id)) = identity {
+        if let Some(resp) = super::require_global_admin(&id) {
+            return resp;
+        }
+    }
     let config = ConnectionConfig {
         name: body.name.clone(),
         driver: body.driver.clone(),
@@ -35,15 +42,24 @@ pub async fn create_connection(
         Ok(()) => (
             StatusCode::CREATED,
             Json(json!({"name": body.name, "driver": body.driver, "status": "created"})),
-        ),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
     }
 }
 
 /// GET /api/v1/connections
 ///
 /// List all registered connections (URLs are masked for security).
-pub async fn list_connections(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn list_connections(
+    State(state): State<Arc<AppState>>,
+    identity: Option<Extension<Arc<Identity>>>,
+) -> Response {
+    if let Some(Extension(id)) = identity {
+        if let Some(resp) = super::require_global_admin(&id) {
+            return resp;
+        }
+    }
     let connections: Vec<serde_json::Value> = state
         .exql
         .connection_registry
@@ -52,7 +68,7 @@ pub async fn list_connections(State(state): State<Arc<AppState>>) -> impl IntoRe
         .map(|(name, driver)| json!({"name": name, "driver": driver}))
         .collect();
 
-    (StatusCode::OK, Json(json!(connections)))
+    (StatusCode::OK, Json(json!(connections))).into_response()
 }
 
 /// DELETE /api/v1/connections/{name}
@@ -61,12 +77,19 @@ pub async fn list_connections(State(state): State<Arc<AppState>>) -> impl IntoRe
 pub async fn delete_connection(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-) -> impl IntoResponse {
+    identity: Option<Extension<Arc<Identity>>>,
+) -> Response {
+    if let Some(Extension(id)) = identity {
+        if let Some(resp) = super::require_global_admin(&id) {
+            return resp;
+        }
+    }
     match state.exql.connection_registry.remove(&name) {
         Ok(()) => (
             StatusCode::OK,
             Json(json!({"status": "removed", "name": name})),
-        ),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
     }
 }

@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
+use exspeed_common::auth::Identity;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -37,9 +38,17 @@ fn value_to_json(v: &Value) -> serde_json::Value {
 /// GET /api/v1/views
 ///
 /// List all registered materialized views.
-pub async fn list_views(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn list_views(
+    State(state): State<Arc<AppState>>,
+    identity: Option<Extension<Arc<Identity>>>,
+) -> Response {
+    if let Some(Extension(id)) = identity {
+        if let Some(resp) = super::require_global_admin(&id) {
+            return resp;
+        }
+    }
     let infos = state.exql.mv_registry.list();
-    (StatusCode::OK, Json(json!(infos)))
+    (StatusCode::OK, Json(json!(infos))).into_response()
 }
 
 /// GET /api/v1/views/{name}
@@ -49,8 +58,14 @@ pub async fn list_views(State(state): State<Arc<AppState>>) -> impl IntoResponse
 pub async fn get_view(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    identity: Option<Extension<Arc<Identity>>>,
     Query(params): Query<GetViewParams>,
-) -> impl IntoResponse {
+) -> Response {
+    if let Some(Extension(id)) = identity {
+        if let Some(resp) = super::require_global_admin(&id) {
+            return resp;
+        }
+    }
     if let Some(key) = params.key {
         // Single-row lookup
         match state.exql.mv_registry.get_row(&name, &key) {
@@ -63,11 +78,13 @@ pub async fn get_view(
                         "row": values,
                     })),
                 )
+                    .into_response()
             }
             None => (
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": format!("key '{key}' not found in view '{name}'")})),
-            ),
+            )
+                .into_response(),
         }
     } else {
         // All-rows lookup
@@ -86,11 +103,13 @@ pub async fn get_view(
                         "row_count": row_count,
                     })),
                 )
+                    .into_response()
             }
             None => (
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": format!("view '{name}' not found")})),
-            ),
+            )
+                .into_response(),
         }
     }
 }
@@ -100,16 +119,24 @@ pub async fn get_view(
 /// Create and start a materialized view.
 pub async fn create_view(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<Arc<Identity>>>,
     Json(body): Json<CreateViewRequest>,
-) -> impl IntoResponse {
+) -> Response {
+    if let Some(Extension(id)) = identity {
+        if let Some(resp) = super::require_global_admin(&id) {
+            return resp;
+        }
+    }
     match state.exql.create_materialized_view(&body.sql).await {
         Ok(query_id) => (
             StatusCode::CREATED,
             Json(json!({"query_id": query_id, "status": "running"})),
-        ),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": e.to_string()})),
-        ),
+        )
+            .into_response(),
     }
 }

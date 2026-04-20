@@ -25,7 +25,6 @@ use crate::state::AppState;
 /// Standard 403 response body used by every scoped-admin and global-admin
 /// handler gate. Body is opaque to match the 401 convention: we don't
 /// leak which stream / action was denied.
-#[allow(dead_code)] // wired into handlers in the commit that adds scoped-admin enforcement
 pub(crate) fn forbid() -> Response {
     (StatusCode::FORBIDDEN, Json(json!({"error": "forbidden"}))).into_response()
 }
@@ -33,7 +32,6 @@ pub(crate) fn forbid() -> Response {
 /// Verify the authenticated identity holds `Admin` on the given stream.
 /// Returns `Some(403 response)` on deny so callers can early-return via
 /// `if let Some(r) = … { return r; }`. Returns `None` on allow.
-#[allow(dead_code)] // wired into handlers in the commit that adds scoped-admin enforcement
 pub(crate) fn require_scoped_admin(id: &Identity, stream: &StreamName) -> Option<Response> {
     if id.authorize(Action::Admin, stream) {
         None
@@ -45,7 +43,6 @@ pub(crate) fn require_scoped_admin(id: &Identity, stream: &StreamName) -> Option
 /// Verify the authenticated identity holds `Admin` with a wildcard-all
 /// glob (`streams = "*"`). Used for endpoints that span multiple streams
 /// (connectors, queries, views, connections).
-#[allow(dead_code)] // wired into handlers in the commit that adds scoped-admin enforcement
 pub(crate) fn require_global_admin(id: &Identity) -> Option<Response> {
     if id.has_global_admin() {
         None
