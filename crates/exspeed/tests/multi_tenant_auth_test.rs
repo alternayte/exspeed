@@ -1031,3 +1031,71 @@ async fn no_auth_configured_is_open() {
         .unwrap();
     assert_eq!(r.status(), 200);
 }
+
+// ===========================================================================
+// File-loading regression tests — Sub-unit 6.3
+// ===========================================================================
+
+// 23 ------------------------------------------------------------------------
+#[tokio::test]
+async fn malformed_toml_refuses_to_start_with_line_number() {
+    use exspeed_common::auth::{AuthError, CredentialStore};
+    // Unterminated string → TOML parse error.
+    let creds = write_creds(
+        r#"
+[[credentials]]
+name = "a
+token_sha256 = "abc"
+"#,
+    );
+    let err = CredentialStore::build(Some(creds.path()), None).unwrap_err();
+    assert!(
+        matches!(err, AuthError::Toml(_)),
+        "expected AuthError::Toml, got {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.to_lowercase().contains("toml") || msg.to_lowercase().contains("parse"),
+        "error message missing TOML/parse context: {msg}"
+    );
+}
+
+// 24 ------------------------------------------------------------------------
+#[tokio::test]
+async fn missing_required_field_refuses_to_start() {
+    use exspeed_common::auth::CredentialStore;
+    // Missing `token_sha256` → serde-driven parse error (surfaces as Toml).
+    let creds = write_creds(
+        r#"
+[[credentials]]
+name = "a"
+"#,
+    );
+    let err = CredentialStore::build(Some(creds.path()), None).unwrap_err();
+    // toml::de::Error is what serde returns for a missing required field.
+    let msg = format!("{err}");
+    assert!(
+        msg.to_lowercase().contains("token_sha256") || msg.to_lowercase().contains("missing"),
+        "error should name the missing field: {msg}"
+    );
+}
+
+// 25 ------------------------------------------------------------------------
+#[tokio::test]
+async fn unknown_action_refuses_to_start() {
+    use exspeed_common::auth::{AuthError, CredentialStore};
+    let creds = write_creds(&format!(
+        r#"
+[[credentials]]
+name = "a"
+token_sha256 = "{}"
+permissions = [{{ streams = "*", actions = ["manage"] }}]
+"#,
+        sha256_hex("x")
+    ));
+    let err = CredentialStore::build(Some(creds.path()), None).unwrap_err();
+    match err {
+        AuthError::UnknownAction { action, .. } => assert_eq!(action, "manage"),
+        other => panic!("expected UnknownAction, got {other:?}"),
+    }
+}
