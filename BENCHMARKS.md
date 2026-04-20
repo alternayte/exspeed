@@ -39,7 +39,9 @@ Measures read-side scaling. One producer at 50k msg/s feeds a single stream; we 
 
 ### ExQL
 
-Measures the highest sustained input rate of a continuous aggregation query (`SELECT subject, COUNT(*) FROM bench GROUP BY subject EMIT CHANGES`) before apply lag exceeds 1 s. Binary-search, 6 iterations, bounds 5k–500k msg/s.
+Runs a continuous aggregation query (`SELECT subject, COUNT(*) FROM bench GROUP BY subject EMIT CHANGES`) while publishing to the source stream, and binary-searches the highest rate the producer sustains (producer at ≥95% of target for the full window). This measures the broker write path WITH an active continuous query running — not the query-apply ceiling itself. Binary-search: 6 iterations, bounds 5k–500k msg/s. A follow-up plan will add a direct apply-lag measurement that queries the output stream's offset vs source offset.
+
+ExQL aggregation query over a single-subject stream (`subject = "bench"` throughout).
 
 ## Comparison against other brokers
 

@@ -12,7 +12,6 @@ name = "exspeed-bench"
 path = "src/main.rs"
 
 [dependencies]
-exspeed = { path = "../exspeed" }
 exspeed-common = { path = "../exspeed-common" }
 exspeed-protocol = { path = "../exspeed-protocol" }
 tokio = { workspace = true }
@@ -36,5 +35,6 @@ default = []
 comparison = ["dep:rdkafka"]
 
 [dev-dependencies]
+exspeed = { path = "../exspeed" }
 portpicker = "0.1"
 tempfile = "3"

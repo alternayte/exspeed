@@ -28,7 +28,7 @@ pub async fn run(
     let source = "bench-exql-source";
     let target = "bench-exql-output";
     let payload_bytes: usize = 1024;
-    let subjects: u32 = 8;
+    let subjects: u32 = 1;
 
     // Ensure source + target streams exist.
     let mut setup = ExspeedClient::connect(tcp_addr).await?;
@@ -43,15 +43,32 @@ pub async fn run(
     );
 
     let http = reqwest::Client::new();
-    // Best-effort: ignore failure (e.g. view already exists from a prior run,
+    // Strip any leading scheme so callers can pass either "http://host:port" or
+    // "host:port" — the CLI default is "http://localhost:8080" (scheme included).
+    let api_base = api_addr
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    let url = format!("http://{api_base}/api/v1/queries/continuous");
+    // Best-effort: warn on failure (e.g. view already exists from a prior run,
     // or auth is required in non-embedded deployments). The binary-search still
     // exercises the producer path and yields a valid sustained_input_rate; the
     // ExqlResult is most meaningful when the query was actually created.
-    let _create_resp = http
-        .post(format!("http://{api_addr}/api/v1/queries/continuous"))
+    match http
+        .post(&url)
         .json(&json!({ "sql": query_sql }))
         .send()
-        .await;
+        .await
+    {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(
+                url,
+                error = %e,
+                "continuous-query POST failed; binary-search will still run \
+                 but ExqlResult.sustained_input_rate may not reflect query load"
+            );
+        }
+    }
 
     // Binary-search the sustainable rate.
     let mut lo = low;
