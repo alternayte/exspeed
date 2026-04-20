@@ -128,7 +128,9 @@ async fn run_retry_loop(inner: Arc<Inner>) {
         }
 
         // Not currently leader — attempt to acquire.
-        match inner.lease.try_acquire(LEASE_NAME, ttl).await {
+        // Plan G: `None` — this pod has no replication endpoint to advertise
+        // yet. Extended to `Some(endpoint)` in the follow-on Task 13 commit.
+        match inner.lease.try_acquire(LEASE_NAME, ttl, None).await {
             Ok(Some(lg)) => {
                 // Install fresh token BEFORE signalling is_leader, so
                 // subscribers that wake up on is_leader=true and call

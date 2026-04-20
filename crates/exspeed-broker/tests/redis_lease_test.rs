@@ -44,13 +44,13 @@ async fn redis_first_acquire_wins_second_rejects() {
     let b = make_backend().await;
 
     let g1 = b
-        .try_acquire("race-1", Duration::from_secs(30))
+        .try_acquire("race-1", Duration::from_secs(30), None)
         .await
         .unwrap();
     assert!(g1.is_some(), "first acquire should win");
 
     let g2 = b
-        .try_acquire("race-1", Duration::from_secs(30))
+        .try_acquire("race-1", Duration::from_secs(30), None)
         .await
         .unwrap();
     assert!(g2.is_none(), "second acquire should reject while g1 holds");
@@ -64,7 +64,7 @@ async fn redis_release_on_drop_enables_reacquire() {
     let b = make_backend().await;
 
     let g1 = b
-        .try_acquire("drop-1", Duration::from_secs(30))
+        .try_acquire("drop-1", Duration::from_secs(30), None)
         .await
         .unwrap();
     drop(g1);
@@ -73,7 +73,7 @@ async fn redis_release_on_drop_enables_reacquire() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let g2 = b
-        .try_acquire("drop-1", Duration::from_secs(30))
+        .try_acquire("drop-1", Duration::from_secs(30), None)
         .await
         .unwrap();
     assert!(g2.is_some(), "reacquire should succeed after release");
@@ -89,17 +89,58 @@ async fn redis_expired_lease_can_be_stolen() {
     // Acquire with a tiny TTL so PEXPIRE elapses before the heartbeat
     // (default 10s) gets a chance to refresh.
     let _g1 = b
-        .try_acquire("expire-1", Duration::from_secs(1))
+        .try_acquire("expire-1", Duration::from_secs(1), None)
         .await
         .unwrap();
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let stolen = b
-        .try_acquire("expire-1", Duration::from_secs(30))
+        .try_acquire("expire-1", Duration::from_secs(30), None)
         .await
         .unwrap();
     assert!(stolen.is_some(), "expired lease should be stealable");
+}
+
+#[tokio::test]
+async fn redis_endpoint_is_stored_and_preserved_across_heartbeats() {
+    if skip_if_no_redis() {
+        return;
+    }
+    let b = make_backend().await;
+
+    let _g = b
+        .try_acquire(
+            "endpoint-1",
+            Duration::from_secs(5),
+            Some("10.0.0.2:5934"),
+        )
+        .await
+        .unwrap()
+        .expect("first acquire wins");
+
+    let listed = b.list_all().await.unwrap();
+    let row = listed
+        .iter()
+        .find(|i| i.name == "endpoint-1")
+        .expect("row present");
+    assert_eq!(row.replication_endpoint.as_deref(), Some("10.0.0.2:5934"));
+
+    // Brief sleep to let the heartbeat task exist alongside; value is
+    // byte-stable (heartbeat refreshes TTL only via Lua, never rewrites
+    // the JSON blob), so this is a stability check on reads, not a
+    // timing-sensitive race against the heartbeat itself.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let listed = b.list_all().await.unwrap();
+    let row = listed
+        .iter()
+        .find(|i| i.name == "endpoint-1")
+        .expect("row still present");
+    assert_eq!(
+        row.replication_endpoint.as_deref(),
+        Some("10.0.0.2:5934"),
+        "heartbeat refresh must preserve replication_endpoint"
+    );
 }
 
 #[tokio::test]
@@ -110,7 +151,7 @@ async fn redis_list_reports_active_holders() {
     let b = make_backend().await;
 
     let _g = b
-        .try_acquire("listed", Duration::from_secs(30))
+        .try_acquire("listed", Duration::from_secs(30), None)
         .await
         .unwrap();
 
