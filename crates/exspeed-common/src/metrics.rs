@@ -573,4 +573,34 @@ impl Metrics {
             &[KeyValue::new("result", if ok { "ok" } else { "err" })],
         );
     }
+
+    /// Increment `exspeed_replication_records_applied_total` by `count` for
+    /// the given stream. Called from the follower's apply path after each
+    /// successful `storage.append`. Label cardinality is bounded by the
+    /// number of streams (same precedent as `truncated_records_total` and
+    /// `reseed_total`).
+    pub fn inc_replication_records_applied(&self, stream: &str, count: u64) {
+        self.replication_records_applied_total
+            .add(count, &[KeyValue::new("stream", stream.to_string())]);
+    }
+
+    /// Set the follower's observed wall-clock lag, in seconds, for a stream.
+    /// Computed as `now_ms - last_applied_record_ms`. Negative inputs can
+    /// arise from clock skew between leader and follower — clamp to 0 so
+    /// the README recipe `rate(exspeed_replication_lag_seconds[...]) > 10`
+    /// behaves the way operators expect.
+    pub fn set_replication_lag_seconds(&self, stream: &str, secs: f64) {
+        self.replication_lag_seconds
+            .record(secs.max(0.0), &[KeyValue::new("stream", stream.to_string())]);
+    }
+
+    /// Set the follower's observed offset-lag (`leader_latest - follower_next`)
+    /// for a stream. This is a best-effort signal derived from the leader's
+    /// manifest + batch deltas — it reflects offset-lag at the moment of the
+    /// last applied batch, not the live tail. See `lag_seconds` for the
+    /// primary indicator.
+    pub fn set_replication_lag_records(&self, stream: &str, records: i64) {
+        self.replication_lag_records
+            .record(records, &[KeyValue::new("stream", stream.to_string())]);
+    }
 }

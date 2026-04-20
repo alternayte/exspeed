@@ -109,10 +109,17 @@ enum SessionOutcome {
 
 /// Follower-side replication client. Holds the local storage handle and
 /// the persistent cursor; loops dialing the leader and applying events.
+///
+/// `leader_latest` is an in-memory best-effort view of the leader's tail
+/// offset per stream. It is seeded from each `ClusterManifest` handshake
+/// and bumped on every `RecordsAppended` (`base_offset + records.len()`).
+/// It feeds `exspeed_replication_lag_records` — imperfect but representative
+/// (see helper doc on `set_replication_lag_records`).
 pub struct ReplicationClient {
     storage: Arc<dyn StorageEngine>,
     cursor_path: PathBuf,
     cursor: Arc<Mutex<Cursor>>,
+    leader_latest: Arc<Mutex<BTreeMap<String, u64>>>,
     follower_id: Uuid,
     metrics: Arc<Metrics>,
 }
@@ -131,6 +138,7 @@ impl ReplicationClient {
             storage,
             cursor_path,
             cursor: Arc::new(Mutex::new(cursor)),
+            leader_latest: Arc::new(Mutex::new(BTreeMap::new())),
             follower_id: Uuid::new_v4(),
             metrics,
         })
@@ -328,6 +336,18 @@ impl ReplicationClient {
     ) -> Result<(), ReplicationError> {
         let mut cursor = self.cursor.lock().await;
         let mut mutated = false;
+
+        // Seed the in-memory `leader_latest` view from the manifest. This
+        // is the best information we have about the leader's tail until
+        // the first `RecordsAppended` bumps it further — and it's the
+        // source for `exspeed_replication_lag_records` zero-init on
+        // freshly-handshaken sessions.
+        {
+            let mut tails = self.leader_latest.lock().await;
+            for summary in &manifest.streams {
+                tails.insert(summary.name.clone(), summary.latest_offset);
+            }
+        }
 
         for summary in &manifest.streams {
             let name = match StreamName::try_from(summary.name.as_str()) {
@@ -598,6 +618,9 @@ impl ReplicationClient {
         }
 
         let base = batch.base_offset;
+        // Track the last record's leader-side timestamp so we can set the
+        // `lag_seconds` gauge once per batch, rather than per record.
+        let mut last_rec_ts_ms: u64 = 0;
         for (i, rec) in batch.records.into_iter().enumerate() {
             // Test-only: inject an apply-time sleep to simulate a slow
             // follower. Controlled via `EXSPEED_TEST_REPLICATION_APPLY_SLEEP_MS`;
@@ -630,6 +653,7 @@ impl ReplicationClient {
                 headers.push(("x-idempotency-key".into(), msg_id));
             }
 
+            let rec_ts_ms = rec.timestamp_ms;
             let record = Record {
                 key: None,
                 value: Bytes::from(rec.payload),
@@ -642,9 +666,13 @@ impl ReplicationClient {
                 // back to ns for storage. `saturating_mul` defends
                 // against pathological far-future values that could
                 // overflow (records > year 2554).
-                timestamp_ns: Some(rec.timestamp_ms.saturating_mul(1_000_000)),
+                timestamp_ns: Some(rec_ts_ms.saturating_mul(1_000_000)),
             };
             let (assigned, _ts) = self.storage.append(&name, &record).await?;
+            // Counter per applied record. Label cardinality is bounded
+            // by stream count (same precedent as `truncated_records_total`).
+            self.metrics.inc_replication_records_applied(&batch.stream, 1);
+            last_rec_ts_ms = rec_ts_ms;
 
             let expected = base + i as u64;
             if assigned.0 != expected {
@@ -675,11 +703,42 @@ impl ReplicationClient {
         let mut cursor = self.cursor.lock().await;
         cursor.set(&batch.stream, new_next);
         cursor.save(&self.cursor_path)?;
+
+        // ── Lag metrics (best-effort) ────────────────────────────────────
+        // `lag_seconds` = wall-clock skew between the last applied record's
+        // leader-side timestamp and the follower's `now`. Clock skew between
+        // hosts can briefly produce negatives; the helper clamps at 0.
+        //
+        // `lag_records` = leader-tail minus follower-next. We bump
+        // `leader_latest` to the tail we just consumed (`base + len`) —
+        // which collapses lag to 0 in the steady state where we're keeping
+        // up. Spikes appear only when the leader races ahead between
+        // batches or a new manifest reveals a larger tail. Documented as
+        // best-effort in the README; `lag_seconds` is the primary signal.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let lag_secs = (now_ms as f64 - last_rec_ts_ms as f64) / 1000.0;
+        self.metrics
+            .set_replication_lag_seconds(&batch.stream, lag_secs);
+
+        {
+            let mut tails = self.leader_latest.lock().await;
+            let current = tails.get(&batch.stream).copied().unwrap_or(0);
+            let bumped = std::cmp::max(current, new_next);
+            tails.insert(batch.stream.clone(), bumped);
+            let lag = bumped.saturating_sub(new_next) as i64;
+            self.metrics
+                .set_replication_lag_records(&batch.stream, lag);
+        }
+
         debug!(
             stream = %batch.stream,
             base_offset = base,
             count = batch_len,
             new_next,
+            lag_secs,
             "applied RecordsAppended batch"
         );
         Ok(())
