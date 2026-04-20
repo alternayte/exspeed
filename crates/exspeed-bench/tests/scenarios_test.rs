@@ -29,3 +29,17 @@ async fn latency_scenario_reports_sensible_percentiles() {
     assert!(r.latency_us.max >= r.latency_us.p99);
     assert!(r.latency_us.p50 < 1_000_000, "p50 should be < 1s in an embedded test");
 }
+
+#[tokio::test]
+async fn fanout_scenario_returns_one_row_per_consumer_count() {
+    let srv = start().await;
+    let mut profile = Profile::local();
+    profile.fanout_duration = std::time::Duration::from_secs(3);
+    profile.fanout_producer_rate = 1_000;
+    profile.fanout_consumer_counts = vec![1, 2];
+    let results = exspeed_bench::scenarios::fanout::run(&srv.tcp_addr, &profile).await.unwrap();
+    assert_eq!(results.len(), 2);
+    for r in &results {
+        assert!(r.aggregate_consumer_rate >= 0.0);
+    }
+}
