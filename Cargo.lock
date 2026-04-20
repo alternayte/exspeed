@@ -1211,6 +1211,7 @@ name = "exspeed"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "bytes",
  "clap",
  "exspeed-api",
