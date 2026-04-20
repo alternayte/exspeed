@@ -171,6 +171,13 @@ fn compile_credential(wc: &WireCredential) -> Result<Identity, AuthError> {
                 "publish" => { actions |= Action::Publish; }
                 "subscribe" => { actions |= Action::Subscribe; }
                 "admin" => { actions |= Action::Admin; }
+                // `replicate` is the cluster-replication verb
+                // (`Action::Replicate`, added in Plan G Wave 1). Follower
+                // pods dial the leader's cluster port and the leader-side
+                // server enforces this permission on Connect. A credential
+                // with `actions = ["replicate"]` is the usual way to gate
+                // replication access on a shared credentials.toml.
+                "replicate" => { actions |= Action::Replicate; }
                 other => {
                     return Err(AuthError::UnknownAction {
                         name: wc.name.clone(),

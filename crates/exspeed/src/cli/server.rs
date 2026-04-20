@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Args;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
@@ -14,6 +14,7 @@ use tracing::{error, info, info_span, warn, Instrument};
 
 use exspeed_broker::broker_append::BrokerAppend;
 use exspeed_broker::consumer_state::DeliveryRecord;
+use exspeed_broker::replication::{ReplicationClient, ReplicationCoordinator, ReplicationServer};
 use exspeed_broker::Broker;
 use exspeed_common::auth::{Action, CredentialStore, Identity, Permission, StreamGlob};
 use exspeed_common::types::StreamName;
@@ -25,6 +26,61 @@ use exspeed_protocol::messages::{ClientMessage, ServerMessage};
 use exspeed_storage::file::FileStorage;
 use exspeed_streams::StorageEngine;
 use sha2::{Digest, Sha256};
+
+/// Default cluster-replication bind address. Matches the advertised default
+/// in the replication design doc and the Plan G Wave 5 contract.
+const DEFAULT_CLUSTER_BIND: &str = "0.0.0.0:5934";
+
+/// Parse `EXSPEED_CLUSTER_BIND` (default `0.0.0.0:5934`). Returns `None` on
+/// parse failure so the caller can fall back rather than panicking at startup.
+fn cluster_bind_addr() -> Option<SocketAddr> {
+    let raw = std::env::var("EXSPEED_CLUSTER_BIND")
+        .unwrap_or_else(|_| DEFAULT_CLUSTER_BIND.to_string());
+    match raw.parse() {
+        Ok(a) => Some(a),
+        Err(e) => {
+            warn!(raw = %raw, error = %e, "EXSPEED_CLUSTER_BIND invalid — treating as unset");
+            None
+        }
+    }
+}
+
+/// What address followers should dial to reach this pod's cluster listener.
+/// Defaults to the bind string; set `EXSPEED_CLUSTER_ADVERTISE` when the
+/// container's bind address differs from what followers can route to
+/// (k8s service name, external LB host, etc.).
+fn cluster_advertise_addr(bind: SocketAddr) -> String {
+    std::env::var("EXSPEED_CLUSTER_ADVERTISE").unwrap_or_else(|_| bind.to_string())
+}
+
+/// The raw bearer a follower sends on the replication Connect handshake.
+/// Must resolve (after sha256) to a credential in the shared credentials
+/// store that holds `actions = ["replicate"]`. Required in multi-pod mode;
+/// startup hard-fails if missing there.
+fn replicator_credential() -> Option<String> {
+    std::env::var("EXSPEED_REPLICATOR_CREDENTIAL").ok()
+}
+
+/// True when the operator asked for a coordinated backend. That's the
+/// single source of truth for "this pod is part of a multi-pod deployment"
+/// — every downstream multi-pod decision (build coord, bind cluster
+/// listener, run the supervisor) branches on this one check.
+fn multi_pod_mode() -> bool {
+    matches!(
+        std::env::var("EXSPEED_CONSUMER_STORE").as_deref(),
+        Ok("postgres") | Ok("redis")
+    )
+}
+
+/// Per-follower mpsc capacity. 100k records is ~100MB at 1KB records —
+/// generous enough that bursty writes don't drop a healthy follower, small
+/// enough that a permanently-stuck follower doesn't balloon leader memory.
+fn replication_follower_queue_records() -> usize {
+    std::env::var("EXSPEED_REPLICATION_FOLLOWER_QUEUE_RECORDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100_000)
+}
 
 /// Synthetic identity used when auth is globally disabled. Grants every verb
 /// against every stream so the per-op `authorize` gates short-circuit to
@@ -338,18 +394,36 @@ where
         );
     }
 
-    // Spawn cluster-leader leadership state machine.
+    // Build the replication coordinator + advertise endpoint up front so
+    // they can be threaded into both the Broker (for emit-on-append) and
+    // `ClusterLeadership::spawn` (which writes the endpoint into the
+    // `cluster:leader` lease row for follower discovery).
     //
-    // `replication_endpoint = None` until Wave 5 wires up the cluster-bind
-    // listener and derives the advertised address. Passing `None` today is
-    // equivalent to today's single-pod behavior: the lease row carries no
-    // endpoint, `leader_replication_endpoint()` returns `None`, and
-    // followers (which don't exist yet) have nothing to dial.
+    // Single-pod deployments get `None` for both and skip every multi-pod
+    // branch below — no cluster listener, no follower client, no
+    // role-transition supervisor, no `state.replication_coordinator`.
+    let multi_pod = multi_pod_mode();
+    let replication_coordinator: Option<Arc<ReplicationCoordinator>> = if multi_pod {
+        let queue_cap = replication_follower_queue_records();
+        Some(ReplicationCoordinator::new(metrics.clone(), queue_cap))
+    } else {
+        None
+    };
+    let cluster_bind = cluster_bind_addr();
+    let replication_advertise: Option<String> = match (multi_pod, cluster_bind) {
+        (true, Some(bind)) => Some(cluster_advertise_addr(bind)),
+        _ => None,
+    };
+
+    // Spawn cluster-leader leadership state machine. The advertised
+    // endpoint is written into the `cluster:leader` lease row on every
+    // acquire so followers can discover the current leader via
+    // `list_all()` without a separate registry.
     let leadership = Arc::new(
         exspeed_broker::leadership::ClusterLeadership::spawn(
             lease.clone(),
             metrics.clone(),
-            None,
+            replication_advertise.clone(),
         )
         .await,
     );
@@ -378,10 +452,18 @@ where
     let mut leadership_rx = leadership.is_leader.clone();
     let _ = tokio::time::timeout(startup_deadline, leadership_rx.wait_for(|&v| v)).await;
 
-    let role = if leadership.is_currently_leader() {
+    // Three-way posture: `standalone` (single-pod), `leader` (multi-pod,
+    // holds the cluster:leader lease), `follower` (multi-pod, standby
+    // on this pod). The single-pod case collapses the leader/standby
+    // distinction: with no coordinated backend there are no peers to
+    // fail over from, so the old `role=standby` log line was always a
+    // lie in that mode.
+    let role = if !multi_pod {
+        "standalone"
+    } else if leadership.is_currently_leader() {
         "leader"
     } else {
-        "standby"
+        "follower"
     };
 
     // Posture log (always). Emitted after lease is built so the backend name
@@ -406,22 +488,28 @@ where
         role = role,
         bind = %args.bind,
         api_bind = %args.api_bind,
+        cluster_bind = ?cluster_bind,
+        replication_endpoint = ?replication_advertise,
         credentials = cred_total,
         cred_file = cred_file_count,
         cred_legacy_admin = if cred_legacy { 1 } else { 0 },
         "exspeed server starting"
     );
-    if role == "standby" {
+    if role == "follower" {
         info!(
-            "role=standby — this pod does not serve client traffic. \
+            "role=follower — this pod does not serve client traffic. \
              Configure your load balancer to probe GET /healthz and only \
-             route to pods returning 200."
+             route to pods returning 200. Replication client will dial \
+             the current leader when one is elected."
         );
     }
 
-    // Create broker
+    // Create broker. In multi-pod mode, attach the replication coordinator
+    // so `Broker::append/create_stream/delete_stream` fan out their
+    // `ReplicationEvent`s to every connected follower's mpsc channel
+    // before returning to the caller.
     let broker_append_for_connectors = broker_append.clone();
-    let broker = Arc::new(Broker::new(
+    let broker_builder = Broker::new(
         storage.clone(),
         broker_append,
         args.data_dir.clone(),
@@ -429,7 +517,11 @@ where
         work_coordinator.clone(),
         lease.clone(),
         metrics.clone(),
-    ));
+    );
+    let broker = Arc::new(match replication_coordinator.as_ref() {
+        Some(coord) => broker_builder.with_replication_coordinator(coord.clone()),
+        None => broker_builder,
+    });
     broker
         .load_consumers()
         .await
@@ -534,7 +626,10 @@ where
     // Until then, /readyz returns 503 with {"status":"starting"}.
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // Create shared AppState
+    // Create shared AppState. `replication_coordinator` lights up
+    // `GET /api/v1/cluster/followers` in multi-pod mode and stays `None`
+    // elsewhere (the endpoint returns 503 in that case, with a hint
+    // pointing at EXSPEED_CONSUMER_STORE).
     let state = Arc::new(exspeed_api::AppState {
         broker: broker.clone(),
         storage: file_storage.clone(),
@@ -548,10 +643,7 @@ where
         leadership: leadership.clone(),
         ready: ready.clone(),
         data_dir: args.data_dir.clone(),
-        // Multi-pod plumbing lives in Commit 4 (Plan Task 20). Single-pod
-        // pods hit the 503 branch of GET /api/v1/cluster/followers, which
-        // is the correct signal — that endpoint is meaningless here.
-        replication_coordinator: None,
+        replication_coordinator: replication_coordinator.clone(),
     });
 
     // Spawn the leader supervisor: waits for is_leader=true, then runs
@@ -565,6 +657,10 @@ where
         let exql_sup = exql_for_supervisor;
         let storage_sup = file_storage.clone();
         let supervisor_cancel = cancel_token.clone();
+        // Retention task emits `RetentionTrimmed` replication events in
+        // multi-pod mode; `None` in single-pod short-circuits the emit
+        // call inside the task.
+        let replication_coordinator_for_retention = replication_coordinator.clone();
         // Leader supervisor: three select-wraps observe `supervisor_cancel` because the
         // supervisor has three idle states (awaiting promotion, active tenure, awaiting
         // demotion). Without the third wrap, SIGTERM during the post-tenure idle window
@@ -593,7 +689,7 @@ where
                     _ = exspeed_broker::retention_task::run(
                             storage_sup.clone(),
                             token.clone(),
-                            None, // replication coordinator — wired up in Wave 5
+                            replication_coordinator_for_retention.clone(),
                         ) => {}
                     _ = token.cancelled() => {}
                     _ = supervisor_cancel.cancelled() => {
@@ -615,6 +711,198 @@ where
                 }
             }
         });
+    }
+
+    // ---- Multi-pod replication wiring --------------------------------
+    //
+    // In multi-pod mode we bind the cluster listener ONCE at startup and
+    // keep the socket alive across leader/follower role flips; the
+    // supervisor below gates the accept loop on `is_leader`. Binding
+    // here (not inside the supervisor) means:
+    //   * `Arc<ReplicationServer>` clones cheaply into the server+client
+    //     futures, so `ReplicationServer::run(&self, cancel)` can be
+    //     called repeatedly across tenures.
+    //   * A bind failure is a hard-fail at startup, not an error that
+    //     surfaces only on first promotion minutes later.
+    //   * Tests using `:0` can read `local_addr()` once and reuse it.
+    //
+    // Single-pod mode skips all of it and just sets the role metric to
+    // `standalone`.
+    let replication_server_handle: Option<Arc<ReplicationServer>> =
+        if let (Some(coord), Some(bind)) = (replication_coordinator.as_ref(), cluster_bind) {
+            let server = ReplicationServer::bind(
+                bind,
+                coord.clone(),
+                storage.clone(),
+                credential_store.clone(),
+                leadership.holder_id,
+                metrics.clone(),
+            )
+            .await
+            .context("failed to bind cluster listener")?;
+            info!(%bind, advertise = ?replication_advertise, "cluster replication listener bound");
+            Some(Arc::new(server))
+        } else if multi_pod {
+            // Multi-pod mode but cluster_bind couldn't be resolved. We
+            // warned above; coord is still useful for emit-on-append but
+            // no peer can actually dial this pod. Prefer a hard error so
+            // the operator doesn't silently run a crippled cluster.
+            anyhow::bail!(
+                "EXSPEED_CONSUMER_STORE is multi-pod but EXSPEED_CLUSTER_BIND is unparseable — \
+                 refusing to start so the misconfiguration is caught at deploy time"
+            );
+        } else {
+            None
+        };
+
+    // Spawn the role-transition supervisor. ONE task observes `is_leader`
+    // and runs either the leader-side accept loop OR the follower client,
+    // never both. On every flip we cancel + await the previous role's
+    // task before starting the new one; overlap would risk double-append
+    // (a brief period where both client and server apply to local
+    // storage). See the cancel-then-await dance below.
+    if multi_pod {
+        let leadership_for_sup = leadership.clone();
+        let metrics_for_sup = metrics.clone();
+        let supervisor_cancel = cancel_token.clone();
+        let server_handle = replication_server_handle.clone();
+
+        // Follower client is a singleton for the process lifetime — its
+        // cursor state must not be re-created on every demotion, or we'd
+        // lose the on-disk offset every time we flapped.
+        let client = {
+            let cursor_path = args.data_dir.join("replication").join("cursor.json");
+            match ReplicationClient::new(
+                storage.clone(),
+                cursor_path,
+                metrics.clone(),
+            ) {
+                Ok(c) => Arc::new(c),
+                Err(e) => {
+                    // Hard fail: if we can't load the follower cursor,
+                    // the follower path is dead and the role supervisor
+                    // has nothing to swap to. Better to surface this at
+                    // startup than crash the first time we demote.
+                    anyhow::bail!(
+                        "failed to initialize replication follower cursor at \
+                         {:?}/replication/cursor.json: {e}",
+                        args.data_dir
+                    );
+                }
+            }
+        };
+
+        // Replicator credential is required in multi-pod mode. It's the
+        // bearer the follower sends on the replication Connect handshake,
+        // and the leader-side server enforces `Action::Replicate` on the
+        // resulting identity. A misconfiguration here would manifest as
+        // every follower session failing with 401; fail fast instead.
+        let replicator_bearer = replicator_credential().context(
+            "EXSPEED_REPLICATOR_CREDENTIAL must be set when EXSPEED_CONSUMER_STORE=postgres|redis \
+             (the bearer a follower uses to authenticate its replication session)",
+        )?;
+
+        tokio::spawn(async move {
+            let mut is_leader_rx = leadership_for_sup.is_leader.clone();
+            // Task handle + cancel token for whichever role we're
+            // currently running. On every change, cancel the old one,
+            // await its exit, then start the new one.
+            let mut previous_task: Option<tokio::task::JoinHandle<()>> = None;
+            let mut previous_cancel: Option<CancellationToken> = None;
+
+            loop {
+                let leader = *is_leader_rx.borrow();
+
+                // Cancel + drain the previous role's task before the
+                // new one starts. Awaiting is essential: without it we'd
+                // have a brief window where both leader server and
+                // follower client ran in parallel, and the follower's
+                // `apply` writes to the same storage the leader serves
+                // from. Cancel-then-await gives us a strict role-swap
+                // boundary.
+                if let Some(tok) = previous_cancel.take() {
+                    tok.cancel();
+                }
+                if let Some(handle) = previous_task.take() {
+                    let _ = handle.await;
+                }
+
+                let role_cancel = CancellationToken::new();
+
+                if leader {
+                    // Leader: start the accept loop on the already-bound
+                    // listener. `server.run(&self, cancel)` returns when
+                    // `cancel` fires.
+                    let server = server_handle
+                        .clone()
+                        .expect("replication server was bound earlier in multi-pod mode");
+                    let rc = role_cancel.clone();
+                    previous_task = Some(tokio::spawn(async move {
+                        server.run(rc).await;
+                    }));
+                    metrics_for_sup.set_replication_role("leader");
+                    info!(
+                        role = "leader",
+                        endpoint = ?replication_advertise,
+                        "exspeed replication: role=leader — serving follower sessions"
+                    );
+                } else {
+                    // Follower: spin up the client loop. Endpoint getter
+                    // reads the lease row on every reconnect attempt;
+                    // that handles both "no leader yet" and "leader
+                    // changed mid-session" transparently.
+                    let rc = role_cancel.clone();
+                    let client_for_task = client.clone();
+                    let leadership_for_getter = leadership_for_sup.clone();
+                    let bearer = replicator_bearer.clone();
+                    previous_task = Some(tokio::spawn(async move {
+                        client_for_task
+                            .run(
+                                || {
+                                    let l = leadership_for_getter.clone();
+                                    async move { l.leader_replication_endpoint().await }
+                                },
+                                bearer,
+                                rc,
+                            )
+                            .await;
+                    }));
+                    metrics_for_sup.set_replication_role("follower");
+                    info!(
+                        role = "follower",
+                        "exspeed replication: role=follower — dialing leader"
+                    );
+                }
+                previous_cancel = Some(role_cancel);
+
+                // Wait for the next role change or process shutdown.
+                // `is_leader_rx.changed()` returning Err means the
+                // watcher was closed (ClusterLeadership dropped) — that
+                // only happens on process teardown, so exit cleanly.
+                tokio::select! {
+                    biased;
+                    _ = supervisor_cancel.cancelled() => {
+                        info!("replication role supervisor: shutdown signal received");
+                        if let Some(tok) = previous_cancel.take() { tok.cancel(); }
+                        if let Some(handle) = previous_task.take() { let _ = handle.await; }
+                        return;
+                    }
+                    res = is_leader_rx.changed() => {
+                        if res.is_err() {
+                            if let Some(tok) = previous_cancel.take() { tok.cancel(); }
+                            if let Some(handle) = previous_task.take() { let _ = handle.await; }
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+    } else {
+        // Single-pod mode: pin the role metric to `standalone` so
+        // dashboards don't interpret the default (`0/0/0`) as "unknown
+        // state". Also makes the posture grep-able.
+        metrics.set_replication_role("standalone");
+        info!(role = "standalone", "exspeed replication: single-instance mode");
     }
 
     // Spawn dedup eviction task (runs every 60 seconds)

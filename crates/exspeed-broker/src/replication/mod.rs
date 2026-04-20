@@ -20,8 +20,10 @@ pub mod errors;
 pub mod server;
 pub mod wire;
 
+pub use client::ReplicationClient;
 pub use coordinator::{FollowerSnapshot, ReplicationCoordinator};
 pub use errors::ReplicationError;
+pub use server::ReplicationServer;
 
 use exspeed_protocol::messages::replicate::{
     RecordsAppended, RetentionTrimmedEvent, RetentionUpdatedEvent, StreamCreatedEvent,
