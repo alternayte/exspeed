@@ -7,6 +7,9 @@ mod memory_tests {
     use super::trait_tests;
     use crate::memory::MemoryStorage;
 
+    // `exact_retention = true` — MemoryStorage trims record-exact.
+    const EXACT_RETENTION: bool = true;
+
     #[tokio::test]
     async fn create_and_append() {
         trait_tests::test_create_and_append(&MemoryStorage::new()).await;
@@ -63,18 +66,60 @@ mod memory_tests {
     }
 
     #[tokio::test]
-    async fn trim_up_to() {
-        trait_tests::test_trim_up_to(&MemoryStorage::new()).await;
+    async fn trim_up_to_earliest_is_noop() {
+        trait_tests::test_trim_up_to_earliest_is_noop(&MemoryStorage::new()).await;
+    }
+
+    #[tokio::test]
+    async fn trim_up_to_drops_earlier_records() {
+        trait_tests::test_trim_up_to_drops_earlier_records(
+            &MemoryStorage::new(),
+            EXACT_RETENTION,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn trim_up_to_past_latest_still_advances() {
+        trait_tests::test_trim_up_to_past_latest_still_advances(
+            &MemoryStorage::new(),
+            EXACT_RETENTION,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn truncate_from_drops_later_records() {
+        trait_tests::test_truncate_from_drops_later_records(&MemoryStorage::new()).await;
+    }
+
+    #[tokio::test]
+    async fn truncate_from_zero_empties() {
+        trait_tests::test_truncate_from_zero_empties(&MemoryStorage::new()).await;
+    }
+
+    #[tokio::test]
+    async fn truncate_from_at_next_is_noop() {
+        trait_tests::test_truncate_from_at_next_is_noop(&MemoryStorage::new()).await;
+    }
+
+    #[tokio::test]
+    async fn stream_bounds_after_trim_and_truncate() {
+        trait_tests::test_stream_bounds_after_trim_and_truncate(
+            &MemoryStorage::new(),
+            EXACT_RETENTION,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delete_then_recreate_resets_bounds() {
+        trait_tests::test_delete_then_recreate_resets_bounds(&MemoryStorage::new()).await;
     }
 
     #[tokio::test]
     async fn delete_stream() {
         trait_tests::test_delete_stream(&MemoryStorage::new()).await;
-    }
-
-    #[tokio::test]
-    async fn truncate_from() {
-        trait_tests::test_truncate_from(&MemoryStorage::new()).await;
     }
 }
 
@@ -82,6 +127,11 @@ mod file_trait_tests {
     use super::trait_tests;
     use crate::file::FileStorage;
     use tempfile::TempDir;
+
+    // `exact_retention = false` — FileStorage's `trim_up_to` is
+    // segment-granular. `truncate_from` IS record-exact and does not
+    // need a flag.
+    const EXACT_RETENTION: bool = false;
 
     fn make_storage() -> (FileStorage, TempDir) {
         let dir = TempDir::new().unwrap();
@@ -156,20 +206,56 @@ mod file_trait_tests {
     }
 
     #[tokio::test]
-    async fn trim_up_to() {
+    async fn trim_up_to_earliest_is_noop() {
         let (s, _d) = make_storage();
-        trait_tests::test_trim_up_to(&s).await;
+        trait_tests::test_trim_up_to_earliest_is_noop(&s).await;
+    }
+
+    #[tokio::test]
+    async fn trim_up_to_drops_earlier_records() {
+        let (s, _d) = make_storage();
+        trait_tests::test_trim_up_to_drops_earlier_records(&s, EXACT_RETENTION).await;
+    }
+
+    #[tokio::test]
+    async fn trim_up_to_past_latest_still_advances() {
+        let (s, _d) = make_storage();
+        trait_tests::test_trim_up_to_past_latest_still_advances(&s, EXACT_RETENTION).await;
+    }
+
+    #[tokio::test]
+    async fn truncate_from_drops_later_records() {
+        let (s, _d) = make_storage();
+        trait_tests::test_truncate_from_drops_later_records(&s).await;
+    }
+
+    #[tokio::test]
+    async fn truncate_from_zero_empties() {
+        let (s, _d) = make_storage();
+        trait_tests::test_truncate_from_zero_empties(&s).await;
+    }
+
+    #[tokio::test]
+    async fn truncate_from_at_next_is_noop() {
+        let (s, _d) = make_storage();
+        trait_tests::test_truncate_from_at_next_is_noop(&s).await;
+    }
+
+    #[tokio::test]
+    async fn stream_bounds_after_trim_and_truncate() {
+        let (s, _d) = make_storage();
+        trait_tests::test_stream_bounds_after_trim_and_truncate(&s, EXACT_RETENTION).await;
+    }
+
+    #[tokio::test]
+    async fn delete_then_recreate_resets_bounds() {
+        let (s, _d) = make_storage();
+        trait_tests::test_delete_then_recreate_resets_bounds(&s).await;
     }
 
     #[tokio::test]
     async fn delete_stream() {
         let (s, _d) = make_storage();
         trait_tests::test_delete_stream(&s).await;
-    }
-
-    #[tokio::test]
-    async fn truncate_from() {
-        let (s, _d) = make_storage();
-        trait_tests::test_truncate_from(&s).await;
     }
 }

@@ -30,7 +30,7 @@ fn record_with_key(subject: &str, key: &[u8], value: &[u8]) -> Record {
 // -- Tests --------------------------------------------------------------------
 
 /// Create a stream, append one record, assert offset is 0.
-pub async fn test_create_and_append(engine: &(impl StorageEngine + Sync)) {
+pub async fn test_create_and_append(engine: &impl StorageEngine) {
     let s = stream("test-create");
     engine.create_stream(&s, 0, 0).await.unwrap();
     let offset = engine.append(&s, &record("events", b"hello")).await.unwrap();
@@ -38,7 +38,7 @@ pub async fn test_create_and_append(engine: &(impl StorageEngine + Sync)) {
 }
 
 /// Create a stream, append a record with key + headers, read back, verify all fields match.
-pub async fn test_append_and_read_back(engine: &(impl StorageEngine + Sync)) {
+pub async fn test_append_and_read_back(engine: &impl StorageEngine) {
     let s = stream("test-readback");
     engine.create_stream(&s, 0, 0).await.unwrap();
 
@@ -74,7 +74,7 @@ pub async fn test_append_and_read_back(engine: &(impl StorageEngine + Sync)) {
 }
 
 /// Append 5 records, verify offsets are 0, 1, 2, 3, 4.
-pub async fn test_sequential_offsets(engine: &(impl StorageEngine + Sync)) {
+pub async fn test_sequential_offsets(engine: &impl StorageEngine) {
     let s = stream("test-offsets");
     engine.create_stream(&s, 0, 0).await.unwrap();
 
@@ -85,7 +85,7 @@ pub async fn test_sequential_offsets(engine: &(impl StorageEngine + Sync)) {
 }
 
 /// Append 10 records, read from offset 3 with max 4, verify records 3, 4, 5, 6 are returned.
-pub async fn test_read_range(engine: &(impl StorageEngine + Sync)) {
+pub async fn test_read_range(engine: &impl StorageEngine) {
     let s = stream("test-range");
     engine.create_stream(&s, 0, 0).await.unwrap();
 
@@ -102,7 +102,7 @@ pub async fn test_read_range(engine: &(impl StorageEngine + Sync)) {
 }
 
 /// Create a stream, read from an empty stream, get an empty vec.
-pub async fn test_read_empty_stream(engine: &(impl StorageEngine + Sync)) {
+pub async fn test_read_empty_stream(engine: &impl StorageEngine) {
     let s = stream("test-empty");
     engine.create_stream(&s, 0, 0).await.unwrap();
 
@@ -111,7 +111,7 @@ pub async fn test_read_empty_stream(engine: &(impl StorageEngine + Sync)) {
 }
 
 /// Append 1 record, read from offset 999, get an empty vec.
-pub async fn test_read_past_end(engine: &(impl StorageEngine + Sync)) {
+pub async fn test_read_past_end(engine: &impl StorageEngine) {
     let s = stream("test-past-end");
     engine.create_stream(&s, 0, 0).await.unwrap();
     engine.append(&s, &record("events", b"only")).await.unwrap();
@@ -121,7 +121,7 @@ pub async fn test_read_past_end(engine: &(impl StorageEngine + Sync)) {
 }
 
 /// Append to a nonexistent stream, get StreamNotFound error.
-pub async fn test_stream_not_found(engine: &(impl StorageEngine + Sync)) {
+pub async fn test_stream_not_found(engine: &impl StorageEngine) {
     let s = stream("nonexistent");
     let err = engine.append(&s, &record("events", b"data")).await.unwrap_err();
     assert!(
@@ -131,7 +131,7 @@ pub async fn test_stream_not_found(engine: &(impl StorageEngine + Sync)) {
 }
 
 /// Create the same stream twice, get StreamAlreadyExists error.
-pub async fn test_stream_already_exists(engine: &(impl StorageEngine + Sync)) {
+pub async fn test_stream_already_exists(engine: &impl StorageEngine) {
     let s = stream("test-duplicate");
     engine.create_stream(&s, 0, 0).await.unwrap();
 
@@ -143,7 +143,7 @@ pub async fn test_stream_already_exists(engine: &(impl StorageEngine + Sync)) {
 }
 
 /// Seek by timestamp: timestamp 0 returns offset 0; far future returns end of stream.
-pub async fn test_seek_by_time(engine: &(impl StorageEngine + Sync)) {
+pub async fn test_seek_by_time(engine: &impl StorageEngine) {
     let s = stream("test-seek");
     engine.create_stream(&s, 0, 0).await.unwrap();
 
@@ -179,18 +179,199 @@ pub async fn test_stream_bounds(engine: &impl StorageEngine) {
     assert_eq!(next, Offset(3));
 }
 
-/// `trim_up_to` discards records earlier than `keep_from` (best-effort on
-/// segment boundaries for FileStorage; exact for MemoryStorage).
-pub async fn test_trim_up_to(engine: &impl StorageEngine) {
-    let s = stream("test-trim");
+/// `trim_up_to(Offset(0))` is a no-op — `keep_from` at or before earliest
+/// discards nothing.
+pub async fn test_trim_up_to_earliest_is_noop(engine: &impl StorageEngine) {
+    let s = stream("test-trim-noop");
+    engine.create_stream(&s, 0, 0).await.unwrap();
+    for i in 0u8..10 {
+        engine.append(&s, &record("events", &[i])).await.unwrap();
+    }
+    engine.trim_up_to(&s, Offset(0)).await.unwrap();
+    let records = engine.read(&s, Offset(0), 100).await.unwrap();
+    assert_eq!(records.len(), 10);
+    // Appending still produces the next sequential offset (10).
+    let next = engine.append(&s, &record("events", b"tail")).await.unwrap();
+    assert_eq!(next, Offset(10));
+}
+
+/// `trim_up_to` drops records at offsets strictly less than `keep_from`.
+/// For FileStorage this is best-effort at segment granularity, so with a
+/// single-segment stream we assert the exact behavior only for
+/// MemoryStorage — FileStorage is verified via bounds instead.
+pub async fn test_trim_up_to_drops_earlier_records(
+    engine: &impl StorageEngine,
+    exact_retention: bool,
+) {
+    let s = stream("test-trim-drops");
+    engine.create_stream(&s, 0, 0).await.unwrap();
+    for i in 0u8..10 {
+        engine.append(&s, &record("events", &[i])).await.unwrap();
+    }
+    engine.trim_up_to(&s, Offset(5)).await.unwrap();
+
+    if exact_retention {
+        // MemoryStorage trims exactly.
+        let records = engine.read(&s, Offset(0), 100).await.unwrap();
+        assert_eq!(records.len(), 5);
+        assert_eq!(records.first().map(|r| r.offset), Some(Offset(5)));
+        assert_eq!(records.last().map(|r| r.offset), Some(Offset(9)));
+    } else {
+        // FileStorage: segment-granular. With a single segment, no records
+        // are dropped — but bounds still report the stream as having
+        // records present.
+        let (_earliest, next) = engine.stream_bounds(&s).await.unwrap();
+        assert_eq!(next, Offset(10));
+    }
+
+    // Appending produces the next sequential offset (10) — trim must not
+    // regress the offset counter.
+    let next = engine.append(&s, &record("events", b"tail")).await.unwrap();
+    assert_eq!(next, Offset(10));
+}
+
+/// `trim_up_to` with a keep_from past every existing record empties the
+/// stream logically, but `append` still produces the sequential next
+/// offset — the counter is not derived from `records.len()`.
+pub async fn test_trim_up_to_past_latest_still_advances(
+    engine: &impl StorageEngine,
+    exact_retention: bool,
+) {
+    let s = stream("test-trim-past");
+    engine.create_stream(&s, 0, 0).await.unwrap();
+    for i in 0u8..10 {
+        engine.append(&s, &record("events", &[i])).await.unwrap();
+    }
+    engine.trim_up_to(&s, Offset(100)).await.unwrap();
+
+    if exact_retention {
+        let records = engine.read(&s, Offset(0), 100).await.unwrap();
+        assert!(records.is_empty());
+    }
+    let (_, next) = engine.stream_bounds(&s).await.unwrap();
+    assert_eq!(next, Offset(10));
+
+    // Append still produces offset 10 — the next_offset counter is
+    // tracked independently of the retained-records set.
+    let next = engine.append(&s, &record("events", b"tail")).await.unwrap();
+    assert_eq!(next, Offset(10));
+}
+
+/// `truncate_from(drop_from)` drops records at offsets `>= drop_from`. A
+/// subsequent `append` produces exactly `drop_from`.
+pub async fn test_truncate_from_drops_later_records(engine: &impl StorageEngine) {
+    let s = stream("test-truncate-drops");
+    engine.create_stream(&s, 0, 0).await.unwrap();
+    for i in 0u8..10 {
+        engine.append(&s, &record("events", &[i])).await.unwrap();
+    }
+    engine.truncate_from(&s, Offset(7)).await.unwrap();
+
+    let records = engine.read(&s, Offset(0), 100).await.unwrap();
+    assert_eq!(records.len(), 7, "expected 7 surviving records");
+    assert_eq!(records.first().map(|r| r.offset), Some(Offset(0)));
+    assert_eq!(records.last().map(|r| r.offset), Some(Offset(6)));
+
+    let (earliest, next) = engine.stream_bounds(&s).await.unwrap();
+    assert_eq!(earliest, Offset(0));
+    assert_eq!(next, Offset(7));
+
+    // The next append must assign exactly `drop_from = 7`.
+    let next_off = engine.append(&s, &record("events", b"new-7")).await.unwrap();
+    assert_eq!(next_off, Offset(7));
+
+    // And we can keep going.
+    let next_off = engine.append(&s, &record("events", b"new-8")).await.unwrap();
+    assert_eq!(next_off, Offset(8));
+}
+
+/// `truncate_from(Offset(0))` empties the stream and resets the offset
+/// counter so the next `append` produces `Offset(0)`.
+pub async fn test_truncate_from_zero_empties(engine: &impl StorageEngine) {
+    let s = stream("test-truncate-zero");
+    engine.create_stream(&s, 0, 0).await.unwrap();
+    for i in 0u8..10 {
+        engine.append(&s, &record("events", &[i])).await.unwrap();
+    }
+    engine.truncate_from(&s, Offset(0)).await.unwrap();
+
+    let records = engine.read(&s, Offset(0), 100).await.unwrap();
+    assert!(records.is_empty());
+
+    let (earliest, next) = engine.stream_bounds(&s).await.unwrap();
+    assert_eq!(earliest, next, "fully-truncated stream should look empty");
+    assert_eq!(next, Offset(0));
+
+    let next_off = engine.append(&s, &record("events", b"fresh")).await.unwrap();
+    assert_eq!(next_off, Offset(0));
+}
+
+/// `truncate_from` with `drop_from == next` is a no-op.
+pub async fn test_truncate_from_at_next_is_noop(engine: &impl StorageEngine) {
+    let s = stream("test-truncate-at-next");
     engine.create_stream(&s, 0, 0).await.unwrap();
     for i in 0u8..5 {
         engine.append(&s, &record("events", &[i])).await.unwrap();
     }
-    // No-op when keep_from is at or before earliest.
-    engine.trim_up_to(&s, Offset(0)).await.unwrap();
-    let records = engine.read(&s, Offset(0), 10).await.unwrap();
+    let (_, next) = engine.stream_bounds(&s).await.unwrap();
+    engine.truncate_from(&s, next).await.unwrap();
+    let records = engine.read(&s, Offset(0), 100).await.unwrap();
     assert_eq!(records.len(), 5);
+
+    let next_off = engine.append(&s, &record("events", b"tail")).await.unwrap();
+    assert_eq!(next_off, Offset(5));
+}
+
+/// `stream_bounds` returns `(earliest, next)` correctly through trim and
+/// truncate operations.
+pub async fn test_stream_bounds_after_trim_and_truncate(
+    engine: &impl StorageEngine,
+    exact_retention: bool,
+) {
+    let s = stream("test-bounds-through-ops");
+    engine.create_stream(&s, 0, 0).await.unwrap();
+    for i in 0u8..10 {
+        engine.append(&s, &record("events", &[i])).await.unwrap();
+    }
+
+    let (earliest, next) = engine.stream_bounds(&s).await.unwrap();
+    assert_eq!(earliest, Offset(0));
+    assert_eq!(next, Offset(10));
+
+    engine.trim_up_to(&s, Offset(3)).await.unwrap();
+    let (earliest, next) = engine.stream_bounds(&s).await.unwrap();
+    if exact_retention {
+        assert_eq!(earliest, Offset(3));
+    }
+    // `next` never regresses on trim.
+    assert_eq!(next, Offset(10));
+
+    engine.truncate_from(&s, Offset(8)).await.unwrap();
+    let (_earliest, next) = engine.stream_bounds(&s).await.unwrap();
+    assert_eq!(next, Offset(8));
+
+    // Append gives offset 8.
+    let next_off = engine.append(&s, &record("events", b"tail")).await.unwrap();
+    assert_eq!(next_off, Offset(8));
+}
+
+/// `delete_stream` followed by `create_stream` resets bounds to `(0, 0)`.
+pub async fn test_delete_then_recreate_resets_bounds(engine: &impl StorageEngine) {
+    let s = stream("test-del-recreate");
+    engine.create_stream(&s, 0, 0).await.unwrap();
+    for i in 0u8..5 {
+        engine.append(&s, &record("events", &[i])).await.unwrap();
+    }
+
+    engine.delete_stream(&s).await.unwrap();
+    engine.create_stream(&s, 0, 0).await.unwrap();
+
+    let (earliest, next) = engine.stream_bounds(&s).await.unwrap();
+    assert_eq!(earliest, Offset(0));
+    assert_eq!(next, Offset(0));
+
+    let next_off = engine.append(&s, &record("events", b"fresh")).await.unwrap();
+    assert_eq!(next_off, Offset(0));
 }
 
 /// `delete_stream` is idempotent: deleting a missing stream is Ok; after
@@ -215,23 +396,8 @@ pub async fn test_delete_stream(engine: &impl StorageEngine) {
     );
 }
 
-/// `truncate_from` drops records at offsets `>= drop_from`. On a no-op
-/// (drop_from == next) all records are retained.
-pub async fn test_truncate_from(engine: &impl StorageEngine) {
-    let s = stream("test-truncate");
-    engine.create_stream(&s, 0, 0).await.unwrap();
-    for i in 0u8..5 {
-        engine.append(&s, &record("events", &[i])).await.unwrap();
-    }
-    // drop_from == next (5) is a no-op.
-    let (_, next) = engine.stream_bounds(&s).await.unwrap();
-    engine.truncate_from(&s, next).await.unwrap();
-    let records = engine.read(&s, Offset(0), 10).await.unwrap();
-    assert_eq!(records.len(), 5);
-}
-
 /// Append 2 records, verify the second timestamp is >= the first.
-pub async fn test_timestamps_increasing(engine: &(impl StorageEngine + Sync)) {
+pub async fn test_timestamps_increasing(engine: &impl StorageEngine) {
     let s = stream("test-timestamps");
     engine.create_stream(&s, 0, 0).await.unwrap();
 
