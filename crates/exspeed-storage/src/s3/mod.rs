@@ -250,35 +250,43 @@ impl StorageEngine for S3TieredStorage {
         &self,
         stream: &StreamName,
     ) -> Result<(Offset, Offset), StorageError> {
-        // Local view of the bounds.
+        // Tightest available view: prefer the live local partition, fall
+        // back to the manifest when the stream doesn't exist locally or
+        // records have been rotated out to S3 only.
         let local_result = self.local.stream_bounds(stream).await;
 
-        // Check S3 manifest for earlier segments.
         let manifests = self.manifests.read().await;
         let manifest = manifests.get(stream.as_str());
 
-        match (local_result, manifest) {
-            (Ok((local_earliest, local_next)), Some(m)) if !m.segments.is_empty() => {
-                let s3_earliest = m
-                    .segments
-                    .iter()
-                    .map(|e| e.base_offset)
-                    .min()
-                    .unwrap_or(local_earliest.0);
-                let s3_latest_end = m.segments.iter().map(|e| e.end_offset).max();
-                let next = match s3_latest_end {
-                    Some(end) => Offset(local_next.0.max(end + 1)),
-                    None => local_next,
-                };
-                let earliest = Offset(local_earliest.0.min(s3_earliest));
-                Ok((earliest, next))
+        let manifest_bounds: Option<(u64, u64)> = manifest.and_then(|m| {
+            if m.segments.is_empty() {
+                None
+            } else {
+                let earliest = m.segments.iter().map(|e| e.base_offset).min()?;
+                let last_end = m.segments.iter().map(|e| e.end_offset).max()?;
+                Some((earliest, last_end + 1))
             }
-            (Ok(bounds), _) => Ok(bounds),
-            (Err(StorageError::StreamNotFound(name)), Some(m)) if !m.segments.is_empty() => {
-                let earliest = m.segments.iter().map(|e| e.base_offset).min().unwrap_or(0);
-                let latest_end = m.segments.iter().map(|e| e.end_offset).max().unwrap_or(0);
-                let _ = name; // keep for clippy; we're about to synthesize
-                Ok((Offset(earliest), Offset(latest_end + 1)))
+        });
+
+        match (local_result, manifest_bounds) {
+            (Ok((local_earliest, local_next)), Some((m_earliest, m_next))) => {
+                // Merge views. If local has zero records
+                // (earliest == next), the true earliest is the manifest's
+                // earliest — don't let the local "empty sentinel" pull it
+                // down to 0.
+                let local_has_records = local_earliest.0 < local_next.0;
+                let earliest = if local_has_records {
+                    local_earliest.0.min(m_earliest)
+                } else {
+                    m_earliest
+                };
+                let next = local_next.0.max(m_next);
+                Ok((Offset(earliest), Offset(next)))
+            }
+            (Ok(bounds), None) => Ok(bounds),
+            (Err(StorageError::StreamNotFound(_)), Some((earliest, next))) => {
+                // Stream is in S3 but not local — synthesize from manifest.
+                Ok((Offset(earliest), Offset(next)))
             }
             (Err(e), _) => Err(e),
         }
