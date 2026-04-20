@@ -15,7 +15,10 @@ pub type Reader = FramedRead<OwnedReadHalf, ExspeedCodec>;
 pub type Writer = FramedWrite<OwnedWriteHalf, ExspeedCodec>;
 
 pub struct ExspeedClient {
+    /// Exposed for subsequent tasks (Subscribe/Ack) that issue frames on the
+    /// same TCP connection without going through this wrapper.
     pub reader: Reader,
+    /// See `reader`.
     pub writer: Writer,
     next_corr: u32,
 }
@@ -64,15 +67,25 @@ impl ExspeedClient {
         let resp = self.reader.next().await.ok_or_else(|| anyhow!("closed"))??;
         match resp.opcode {
             OpCode::Ok => Ok(()),
-            // Broker returns Error for "stream already exists" — that's fine here.
-            OpCode::Error => Ok(()),
+            OpCode::Error => {
+                // Any Error response is treated as "stream already exists". This is the
+                // only Error path reachable in a well-formed benchmark run. Invalid
+                // stream names would also land here and be silently ignored; if
+                // ensure_stream ever starts being called with dynamic/untrusted names,
+                // decode the error payload and only accept code == 409.
+                Ok(())
+            }
             other => Err(anyhow!("ensure_stream: unexpected opcode {other:?}")),
         }
     }
 
     pub fn alloc_corr(&mut self) -> u32 {
         let c = self.next_corr;
-        self.next_corr = self.next_corr.wrapping_add(1).max(1);
+        // CorrelID 0 is reserved for push-delivered records, so skip it on wrap.
+        self.next_corr = match self.next_corr.wrapping_add(1) {
+            0 => 1,
+            n => n,
+        };
         c
     }
 }
