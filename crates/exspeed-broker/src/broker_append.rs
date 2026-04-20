@@ -690,6 +690,7 @@ mod tests {
             value,
             subject: "test.event".to_string(),
             headers,
+            timestamp_ns: None,
         }
     }
 
@@ -703,6 +704,7 @@ mod tests {
             value: Bytes::copy_from_slice(value),
             subject: subject.to_string(),
             headers,
+            timestamp_ns: None,
         }
     }
 
@@ -856,12 +858,14 @@ mod tests {
             value: Bytes::from_static(b"data1"),
             subject: "evt".to_string(),
             headers: vec![("x-idempotency-key".to_string(), "key-A".to_string())],
+            timestamp_ns: None,
         };
         let r2 = Record {
             key: None,
             value: Bytes::from_static(b"data2"),
             subject: "evt".to_string(),
             headers: vec![("x-idempotency-key".to_string(), "key-B".to_string())],
+            timestamp_ns: None,
         };
         storage.append(&stream, &r1).await.unwrap();
         storage.append(&stream, &r2).await.unwrap();

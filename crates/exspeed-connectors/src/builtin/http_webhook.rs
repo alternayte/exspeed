@@ -52,6 +52,7 @@ pub async fn handle_webhook_post(
             ("x-exspeed-source".to_string(), "http_webhook".to_string()),
             ("x-exspeed-connector".to_string(), config.name.clone()),
         ],
+        timestamp_ns: None,
     };
 
     // 4. Resolve stream name and append

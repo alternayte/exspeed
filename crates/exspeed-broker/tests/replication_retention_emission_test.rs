@@ -30,6 +30,7 @@ fn record(value: &[u8]) -> Record {
         value: Bytes::copy_from_slice(value),
         subject: "retention.test".into(),
         headers: vec![],
+        timestamp_ns: None,
     }
 }
 

@@ -261,6 +261,7 @@ async fn fresh_follower_bootstrap_streams_records() {
                 value: Bytes::from(format!("{s}-{i}").into_bytes()),
                 subject: format!("{s}.subj"),
                 headers: vec![],
+                timestamp_ns: None,
             };
             storage.append(&name, &rec).await.unwrap();
         }
@@ -371,6 +372,7 @@ async fn reseed_detect_emits_streamreseed() {
             value: Bytes::from(format!("v{i}").into_bytes()),
             subject: "orders.placed".into(),
             headers: vec![],
+            timestamp_ns: None,
         };
         storage.append(&name, &rec).await.unwrap();
     }
@@ -499,6 +501,7 @@ async fn bootstrap_does_not_lose_events_emitted_during_catchup() {
             value: Bytes::from(format!("v{i}").into_bytes()),
             subject: "alpha.subj".into(),
             headers: vec![],
+            timestamp_ns: None,
         };
         storage.append(&name, &rec).await.unwrap();
     }
@@ -577,6 +580,7 @@ async fn catchup_empty_read_with_stream_deleted_logs_and_continues() {
             value: Bytes::from(format!("v{i}").into_bytes()),
             subject: "doomed.subj".into(),
             headers: vec![],
+            timestamp_ns: None,
         };
         storage.append(&name, &rec).await.unwrap();
     }

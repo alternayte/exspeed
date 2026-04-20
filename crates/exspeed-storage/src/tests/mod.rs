@@ -56,6 +56,11 @@ mod memory_tests {
     }
 
     #[tokio::test]
+    async fn append_honors_timestamp_override() {
+        trait_tests::test_append_honors_timestamp_override(&MemoryStorage::new()).await;
+    }
+
+    #[tokio::test]
     async fn seek_by_time() {
         trait_tests::test_seek_by_time(&MemoryStorage::new()).await;
     }
@@ -191,6 +196,12 @@ mod file_trait_tests {
     async fn timestamps_increasing() {
         let (s, _d) = make_storage();
         trait_tests::test_timestamps_increasing(&s).await;
+    }
+
+    #[tokio::test]
+    async fn append_honors_timestamp_override() {
+        let (s, _d) = make_storage();
+        trait_tests::test_append_honors_timestamp_override(&s).await;
     }
 
     #[tokio::test]

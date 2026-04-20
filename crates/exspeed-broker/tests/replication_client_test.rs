@@ -333,6 +333,7 @@ async fn deletes_stream_on_stream_deleted_event() {
                     value: Bytes::from(format!("v{i}")),
                     subject: "s".into(),
                     headers: vec![],
+                    timestamp_ns: None,
                 },
             )
             .await
@@ -414,6 +415,7 @@ async fn trims_on_retention_trimmed_event() {
                     value: Bytes::from(format!("v{i}")),
                     subject: "s".into(),
                     headers: vec![],
+                    timestamp_ns: None,
                 },
             )
             .await
@@ -486,6 +488,7 @@ async fn reseeds_on_stream_reseed_event() {
                     value: Bytes::from(format!("v{i}")),
                     subject: "s".into(),
                     headers: vec![],
+                    timestamp_ns: None,
                 },
             )
             .await
@@ -574,6 +577,7 @@ async fn divergent_history_truncation_on_manifest() {
                     value: Bytes::from(format!("v{i}")),
                     subject: "s".into(),
                     headers: vec![],
+                    timestamp_ns: None,
                 },
             )
             .await

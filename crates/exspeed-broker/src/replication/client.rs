@@ -540,6 +540,7 @@ impl ReplicationClient {
                 value: Bytes::from(rec.payload),
                 subject: rec.subject,
                 headers,
+                timestamp_ns: None,
             };
             let (assigned, _ts) = self.storage.append(&name, &record).await?;
 

@@ -370,6 +370,8 @@ mod tests {
                 )),
                 subject: format!("order.{}.created", if i % 2 == 0 { "eu" } else { "us" }),
                 headers: vec![],
+
+                timestamp_ns: None,
             };
             storage
                 .append(&StreamName::try_from("orders").unwrap(), &record)

@@ -90,6 +90,7 @@ pub async fn handle_publish(broker: &Broker, req: PublishRequest) -> ServerMessa
         value: req.value,
         subject: req.subject,
         headers,
+        timestamp_ns: None,
     };
 
     let start = std::time::Instant::now();
@@ -565,6 +566,7 @@ pub async fn handle_nack(broker: &Broker, req: NackRequest) -> ServerMessage {
             value: record.value.clone(),
             subject: record.subject.clone(),
             headers: dlq_headers,
+            timestamp_ns: None,
         };
 
         if let Err(e) = broker.storage.append(&dlq_stream_name, &dlq_record).await {

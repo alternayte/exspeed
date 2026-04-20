@@ -19,6 +19,7 @@ fn record(value: &[u8]) -> Record {
         value: Bytes::copy_from_slice(value),
         subject: "test.subject".into(),
         headers: vec![],
+        timestamp_ns: None,
     }
 }
 
@@ -175,6 +176,7 @@ fn retention_deletes_old_segments_by_age() {
                 value: Bytes::from(val),
                 subject: "test.subject".into(),
                 headers: vec![],
+                timestamp_ns: None,
             })
             .unwrap();
     }
@@ -225,6 +227,7 @@ fn retention_deletes_oldest_segments_by_size() {
                 value: Bytes::from(val),
                 subject: "test.subject".into(),
                 headers: vec![],
+                timestamp_ns: None,
             })
             .unwrap();
     }
@@ -311,6 +314,7 @@ fn truncate_from_inside_sealed_segment() {
                 value: Bytes::from(val),
                 subject: "test.subject".into(),
                 headers: vec![],
+                timestamp_ns: None,
             })
             .unwrap();
     }
@@ -336,6 +340,7 @@ fn truncate_from_inside_sealed_segment() {
             value: Bytes::from_static(b"post-truncate"),
             subject: "test.subject".into(),
             headers: vec![],
+            timestamp_ns: None,
         })
         .unwrap();
     assert_eq!(new_off, Offset(7));
@@ -365,6 +370,7 @@ fn truncate_from_inside_active_segment() {
                 value: Bytes::from(val),
                 subject: "test.subject".into(),
                 headers: vec![],
+                timestamp_ns: None,
             })
             .unwrap();
     }
@@ -383,6 +389,7 @@ fn truncate_from_inside_active_segment() {
             value: Bytes::from_static(b"tail"),
             subject: "test.subject".into(),
             headers: vec![],
+            timestamp_ns: None,
         })
         .unwrap();
     assert_eq!(new_off, Offset(4));
@@ -406,6 +413,7 @@ fn truncate_from_zero_wipes_all_segments() {
                 value: Bytes::from(val),
                 subject: "test.subject".into(),
                 headers: vec![],
+                timestamp_ns: None,
             })
             .unwrap();
     }
@@ -423,6 +431,7 @@ fn truncate_from_zero_wipes_all_segments() {
             value: Bytes::from_static(b"fresh"),
             subject: "test.subject".into(),
             headers: vec![],
+            timestamp_ns: None,
         })
         .unwrap();
     assert_eq!(new_off, Offset(0));
@@ -481,6 +490,7 @@ fn retention_never_deletes_active_segment() {
             value: Bytes::from("active-data"),
             subject: "test.subject".into(),
             headers: vec![],
+            timestamp_ns: None,
         })
         .unwrap();
 

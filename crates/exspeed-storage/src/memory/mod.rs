@@ -79,7 +79,10 @@ impl StorageEngine for MemoryStorage {
             .get_mut(&key)
             .ok_or_else(|| StorageError::StreamNotFound(stream.clone()))?;
         let offset = Offset(state.next_offset);
-        let timestamp = now_nanos();
+        // Honor the caller-supplied timestamp when present (replication
+        // follower path preserves the leader's persisted timestamp); else
+        // mint a fresh one from the wall clock.
+        let timestamp = record.timestamp_ns.unwrap_or_else(now_nanos);
         let stored = StoredRecord {
             offset,
             timestamp,

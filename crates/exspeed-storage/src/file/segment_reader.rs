@@ -293,6 +293,7 @@ mod tests {
             value: Bytes::from_static(value),
             subject: "test.subject".to_string(),
             headers: vec![],
+            timestamp_ns: None,
         }
     }
 

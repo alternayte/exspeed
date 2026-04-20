@@ -234,7 +234,10 @@ impl Partition {
     /// write, a new segment is rolled.
     pub fn append(&mut self, record: &Record) -> io::Result<(Offset, u64)> {
         let offset = Offset(self.next_offset);
-        let timestamp = now_nanos();
+        // Honor the caller-supplied timestamp when present (replication
+        // follower path preserves the leader's persisted timestamp); else
+        // mint a fresh one from the wall clock.
+        let timestamp = record.timestamp_ns.unwrap_or_else(now_nanos);
 
         // WAL first — durable after sync_data inside WalWriter::append.
         if let Err(e) = self.wal.append(
@@ -605,6 +608,7 @@ impl Partition {
                 value: stored.value.clone(),
                 subject: stored.subject.clone(),
                 headers: stored.headers.clone(),
+                timestamp_ns: None,
             };
             self.active_writer
                 .append(stored.offset, stored.timestamp, &record)?;

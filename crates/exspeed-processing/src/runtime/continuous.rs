@@ -909,6 +909,7 @@ fn row_to_record(row: &Row, target_stream: &str) -> Record {
         value,
         subject,
         headers: vec![],
+        timestamp_ns: None,
     }
 }
 
@@ -970,6 +971,8 @@ mod tests {
                 )),
                 subject: format!("order.{}.created", if i % 2 == 0 { "eu" } else { "us" }),
                 headers: vec![],
+
+                timestamp_ns: None,
             };
             storage
                 .append(&StreamName::try_from("orders").unwrap(), &record)
@@ -1175,6 +1178,8 @@ mod tests {
                 value: Bytes::from(format!(r#"{{"amount": {amount}, "region": "us"}}"#)),
                 subject: "event.created".into(),
                 headers: vec![],
+
+                timestamp_ns: None,
             };
             storage
                 .append(&StreamName::try_from("events").unwrap(), &record)
@@ -1413,6 +1418,8 @@ mod tests {
                 value: Bytes::from(format!(r#"{{"user_id": {}, "page": "p{i}"}}"#, i + 1)),
                 subject: "click".into(),
                 headers: vec![],
+
+                timestamp_ns: None,
             };
             storage
                 .append(&StreamName::try_from("clicks").unwrap(), &record)
@@ -1427,6 +1434,8 @@ mod tests {
                 value: Bytes::from(format!(r#"{{"user_id": {uid}, "item": "widget"}}"#)),
                 subject: "purchase".into(),
                 headers: vec![],
+
+                timestamp_ns: None,
             };
             storage
                 .append(&StreamName::try_from("purchases").unwrap(), &record)

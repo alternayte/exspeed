@@ -14,6 +14,7 @@ fn record(subject: &str, value: &[u8]) -> Record {
         value: Bytes::copy_from_slice(value),
         subject: subject.to_string(),
         headers: Vec::new(),
+        timestamp_ns: None,
     }
 }
 
@@ -24,6 +25,7 @@ fn record_with_key(subject: &str, key: &[u8], value: &[u8]) -> Record {
         value: Bytes::copy_from_slice(value),
         subject: subject.to_string(),
         headers: Vec::new(),
+        timestamp_ns: None,
     }
 }
 
@@ -50,6 +52,7 @@ pub async fn test_append_and_read_back(engine: &impl StorageEngine) {
             ("content-type".to_string(), "application/json".to_string()),
             ("correlation-id".to_string(), "abc-123".to_string()),
         ],
+        timestamp_ns: None,
     };
 
     engine.append(&s, &rec).await.unwrap();
@@ -411,5 +414,35 @@ pub async fn test_timestamps_increasing(engine: &impl StorageEngine) {
         "expected second timestamp ({}) >= first ({})",
         results[1].timestamp,
         results[0].timestamp
+    );
+}
+
+/// `Record::timestamp_ns` override is honored by `append`: when set, the
+/// engine persists the exact supplied value; when `None`, it mints a fresh
+/// wall-clock timestamp. The replication follower path depends on this so
+/// that `seek_by_time` is consistent across the cluster.
+pub async fn test_append_honors_timestamp_override(engine: &impl StorageEngine) {
+    let s = stream("test-ts-override");
+    engine.create_stream(&s, 0, 0).await.unwrap();
+
+    // Arbitrary known-good ns value in the past (year 2023).
+    const PINNED_NS: u64 = 1_700_000_000_000_000_000;
+
+    let mut pinned = record("events", b"pinned");
+    pinned.timestamp_ns = Some(PINNED_NS);
+    engine.append(&s, &pinned).await.unwrap();
+
+    // No override → engine mints a fresh timestamp.
+    engine.append(&s, &record("events", b"minted")).await.unwrap();
+
+    let results = engine.read(&s, Offset(0), 10).await.unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(
+        results[0].timestamp, PINNED_NS,
+        "first record should have the caller-supplied timestamp"
+    );
+    assert_ne!(
+        results[1].timestamp, PINNED_NS,
+        "second record (no override) should be freshly stamped, not reuse the pinned value"
     );
 }

@@ -150,6 +150,7 @@ mod tests {
             value: Bytes::from_static(b"hello segment"),
             subject: "test.subject".to_string(),
             headers: vec![],
+            timestamp_ns: None,
         }
     }
 

@@ -413,6 +413,7 @@ pub async fn publish_to_stream(
         value,
         subject,
         headers,
+        timestamp_ns: None,
     };
 
     let start = std::time::Instant::now();
