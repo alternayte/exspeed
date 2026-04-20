@@ -68,16 +68,21 @@ impl StorageEngine for MemoryStorage {
         Ok(())
     }
 
-    async fn append(&self, stream: &StreamName, record: &Record) -> Result<Offset, StorageError> {
+    async fn append(
+        &self,
+        stream: &StreamName,
+        record: &Record,
+    ) -> Result<(Offset, u64), StorageError> {
         let mut map = self.streams.write().unwrap();
         let key = stream.as_str().to_string();
         let state = map
             .get_mut(&key)
             .ok_or_else(|| StorageError::StreamNotFound(stream.clone()))?;
         let offset = Offset(state.next_offset);
+        let timestamp = now_nanos();
         let stored = StoredRecord {
             offset,
-            timestamp: now_nanos(),
+            timestamp,
             subject: record.subject.clone(),
             key: record.key.clone(),
             value: record.value.clone(),
@@ -85,7 +90,7 @@ impl StorageEngine for MemoryStorage {
         };
         state.records.push(stored);
         state.next_offset += 1;
-        Ok(offset)
+        Ok((offset, timestamp))
     }
 
     async fn read(

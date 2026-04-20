@@ -34,7 +34,7 @@ async fn crash_recovery_replays_wal() {
         storage.create_stream(&stream("crash"), 0, 0).await.unwrap();
         for i in 0u64..10 {
             let val = format!("val-{}", i);
-            let offset = storage
+            let (offset, _) = storage
                 .append(&stream("crash"), &record(val.as_bytes()))
                 .await
                 .unwrap();
@@ -91,7 +91,7 @@ async fn segment_rolling() {
 
     for i in 0u64..1000 {
         let val = format!("rec-{:04}", i);
-        let offset = storage
+        let (offset, _) = storage
             .append(&stream("rolling"), &record(val.as_bytes()))
             .await
             .unwrap();
@@ -118,7 +118,7 @@ async fn milestone_10k_records_crash_recover() {
 
         for i in 0u64..10_000 {
             let val = format!("record-{:05}", i);
-            let offset = storage
+            let (offset, _) = storage
                 .append(&stream("milestone"), &record(val.as_bytes()))
                 .await
                 .unwrap();
@@ -330,7 +330,7 @@ fn truncate_from_inside_sealed_segment() {
     }
 
     // Next append assigns exactly 7.
-    let new_off = partition
+    let (new_off, _) = partition
         .append(&Record {
             key: None,
             value: Bytes::from_static(b"post-truncate"),
@@ -377,7 +377,7 @@ fn truncate_from_inside_active_segment() {
     assert_eq!(records[3].offset, Offset(3));
 
     // Appending resumes at 4.
-    let new_off = partition
+    let (new_off, _) = partition
         .append(&Record {
             key: None,
             value: Bytes::from_static(b"tail"),
@@ -417,7 +417,7 @@ fn truncate_from_zero_wipes_all_segments() {
     assert!(records.is_empty());
 
     // Append resumes at 0.
-    let new_off = partition
+    let (new_off, _) = partition
         .append(&Record {
             key: None,
             value: Bytes::from_static(b"fresh"),
@@ -458,7 +458,7 @@ async fn truncate_from_survives_reopen() {
         assert_eq!(records.len(), 6);
         assert_eq!(records.last().unwrap().offset, Offset(5));
 
-        let new_off = storage
+        let (new_off, _) = storage
             .append(&stream("trunc-reopen"), &record(b"post-reopen"))
             .await
             .unwrap();

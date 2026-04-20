@@ -96,7 +96,7 @@ pub async fn handle_publish(broker: &Broker, req: PublishRequest) -> ServerMessa
 
     let start = std::time::Instant::now();
     match broker.broker_append.append(&stream_name, &record).await {
-        Ok(crate::broker_append::AppendResult::Written(offset)) => {
+        Ok(crate::broker_append::AppendResult::Written(offset, timestamp_ns)) => {
             let elapsed_secs = start.elapsed().as_secs_f64();
             broker
                 .metrics
@@ -106,19 +106,18 @@ pub async fn handle_publish(broker: &Broker, req: PublishRequest) -> ServerMessa
             // Fan out to replication followers. Only on `Written` — a
             // `Duplicate` means the record was persisted on an earlier
             // publish, which was itself replicated at that time.
+            //
+            // Use the leader-assigned timestamp (converted from ns to ms)
+            // rather than a fresh wall-clock reading, so the follower's
+            // time-index matches the leader's for seek_by_time + windowed
+            // continuous queries.
             if let Some(coord) = &broker.replication_coordinator {
                 use exspeed_protocol::messages::replicate::{RecordsAppended, ReplicatedRecord};
-                // Extract msg_id from the idempotency header if present, so the
-                // follower's dedup map stays synchronized with the leader's.
                 let msg_id = record
                     .headers
                     .iter()
                     .find(|(k, _)| k == "x-idempotency-key")
                     .map(|(_, v)| v.clone());
-                let timestamp_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
                 coord.emit(crate::replication::ReplicationEvent::RecordsAppended(
                     RecordsAppended {
                         stream: stream_name.as_str().to_string(),
@@ -127,7 +126,7 @@ pub async fn handle_publish(broker: &Broker, req: PublishRequest) -> ServerMessa
                             subject: record.subject.clone(),
                             payload: record.value.to_vec(),
                             headers: record.headers.clone(),
-                            timestamp_ms,
+                            timestamp_ms: timestamp_ns / 1_000_000,
                             msg_id,
                         }],
                     },

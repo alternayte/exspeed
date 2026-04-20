@@ -417,7 +417,7 @@ pub async fn publish_to_stream(
 
     let start = std::time::Instant::now();
     match state.broker.broker_append.append(&stream_name, &record).await {
-        Ok(AppendResult::Written(offset)) => {
+        Ok(AppendResult::Written(offset, _)) => {
             let elapsed_secs = start.elapsed().as_secs_f64();
             state
                 .metrics

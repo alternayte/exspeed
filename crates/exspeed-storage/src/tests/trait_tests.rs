@@ -33,7 +33,7 @@ fn record_with_key(subject: &str, key: &[u8], value: &[u8]) -> Record {
 pub async fn test_create_and_append(engine: &impl StorageEngine) {
     let s = stream("test-create");
     engine.create_stream(&s, 0, 0).await.unwrap();
-    let offset = engine.append(&s, &record("events", b"hello")).await.unwrap();
+    let (offset, _ts) = engine.append(&s, &record("events", b"hello")).await.unwrap();
     assert_eq!(offset, Offset(0));
 }
 
@@ -79,7 +79,7 @@ pub async fn test_sequential_offsets(engine: &impl StorageEngine) {
     engine.create_stream(&s, 0, 0).await.unwrap();
 
     for i in 0u64..5 {
-        let offset = engine.append(&s, &record("events", b"data")).await.unwrap();
+        let (offset, _ts) = engine.append(&s, &record("events", b"data")).await.unwrap();
         assert_eq!(offset, Offset(i), "expected offset {i} on append #{i}");
     }
 }
@@ -191,7 +191,7 @@ pub async fn test_trim_up_to_earliest_is_noop(engine: &impl StorageEngine) {
     let records = engine.read(&s, Offset(0), 100).await.unwrap();
     assert_eq!(records.len(), 10);
     // Appending still produces the next sequential offset (10).
-    let next = engine.append(&s, &record("events", b"tail")).await.unwrap();
+    let (next, _) = engine.append(&s, &record("events", b"tail")).await.unwrap();
     assert_eq!(next, Offset(10));
 }
 
@@ -226,7 +226,7 @@ pub async fn test_trim_up_to_drops_earlier_records(
 
     // Appending produces the next sequential offset (10) — trim must not
     // regress the offset counter.
-    let next = engine.append(&s, &record("events", b"tail")).await.unwrap();
+    let (next, _) = engine.append(&s, &record("events", b"tail")).await.unwrap();
     assert_eq!(next, Offset(10));
 }
 
@@ -253,7 +253,7 @@ pub async fn test_trim_up_to_past_latest_still_advances(
 
     // Append still produces offset 10 — the next_offset counter is
     // tracked independently of the retained-records set.
-    let next = engine.append(&s, &record("events", b"tail")).await.unwrap();
+    let (next, _) = engine.append(&s, &record("events", b"tail")).await.unwrap();
     assert_eq!(next, Offset(10));
 }
 
@@ -277,11 +277,11 @@ pub async fn test_truncate_from_drops_later_records(engine: &impl StorageEngine)
     assert_eq!(next, Offset(7));
 
     // The next append must assign exactly `drop_from = 7`.
-    let next_off = engine.append(&s, &record("events", b"new-7")).await.unwrap();
+    let (next_off, _) = engine.append(&s, &record("events", b"new-7")).await.unwrap();
     assert_eq!(next_off, Offset(7));
 
     // And we can keep going.
-    let next_off = engine.append(&s, &record("events", b"new-8")).await.unwrap();
+    let (next_off, _) = engine.append(&s, &record("events", b"new-8")).await.unwrap();
     assert_eq!(next_off, Offset(8));
 }
 
@@ -302,7 +302,7 @@ pub async fn test_truncate_from_zero_empties(engine: &impl StorageEngine) {
     assert_eq!(earliest, next, "fully-truncated stream should look empty");
     assert_eq!(next, Offset(0));
 
-    let next_off = engine.append(&s, &record("events", b"fresh")).await.unwrap();
+    let (next_off, _) = engine.append(&s, &record("events", b"fresh")).await.unwrap();
     assert_eq!(next_off, Offset(0));
 }
 
@@ -318,7 +318,7 @@ pub async fn test_truncate_from_at_next_is_noop(engine: &impl StorageEngine) {
     let records = engine.read(&s, Offset(0), 100).await.unwrap();
     assert_eq!(records.len(), 5);
 
-    let next_off = engine.append(&s, &record("events", b"tail")).await.unwrap();
+    let (next_off, _) = engine.append(&s, &record("events", b"tail")).await.unwrap();
     assert_eq!(next_off, Offset(5));
 }
 
@@ -351,7 +351,7 @@ pub async fn test_stream_bounds_after_trim_and_truncate(
     assert_eq!(next, Offset(8));
 
     // Append gives offset 8.
-    let next_off = engine.append(&s, &record("events", b"tail")).await.unwrap();
+    let (next_off, _) = engine.append(&s, &record("events", b"tail")).await.unwrap();
     assert_eq!(next_off, Offset(8));
 }
 
@@ -370,7 +370,7 @@ pub async fn test_delete_then_recreate_resets_bounds(engine: &impl StorageEngine
     assert_eq!(earliest, Offset(0));
     assert_eq!(next, Offset(0));
 
-    let next_off = engine.append(&s, &record("events", b"fresh")).await.unwrap();
+    let (next_off, _) = engine.append(&s, &record("events", b"fresh")).await.unwrap();
     assert_eq!(next_off, Offset(0));
 }
 

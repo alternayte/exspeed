@@ -232,7 +232,7 @@ impl Partition {
     /// The record is first written to the WAL (and synced), then to the
     /// active segment. If the segment exceeds `segment_max_bytes` after the
     /// write, a new segment is rolled.
-    pub fn append(&mut self, record: &Record) -> io::Result<Offset> {
+    pub fn append(&mut self, record: &Record) -> io::Result<(Offset, u64)> {
         let offset = Offset(self.next_offset);
         let timestamp = now_nanos();
 
@@ -265,7 +265,7 @@ impl Partition {
             self.roll_segment()?;
         }
 
-        Ok(offset)
+        Ok((offset, timestamp))
     }
 
     /// Read records from this partition starting at `from_offset`.

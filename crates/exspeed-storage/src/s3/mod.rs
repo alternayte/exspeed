@@ -126,7 +126,11 @@ impl StorageEngine for S3TieredStorage {
         self.local.create_stream(stream, max_age_secs, max_bytes).await
     }
 
-    async fn append(&self, stream: &StreamName, record: &Record) -> Result<Offset, StorageError> {
+    async fn append(
+        &self,
+        stream: &StreamName,
+        record: &Record,
+    ) -> Result<(Offset, u64), StorageError> {
         self.local.append(stream, record).await
     }
 

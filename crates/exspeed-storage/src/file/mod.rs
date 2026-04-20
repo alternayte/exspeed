@@ -244,7 +244,11 @@ impl FileStorage {
         Ok(())
     }
 
-    fn append_sync(&self, stream: &StreamName, record: &Record) -> Result<Offset, StorageError> {
+    fn append_sync(
+        &self,
+        stream: &StreamName,
+        record: &Record,
+    ) -> Result<(Offset, u64), StorageError> {
         let mut map = self.inner.partitions.write().unwrap();
         let key = (stream.as_str().to_string(), 0u32);
 
@@ -252,8 +256,8 @@ impl FileStorage {
             .get_mut(&key)
             .ok_or_else(|| StorageError::StreamNotFound(stream.clone()))?;
 
-        let offset = part.append(record)?;
-        Ok(offset)
+        let (offset, timestamp) = part.append(record)?;
+        Ok((offset, timestamp))
     }
 
     fn read_sync(
@@ -370,7 +374,11 @@ impl StorageEngine for FileStorage {
             .map_err(|e| StorageError::Io(std::io::Error::other(e)))?
     }
 
-    async fn append(&self, stream: &StreamName, record: &Record) -> Result<Offset, StorageError> {
+    async fn append(
+        &self,
+        stream: &StreamName,
+        record: &Record,
+    ) -> Result<(Offset, u64), StorageError> {
         let this = self.clone();
         let stream = stream.clone();
         let record = record.clone();

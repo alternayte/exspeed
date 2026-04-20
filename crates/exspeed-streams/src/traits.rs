@@ -12,7 +12,16 @@ pub trait StorageEngine: Send + Sync {
         max_bytes: u64,
     ) -> Result<(), StorageError>;
 
-    async fn append(&self, stream: &StreamName, record: &Record) -> Result<Offset, StorageError>;
+    /// Append a record and return `(offset, timestamp_ns)` — the offset the
+    /// record was assigned and the nanosecond-precision wall-clock timestamp
+    /// the storage engine stamped it with. Returning the timestamp alongside
+    /// the offset lets callers (e.g. the replication fan-out) propagate the
+    /// leader-assigned timestamp to followers without a round-trip read.
+    async fn append(
+        &self,
+        stream: &StreamName,
+        record: &Record,
+    ) -> Result<(Offset, u64), StorageError>;
 
     async fn read(
         &self,

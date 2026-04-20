@@ -58,7 +58,7 @@ pub async fn handle_webhook_post(
     let stream = StreamName::try_from(config.stream.as_str())
         .map_err(|e| format!("invalid stream name: {e}"))?;
 
-    let offset = storage
+    let (offset, _timestamp) = storage
         .append(&stream, &record)
         .await
         .map_err(|e| format!("storage error: {e}"))?;
