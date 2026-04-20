@@ -578,6 +578,7 @@ where
                     _ = exspeed_broker::retention_task::run(
                             storage_sup.clone(),
                             token.clone(),
+                            None, // replication coordinator — wired up in Wave 5
                         ) => {}
                     _ = token.cancelled() => {}
                     _ = supervisor_cancel.cancelled() => {
