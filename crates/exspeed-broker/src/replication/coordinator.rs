@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -15,10 +16,30 @@ use exspeed_common::Metrics;
 
 use crate::replication::ReplicationEvent;
 
+/// Per-follower metadata kept alongside the fan-out channel. Extended
+/// over time with lag / apply counters; v1 tracks just the wall-clock
+/// time of registration so `GET /api/v1/cluster/followers` can surface
+/// "who's connected + for how long".
+struct FollowerState {
+    tx: mpsc::Sender<ReplicationEvent>,
+    registered_at: DateTime<Utc>,
+}
+
+/// Operator-facing snapshot of one registered follower. Returned in the
+/// JSON body of `GET /api/v1/cluster/followers`. Field set is intentionally
+/// minimal at v1 — richer data (cursor summary, lag seconds, records
+/// applied) lands in a later wave when we have lag-tracking plumbed in.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FollowerSnapshot {
+    pub follower_id: Uuid,
+    pub registered_at: DateTime<Utc>,
+}
+
 pub struct ReplicationCoordinator {
-    /// Per-follower sender. The receiver end is owned by the per-connection
-    /// task in `server.rs` and is dropped when that task exits.
-    followers: RwLock<HashMap<Uuid, mpsc::Sender<ReplicationEvent>>>,
+    /// Per-follower state (fan-out sender + registration timestamp).
+    /// The receiver end is owned by the per-connection task in
+    /// `server.rs` and is dropped when that task exits.
+    followers: RwLock<HashMap<Uuid, FollowerState>>,
     metrics: Arc<Metrics>,
     queue_capacity: usize,
 }
@@ -40,7 +61,13 @@ impl ReplicationCoordinator {
         let (tx, rx) = mpsc::channel(self.queue_capacity);
         {
             let mut map = self.followers.write();
-            map.insert(id, tx);
+            map.insert(
+                id,
+                FollowerState {
+                    tx,
+                    registered_at: Utc::now(),
+                },
+            );
             self.metrics
                 .replication_connected_followers
                 .record(map.len() as i64, &[]);
@@ -64,6 +91,20 @@ impl ReplicationCoordinator {
         self.followers.read().len()
     }
 
+    /// Operator snapshot of every currently-registered follower. Holds
+    /// the read lock only for the duration of the iteration (the
+    /// `DateTime<Utc>` copy is cheap; no I/O inside the lock). Returned
+    /// by `GET /api/v1/cluster/followers`.
+    pub fn snapshot(&self) -> Vec<FollowerSnapshot> {
+        let map = self.followers.read();
+        map.iter()
+            .map(|(id, state)| FollowerSnapshot {
+                follower_id: *id,
+                registered_at: state.registered_at,
+            })
+            .collect()
+    }
+
     /// Best-effort broadcast. Followers whose queues are full are
     /// dropped; their connection task will see the closed channel on
     /// next recv and tear down its TCP socket.
@@ -71,8 +112,8 @@ impl ReplicationCoordinator {
         let mut to_drop: Vec<Uuid> = Vec::new();
         {
             let map = self.followers.read();
-            for (id, tx) in map.iter() {
-                match tx.try_send(event.clone()) {
+            for (id, state) in map.iter() {
+                match state.tx.try_send(event.clone()) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         warn!(follower_id = %id, "follower queue full — dropping connection");

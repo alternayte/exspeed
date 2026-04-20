@@ -96,3 +96,63 @@ async fn connected_followers_count_reflects_registrations() {
     coord.deregister_follower(id1);
     assert_eq!(coord.connected_followers(), 1);
 }
+
+#[tokio::test]
+async fn snapshot_returns_registered_followers_with_timestamps() {
+    let coord = ReplicationCoordinator::new(metrics(), 100);
+    assert!(
+        coord.snapshot().is_empty(),
+        "snapshot of empty coordinator is empty"
+    );
+
+    let before = chrono::Utc::now();
+    let (id1, _rx1) = coord.register_follower();
+    let (id2, _rx2) = coord.register_follower();
+    let after = chrono::Utc::now();
+
+    let mut snap = coord.snapshot();
+    assert_eq!(snap.len(), 2, "both followers should appear in snapshot");
+
+    // Sort by id so assertions don't depend on HashMap iteration order.
+    snap.sort_by_key(|s| s.follower_id);
+    let mut expected = vec![id1, id2];
+    expected.sort();
+
+    let ids: Vec<_> = snap.iter().map(|s| s.follower_id).collect();
+    assert_eq!(ids, expected, "snapshot ids should match registered ids");
+
+    // Registration times fall inside the wall-clock window we framed
+    // around the `register_follower` calls. Chrono is monotonic enough
+    // on every platform we care about; allow ±1ms slack if we ever hit
+    // a clock that isn't.
+    for s in &snap {
+        assert!(
+            s.registered_at >= before - chrono::Duration::milliseconds(1),
+            "registered_at {:?} < before {:?}",
+            s.registered_at,
+            before
+        );
+        assert!(
+            s.registered_at <= after + chrono::Duration::milliseconds(1),
+            "registered_at {:?} > after {:?}",
+            s.registered_at,
+            after
+        );
+    }
+
+    // Deregister one → snapshot shrinks; remaining follower keeps its
+    // original registered_at.
+    let remaining_before = snap
+        .iter()
+        .find(|s| s.follower_id == id2)
+        .expect("id2 in snapshot")
+        .registered_at;
+    coord.deregister_follower(id1);
+    let snap2 = coord.snapshot();
+    assert_eq!(snap2.len(), 1);
+    assert_eq!(snap2[0].follower_id, id2);
+    assert_eq!(
+        snap2[0].registered_at, remaining_before,
+        "registered_at is stable across other followers' deregistration"
+    );
+}

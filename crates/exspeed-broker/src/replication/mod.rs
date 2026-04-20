@@ -20,7 +20,7 @@ pub mod errors;
 pub mod server;
 pub mod wire;
 
-pub use coordinator::ReplicationCoordinator;
+pub use coordinator::{FollowerSnapshot, ReplicationCoordinator};
 pub use errors::ReplicationError;
 
 use exspeed_protocol::messages::replicate::{
