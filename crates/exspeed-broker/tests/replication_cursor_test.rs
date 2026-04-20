@@ -31,7 +31,7 @@ fn save_then_load_roundtrip() {
 }
 
 #[test]
-fn save_overwrites_existing_file_atomically() {
+fn last_save_wins() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("cursor.json");
 
@@ -55,6 +55,19 @@ fn load_from_corrupt_file_returns_empty() {
 
     // Corrupt file is treated as empty + a warning is logged. Callers
     // interpret as "fresh follower."
+    let cursor = Cursor::load(&path).unwrap();
+    assert!(cursor.is_empty());
+}
+
+#[test]
+fn load_from_wrong_value_type_returns_empty() {
+    // Well-formed JSON whose values aren't u64 — the cursor map is
+    // `BTreeMap<String, u64>`, so `"not-a-number"` fails deserialization.
+    // Treated the same as a corrupt file: empty + warn.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("cursor.json");
+    std::fs::write(&path, b"{\"orders\": \"not-a-number\"}").unwrap();
+
     let cursor = Cursor::load(&path).unwrap();
     assert!(cursor.is_empty());
 }

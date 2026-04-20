@@ -48,7 +48,12 @@ pub async fn run(
 /// offsets before and after `enforce_all_retention`; when a coordinator
 /// is attached and a stream's earliest moved forward, emits a
 /// `RetentionTrimmed` event so followers apply the same trim.
-async fn enforce_once(
+///
+/// Exposed as `pub` (not `pub(crate)`) so the replication-retention
+/// integration test suite can drive it directly — otherwise the only
+/// way to trigger a pass is the 60s background tick, which would make
+/// the test slow and flaky.
+pub async fn enforce_once(
     storage: &Arc<FileStorage>,
     coordinator: Option<&Arc<ReplicationCoordinator>>,
 ) {

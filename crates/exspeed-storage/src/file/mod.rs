@@ -191,6 +191,21 @@ impl FileStorage {
 }
 
 impl FileStorage {
+    /// Override the segment max bytes threshold for a specific stream.
+    /// Returns `false` if the stream is unknown. Intended for tests that
+    /// need to force segment rolling without producing 256 MiB of data.
+    pub fn set_stream_segment_max_bytes(&self, stream: &str, max: u64) -> bool {
+        let mut map = self.inner.partitions.write().unwrap();
+        let key = (stream.to_string(), 0u32);
+        match map.get_mut(&key) {
+            Some(p) => {
+                p.set_segment_max_bytes(max);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Enforce retention for all streams.
     pub fn enforce_all_retention(&self) -> io::Result<()> {
         let mut map = self.inner.partitions.write().unwrap();

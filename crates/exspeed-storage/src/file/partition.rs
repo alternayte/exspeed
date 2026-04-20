@@ -634,9 +634,9 @@ impl Partition {
         self.seal_tx.clone()
     }
 
-    /// Override the segment max bytes threshold (for testing).
-    #[cfg(test)]
-    pub(crate) fn set_segment_max_bytes(&mut self, max: u64) {
+    /// Override the segment max bytes threshold. Intended for tests that
+    /// need to force segment rolling without writing 256MB of data.
+    pub fn set_segment_max_bytes(&mut self, max: u64) {
         self.segment_max_bytes = max;
     }
 
