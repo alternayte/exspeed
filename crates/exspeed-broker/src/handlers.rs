@@ -112,18 +112,28 @@ pub async fn handle_publish(broker: &Broker, req: PublishRequest) -> ServerMessa
             // continuous queries.
             broker.emit_replication_event(|| {
                 use exspeed_protocol::messages::replicate::{RecordsAppended, ReplicatedRecord};
-                let msg_id = record
-                    .headers
-                    .iter()
-                    .find(|(k, _)| k == "x-idempotency-key")
-                    .map(|(_, v)| v.clone());
+                // Translate `x-idempotency-key` out of the headers into
+                // the typed `msg_id` field. The follower's apply path
+                // rehydrates it back under the same header name, so this
+                // keeps the wire tight (no duplicated representation) and
+                // lets the follower skip a per-record header dedup pass.
+                let mut headers = record.headers.clone();
+                let mut msg_id = None;
+                headers.retain(|(k, v)| {
+                    if k.eq_ignore_ascii_case("x-idempotency-key") {
+                        msg_id = Some(v.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
                 crate::replication::ReplicationEvent::RecordsAppended(RecordsAppended {
                     stream: stream_name.as_str().to_string(),
                     base_offset: offset.0,
                     records: vec![ReplicatedRecord {
                         subject: record.subject.clone(),
                         payload: record.value.to_vec(),
-                        headers: record.headers.clone(),
+                        headers,
                         timestamp_ms: timestamp_ns / 1_000_000,
                         msg_id,
                     }],

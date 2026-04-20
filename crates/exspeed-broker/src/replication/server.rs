@@ -625,18 +625,25 @@ where
         let replicated: Vec<ReplicatedRecord> = records
             .iter()
             .map(|r| {
-                // msg_id rehydrated from the x-idempotency-key header,
-                // mirroring the leader's publish path so follower dedup
-                // stays in sync.
-                let msg_id = r
-                    .headers
-                    .iter()
-                    .find(|(k, _)| k == "x-idempotency-key")
-                    .map(|(_, v)| v.clone());
+                // Translate `x-idempotency-key` out of the headers into
+                // the typed `msg_id` field so the wire carries exactly
+                // one representation. Mirrors the live-path strip in
+                // `handlers::handle_publish`; the follower rehydrates
+                // the header on apply.
+                let mut headers = r.headers.clone();
+                let mut msg_id = None;
+                headers.retain(|(k, v)| {
+                    if k.eq_ignore_ascii_case("x-idempotency-key") {
+                        msg_id = Some(v.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
                 ReplicatedRecord {
                     subject: r.subject.clone(),
                     payload: r.value.to_vec(),
-                    headers: r.headers.clone(),
+                    headers,
                     timestamp_ms: r.timestamp / 1_000_000,
                     msg_id,
                 }

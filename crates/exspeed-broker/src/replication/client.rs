@@ -600,12 +600,20 @@ impl ReplicationClient {
         let base = batch.base_offset;
         for (i, rec) in batch.records.into_iter().enumerate() {
             // Rehydrate msg_id back into headers so the follower's dedup
-            // map matches the leader's. The leader stripped it into its
-            // own `msg_id` field — put it back under the same header.
+            // map matches the leader's. The leader's publish + catch-up
+            // paths strip `x-idempotency-key` from headers into the
+            // dedicated `msg_id` field before emitting, so a
+            // pre-existing header here would be a protocol violation —
+            // no per-record `retain()` dedup is needed.  The debug
+            // assertion guards against regressions on the leader side.
             let mut headers = rec.headers;
+            debug_assert!(
+                !headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("x-idempotency-key")),
+                "leader should have stripped x-idempotency-key before emit; found one in replicated headers"
+            );
             if let Some(msg_id) = rec.msg_id {
-                // Overwrite if already present to avoid duplicate headers.
-                headers.retain(|(k, _)| k != "x-idempotency-key");
                 headers.push(("x-idempotency-key".into(), msg_id));
             }
 
