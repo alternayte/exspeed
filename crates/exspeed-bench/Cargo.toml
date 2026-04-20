@@ -29,10 +29,11 @@ hdrhistogram = { workspace = true }
 sysinfo = { workspace = true }
 reqwest = { workspace = true }
 chrono = { workspace = true }
+rdkafka = { workspace = true, optional = true }
 
 [features]
 default = []
-comparison = []                                   # enables Kafka driver in Task 12
+comparison = ["dep:rdkafka"]
 
 [dev-dependencies]
 portpicker = "0.1"

@@ -30,6 +30,23 @@ impl ProfileArg {
     }
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum TargetArg {
+    Exspeed,
+    #[cfg(feature = "comparison")]
+    Kafka,
+}
+
+impl TargetArg {
+    fn to_target(self) -> exspeed_bench::driver::Target {
+        match self {
+            TargetArg::Exspeed => exspeed_bench::driver::Target::Exspeed,
+            #[cfg(feature = "comparison")]
+            TargetArg::Kafka => exspeed_bench::driver::Target::Kafka,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Producer ceiling benchmark
@@ -62,6 +79,8 @@ struct ScenarioArgs {
     storage: Option<String>,
     #[arg(long)]
     output: Option<PathBuf>,
+    #[arg(long, value_enum, default_value_t = TargetArg::Exspeed)]
+    target: TargetArg,
 }
 
 #[derive(clap::Args)]
@@ -100,6 +119,8 @@ struct AllArgs {
     storage: Option<String>,
     #[arg(long)]
     output: PathBuf,
+    #[arg(long, value_enum, default_value_t = TargetArg::Exspeed)]
+    target: TargetArg,
 }
 
 fn git_sha() -> String {
@@ -148,19 +169,22 @@ async fn main() -> Result<()> {
         Cmd::Publish(a) => {
             let profile = a.profile.to_profile();
             let mut result = new_result(&profile, a.sku, a.storage);
-            result.scenarios.publish = scenarios::publish::run(&a.server, &profile).await?;
+            result.scenarios.publish =
+                scenarios::publish::run(a.target.to_target(), &a.server, &profile).await?;
             write_output(&result, a.output)
         }
         Cmd::Latency(a) => {
             let profile = a.profile.to_profile();
             let mut result = new_result(&profile, a.sku, a.storage);
-            result.scenarios.latency = Some(scenarios::latency::run(&a.server, &profile).await?);
+            result.scenarios.latency =
+                Some(scenarios::latency::run(a.target.to_target(), &a.server, &profile).await?);
             write_output(&result, a.output)
         }
         Cmd::Fanout(a) => {
             let profile = a.profile.to_profile();
             let mut result = new_result(&profile, a.sku, a.storage);
-            result.scenarios.fanout = scenarios::fanout::run(&a.server, &profile).await?;
+            result.scenarios.fanout =
+                scenarios::fanout::run(a.target.to_target(), &a.server, &profile).await?;
             write_output(&result, a.output)
         }
         Cmd::Exql(a) => {
@@ -174,11 +198,14 @@ async fn main() -> Result<()> {
         }
         Cmd::All(a) => {
             let profile = a.profile.to_profile();
+            let target = a.target.to_target();
             let mut result = new_result(&profile, a.sku, a.storage);
-            result.scenarios.publish = scenarios::publish::run(&a.server, &profile).await?;
+            result.scenarios.publish =
+                scenarios::publish::run(target, &a.server, &profile).await?;
             result.scenarios.latency =
-                Some(scenarios::latency::run(&a.server, &profile).await?);
-            result.scenarios.fanout = scenarios::fanout::run(&a.server, &profile).await?;
+                Some(scenarios::latency::run(target, &a.server, &profile).await?);
+            result.scenarios.fanout =
+                scenarios::fanout::run(target, &a.server, &profile).await?;
             result.scenarios.exql = Some(
                 scenarios::exql::run(&a.server, &a.api, &profile, 5_000, 500_000, 6).await?,
             );

@@ -2,19 +2,19 @@ use std::time::Instant;
 
 use anyhow::Result;
 
-use crate::driver::exspeed::{self, ExspeedClient};
+use crate::driver::Target;
 use crate::profile::Profile;
 use crate::report::FanoutResult;
+use crate::scenarios::dispatch;
 
-pub async fn run(addr: &str, profile: &Profile) -> Result<Vec<FanoutResult>> {
+pub async fn run(target: Target, addr: &str, profile: &Profile) -> Result<Vec<FanoutResult>> {
     let mut out = Vec::with_capacity(profile.fanout_consumer_counts.len());
     let payload_bytes: usize = 1024;
 
     for &n in &profile.fanout_consumer_counts {
         // Fresh stream per rung so consumer offsets start from zero.
         let stream = format!("bench-fanout-{n}");
-        let mut setup = ExspeedClient::connect(addr).await?;
-        setup.ensure_stream(&stream).await?;
+        dispatch::ensure_stream(target, addr, &stream).await?;
 
         let origin = Instant::now();
         let duration = profile.fanout_duration;
@@ -26,26 +26,30 @@ pub async fn run(addr: &str, profile: &Profile) -> Result<Vec<FanoutResult>> {
             let consumer_name = format!("bench-fanout-c-{n}-{i}");
             let s = stream.clone();
             handles.push(tokio::spawn(async move {
-                exspeed::run_consumer(
+                dispatch::run_consumer(
+                    target,
                     &consumer_addr,
                     &s,
                     &consumer_name,
                     duration + std::time::Duration::from_millis(500),
                     origin,
-                ).await
+                )
+                .await
             }));
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
-        let pstats = exspeed::run_producer_at_rate(
+        let pstats = dispatch::run_producer_at_rate(
+            target,
             addr,
             &stream,
             payload_bytes,
             duration,
             profile.fanout_producer_rate,
             origin,
-        ).await?;
+        )
+        .await?;
 
         let mut total_received: u64 = 0;
         let mut max_lag: u64 = 0;

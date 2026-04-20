@@ -2,16 +2,16 @@ use std::time::Instant;
 
 use anyhow::Result;
 
-use crate::driver::exspeed::{self, ExspeedClient};
+use crate::driver::Target;
 use crate::profile::Profile;
 use crate::report::{LatencyPercentiles, LatencyResult};
+use crate::scenarios::dispatch;
 
-pub async fn run(addr: &str, profile: &Profile) -> Result<LatencyResult> {
+pub async fn run(target: Target, addr: &str, profile: &Profile) -> Result<LatencyResult> {
     let stream = "bench-latency";
     let payload_bytes: usize = 1024;
 
-    let mut setup = ExspeedClient::connect(addr).await?;
-    setup.ensure_stream(stream).await?;
+    dispatch::ensure_stream(target, addr, stream).await?;
 
     let origin = Instant::now();
     let consumer_addr = addr.to_owned();
@@ -19,26 +19,30 @@ pub async fn run(addr: &str, profile: &Profile) -> Result<LatencyResult> {
 
     // Start the consumer first so the subscription is live before publishes start.
     let consumer = tokio::spawn(async move {
-        exspeed::run_consumer(
+        dispatch::run_consumer(
+            target,
             &consumer_addr,
             stream,
             "bench-latency-consumer",
             duration + std::time::Duration::from_millis(500),
             origin,
-        ).await
+        )
+        .await
     });
     // Small delay so the consumer has subscribed and the broker will start
     // delivering records as soon as they are published.
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
-    let _producer = exspeed::run_producer_at_rate(
+    let _producer = dispatch::run_producer_at_rate(
+        target,
         addr,
         stream,
         payload_bytes,
         duration,
         profile.latency_target_rate,
         origin,
-    ).await?;
+    )
+    .await?;
 
     let cstats = consumer.await??;
     let h = &cstats.latency_histogram;
