@@ -396,23 +396,37 @@ where
     //   * no credential store → anonymous identity with full privileges
     //     (single-pod dev mode; auth disabled globally)
     //   * otherwise Token auth required, sha256 lookup
+    //
+    // TODO(post-plan-g): this duplicates
+    // `crates/exspeed/src/cli/server.rs:853-906`. Extract a shared helper
+    // into `exspeed-broker::auth` (or wherever a shared location lives).
+    // The exhaustive match on `req.auth_type` below forces a compile error
+    // here AND in the CLI site when a new AuthType variant is added, so
+    // the two paths cannot silently drift apart in the meantime.
     let identity: Arc<Identity> = match credential_store.as_ref() {
-        Some(store) => {
-            if req.auth_type != AuthType::Token {
-                metrics.auth_denied("unauthorized", "tcp", "Connect");
-                send_error(framed_write, correlation_id, 401, "unauthorized").await?;
-                return Err(ReplicationError::AuthDenied("non-token auth".into()));
-            }
-            let digest: [u8; 32] = Sha256::digest(&req.auth_payload).into();
-            match store.lookup(&digest) {
-                Some(id) => id,
-                None => {
-                    metrics.auth_denied("unauthorized", "tcp", "Connect");
-                    send_error(framed_write, correlation_id, 401, "unauthorized").await?;
-                    return Err(ReplicationError::AuthDenied("unknown credential".into()));
+        Some(store) => match req.auth_type {
+            AuthType::Token => {
+                let digest: [u8; 32] = Sha256::digest(&req.auth_payload).into();
+                match store.lookup(&digest) {
+                    Some(id) => id,
+                    None => {
+                        metrics.auth_denied("unauthorized", "tcp", "Connect");
+                        send_error(framed_write, correlation_id, 401, "unauthorized").await?;
+                        return Err(ReplicationError::AuthDenied("unknown credential".into()));
+                    }
                 }
             }
-        }
+            // Non-Token variants are rejected. Listed explicitly so adding
+            // a new AuthType forces a compile error in both Connect sites.
+            AuthType::None | AuthType::MTls | AuthType::Sasl => {
+                metrics.auth_denied("unauthorized", "tcp", "Connect");
+                send_error(framed_write, correlation_id, 401, "unauthorized").await?;
+                return Err(ReplicationError::AuthDenied(format!(
+                    "unsupported auth_type {:?}",
+                    req.auth_type
+                )));
+            }
+        },
         None => Arc::new(anonymous_identity()),
     };
 

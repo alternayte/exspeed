@@ -851,19 +851,30 @@ where
 
                         match parsed {
                             Ok(ClientMessage::Connect(req)) => {
+                                // TODO(post-plan-g): this Connect handshake duplicates
+                                // `crates/exspeed-broker/src/replication/server.rs`
+                                // `read_connect_and_authorize`. Extract a shared helper.
+                                // The exhaustive match on `req.auth_type` below forces a
+                                // compile error in BOTH sites when a new AuthType variant
+                                // is added, so the two paths cannot silently drift.
+                                use exspeed_protocol::messages::connect::AuthType;
                                 let result: Result<Arc<Identity>, &'static str> =
                                     if let Some(store) = credential_store.as_ref() {
-                                        if req.auth_type
-                                            != exspeed_protocol::messages::connect::AuthType::Token
-                                        {
-                                            Err("unauthorized")
-                                        } else {
-                                            let digest: [u8; 32] =
-                                                Sha256::digest(&req.auth_payload).into();
-                                            match store.lookup(&digest) {
-                                                Some(id) => Ok(id),
-                                                None => Err("unauthorized"),
+                                        match req.auth_type {
+                                            AuthType::Token => {
+                                                let digest: [u8; 32] =
+                                                    Sha256::digest(&req.auth_payload).into();
+                                                match store.lookup(&digest) {
+                                                    Some(id) => Ok(id),
+                                                    None => Err("unauthorized"),
+                                                }
                                             }
+                                            // Non-Token variants are rejected. Listed
+                                            // explicitly so adding a new AuthType forces a
+                                            // compile error in both Connect sites.
+                                            AuthType::None
+                                            | AuthType::MTls
+                                            | AuthType::Sasl => Err("unauthorized"),
                                         }
                                     } else {
                                         // Auth off — attach a synthetic anonymous identity
