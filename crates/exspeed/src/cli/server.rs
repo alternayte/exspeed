@@ -10,7 +10,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{error, info, info_span, warn, Instrument};
 
 use exspeed_broker::broker_append::BrokerAppend;
 use exspeed_broker::consumer_state::DeliveryRecord;
@@ -691,40 +691,53 @@ where
                 let credential_store_clone = credential_store.clone();
                 let tls_config_clone = tls_config.clone();
                 let conn_token = cancel_token.child_token();
-                tokio::spawn(async move {
-                    let _permit = permit; // released when this task ends
-                    let result: Result<()> = async move {
-                        if let Some(tls_cfg) = tls_config_clone {
-                            let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
-                            let tls_stream = acceptor.accept(socket).await?;
-                            handle_connection(
-                                tls_stream,
-                                peer,
-                                broker,
-                                credential_store_clone,
-                                metrics_for_handler,
-                                conn_token,
-                            )
-                            .await
-                        } else {
-                            handle_connection(
-                                socket,
-                                peer,
-                                broker,
-                                credential_store_clone,
-                                metrics_for_handler,
-                                conn_token,
-                            )
-                            .await
+                // Per-connection span: `identity` starts empty and is filled
+                // in via `Span::current().record(...)` when Connect succeeds.
+                // Every `info!`/`warn!` inside this connection inherits the
+                // field, so log aggregators can slice by tenant without
+                // needing each call-site to pass `identity = ...`.
+                let conn_span = info_span!(
+                    "connection",
+                    %peer,
+                    identity = tracing::field::Empty,
+                );
+                tokio::spawn(
+                    async move {
+                        let _permit = permit; // released when this task ends
+                        let result: Result<()> = async move {
+                            if let Some(tls_cfg) = tls_config_clone {
+                                let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
+                                let tls_stream = acceptor.accept(socket).await?;
+                                handle_connection(
+                                    tls_stream,
+                                    peer,
+                                    broker,
+                                    credential_store_clone,
+                                    metrics_for_handler,
+                                    conn_token,
+                                )
+                                .await
+                            } else {
+                                handle_connection(
+                                    socket,
+                                    peer,
+                                    broker,
+                                    credential_store_clone,
+                                    metrics_for_handler,
+                                    conn_token,
+                                )
+                                .await
+                            }
                         }
+                        .await;
+                        if let Err(e) = result {
+                            error!(%peer, "connection error: {}", e);
+                        }
+                        metrics_clone.connection_closed();
+                        info!(%peer, "connection closed");
                     }
-                    .await;
-                    if let Err(e) = result {
-                        error!(%peer, "connection error: {}", e);
-                    }
-                    metrics_clone.connection_closed();
-                    info!(%peer, "connection closed");
-                });
+                    .instrument(conn_span),
+                );
             }
         }
     }
@@ -847,6 +860,11 @@ where
                                     };
                                 match result {
                                     Ok(id) => {
+                                        // Populate the enclosing connection span's
+                                        // `identity` field so every subsequent log
+                                        // line on this connection carries it.
+                                        tracing::Span::current()
+                                            .record("identity", id.name.as_str());
                                         info!(
                                             %peer,
                                             client_id = %req.client_id,

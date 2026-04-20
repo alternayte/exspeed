@@ -66,6 +66,11 @@ pub async fn require_authenticated(
         return unauthorized();
     };
 
+    // Record the authenticated name on the current tracing span (no-op if
+    // the surrounding request has no span, e.g. in tests). Lets log
+    // aggregators slice HTTP events by tenant when a request span is in
+    // scope.
+    tracing::Span::current().record("identity", identity.name.as_str());
     req.extensions_mut().insert(identity);
     next.run(req).await
 }
@@ -101,6 +106,9 @@ pub async fn require_admin(
         return forbidden();
     }
 
+    // Same rationale as `require_authenticated` above — record on current
+    // span so downstream handler logs carry the identity field.
+    tracing::Span::current().record("identity", identity.name.as_str());
     req.extensions_mut().insert(identity);
     next.run(req).await
 }
