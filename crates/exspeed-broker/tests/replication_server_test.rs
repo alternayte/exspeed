@@ -454,15 +454,15 @@ async fn connection_close_always_deregisters_follower() {
     drop(rx);
     drop(tx);
 
-    // Provoke a write so the server sees the socket close. A heartbeat
-    // would eventually do it, but emit() is synchronous and deterministic.
-    coord.emit(ReplicationEvent::StreamDeleted(StreamDeletedEvent {
-        name: "trigger-write-after-close".into(),
-    }));
-
-    // Wait until the count returns to 0 (bounded — the server task should
-    // run within a few ms).
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // Provoke writes until the server notices the socket is dead. A
+    // single small write may land in the kernel TCP send buffer even
+    // after the peer has closed; a handful of writes plus a brief
+    // sleep forces the FIN/RST to propagate back as a write error.
+    //
+    // (Alternatively: use `cancel.cancel()` to force the fan-out loop
+    // to exit via the cancel branch — but we specifically want to
+    // verify the I/O-error exit path, so we stick with the socket drop.)
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while coord.connected_followers() != 0 {
         if std::time::Instant::now() > deadline {
             panic!(
@@ -470,7 +470,10 @@ async fn connection_close_always_deregisters_follower() {
                 coord.connected_followers()
             );
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        coord.emit(ReplicationEvent::StreamDeleted(StreamDeletedEvent {
+            name: "trigger-write-after-close".into(),
+        }));
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
     cancel.cancel();
