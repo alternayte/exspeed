@@ -20,6 +20,11 @@ pub enum StorageError {
 
     #[error("dedup map full for this stream; retry after {retry_after_secs}s")]
     DedupMapFull { retry_after_secs: u32 },
+
+    #[error(
+        "offset {requested} is below earliest retained offset {earliest} (records trimmed by retention)"
+    )]
+    OffsetOutOfRange { requested: u64, earliest: u64 },
 }
 
 #[cfg(test)]
@@ -36,5 +41,14 @@ mod tests {
     fn dedup_map_full_display() {
         let err = StorageError::DedupMapFull { retry_after_secs: 30 };
         assert_eq!(err.to_string(), "dedup map full for this stream; retry after 30s");
+    }
+
+    #[test]
+    fn offset_out_of_range_display() {
+        let err = StorageError::OffsetOutOfRange { requested: 50, earliest: 100 };
+        assert_eq!(
+            err.to_string(),
+            "offset 50 is below earliest retained offset 100 (records trimmed by retention)"
+        );
     }
 }

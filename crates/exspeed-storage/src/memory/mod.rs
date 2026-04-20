@@ -107,6 +107,24 @@ impl StorageEngine for MemoryStorage {
         let state = map
             .get(&key)
             .ok_or_else(|| StorageError::StreamNotFound(stream.clone()))?;
+
+        // Refuse to silently skip over trimmed-away history. `earliest` is
+        // the first retained offset, or `next_offset` when the stream has no
+        // records (either never written or fully trimmed) — the second case
+        // still returns an empty Ok below because `from >= next_offset` is
+        // legal tailing behavior.
+        let earliest = state
+            .records
+            .first()
+            .map(|r| r.offset.0)
+            .unwrap_or(state.next_offset);
+        if from.0 < earliest && from.0 < state.next_offset {
+            return Err(StorageError::OffsetOutOfRange {
+                requested: from.0,
+                earliest,
+            });
+        }
+
         // Records are stored in offset order; find the first record whose
         // offset >= `from` and take up to `max_records` from there.
         let first_idx = state

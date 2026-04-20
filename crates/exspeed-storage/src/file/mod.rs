@@ -288,6 +288,18 @@ impl FileStorage {
             .get(&key)
             .ok_or_else(|| StorageError::StreamNotFound(stream.clone()))?;
 
+        // Refuse to silently skip over trimmed-away history. `from < earliest`
+        // indicates the consumer is behind the retention window — they must
+        // explicitly re-seek. Tailing past `next` is still legal (empty Ok).
+        let earliest = part.earliest_offset();
+        let next = part.next_offset();
+        if from.0 < earliest && from.0 < next {
+            return Err(StorageError::OffsetOutOfRange {
+                requested: from.0,
+                earliest,
+            });
+        }
+
         let records = part.read(from, max_records)?;
         Ok(records)
     }

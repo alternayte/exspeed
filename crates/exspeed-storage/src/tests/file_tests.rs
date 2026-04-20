@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use exspeed_common::{Offset, StreamName};
-use exspeed_streams::{Record, StorageEngine};
+use exspeed_streams::{Record, StorageEngine, StorageError};
 use tempfile::TempDir;
 
 use crate::file::partition::Partition;
@@ -506,4 +506,68 @@ fn retention_never_deletes_active_segment() {
     let records = partition.read(Offset(0), 10).unwrap();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].value, Bytes::from("active-data"));
+}
+
+/// End-to-end check: after size-based retention drops leading sealed
+/// segments, `FileStorage::read` from an offset below the new earliest must
+/// return `StorageError::OffsetOutOfRange` — not silently jump forward.
+/// Uses size-based retention (deterministic) rather than age (timing-sensitive).
+#[tokio::test]
+async fn read_below_earliest_after_retention_returns_out_of_range() {
+    let dir = TempDir::new().unwrap();
+    let part_dir = dir.path().join("streams/retain-test/partitions/0");
+    std::fs::create_dir_all(&part_dir).unwrap();
+
+    // Force multiple small sealed segments. Each record is ~80 bytes framed,
+    // so a 256-byte cap gives roughly 3 records per segment — enough to have
+    // both deleted and surviving sealed segments after retention.
+    let mut partition = Partition::create(&part_dir, "retain-test", 0).unwrap();
+    partition.set_segment_max_bytes(256);
+
+    for i in 0u64..30 {
+        partition
+            .append(&Record {
+                key: None,
+                value: Bytes::from(format!("retain-value-{i:04}")),
+                subject: "test.subject".into(),
+                headers: vec![],
+                timestamp_ns: None,
+            })
+            .unwrap();
+    }
+    assert_eq!(partition.earliest_offset(), 0);
+
+    // Size-based retention: keep only ~1/3 of the data. Drops oldest sealed
+    // segments one at a time until total_bytes <= max_bytes. Leaves some
+    // sealed segments + the active segment.
+    let max_bytes = partition.total_bytes() / 3;
+    // Use 999_999_999 secs (≈31 years) for "effectively disabled" age-based
+    // retention without overflowing `age_cutoff_nanos = secs * 1e9`.
+    let stats = partition.enforce_retention(999_999_999, max_bytes).unwrap();
+    assert!(
+        stats.segments_deleted > 0,
+        "expected retention to delete some sealed segments"
+    );
+    let new_earliest = partition.earliest_offset();
+    assert!(new_earliest > 0, "earliest must advance past trimmed offsets");
+
+    // Reopen via FileStorage — this is the public surface broker uses.
+    drop(partition);
+    let storage = FileStorage::open(dir.path()).unwrap();
+    let s = stream("retain-test");
+
+    // Read from a trimmed-away offset must error, not silently skip.
+    let err = storage.read(&s, Offset(0), 10).await.unwrap_err();
+    match err {
+        StorageError::OffsetOutOfRange { requested, earliest } => {
+            assert_eq!(requested, 0);
+            assert_eq!(earliest, new_earliest);
+        }
+        other => panic!("expected OffsetOutOfRange, got {other:?}"),
+    }
+
+    // Reading at the new earliest succeeds.
+    let recs = storage.read(&s, Offset(new_earliest), 100).await.unwrap();
+    assert!(!recs.is_empty());
+    assert_eq!(recs[0].offset.0, new_earliest);
 }

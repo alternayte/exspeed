@@ -94,6 +94,11 @@ mod memory_tests {
     }
 
     #[tokio::test]
+    async fn read_below_earliest_returns_out_of_range() {
+        trait_tests::test_read_below_earliest_returns_out_of_range(&MemoryStorage::new()).await;
+    }
+
+    #[tokio::test]
     async fn truncate_from_drops_later_records() {
         trait_tests::test_truncate_from_drops_later_records(&MemoryStorage::new()).await;
     }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use exspeed_common::{subject_matches, Metrics, Offset, StreamName};
-use exspeed_streams::StorageEngine;
+use exspeed_streams::{StorageEngine, StorageError};
 
 use crate::consumer_state::DeliveryRecord;
 use crate::work_coordinator::WorkCoordinator;
@@ -95,6 +95,17 @@ async fn run_ungrouped(
             .await
         {
             Ok(recs) => recs,
+            Err(StorageError::OffsetOutOfRange { requested, earliest }) => {
+                tracing::warn!(
+                    stream = %stream_name,
+                    consumer = %config.consumer_name,
+                    requested,
+                    earliest,
+                    "consumer is behind retention window; subscription ending — \
+                     client must re-seek to earliest or a chosen offset"
+                );
+                break;
+            }
             Err(_) => break,
         };
 
@@ -164,6 +175,17 @@ async fn run_grouped(
                 .await
             {
                 Ok(recs) => recs,
+                Err(StorageError::OffsetOutOfRange { requested, earliest }) => {
+                    tracing::warn!(
+                        stream = %stream_name,
+                        group = %group,
+                        consumer = %config.consumer_name,
+                        requested,
+                        earliest,
+                        "group consumer behind retention window; delivery task ending"
+                    );
+                    return;
+                }
                 Err(_) => {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     continue;

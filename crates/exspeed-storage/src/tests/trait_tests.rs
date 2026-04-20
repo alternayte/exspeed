@@ -214,8 +214,9 @@ pub async fn test_trim_up_to_drops_earlier_records(
     engine.trim_up_to(&s, Offset(5)).await.unwrap();
 
     if exact_retention {
-        // MemoryStorage trims exactly.
-        let records = engine.read(&s, Offset(0), 100).await.unwrap();
+        // MemoryStorage trims exactly. A read starting at the new earliest
+        // returns the surviving records.
+        let records = engine.read(&s, Offset(5), 100).await.unwrap();
         assert_eq!(records.len(), 5);
         assert_eq!(records.first().map(|r| r.offset), Some(Offset(5)));
         assert_eq!(records.last().map(|r| r.offset), Some(Offset(9)));
@@ -248,8 +249,14 @@ pub async fn test_trim_up_to_past_latest_still_advances(
     engine.trim_up_to(&s, Offset(100)).await.unwrap();
 
     if exact_retention {
-        let records = engine.read(&s, Offset(0), 100).await.unwrap();
-        assert!(records.is_empty());
+        // Reading from an offset that was trimmed is an error — consumers
+        // must not silently jump forward past lost data. Reading at `next`
+        // is legal (empty Ok) because tailing past the current head is
+        // normal subscription behavior.
+        let err = engine.read(&s, Offset(0), 100).await.unwrap_err();
+        assert!(matches!(err, StorageError::OffsetOutOfRange { .. }));
+        let at_next = engine.read(&s, Offset(10), 100).await.unwrap();
+        assert!(at_next.is_empty());
     }
     let (_, next) = engine.stream_bounds(&s).await.unwrap();
     assert_eq!(next, Offset(10));
@@ -258,6 +265,50 @@ pub async fn test_trim_up_to_past_latest_still_advances(
     // tracked independently of the retained-records set.
     let (next, _) = engine.append(&s, &record("events", b"tail")).await.unwrap();
     assert_eq!(next, Offset(10));
+}
+
+/// Reading from an offset below the earliest retained offset must surface an
+/// explicit `OffsetOutOfRange` error — it must not silently jump forward to
+/// the first surviving record. Silent skip hides data loss from lagging
+/// consumers; callers must opt in by explicitly re-seeking.
+///
+/// Only run this test on engines that trim exactly (MemoryStorage).
+/// FileStorage trims at segment granularity, so a single-segment stream after
+/// `trim_up_to(5)` may still have earliest == 0 and the test would be
+/// ambiguous. The FileStorage equivalent lives alongside the retention tests
+/// where we can force multiple sealed segments.
+pub async fn test_read_below_earliest_returns_out_of_range(
+    engine: &impl StorageEngine,
+) {
+    let s = stream("test-read-below-earliest");
+    engine.create_stream(&s, 0, 0).await.unwrap();
+    for i in 0u8..10 {
+        engine.append(&s, &record("events", &[i])).await.unwrap();
+    }
+    engine.trim_up_to(&s, Offset(5)).await.unwrap();
+
+    // Sanity: reading from the new earliest works.
+    let ok = engine.read(&s, Offset(5), 100).await.unwrap();
+    assert_eq!(ok.len(), 5);
+
+    // Reading below the new earliest must error, not silently skip.
+    let err = engine.read(&s, Offset(2), 100).await.unwrap_err();
+    match err {
+        StorageError::OffsetOutOfRange { requested, earliest } => {
+            assert_eq!(requested, 2);
+            assert_eq!(earliest, 5);
+        }
+        other => panic!("expected OffsetOutOfRange, got {other:?}"),
+    }
+
+    // Reading at the earliest boundary (==) is still OK.
+    let at_boundary = engine.read(&s, Offset(5), 1).await.unwrap();
+    assert_eq!(at_boundary.len(), 1);
+
+    // Reading past `next` returns an empty vec (consumer tailing a stream is
+    // normal — only trimmed-away history is an error).
+    let past_end = engine.read(&s, Offset(100), 1).await.unwrap();
+    assert!(past_end.is_empty());
 }
 
 /// `truncate_from(drop_from)` drops records at offsets `>= drop_from`. A
