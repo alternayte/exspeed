@@ -63,35 +63,46 @@ impl CredentialStore {
         env_token: Option<&str>,
     ) -> Result<Self, AuthError> {
         let mut by_hash: HashMap<[u8; 32], IdentityRef> = HashMap::new();
-        let mut names: HashMap<String, String> = HashMap::new(); // name → token_sha256 (for dup detection)
-        let mut hash_to_name: HashMap<[u8; 32], String> = HashMap::new(); // for dup-hash msg
+        let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut hash_to_name: HashMap<[u8; 32], String> = HashMap::new();
         let mut file_count = 0usize;
 
         if let Some(path) = from_file {
-            if !path.exists() {
-                return Err(AuthError::FileMissing(path.to_path_buf()));
-            }
-            let raw = std::fs::read_to_string(path)?;
+            // Open-once + match on NotFound rather than exists()+read: avoids a TOCTOU
+            // race where the file vanishes between the two calls and `?` surfaces the
+            // uglier FileIo(NotFound) instead of the intended FileMissing.
+            let raw = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(AuthError::FileMissing(path.to_path_buf()));
+                }
+                Err(e) => return Err(e.into()),
+            };
             let wire: WireFile = toml::from_str(&raw)?;
 
+            // Validation order: cheap syntactic checks → dup checks → expensive compile.
+            // Running dup checks before compile_credential means a double-pasted block
+            // produces the more actionable DuplicateName (not DuplicateTokenHash) and
+            // avoids wasted glob compilation on the error path.
             for wc in wire.credentials {
                 if wc.name == LEGACY_ADMIN_NAME && env_token.is_some() {
                     return Err(AuthError::LegacyAdminReserved);
                 }
-                let id = Arc::new(compile_credential(&wc)?);
+                validate_name_charset(&wc.name)?;
                 let digest = decode_hash(&wc.token_sha256, &wc.name)?;
 
+                if names.contains(&wc.name) {
+                    return Err(AuthError::DuplicateName(wc.name.clone()));
+                }
                 if let Some(other) = hash_to_name.get(&digest) {
                     return Err(AuthError::DuplicateTokenHash {
                         first: other.clone(),
                         second: wc.name.clone(),
                     });
                 }
-                if names.contains_key(&wc.name) {
-                    return Err(AuthError::DuplicateName(wc.name.clone()));
-                }
 
-                names.insert(wc.name.clone(), wc.token_sha256.clone());
+                let id = Arc::new(compile_credential(&wc)?);
+                names.insert(wc.name.clone());
                 hash_to_name.insert(digest, wc.name.clone());
                 by_hash.insert(digest, id);
                 file_count += 1;
@@ -141,11 +152,15 @@ impl CredentialStore {
     }
 }
 
-fn compile_credential(wc: &WireCredential) -> Result<Identity, AuthError> {
-    // Validate name charset.
-    if wc.name.is_empty() || !wc.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-        return Err(AuthError::InvalidName { name: wc.name.clone() });
+fn validate_name_charset(name: &str) -> Result<(), AuthError> {
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return Err(AuthError::InvalidName { name: name.to_string() });
     }
+    Ok(())
+}
+
+fn compile_credential(wc: &WireCredential) -> Result<Identity, AuthError> {
+    validate_name_charset(&wc.name)?;
 
     let mut permissions = Vec::with_capacity(wc.permissions.len());
     for wp in &wc.permissions {
