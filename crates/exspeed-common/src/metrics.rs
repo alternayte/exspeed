@@ -51,7 +51,6 @@ pub struct Metrics {
     pub subscription_queue_fill_ratio: Gauge<f64>,
 
     // -- dedup observability ------------------------------------------------
-
     /// Current number of live dedup entries per stream. Labeled by `stream`.
     pub dedup_map_entries: Gauge<i64>,
     /// Counts idempotent publish outcomes. Labeled by `stream` and `result`
@@ -72,7 +71,6 @@ pub struct Metrics {
     pub dedup_window_secs: Gauge<i64>,
 
     // -- auth observability --------------------------------------------------
-
     /// Counts every auth denial. Labeled by:
     /// - `reason`: `"unauthorized"` (no/invalid credential) | `"forbidden"`
     ///   (authenticated identity lacked the required permission).
