@@ -70,6 +70,16 @@ pub struct Metrics {
     pub dedup_rebuild_duration_seconds: Histogram<f64>,
     /// Configured dedup window in seconds per stream. Labeled by `stream`.
     pub dedup_window_secs: Gauge<i64>,
+
+    // -- auth observability --------------------------------------------------
+
+    /// Counts every auth denial. Labeled by:
+    /// - `reason`: `"unauthorized"` (no/invalid credential) | `"forbidden"`
+    ///   (authenticated identity lacked the required permission).
+    /// - `transport`: `"tcp"` | `"http"`.
+    /// - `op`: opcode name on TCP (e.g. `"Publish"`) or request path on HTTP
+    ///   (e.g. `"/api/v1/streams"`).
+    pub auth_denied_total: Counter<u64>,
 }
 
 impl Metrics {
@@ -177,6 +187,27 @@ impl Metrics {
             .with_description("Configured dedup window in seconds per stream")
             .build();
 
+        // -- auth instruments ------------------------------------------------
+
+        let auth_denied_total = meter
+            .u64_counter("exspeed_auth_denied_total")
+            .with_description(
+                "Auth denials. Labels: reason=unauthorized|forbidden, transport=tcp|http, op=<opcode or path>",
+            )
+            .build();
+
+        // Zero-initialize a representative label set so the descriptor is
+        // visible in /metrics before any denial fires. Operators alerting on
+        // `rate(exspeed_auth_denied_total[...]) > 0` want the series to exist.
+        auth_denied_total.add(
+            0,
+            &[
+                KeyValue::new("reason", "unauthorized"),
+                KeyValue::new("transport", "tcp"),
+                KeyValue::new("op", "__init__"),
+            ],
+        );
+
         // Keep the provider alive — dropping it shuts down the metrics pipeline.
         std::mem::forget(provider);
 
@@ -204,6 +235,7 @@ impl Metrics {
             dedup_snapshot_write_duration_seconds,
             dedup_rebuild_duration_seconds,
             dedup_window_secs,
+            auth_denied_total,
         };
 
         (metrics, registry)
@@ -404,5 +436,22 @@ impl Metrics {
     pub fn set_dedup_window_secs(&self, stream: &str, secs: i64) {
         self.dedup_window_secs
             .record(secs, &[KeyValue::new("stream", stream.to_owned())]);
+    }
+
+    // -- auth helpers --------------------------------------------------------
+
+    /// Increment `exspeed_auth_denied_total`. `reason` must be
+    /// `"unauthorized"` or `"forbidden"`; `transport` is `"tcp"` or `"http"`;
+    /// `op` is the opcode name (TCP) or request path (HTTP). Operator
+    /// dashboards depend on this label set — keep it stable.
+    pub fn auth_denied(&self, reason: &str, transport: &str, op: &str) {
+        self.auth_denied_total.add(
+            1,
+            &[
+                KeyValue::new("reason", reason.to_owned()),
+                KeyValue::new("transport", transport.to_owned()),
+                KeyValue::new("op", op.to_owned()),
+            ],
+        );
     }
 }
