@@ -52,6 +52,25 @@ fn now_nanos() -> u64 {
         .as_nanos() as u64
 }
 
+/// Pick a base_offset for a throw-away placeholder segment whose filename
+/// is guaranteed not to collide with any doomed segment or any file the
+/// truncate rewrite is about to create. We walk down from `u64::MAX` —
+/// real segments never reach that range.
+fn pick_placeholder_base(dir: &Path, doomed: &[(PathBuf, u64, bool)]) -> io::Result<u64> {
+    let mut candidate: u64 = u64::MAX;
+    loop {
+        let filename = format!("{:020}.seg", candidate);
+        let path = dir.join(&filename);
+        let collides = doomed.iter().any(|(p, _, _)| p == &path) || path.exists();
+        if !collides {
+            return Ok(candidate);
+        }
+        candidate = candidate
+            .checked_sub(1)
+            .ok_or_else(|| io::Error::other("no placeholder base_offset available"))?;
+    }
+}
+
 /// Emit a structured `error!` log for a partition write failure. Disk-full
 /// errors are highlighted separately so operators can alert on them.
 fn log_write_error(stream_name: &str, partition_id: u32, msg: &'static str, err: &io::Error) {
@@ -429,60 +448,178 @@ impl Partition {
         Ok(stats)
     }
 
-    /// Drop records at offsets `>= drop_from` at segment granularity.
+    /// Drop records at offsets `>= drop_from`. Record-exact truncation —
+    /// the partition is rewritten so that subsequent `stream_bounds`
+    /// returns `next == drop_from`, and the next `append` assigns exactly
+    /// `drop_from`.
     ///
-    /// Sealed segments whose `base_offset >= drop_from` are deleted. The
-    /// active segment is preserved when `drop_from` falls inside it; a
-    /// future iteration may rewrite the active segment to strip the tail.
-    /// After truncation, `next_offset` is lowered to the new high-water
-    /// mark so subsequent appends resume at the correct offset.
+    /// Algorithm:
+    ///   1. Classify the segment that straddles `drop_from` (the one whose
+    ///      records include offsets `< drop_from` AND `>= drop_from`), if any.
+    ///      It is either the last surviving sealed segment or the active
+    ///      segment.
+    ///   2. Read the surviving records (offset `< drop_from`) from the
+    ///      straddled segment into memory.
+    ///   3. Delete every segment whose records are entirely `>= drop_from`
+    ///      (sealed and the active segment if it falls past drop_from).
+    ///   4. Delete the straddled segment's file.
+    ///   5. Create a fresh active segment at the straddled segment's
+    ///      `base_offset` and replay the surviving records into it.
+    ///   6. Set `next_offset = drop_from` and truncate the WAL.
+    ///
+    /// Called only on the follower's divergent-history recovery path, so
+    /// the rewrite cost (bounded by `replication_lag`) is acceptable;
+    /// correctness over speed.
     pub fn truncate_from(&mut self, drop_from: u64) -> io::Result<RetentionStats> {
         let mut stats = RetentionStats::default();
         if drop_from >= self.next_offset {
             return Ok(stats);
         }
 
-        // Drop sealed segments whose base_offset >= drop_from.
-        let mut to_remove: Vec<usize> = Vec::new();
-        for (i, reader) in self.sealed_readers.iter().enumerate() {
-            if reader.base_offset() >= drop_from {
-                to_remove.push(i);
-            }
+        // ── Step 1: Classify segments. ────────────────────────────────────
+        //
+        // Sealed segments are ordered by base_offset. We split them into:
+        //   - kept:    entirely below drop_from (base < drop_from AND
+        //              last_offset < drop_from)
+        //   - straddle: contains drop_from (some records below, some at/past)
+        //   - gone:    base >= drop_from (entirely at or past drop_from)
+        //
+        // The active segment is either straddled, entirely gone, or entirely
+        // below drop_from (which can't happen here because drop_from <
+        // next_offset, and the active always contains next_offset - 1 when
+        // the stream has records).
+
+        enum StraddleSegment {
+            Sealed(usize, PathBuf, u64), // (index in sealed_readers, path, base_offset)
+            Active(PathBuf, u64),         // (path, base_offset)
+            None,                          // no straddle (e.g. drop_from == 0)
         }
-        for &i in to_remove.iter().rev() {
-            let reader = self.sealed_readers.remove(i);
-            let seg_path = reader.path().to_path_buf();
-            let size = reader.file_size();
-            let _ = fs::remove_file(&seg_path);
-            let _ = fs::remove_file(seg_path.with_extension("idx"));
-            let _ = fs::remove_file(seg_path.with_extension("tix"));
-            stats.segments_deleted += 1;
+
+        let active_base = self.active_writer.base_offset();
+        let active_path = self.active_writer.path().to_path_buf();
+
+        let straddle = if drop_from == 0 {
+            StraddleSegment::None
+        } else if active_base < drop_from {
+            // drop_from - 1 is at or past active_base → active is the straddle.
+            StraddleSegment::Active(active_path.clone(), active_base)
+        } else {
+            // drop_from - 1 is in some sealed segment. Find the last sealed
+            // segment whose base_offset < drop_from.
+            match self
+                .sealed_readers
+                .iter()
+                .rposition(|r| r.base_offset() < drop_from)
+            {
+                Some(i) => {
+                    let r = &self.sealed_readers[i];
+                    StraddleSegment::Sealed(i, r.path().to_path_buf(), r.base_offset())
+                }
+                None => StraddleSegment::None,
+            }
+        };
+
+        // ── Step 2: Read surviving records from the straddle. ─────────────
+        //
+        // Do this BEFORE any deletion so a read error leaves the partition
+        // intact.
+        let (replay_records, replay_base_offset): (Vec<StoredRecord>, u64) = match &straddle {
+            StraddleSegment::None => (Vec::new(), drop_from),
+            StraddleSegment::Sealed(_i, path, base) => {
+                let reader = SegmentReader::open(path)?;
+                let records: Vec<StoredRecord> = reader
+                    .read_all()?
+                    .into_iter()
+                    .filter(|r| r.offset.0 < drop_from)
+                    .collect();
+                (records, *base)
+            }
+            StraddleSegment::Active(_path, base) => {
+                self.active_writer.sync()?;
+                let reader = SegmentReader::open(&active_path)?;
+                let records: Vec<StoredRecord> = reader
+                    .read_all()?
+                    .into_iter()
+                    .filter(|r| r.offset.0 < drop_from)
+                    .collect();
+                (records, *base)
+            }
+        };
+
+        // ── Step 3: Determine what to delete. ─────────────────────────────
+        //
+        // We'll delete the straddle (if any) + all sealed segments strictly
+        // past the straddle + the old active segment (whether or not it's
+        // the straddle). Kept sealed segments stay untouched.
+
+        let kept_sealed_count = match &straddle {
+            StraddleSegment::Sealed(i, _, _) => *i, // sealed below the straddle
+            StraddleSegment::Active(_, _) => self.sealed_readers.len(),
+            StraddleSegment::None => {
+                // drop_from is 0 or earlier than every sealed segment.
+                // Keep nothing.
+                0
+            }
+        };
+
+        // Paths of segments to delete, gathered from:
+        //   a) sealed segments at index >= kept_sealed_count (straddle + past)
+        //   b) the active segment
+        let mut doomed_paths: Vec<(PathBuf, u64, bool)> = Vec::new();
+        //   ^ (path, size, counts_as_sealed_for_stats)
+        while self.sealed_readers.len() > kept_sealed_count {
+            let reader = self.sealed_readers.pop().unwrap();
+            doomed_paths.push((reader.path().to_path_buf(), reader.file_size(), true));
+        }
+        // The active segment is always replaced. If it's the straddle,
+        // we've already captured its surviving records; if not, it's
+        // entirely past drop_from and has nothing to replay.
+        doomed_paths.push((active_path.clone(), self.active_writer.bytes_written(), false));
+
+        // ── Step 4: Close and delete doomed segments. ─────────────────────
+        //
+        // Close the active writer first by replacing it with a placeholder.
+        // The placeholder lives at a base_offset guaranteed not to collide
+        // with any retained or new segment.
+        let placeholder_base = pick_placeholder_base(&self.dir, &doomed_paths)?;
+        let placeholder = SegmentWriter::create(&self.dir, placeholder_base)?;
+        let placeholder_path = placeholder.path().to_path_buf();
+        drop(std::mem::replace(&mut self.active_writer, placeholder));
+
+        for (path, size, counts_sealed) in &doomed_paths {
+            let _ = fs::remove_file(path);
+            let _ = fs::remove_file(path.with_extension("idx"));
+            let _ = fs::remove_file(path.with_extension("tix"));
+            if *counts_sealed {
+                stats.segments_deleted += 1;
+            }
             stats.bytes_reclaimed += size;
         }
 
-        // Recompute next_offset from the remaining segments.
-        let mut new_next: u64 = 0;
-        for reader in &self.sealed_readers {
-            if let Some(last) = reader.last_offset()? {
-                new_next = new_next.max(last + 1);
-            }
-        }
-        // If the active segment survives and it contains records at or past
-        // `drop_from`, sub-segment truncation would require a rewrite. For
-        // the trait contract we accept this as best-effort: leave the active
-        // segment alone unless its base_offset is past drop_from, in which
-        // case it's a fresh empty segment the next append will reuse.
-        if self.active_writer.base_offset() >= drop_from {
-            // Segment created but no records written: reset next_offset to
-            // drop_from.
-            new_next = drop_from;
-        } else if let Some(last) = SegmentReader::open(self.active_writer.path())?.last_offset()? {
-            new_next = new_next.max(last + 1);
-        }
+        // ── Step 5: Build the new active segment and replay. ──────────────
+        let new_active = SegmentWriter::create(&self.dir, replay_base_offset)?;
+        drop(std::mem::replace(&mut self.active_writer, new_active));
+        // Remove the placeholder now that the real writer owns a different file.
+        let _ = fs::remove_file(&placeholder_path);
+        let _ = fs::remove_file(placeholder_path.with_extension("idx"));
+        let _ = fs::remove_file(placeholder_path.with_extension("tix"));
 
-        self.next_offset = new_next.max(drop_from.min(self.next_offset));
-        // Truncate WAL — its contents may reference offsets we just deleted.
+        for stored in &replay_records {
+            let record = Record {
+                key: stored.key.clone(),
+                value: stored.value.clone(),
+                subject: stored.subject.clone(),
+                headers: stored.headers.clone(),
+            };
+            self.active_writer
+                .append(stored.offset, stored.timestamp, &record)?;
+        }
+        self.active_writer.sync()?;
+
+        // ── Step 6: Update next_offset + truncate WAL. ────────────────────
+        self.next_offset = drop_from;
         self.wal.truncate()?;
+
         Ok(stats)
     }
 

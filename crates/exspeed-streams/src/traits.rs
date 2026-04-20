@@ -46,6 +46,11 @@ pub trait StorageEngine: Send + Sync {
     /// Return `(earliest, next)` for a stream — the offset of the first
     /// retained record and the offset the NEXT append will write to.
     /// `earliest == next` means the stream is empty.
+    ///
+    /// Implementations return the tightest available view: local storage
+    /// first, falling back to a remote/tiered manifest when the backend
+    /// has one. No backend returns `(0, 0)` for a stream it knows nothing
+    /// about — that case is always `StorageError::StreamNotFound`.
     async fn stream_bounds(
         &self,
         stream: &StreamName,
@@ -56,10 +61,13 @@ pub trait StorageEngine: Send + Sync {
     /// divergent-history recovery path — after a leader failover the
     /// follower may have records that the new leader's log does not
     /// contain. This method removes those records and makes `drop_from`
-    /// the new `next` offset for the stream. A `drop_from` at or past the
-    /// current `next` offset is a no-op. Implementations SHOULD be
-    /// segment-aware where possible but MAY be best-effort at segment
-    /// boundaries.
+    /// the new `next` offset for the stream.
+    ///
+    /// Contract: records at offsets `>= drop_from` are dropped; records
+    /// at offsets `< drop_from` are preserved. After a successful call,
+    /// `stream_bounds` returns `next == drop_from`, and the next
+    /// `append` on this stream assigns exactly `drop_from`. A `drop_from`
+    /// at or past the current `next` offset is a no-op.
     async fn truncate_from(
         &self,
         stream: &StreamName,
