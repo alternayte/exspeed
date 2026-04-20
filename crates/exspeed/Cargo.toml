@@ -46,6 +46,7 @@ uuid = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 sha2 = "0.10"
+rand = "0.8"
 
 [dev-dependencies]
 portpicker = "0.1"

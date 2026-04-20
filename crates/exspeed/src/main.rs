@@ -95,5 +95,6 @@ async fn main() -> anyhow::Result<()> {
         cli::Command::View { name } => cli::view::get(&client, &name, json).await,
         cli::Command::Connectors => cli::stream::list_connectors(&client, json).await,
         cli::Command::Snapshot(a) => cli::snapshot::run(a).await,
+        cli::Command::Auth { cmd } => cli::auth::run(cmd, &client).await,
     }
 }

@@ -20,7 +20,6 @@ use tokio_util::sync::CancellationToken;
 
 use exspeed_protocol::codec::ExspeedCodec;
 use exspeed_protocol::frame::Frame;
-use exspeed_protocol::messages::ServerMessage;
 use exspeed_protocol::messages::ack::{AckRequest, NackRequest};
 use exspeed_protocol::messages::connect::{AuthType, ConnectRequest};
 use exspeed_protocol::messages::consumer::{CreateConsumerRequest, StartFrom, SubscribeRequest};
@@ -28,6 +27,7 @@ use exspeed_protocol::messages::fetch::FetchRequest;
 use exspeed_protocol::messages::publish::PublishRequest;
 use exspeed_protocol::messages::seek::SeekRequest;
 use exspeed_protocol::messages::stream_mgmt::CreateStreamRequest;
+use exspeed_protocol::messages::ServerMessage;
 use exspeed_protocol::opcodes::OpCode;
 
 // ---------------------------------------------------------------------------
@@ -1098,4 +1098,125 @@ permissions = [{{ streams = "*", actions = ["manage"] }}]
         AuthError::UnknownAction { action, .. } => assert_eq!(action, "manage"),
         other => panic!("expected UnknownAction, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// `exspeed auth` CLI subcommand tests (Task 7).
+//
+// These spawn the `exspeed` binary via `CARGO_BIN_EXE_exspeed` — cargo
+// rebuilds the binary on demand so the tests always run against the
+// just-compiled code.
+// ---------------------------------------------------------------------------
+
+// 26 ------------------------------------------------------------------------
+#[test]
+fn exspeed_auth_hash_from_stdin_matches_sha256_reference() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_exspeed"))
+        .args(["auth", "hash"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(b"hello").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "auth hash failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // Known SHA-256 of "hello".
+    assert_eq!(
+        stdout.trim(),
+        "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+    );
+}
+
+// 27 ------------------------------------------------------------------------
+#[test]
+fn exspeed_auth_gen_token_outputs_64_hex_and_matching_hash() {
+    use std::process::Command;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_exspeed"))
+        .args(["auth", "gen-token"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "auth gen-token failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let token = String::from_utf8(output.stdout).unwrap().trim().to_string();
+    // stderr may carry unrelated tracing log lines (e.g. when
+    // EXSPEED_INSECURE_SKIP_VERIFY is set). Only the last non-empty line
+    // is the hash we emit.
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let hash = stderr
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .last()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    assert_eq!(token.len(), 64, "token should be 64 hex chars: {token}");
+    assert!(
+        token.chars().all(|c| c.is_ascii_hexdigit()),
+        "token should be hex: {token}"
+    );
+    let expected = exspeed_common::auth::sha256_hex(token.as_bytes());
+    assert_eq!(hash, expected, "stderr hash should be sha256(token)");
+}
+
+// 28 ------------------------------------------------------------------------
+#[test]
+fn exspeed_auth_lint_on_valid_file_exits_0() {
+    use std::process::Command;
+
+    let file = write_creds(&format!(
+        r#"[[credentials]]
+name = "a"
+token_sha256 = "{}"
+permissions = [{{ streams = "*", actions = ["admin"] }}]
+"#,
+        sha256_hex("t")
+    ));
+    let status = Command::new(env!("CARGO_BIN_EXE_exspeed"))
+        .args(["auth", "lint"])
+        .arg(file.path())
+        .status()
+        .unwrap();
+    assert!(status.success(), "auth lint on valid file should exit 0");
+}
+
+// 29 ------------------------------------------------------------------------
+#[test]
+fn exspeed_auth_lint_on_duplicate_name_exits_nonzero() {
+    use std::process::Command;
+
+    let file = write_creds(&format!(
+        r#"[[credentials]]
+name = "dup"
+token_sha256 = "{}"
+
+[[credentials]]
+name = "dup"
+token_sha256 = "{}"
+"#,
+        sha256_hex("a"),
+        sha256_hex("b"),
+    ));
+    let status = Command::new(env!("CARGO_BIN_EXE_exspeed"))
+        .args(["auth", "lint"])
+        .arg(file.path())
+        .status()
+        .unwrap();
+    assert!(
+        !status.success(),
+        "auth lint on duplicate-name file should exit non-zero"
+    );
 }
