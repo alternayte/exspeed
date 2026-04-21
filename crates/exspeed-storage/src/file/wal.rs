@@ -76,6 +76,41 @@ impl WalWriter {
         Ok(())
     }
 
+    /// Append N records in a single `write_all`. Performs `sync_data` once at
+    /// the end IFF `sync_now` is true. Used by:
+    /// - The `WalAppender` group-commit path (sync_now = true) — durable mode.
+    /// - The async-sync path (sync_now = false) — fsync handled by `WalSyncer`.
+    ///
+    /// On error, no caller's record is guaranteed persisted; the file may
+    /// contain a partial batch. Replay tolerates partial WAL trailers (existing
+    /// behavior of `replay_wal`).
+    pub fn append_batch(
+        &mut self,
+        records: &[(String, u32, Offset, u64, Record)],
+        sync_now: bool,
+    ) -> io::Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        // Build one big buffer with all framed records, then write once.
+        let mut combined: Vec<u8> = Vec::new();
+        for (stream, partition, offset, timestamp, record) in records {
+            let stream_bytes = stream.as_bytes();
+            let mut payload = Vec::new();
+            payload.put_u16_le(stream_bytes.len() as u16);
+            payload.put_slice(stream_bytes);
+            payload.put_u32_le(*partition);
+            encode_record(*offset, *timestamp, record, &mut payload);
+            let framed = wrap_with_crc(&payload);
+            combined.extend_from_slice(&framed);
+        }
+        self.file.write_all(&combined)?;
+        if sync_now {
+            self.file.sync_data()?;
+        }
+        Ok(())
+    }
+
     /// Truncate the WAL to zero bytes and seek back to the start.
     pub fn truncate(&mut self) -> io::Result<()> {
         self.file.set_len(0)?;
@@ -323,5 +358,58 @@ mod tests {
         let records = replay_wal(&wal_path).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].record.value, Bytes::from_static(b"good"));
+    }
+
+    #[test]
+    fn append_batch_writes_all_records_with_one_sync() {
+        use tempfile::tempdir;
+        let tmp = tempdir().unwrap();
+        let mut wal = WalWriter::open(&tmp.path().join("wal.log")).unwrap();
+        let rec = Record {
+            subject: "s".into(),
+            key: None,
+            value: Bytes::from_static(b"v"),
+            headers: vec![],
+            timestamp_ns: None,
+        };
+        let entries: Vec<_> = (0..5)
+            .map(|i| ("stream".to_string(), 0u32, Offset(i), 1000 + i, rec.clone()))
+            .collect();
+        wal.append_batch(&entries, /*sync_now=*/ true).unwrap();
+        drop(wal);
+
+        // Replay must yield 5 records in order.
+        let replayed = replay_wal(&tmp.path().join("wal.log")).unwrap();
+        assert_eq!(replayed.len(), 5);
+        for (i, r) in replayed.iter().enumerate() {
+            assert_eq!(r.offset, Offset(i as u64));
+            assert_eq!(r.timestamp, 1000 + i as u64);
+            assert_eq!(r.stream, "stream");
+            assert_eq!(r.partition, 0);
+        }
+    }
+
+    #[test]
+    fn append_batch_without_sync_is_persisted_after_drop() {
+        use tempfile::tempdir;
+        let tmp = tempdir().unwrap();
+        let mut wal = WalWriter::open(&tmp.path().join("wal.log")).unwrap();
+        let rec = Record {
+            subject: "s".into(),
+            key: None,
+            value: Bytes::from_static(b"v"),
+            headers: vec![],
+            timestamp_ns: None,
+        };
+        let entries: Vec<_> = (0..3)
+            .map(|i| ("stream".to_string(), 0u32, Offset(i), 1000 + i, rec.clone()))
+            .collect();
+        // sync_now = false: caller is responsible for calling sync_data later
+        // (e.g. via WalSyncer task in Wave 2). Drop calls sync_all, so post-drop
+        // replay should still see all records.
+        wal.append_batch(&entries, /*sync_now=*/ false).unwrap();
+        drop(wal); // Drop's sync_all flushes
+        let replayed = replay_wal(&tmp.path().join("wal.log")).unwrap();
+        assert_eq!(replayed.len(), 3);
     }
 }
