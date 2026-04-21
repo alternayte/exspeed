@@ -16,6 +16,7 @@ pub enum OpCode {
     Fetch = 0x07,
     Seek = 0x08,
     RebalanceAck = 0x09,
+    PublishBatch = 0x0A,
     CreateStream = 0x10,
     DeleteStream = 0x11,
     StreamInfo = 0x12,
@@ -41,6 +42,7 @@ pub enum OpCode {
     Drain = 0x87,
     PublishOk = 0x88,
     ConnectOk = 0x89,
+    PublishBatchOk = 0x8A,
 
     // Cluster / replication — Leader -> Follower (0xA0-0xAF)
     ClusterManifest = 0xA0,
@@ -67,6 +69,7 @@ impl OpCode {
                 | OpCode::Fetch
                 | OpCode::Seek
                 | OpCode::RebalanceAck
+                | OpCode::PublishBatch
                 | OpCode::CreateStream
                 | OpCode::DeleteStream
                 | OpCode::StreamInfo
@@ -93,6 +96,7 @@ impl OpCode {
                 | OpCode::Drain
                 | OpCode::PublishOk
                 | OpCode::ConnectOk
+                | OpCode::PublishBatchOk
                 | OpCode::Pong
                 | OpCode::ReplicationHeartbeat
                 | OpCode::ClusterManifest
@@ -124,6 +128,7 @@ impl TryFrom<u8> for OpCode {
             0x07 => Ok(OpCode::Fetch),
             0x08 => Ok(OpCode::Seek),
             0x09 => Ok(OpCode::RebalanceAck),
+            0x0A => Ok(OpCode::PublishBatch),
             0x10 => Ok(OpCode::CreateStream),
             0x11 => Ok(OpCode::DeleteStream),
             0x12 => Ok(OpCode::StreamInfo),
@@ -144,6 +149,7 @@ impl TryFrom<u8> for OpCode {
             0x87 => Ok(OpCode::Drain),
             0x88 => Ok(OpCode::PublishOk),
             0x89 => Ok(OpCode::ConnectOk),
+            0x8A => Ok(OpCode::PublishBatchOk),
             0xA0 => Ok(OpCode::ClusterManifest),
             0xA1 => Ok(OpCode::RecordsAppended),
             0xA2 => Ok(OpCode::StreamCreatedEvent),

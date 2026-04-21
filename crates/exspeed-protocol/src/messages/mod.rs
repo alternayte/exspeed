@@ -4,6 +4,7 @@ pub mod consumer;
 pub mod fetch;
 pub mod ping;
 pub mod publish;
+pub mod publish_batch;
 pub mod record_delivery;
 pub mod records_batch;
 pub mod replicate;
