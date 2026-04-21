@@ -6,7 +6,7 @@ mod trait_tests;
 mod segment_appender_tests;
 
 #[cfg(test)]
-mod wal_syncer_tests;
+mod segment_syncer_tests;
 
 mod memory_tests {
     use super::trait_tests;

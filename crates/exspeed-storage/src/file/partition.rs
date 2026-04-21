@@ -3,6 +3,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
@@ -15,6 +16,7 @@ use crate::file::io_errors::is_storage_full;
 
 use crate::file::offset_index::OffsetIndex;
 use crate::file::segment_reader::SegmentReader;
+use crate::file::segment_syncer::SegmentSyncerHandle;
 use crate::file::segment_writer::SegmentWriter;
 use crate::file::time_index::{self, TimeIndex};
 
@@ -114,6 +116,13 @@ pub struct Partition {
     partition_id: u32,
     segment_max_bytes: u64,
     seal_tx: Option<mpsc::UnboundedSender<SealedSegmentInfo>>,
+    /// Handle to the per-partition `SegmentSyncer` task in async mode.
+    /// Present only when `FileStorage` is configured with
+    /// `StorageSyncMode::Async`. On segment roll, `roll_segment` uses this
+    /// to swap the syncer's fsync target to the newly created active
+    /// segment so periodic fsync follows the active segment instead of
+    /// fsyncing a sealed (unchanging) file.
+    syncer_handle: Option<Arc<SegmentSyncerHandle>>,
 }
 
 impl Partition {
@@ -135,6 +144,7 @@ impl Partition {
             partition_id,
             segment_max_bytes: DEFAULT_SEGMENT_MAX_BYTES,
             seal_tx: None,
+            syncer_handle: None,
         })
     }
 
@@ -229,6 +239,7 @@ impl Partition {
             partition_id,
             segment_max_bytes: DEFAULT_SEGMENT_MAX_BYTES,
             seal_tx: None,
+            syncer_handle: None,
         })
     }
 
@@ -699,6 +710,14 @@ impl Partition {
         self.active_writer.try_clone_file()
     }
 
+    /// Register the `SegmentSyncer` handle for this partition so that
+    /// `roll_segment` can swap the syncer's fsync target when a segment
+    /// rolls. Called once at construction (in async mode) from
+    /// `FileStorage`; in sync mode the handle remains `None`.
+    pub(crate) fn set_syncer_handle(&mut self, handle: Arc<SegmentSyncerHandle>) {
+        self.syncer_handle = Some(handle);
+    }
+
     /// Force a `sync_data` on the active segment. Called by `SegmentSyncer`
     /// in async mode as a last-resort direct sync, and whenever a caller
     /// needs to commit the current batch without waiting for the next timer
@@ -737,6 +756,15 @@ impl Partition {
 
         // Create a new segment.
         self.active_writer = SegmentWriter::create(&self.dir, self.next_offset)?;
+
+        // If an async-mode syncer is attached, hand it a clone of the new
+        // active segment's file handle. Without this the syncer would keep
+        // fsyncing the now-sealed (unchanging) segment instead of the new
+        // active one.
+        if let Some(handle) = &self.syncer_handle {
+            let new_file = self.active_writer.try_clone_file()?;
+            handle.set_active_file(new_file);
+        }
 
         // Send sealed-segment notification (non-blocking, best-effort).
         if let Some(ref tx) = self.seal_tx {
