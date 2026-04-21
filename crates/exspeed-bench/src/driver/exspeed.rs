@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use bytes::{Buf, Bytes, BytesMut};
+use futures_util::stream::FuturesUnordered;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -145,10 +146,10 @@ pub struct ProducerStats {
     pub wall_secs: f64,
 }
 
-/// Spawn `tasks` producer loops all sharing one coalescing Publisher. Each loop
-/// calls publish().await sequentially; with `tasks` concurrent callers on the
-/// same Publisher the flusher sees `tasks`-wide batches, so throughput scales
-/// with parallelism without any manual FuturesUnordered bookkeeping.
+/// Spawn `tasks` producer loops all sharing one coalescing Publisher. Each task
+/// keeps `in_flight_per_task` publishes in-flight simultaneously via
+/// FuturesUnordered, giving the Publisher's flusher `tasks × in_flight_per_task`
+/// concurrent enqueues and enabling fat-batch coalescing.
 /// `origin` is the shared start instant for publish_us headers so the consumer
 /// can compute deltas with `now.duration_since(origin)`.
 pub async fn run_producer(
@@ -166,48 +167,67 @@ pub async fn run_producer(
     let stream = stream.to_owned();
     let start = Instant::now();
 
-    // One shared Publisher — all task loops coalesce into the same flusher.
+    // Shared Publisher across all tasks: coalesces cross-task concurrent publishes.
     let publisher = PublisherBuilder::new(addr)
-        .max_batch_records(256)
+        .max_batch_records(512)
         .batch_window(Duration::from_micros(100))
+        .max_in_flight(8192) // enough for tasks × in_flight_per_task
         .build()
         .await?;
 
+    let in_flight_per_task: usize = 64;
     let mut handles = Vec::with_capacity(tasks);
 
     for _ in 0..tasks {
+        let publisher = publisher.clone();
         let stream = stream.clone();
         let payload = payload.clone();
         let shared_count = shared_count.clone();
-        let publisher = publisher.clone();
         handles.push(tokio::spawn(async move {
             let deadline = Instant::now() + duration;
             let mut local: u64 = 0;
+            let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+
             while Instant::now() < deadline {
-                let us = origin.elapsed().as_micros() as u64;
-                let req = exspeed_protocol::messages::publish::PublishRequest {
-                    stream: stream.clone(),
-                    subject: "bench".into(),
-                    key: None,
-                    msg_id: None,
-                    value: payload.clone(),
-                    headers: vec![(PUBLISH_TS_HEADER.to_owned(), format!("{us}"))],
-                };
-                let _ = publisher.publish(req).await;
+                // Top up in-flight window.
+                while in_flight.len() < in_flight_per_task && Instant::now() < deadline {
+                    let us = origin.elapsed().as_micros() as u64;
+                    let req = exspeed_protocol::messages::publish::PublishRequest {
+                        stream: stream.clone(),
+                        subject: "bench".into(),
+                        key: None,
+                        msg_id: None,
+                        value: payload.clone(),
+                        headers: vec![(PUBLISH_TS_HEADER.to_owned(), format!("{us}"))],
+                    };
+                    in_flight.push(publisher.publish(req));
+                }
+                // Drain one completion before topping up again.
+                if let Some(_result) = in_flight.next().await {
+                    local += 1;
+                    if local.is_multiple_of(256) {
+                        shared_count.fetch_add(256, Ordering::Relaxed);
+                    }
+                }
+            }
+
+            // Drain remaining in-flight.
+            while let Some(_result) = in_flight.next().await {
                 local += 1;
                 if local.is_multiple_of(256) {
                     shared_count.fetch_add(256, Ordering::Relaxed);
                 }
             }
             shared_count.fetch_add(local % 256, Ordering::Relaxed);
+
             Ok::<u64, anyhow::Error>(local)
         }));
     }
 
     let mut total: u64 = 0;
     for h in handles { total += h.await??; }
-    // Flush + close the shared publisher once all tasks are done.
     publisher.close().await.ok();
+
     Ok(ProducerStats {
         messages: total,
         bytes: total * payload_bytes as u64,
