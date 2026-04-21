@@ -162,6 +162,90 @@ impl SegmentWriter {
         &self.path
     }
 
+    /// Scan an existing segment file from `SEGMENT_HEADER_SIZE` forward,
+    /// validating each CRC-framed record. Stops at the first torn or corrupt
+    /// frame and truncates the file to the last known-good boundary.
+    ///
+    /// Returns `(max_offset_seen, max_timestamp_seen, final_file_size)`. If
+    /// the segment contains no records (empty past the header), both max
+    /// values are `None` and `final_file_size` is `SEGMENT_HEADER_SIZE`.
+    ///
+    /// Used by `Partition::open` as the unified recovery primitive. Replaces
+    /// the separate WAL replay path.
+    pub fn recover_tail(path: &Path) -> io::Result<(Option<u64>, Option<u64>, u64)> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        let total_size = file.metadata()?.len();
+
+        if total_size <= SEGMENT_HEADER_SIZE as u64 {
+            return Ok((None, None, SEGMENT_HEADER_SIZE as u64));
+        }
+
+        file.seek(SeekFrom::Start(SEGMENT_HEADER_SIZE as u64))?;
+
+        let mut max_offset: Option<u64> = None;
+        let mut max_timestamp: Option<u64> = None;
+        let mut last_good_pos: u64 = SEGMENT_HEADER_SIZE as u64;
+
+        loop {
+            let pos = file.stream_position()?;
+            if pos >= total_size {
+                break;
+            }
+
+            // Read length prefix (u32 LE).
+            let remaining = total_size - pos;
+            if remaining < 4 {
+                // Torn: partial length prefix.
+                break;
+            }
+            let mut len_buf = [0u8; 4];
+            file.read_exact(&mut len_buf)?;
+            let frame_len = u32::from_le_bytes(len_buf) as u64;
+
+            // frame_len includes the 4-byte CRC + payload. We already read the length prefix.
+            let after_len = pos + 4;
+            if total_size - after_len < frame_len {
+                // Torn: payload truncated.
+                break;
+            }
+
+            // Read CRC (u32 LE) + payload.
+            let payload_len = frame_len - 4;
+            let mut crc_buf = [0u8; 4];
+            file.read_exact(&mut crc_buf)?;
+            let stored_crc = u32::from_le_bytes(crc_buf);
+
+            let mut payload = vec![0u8; payload_len as usize];
+            file.read_exact(&mut payload)?;
+
+            let computed_crc = crc32c::crc32c(&payload);
+            if computed_crc != stored_crc {
+                // Corrupt: CRC mismatch. Treat as end of valid data.
+                break;
+            }
+
+            // Payload is: offset(u64 LE) + timestamp(u64 LE) + encoded_record_bytes
+            if payload_len < 16 {
+                // Malformed: too short to contain offset + timestamp.
+                break;
+            }
+            let offset = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+            let timestamp = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+
+            max_offset = Some(max_offset.map_or(offset, |m| m.max(offset)));
+            max_timestamp = Some(max_timestamp.map_or(timestamp, |m| m.max(timestamp)));
+            last_good_pos = pos + 4 + frame_len; // advance past this whole frame
+        }
+
+        // Truncate any torn/corrupt tail past the last good frame.
+        if last_good_pos < total_size {
+            file.set_len(last_good_pos)?;
+        }
+        Ok((max_offset, max_timestamp, last_good_pos))
+    }
+
     // ── Private helpers ──────────────────────────────────────────────────────
 
     fn build_header(base_offset: u64) -> [u8; SEGMENT_HEADER_SIZE] {
@@ -384,6 +468,114 @@ mod tests {
             on_disk_len,
             writer.bytes_written(),
         );
+    }
+
+    #[test]
+    fn recover_tail_on_empty_segment_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _writer = SegmentWriter::create(tmp.path(), 0).unwrap();
+        let seg_path = tmp.path().join("00000000000000000000.seg");
+        let (max_offset, max_ts, _file_size) = SegmentWriter::recover_tail(&seg_path).unwrap();
+        assert_eq!(max_offset, None);
+        assert_eq!(max_ts, None);
+    }
+
+    #[test]
+    fn recover_tail_walks_valid_records() {
+        use bytes::Bytes;
+        use exspeed_streams::record::Record;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut writer = SegmentWriter::create(tmp.path(), 0).unwrap();
+        let rec = Record {
+            subject: "s".into(), key: None, value: Bytes::from_static(b"v"),
+            headers: vec![], timestamp_ns: None,
+        };
+        for i in 0..10 {
+            writer.append(Offset(i), 2000 + i, &rec).unwrap();
+        }
+        writer.sync_data().unwrap();
+        drop(writer);
+
+        let seg_path = tmp.path().join("00000000000000000000.seg");
+        let (max_offset, max_ts, _size) = SegmentWriter::recover_tail(&seg_path).unwrap();
+        assert_eq!(max_offset, Some(9));
+        assert_eq!(max_ts, Some(2009));
+    }
+
+    #[test]
+    fn recover_tail_truncates_trailing_partial_length() {
+        use bytes::Bytes;
+        use exspeed_streams::record::Record;
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut writer = SegmentWriter::create(tmp.path(), 0).unwrap();
+        let rec = Record {
+            subject: "s".into(), key: None, value: Bytes::from_static(b"v"),
+            headers: vec![], timestamp_ns: None,
+        };
+        for i in 0..5 {
+            writer.append(Offset(i), 3000 + i, &rec).unwrap();
+        }
+        writer.sync_data().unwrap();
+        drop(writer);
+
+        // Append 2 garbage bytes (incomplete length prefix).
+        let seg_path = tmp.path().join("00000000000000000000.seg");
+        let size_before = std::fs::metadata(&seg_path).unwrap().len();
+        let mut f = OpenOptions::new().append(true).open(&seg_path).unwrap();
+        f.write_all(&[0xFF, 0xFF]).unwrap();
+        drop(f);
+
+        let (max_offset, _ts, size_after) = SegmentWriter::recover_tail(&seg_path).unwrap();
+        assert_eq!(max_offset, Some(4));
+        assert_eq!(size_after, size_before, "file truncated back to last valid record");
+        assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), size_before);
+    }
+
+    #[test]
+    fn recover_tail_truncates_bad_crc_mid_record() {
+        use bytes::Bytes;
+        use exspeed_streams::record::Record;
+        use std::fs::OpenOptions;
+        use std::io::{Seek, SeekFrom, Write, Read};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut writer = SegmentWriter::create(tmp.path(), 0).unwrap();
+        let rec = Record {
+            subject: "s".into(), key: None, value: Bytes::from_static(b"v"),
+            headers: vec![], timestamp_ns: None,
+        };
+        for i in 0..3 {
+            writer.append(Offset(i), 4000 + i, &rec).unwrap();
+        }
+        writer.sync_data().unwrap();
+        let good_size = writer.bytes_written();
+        drop(writer);
+
+        // Append a record whose body we then corrupt.
+        let mut writer = SegmentWriter::open_append(
+            &tmp.path().join("00000000000000000000.seg"),
+            0,
+            good_size,
+        ).unwrap();
+        writer.append(Offset(3), 4003, &rec).unwrap();
+        writer.sync_data().unwrap();
+        drop(writer);
+
+        // Flip the last payload byte to break the CRC.
+        let seg_path = tmp.path().join("00000000000000000000.seg");
+        {
+            let mut f = OpenOptions::new().read(true).write(true).open(&seg_path).unwrap();
+            f.seek(SeekFrom::End(-1)).unwrap();
+            let mut byte = [0u8; 1];
+            f.read_exact(&mut byte).unwrap();
+            f.seek(SeekFrom::End(-1)).unwrap();
+            f.write_all(&[byte[0] ^ 0x01]).unwrap();
+        }
+
+        let (max_offset, _ts, size_after) = SegmentWriter::recover_tail(&seg_path).unwrap();
+        assert_eq!(max_offset, Some(2), "CRC-failed record discarded, only 0..3 valid");
+        assert_eq!(size_after, good_size as u64, "file truncated to pre-corruption length");
     }
 
     #[test]
