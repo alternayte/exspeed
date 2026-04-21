@@ -78,3 +78,26 @@ async fn concurrent_appends_complete_faster_than_n_serial_fsyncs() {
         "100 concurrent appends took {elapsed:?}, expected < 500ms (group commit working)"
     );
 }
+
+#[tokio::test]
+async fn explicit_batch_through_appender_handle() {
+    let tmp = tempdir().unwrap();
+    let storage = Arc::new(FileStorage::open(tmp.path()).unwrap());
+    let stream: StreamName = "batch-stream".try_into().unwrap();
+    storage.create_stream(&stream, 0, 0).await.unwrap();
+
+    let records: Vec<Record> = (0..10)
+        .map(|i| Record {
+            subject: "bench".into(),
+            key: None,
+            value: Bytes::from(format!("v{i}").into_bytes()),
+            headers: vec![],
+            timestamp_ns: None,
+        })
+        .collect();
+    let results = storage.append_batch(&stream, records).await.unwrap();
+    assert_eq!(results.len(), 10);
+    for (i, (offset, _ts)) in results.iter().enumerate() {
+        assert_eq!(offset.0, i as u64);
+    }
+}

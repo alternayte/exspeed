@@ -683,4 +683,22 @@ impl StorageEngine for FileStorage {
             .await
             .map_err(|e| StorageError::Io(std::io::Error::other(e)))?
     }
+
+    async fn append_batch(
+        &self,
+        stream: &StreamName,
+        records: Vec<exspeed_streams::Record>,
+    ) -> Result<Vec<(exspeed_common::Offset, u64)>, StorageError> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        let key = (stream.as_str().to_string(), 0u32);
+        let appender = self
+            .inner
+            .appenders
+            .get(&key)
+            .map(|r| r.value().clone())
+            .ok_or_else(|| StorageError::StreamNotFound(stream.clone()))?;
+        appender.append_batch(records).await
+    }
 }
