@@ -56,13 +56,20 @@ impl Default for StorageSyncMode {
 struct FileStorageInner {
     data_dir: PathBuf,
     /// Drop order matters here — Rust drops struct fields in declaration order
-    /// (first-declared = first-dropped). We want:
+    /// (first-declared = first-dropped). Each `SegmentSyncerHandle` is held by
+    /// two `Arc` clones: one in the `syncers` map, and one inside the matching
+    /// `Partition` (`syncer_handle` field). The `watch::Sender` that signals
+    /// syncer-task shutdown only fires when the LAST clone drops. So:
     ///   1. `appenders` dropped first  → writer tasks drain their in-flight
-    ///      batch and exit, releasing their Arc<Mutex<Partition>>.
-    ///   2. `syncers` dropped second   → shutdown signal fires; each syncer
-    ///      task performs a final fsync and exits, releasing its Arc.
-    ///   3. `partitions` dropped last  → by this point all background tasks
-    ///      have released their Arc<Mutex<Partition>> references.
+    ///      batch and exit, releasing their `Arc<Mutex<Partition>>`.
+    ///   2. `syncers` dropped second   → just decrements its `Arc` clone; the
+    ///      syncer tasks keep running because `Partition` still holds the other
+    ///      clone.
+    ///   3. `partitions` dropped last  → the appenders have already released
+    ///      their `Arc<Mutex<Partition>>`, so dropping this map drops the last
+    ///      `Partition`, which in turn drops the final `Arc<SegmentSyncerHandle>`.
+    ///      The `watch::Sender` fires, each syncer task performs a final fsync
+    ///      and exits.
     appenders: DashMap<(String, u32), AppenderHandle>,
     syncers: DashMap<(String, u32), Arc<SegmentSyncerHandle>>,
     partitions: DashMap<(String, u32), Arc<Mutex<Partition>>>,

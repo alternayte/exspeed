@@ -718,14 +718,6 @@ impl Partition {
         self.syncer_handle = Some(handle);
     }
 
-    /// Force a `sync_data` on the active segment. Called by `SegmentSyncer`
-    /// in async mode as a last-resort direct sync, and whenever a caller
-    /// needs to commit the current batch without waiting for the next timer
-    /// tick.
-    pub(crate) fn sync_active_segment_now(&mut self) -> io::Result<()> {
-        self.active_writer.sync_data()
-    }
-
     /// Roll the active segment: seal it, build indexes, open a reader for it,
     /// and create a new active segment starting at `next_offset`.
     fn roll_segment(&mut self) -> io::Result<()> {
