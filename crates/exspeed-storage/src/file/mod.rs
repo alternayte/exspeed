@@ -5,9 +5,8 @@ pub mod segment_reader;
 pub mod segment_writer;
 pub mod stream_config;
 pub mod time_index;
-pub mod wal;
-pub mod wal_appender;
-pub mod wal_syncer;
+pub mod segment_appender;
+pub mod segment_syncer;
 
 use std::collections::HashMap;
 use std::fs;
@@ -24,8 +23,8 @@ use exspeed_streams::{Record, StorageEngine, StorageError, StoredRecord};
 
 use crate::file::partition::Partition;
 use crate::file::stream_config::StreamConfig;
-use crate::file::wal_appender::{AppenderConfig, AppenderHandle, AppenderMode};
-use crate::file::wal_syncer::WalSyncerHandle;
+use crate::file::segment_appender::{AppenderConfig, AppenderHandle, AppenderMode};
+use crate::file::segment_syncer::SegmentSyncerHandle;
 
 /// Storage durability mode. `Sync` = group commit + fsync per batch (default,
 /// strongest durability). `Async` = batch writes immediately, fsync on a timer
@@ -56,15 +55,22 @@ impl Default for StorageSyncMode {
 struct FileStorageInner {
     data_dir: PathBuf,
     /// Drop order matters here — Rust drops struct fields in declaration order
-    /// (first-declared = first-dropped). We want:
+    /// (first-declared = first-dropped). Each `SegmentSyncerHandle` is held by
+    /// two `Arc` clones: one in the `syncers` map, and one inside the matching
+    /// `Partition` (`syncer_handle` field). The `watch::Sender` that signals
+    /// syncer-task shutdown only fires when the LAST clone drops. So:
     ///   1. `appenders` dropped first  → writer tasks drain their in-flight
-    ///      batch and exit, releasing their Arc<Mutex<Partition>>.
-    ///   2. `syncers` dropped second   → shutdown signal fires; each syncer
-    ///      task performs a final fsync and exits, releasing its Arc.
-    ///   3. `partitions` dropped last  → by this point all background tasks
-    ///      have released their Arc<Mutex<Partition>> references.
+    ///      batch and exit, releasing their `Arc<Mutex<Partition>>`.
+    ///   2. `syncers` dropped second   → just decrements its `Arc` clone; the
+    ///      syncer tasks keep running because `Partition` still holds the other
+    ///      clone.
+    ///   3. `partitions` dropped last  → the appenders have already released
+    ///      their `Arc<Mutex<Partition>>`, so dropping this map drops the last
+    ///      `Partition`, which in turn drops the final `Arc<SegmentSyncerHandle>`.
+    ///      The `watch::Sender` fires, each syncer task performs a final fsync
+    ///      and exits.
     appenders: DashMap<(String, u32), AppenderHandle>,
-    syncers: DashMap<(String, u32), WalSyncerHandle>,
+    syncers: DashMap<(String, u32), Arc<SegmentSyncerHandle>>,
     partitions: DashMap<(String, u32), Arc<Mutex<Partition>>>,
     appender_config: AppenderConfig,
     storage_sync_mode: StorageSyncMode,
@@ -129,7 +135,7 @@ impl FileStorage {
 
         let mut partitions: HashMap<(String, u32), Arc<Mutex<Partition>>> = HashMap::new();
         let mut appenders: HashMap<(String, u32), AppenderHandle> = HashMap::new();
-        let mut syncers: HashMap<(String, u32), WalSyncerHandle> = HashMap::new();
+        let mut syncers: HashMap<(String, u32), Arc<SegmentSyncerHandle>> = HashMap::new();
         let appender_mode = match mode {
             StorageSyncMode::Sync => AppenderMode::Sync,
             StorageSyncMode::Async { .. } => AppenderMode::Async,
@@ -161,22 +167,33 @@ impl FileStorage {
                         Err(_) => continue, // skip non-numeric directories
                     };
 
-                    let partition = Partition::open(&part_path, &stream_name, part_id)?;
-                    // Clone the WAL file handle BEFORE wrapping in Arc<Mutex>
-                    // so the syncer task owns an independent File that it
-                    // can sync_data() on without holding the partition mutex.
-                    let wal_clone = if let StorageSyncMode::Async { .. } = mode {
-                        Some(partition.try_clone_wal_file()?)
+                    let mut partition = Partition::open(&part_path, &stream_name, part_id)?;
+                    // Clone the active segment's file handle BEFORE wrapping
+                    // in Arc<Mutex> so the syncer task owns an independent
+                    // File that it can sync_data() on without holding the
+                    // partition mutex. In async mode we also spawn the
+                    // syncer here and register its handle on the Partition
+                    // so roll_segment can swap the syncer's fsync target
+                    // when a segment rolls.
+                    let syncer_handle = if let StorageSyncMode::Async { interval, .. } = mode {
+                        let file = partition.try_clone_active_segment_file()?;
+                        let handle = Arc::new(segment_syncer::spawn(
+                            file,
+                            stream_name.clone(),
+                            part_id,
+                            interval,
+                        ));
+                        partition.set_syncer_handle(handle.clone());
+                        Some(handle)
                     } else {
                         None
                     };
                     let key = (stream_name.clone(), part_id);
                     let partition_arc = Arc::new(Mutex::new(partition));
                     let appender =
-                        wal_appender::spawn(partition_arc.clone(), appender_config, appender_mode);
-                    if let (Some(f), StorageSyncMode::Async { interval, .. }) = (wal_clone, mode) {
-                        let syncer = wal_syncer::spawn(f, stream_name.clone(), part_id, interval);
-                        syncers.insert(key.clone(), syncer);
+                        segment_appender::spawn(partition_arc.clone(), appender_config, appender_mode);
+                    if let Some(handle) = syncer_handle {
+                        syncers.insert(key.clone(), handle);
                     }
                     appenders.insert(key.clone(), appender);
                     partitions.insert(key, partition_arc);
@@ -299,11 +316,22 @@ impl FileStorage {
             new_partition.set_seal_notifier(tx);
         }
 
-        // Clone the WAL file handle BEFORE wrapping in Arc<Mutex> so the
-        // syncer task owns an independent File that it can sync_data() on
-        // without holding the partition mutex.
-        let wal_clone = if let StorageSyncMode::Async { .. } = self.inner.storage_sync_mode {
-            Some(new_partition.try_clone_wal_file()?)
+        // In async mode, clone the active segment's file handle BEFORE
+        // wrapping in Arc<Mutex>, spawn the syncer, and register the
+        // syncer handle on the Partition so roll_segment can swap the
+        // syncer's fsync target on segment roll.
+        let syncer_handle = if let StorageSyncMode::Async { interval, .. } =
+            self.inner.storage_sync_mode
+        {
+            let file = new_partition.try_clone_active_segment_file()?;
+            let handle = Arc::new(segment_syncer::spawn(
+                file,
+                stream.to_string(),
+                partition_id,
+                interval,
+            ));
+            new_partition.set_syncer_handle(handle.clone());
+            Some(handle)
         } else {
             None
         };
@@ -315,17 +343,11 @@ impl FileStorage {
             StorageSyncMode::Async { .. } => AppenderMode::Async,
         };
         let appender =
-            wal_appender::spawn(partition_arc.clone(), self.inner.appender_config, appender_mode);
-        let syncer = match (wal_clone, self.inner.storage_sync_mode) {
-            (Some(f), StorageSyncMode::Async { interval, .. }) => {
-                Some(wal_syncer::spawn(f, stream.to_string(), partition_id, interval))
-            }
-            _ => None,
-        };
+            segment_appender::spawn(partition_arc.clone(), self.inner.appender_config, appender_mode);
 
         self.inner.partitions.insert(key.clone(), partition_arc);
         self.inner.appenders.insert(key.clone(), appender);
-        if let Some(s) = syncer {
+        if let Some(s) = syncer_handle {
             self.inner.syncers.insert(key, s);
         } else {
             self.inner.syncers.remove(&key);
@@ -417,11 +439,22 @@ impl FileStorage {
             partition.set_seal_notifier(tx.clone());
         }
 
-        // Clone the WAL file handle BEFORE wrapping in Arc<Mutex> so the
-        // syncer task owns an independent File that it can sync_data() on
-        // without holding the partition mutex.
-        let wal_clone = if let StorageSyncMode::Async { .. } = self.inner.storage_sync_mode {
-            Some(partition.try_clone_wal_file()?)
+        // In async mode, clone the active segment's file handle BEFORE
+        // wrapping in Arc<Mutex>, spawn the syncer, and register the
+        // syncer handle on the Partition so roll_segment can swap the
+        // syncer's fsync target on segment roll.
+        let syncer_handle = if let StorageSyncMode::Async { interval, .. } =
+            self.inner.storage_sync_mode
+        {
+            let file = partition.try_clone_active_segment_file()?;
+            let handle = Arc::new(segment_syncer::spawn(
+                file,
+                stream.as_str().to_string(),
+                0,
+                interval,
+            ));
+            partition.set_syncer_handle(handle.clone());
+            Some(handle)
         } else {
             None
         };
@@ -432,13 +465,7 @@ impl FileStorage {
             StorageSyncMode::Async { .. } => AppenderMode::Async,
         };
         let appender =
-            wal_appender::spawn(partition_arc.clone(), self.inner.appender_config, appender_mode);
-        let syncer = match (wal_clone, self.inner.storage_sync_mode) {
-            (Some(f), StorageSyncMode::Async { interval, .. }) => {
-                Some(wal_syncer::spawn(f, stream.as_str().to_string(), 0, interval))
-            }
-            _ => None,
-        };
+            segment_appender::spawn(partition_arc.clone(), self.inner.appender_config, appender_mode);
 
         // Atomic check-and-insert: use entry() API to guard against a race where
         // two callers pass the fast-path check simultaneously.
@@ -454,7 +481,7 @@ impl FileStorage {
         }
 
         self.inner.appenders.insert(key.clone(), appender);
-        if let Some(s) = syncer {
+        if let Some(s) = syncer_handle {
             self.inner.syncers.insert(key.clone(), s);
         }
 

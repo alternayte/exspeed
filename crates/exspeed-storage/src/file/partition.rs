@@ -3,6 +3,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
@@ -15,9 +16,9 @@ use crate::file::io_errors::is_storage_full;
 
 use crate::file::offset_index::OffsetIndex;
 use crate::file::segment_reader::SegmentReader;
+use crate::file::segment_syncer::SegmentSyncerHandle;
 use crate::file::segment_writer::SegmentWriter;
 use crate::file::time_index::{self, TimeIndex};
-use crate::file::wal::{replay_wal, WalWriter};
 
 /// Default maximum segment size before rolling: 256 MiB.
 const DEFAULT_SEGMENT_MAX_BYTES: u64 = 256 * 1024 * 1024;
@@ -99,44 +100,77 @@ fn log_write_error(stream_name: &str, partition_id: u32, msg: &'static str, err:
     }
 }
 
-/// Manages a single partition's on-disk state: active segment writer,
-/// sealed segment readers, and the write-ahead log.
+/// Manages a single partition's on-disk state: active segment writer and
+/// sealed segment readers.
+///
+/// v0.2.0 removed the separate WAL file — the active segment is the sole
+/// durability journal. Every `append` / `append_batch` writes directly to
+/// the segment and (in sync mode) fsyncs it. In async mode the
+/// `SegmentSyncer` task fsyncs periodically on a cloned file handle.
 pub struct Partition {
     dir: PathBuf,
     active_writer: SegmentWriter,
     sealed_readers: Vec<SegmentReader>,
-    wal: WalWriter,
     next_offset: u64,
     stream_name: String,
     partition_id: u32,
     segment_max_bytes: u64,
     seal_tx: Option<mpsc::UnboundedSender<SealedSegmentInfo>>,
+    /// Handle to the per-partition `SegmentSyncer` task in async mode.
+    /// Present only when `FileStorage` is configured with
+    /// `StorageSyncMode::Async`. On segment roll, `roll_segment` uses this
+    /// to swap the syncer's fsync target to the newly created active
+    /// segment so periodic fsync follows the active segment instead of
+    /// fsyncing a sealed (unchanging) file.
+    syncer_handle: Option<Arc<SegmentSyncerHandle>>,
 }
 
 impl Partition {
-    /// Create a brand-new partition directory with its first segment and WAL.
+    /// Create a brand-new partition directory with its first segment.
+    ///
+    /// v0.2.0 removed the separate WAL file — the segment is the sole
+    /// durability journal from the first write onwards.
     pub fn create(dir: &Path, stream_name: &str, partition_id: u32) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
 
         let writer = SegmentWriter::create(dir, 0)?;
-        let wal = WalWriter::open(&dir.join("wal.log"))?;
 
         Ok(Self {
             dir: dir.to_path_buf(),
             active_writer: writer,
             sealed_readers: Vec::new(),
-            wal,
             next_offset: 0,
             stream_name: stream_name.to_string(),
             partition_id,
             segment_max_bytes: DEFAULT_SEGMENT_MAX_BYTES,
             seal_tx: None,
+            syncer_handle: None,
         })
     }
 
-    /// Open an existing partition directory, recovering state from segment
-    /// files and replaying the WAL.
+    /// Open an existing partition directory, recovering state via a
+    /// CRC-validating tail scan of the active segment.
+    ///
+    /// v0.2.0 removed the separate `wal.log` file — recovery is now unified
+    /// through `SegmentWriter::recover_tail`, which walks the active segment
+    /// from the header forward and truncates any torn/corrupt tail. If a
+    /// legacy `wal.log` is present the open fails fast rather than silently
+    /// ignoring durable data the caller expected to be replayed.
     pub fn open(dir: &Path, stream_name: &str, partition_id: u32) -> io::Result<Self> {
+        // Fail-fast if a legacy WAL is present. Pre-v0.2.0 data is unsupported.
+        let legacy_wal = dir.join("wal.log");
+        if legacy_wal.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "legacy wal.log found at {}; v0.2.0 removed the separate \
+                     WAL file. Either delete your data dir (fresh start) or \
+                     downgrade to exspeed 0.1.1.",
+                    legacy_wal.display()
+                ),
+            ));
+        }
+
         // Find all .seg files, sorted by name (which sorts by base_offset
         // due to zero-padded filenames).
         let mut seg_paths: Vec<PathBuf> = fs::read_dir(dir)?
@@ -163,75 +197,58 @@ impl Partition {
             sealed_readers.push(SegmentReader::open(path)?);
         }
 
-        // Read metadata from the last segment to derive base_offset and next_offset.
-        let last_seg_path = &seg_paths[seg_paths.len() - 1];
-        let last_reader = SegmentReader::open(last_seg_path)?;
-        let base_offset = last_reader.base_offset();
-
-        // Derive next_offset from the last offset across all segments.
+        // Derive next_offset from sealed segments first.
         let mut next_offset: u64 = 0;
         for reader in &sealed_readers {
             if let Some(last) = reader.last_offset()? {
                 next_offset = next_offset.max(last + 1);
             }
         }
-        if let Some(last) = last_reader.last_offset()? {
-            next_offset = next_offset.max(last + 1);
+
+        // Tail-scan the active segment: validate every frame's CRC and
+        // truncate at the first torn/corrupt record. Replaces WAL replay.
+        let last_seg_path = &seg_paths[seg_paths.len() - 1];
+        let (max_offset_in_active, _max_ts, current_size) =
+            SegmentWriter::recover_tail(last_seg_path)?;
+
+        if let Some(m) = max_offset_in_active {
+            next_offset = next_offset.max(m + 1);
         }
 
-        // Open the WAL and replay any records that weren't flushed to segments.
-        let wal_path = dir.join("wal.log");
-        let wal_records = replay_wal(&wal_path)?;
+        info!(
+            stream = stream_name,
+            partition = partition_id,
+            segment = %last_seg_path.display(),
+            current_size,
+            next_offset,
+            "partition recovery complete (tail-scan)"
+        );
 
-        let mut wal = WalWriter::open(&wal_path)?;
-
-        // Open the last segment as the active writer and replay WAL records
-        // that are not yet in any segment.
-        let replay_base = next_offset;
-        let current_size = fs::metadata(last_seg_path)?.len();
-        let mut active_writer =
+        // Open the active segment for append at the post-recovery length.
+        let last_reader = SegmentReader::open(last_seg_path)?;
+        let base_offset = last_reader.base_offset();
+        let active_writer =
             SegmentWriter::open_append(last_seg_path, base_offset, current_size)?;
-
-        let mut replayed = 0usize;
-        for wal_rec in &wal_records {
-            if wal_rec.offset.0 >= replay_base {
-                active_writer.append(wal_rec.offset, wal_rec.timestamp, &wal_rec.record)?;
-                next_offset = wal_rec.offset.0 + 1;
-                replayed += 1;
-            }
-        }
-
-        if replayed > 0 {
-            active_writer.sync()?;
-            info!(
-                stream = stream_name,
-                partition = partition_id,
-                replayed,
-                "WAL replay complete"
-            );
-        }
-
-        // Truncate the WAL now that all records are in segments.
-        wal.truncate()?;
 
         Ok(Self {
             dir: dir.to_path_buf(),
             active_writer,
             sealed_readers,
-            wal,
             next_offset,
             stream_name: stream_name.to_string(),
             partition_id,
             segment_max_bytes: DEFAULT_SEGMENT_MAX_BYTES,
             seal_tx: None,
+            syncer_handle: None,
         })
     }
 
     /// Append a record to this partition.
     ///
-    /// The record is first written to the WAL (and synced), then to the
-    /// active segment. If the segment exceeds `segment_max_bytes` after the
-    /// write, a new segment is rolled.
+    /// v0.2.0: the active segment is the sole durability journal. The record
+    /// is written to the segment and `sync_data` is called directly (this
+    /// used to happen via the WAL). If the segment exceeds `segment_max_bytes`
+    /// after the write, a new segment is rolled.
     pub fn append(&mut self, record: &Record) -> io::Result<(Offset, u64)> {
         let offset = Offset(self.next_offset);
         // Honor the caller-supplied timestamp when present (replication
@@ -239,19 +256,7 @@ impl Partition {
         // mint a fresh one from the wall clock.
         let timestamp = record.timestamp_ns.unwrap_or_else(now_nanos);
 
-        // WAL first — durable after sync_data inside WalWriter::append.
-        if let Err(e) = self.wal.append(
-            &self.stream_name,
-            self.partition_id,
-            offset,
-            timestamp,
-            record,
-        ) {
-            log_write_error(&self.stream_name, self.partition_id, "WAL write failed", &e);
-            return Err(e);
-        }
-
-        // Then segment.
+        // Write to the active segment (sole durability path as of v0.2.0).
         if let Err(e) = self.active_writer.append(offset, timestamp, record) {
             log_write_error(
                 &self.stream_name,
@@ -261,6 +266,9 @@ impl Partition {
             );
             return Err(e);
         }
+        // Fsync the segment directly (previously done via the WAL).
+        self.active_writer.sync_data()?;
+
         self.next_offset += 1;
 
         // Check if we need to roll the segment.
@@ -271,26 +279,25 @@ impl Partition {
         Ok((offset, timestamp))
     }
 
-    /// Append N records in one shot. Performs ONE WAL write for the whole
-    /// batch via `WalWriter::append_batch`, then writes each record to the
-    /// active segment. Single-record `append` remains for the slow path.
+    /// Append N records in one shot via `SegmentWriter::append_batch`.
     ///
-    /// `sync_now` controls whether `sync_data` is called on the WAL after
-    /// the batch write. In `Sync` mode this is `true` (group-commit + fsync).
-    /// In `Async` mode this is `false` — the `WalSyncer` task handles the
-    /// periodic fsync.
+    /// v0.2.0: the active segment is the sole durability journal. A single
+    /// `write_all` lands every record's framed bytes in the page cache; if
+    /// `sync_now` is true the writer issues exactly one `sync_data` at the
+    /// end (group-commit + fsync). In `Async` mode `sync_now` is false —
+    /// the `SegmentSyncer` task handles the periodic fsync on a cloned file
+    /// handle.
     ///
-    /// On `Err`, the entire batch should be considered failed from the caller's
-    /// perspective. Some records may already be durable in the WAL (and will be
-    /// replayed on next `Partition::open`); the returned `results` Vec is dropped
-    /// and never observable. Do not retry individual records from a failed batch
-    /// without restarting the partition first.
+    /// On `Err`, the entire batch fails from the caller's perspective. If
+    /// the write reached the page cache partially before failing, the next
+    /// `Partition::open` will detect the torn tail via `recover_tail` and
+    /// truncate to the last durable frame.
     pub fn append_batch(&mut self, records: &[Record], sync_now: bool) -> io::Result<Vec<(Offset, u64)>> {
         if records.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Phase 1: assign offsets + timestamps. No stream clone per record.
+        // Phase 1: assign offsets + timestamps.
         let mut assignments: Vec<(Offset, u64, Record)> = Vec::with_capacity(records.len());
         let mut results: Vec<(Offset, u64)> = Vec::with_capacity(records.len());
         for record in records {
@@ -301,28 +308,19 @@ impl Partition {
             self.next_offset += 1;
         }
 
-        // Phase 2: ONE WAL append + (conditional) sync_data.
-        if let Err(e) = self.wal.append_batch(&self.stream_name, self.partition_id, &assignments, sync_now) {
-            log_write_error(&self.stream_name, self.partition_id, "WAL batch write failed", &e);
+        // Phase 2: ONE segment append + (conditional) sync_data. No WAL step.
+        if let Err(e) = self.active_writer.append_batch(&assignments, sync_now) {
+            log_write_error(
+                &self.stream_name,
+                self.partition_id,
+                "segment batch write failed",
+                &e,
+            );
             self.next_offset -= records.len() as u64;
             return Err(e);
         }
 
-        // Phase 3: segment writes (unchanged).
-        for (i, (offset, timestamp, record)) in assignments.iter().enumerate() {
-            if let Err(e) = self.active_writer.append(*offset, *timestamp, record) {
-                log_write_error(
-                    &self.stream_name,
-                    self.partition_id,
-                    "segment write failed in batch (records ahead are durable in WAL)",
-                    &e,
-                );
-                results.truncate(i);
-                self.next_offset -= (records.len() - i) as u64;
-                return Err(e);
-            }
-        }
-
+        // Segment roll AFTER the batch completes.
         if self.active_writer.bytes_written() >= self.segment_max_bytes {
             self.roll_segment()?;
         }
@@ -524,7 +522,7 @@ impl Partition {
     ///   4. Delete the straddled segment's file.
     ///   5. Create a fresh active segment at the straddled segment's
     ///      `base_offset` and replay the surviving records into it.
-    ///   6. Set `next_offset = drop_from` and truncate the WAL.
+    ///   6. Set `next_offset = drop_from`.
     ///
     /// Called only on the follower's divergent-history recovery path, so
     /// the rewrite cost (bounded by `replication_lag`) is acceptable;
@@ -674,9 +672,8 @@ impl Partition {
         }
         self.active_writer.sync()?;
 
-        // ── Step 6: Update next_offset + truncate WAL. ────────────────────
+        // ── Step 6: Update next_offset. ───────────────────────────────────
         self.next_offset = drop_from;
-        self.wal.truncate()?;
 
         Ok(stats)
     }
@@ -703,13 +700,22 @@ impl Partition {
         self.segment_max_bytes = max;
     }
 
-    /// Clone the WAL file handle so `WalSyncer` can issue `sync_data`
-    /// without holding the per-partition `Mutex<Partition>` that serializes
-    /// writes. Both handles share the same kernel fd — concurrent fsync on
-    /// the syncer's handle does not block writes through the WalWriter's
-    /// handle, which is exactly the async-storage-mode semantic.
-    pub(crate) fn try_clone_wal_file(&self) -> io::Result<std::fs::File> {
-        self.wal.try_clone_file()
+    /// Clone the active segment's file handle so `SegmentSyncer` can issue
+    /// `sync_data` without holding the per-partition `Mutex<Partition>`
+    /// that serializes writes. Both handles share the same kernel fd —
+    /// concurrent fsync on the syncer's handle does not block writes
+    /// through the `SegmentWriter`'s handle, which is exactly the
+    /// async-storage-mode semantic.
+    pub(crate) fn try_clone_active_segment_file(&self) -> io::Result<std::fs::File> {
+        self.active_writer.try_clone_file()
+    }
+
+    /// Register the `SegmentSyncer` handle for this partition so that
+    /// `roll_segment` can swap the syncer's fsync target when a segment
+    /// rolls. Called once at construction (in async mode) from
+    /// `FileStorage`; in sync mode the handle remains `None`.
+    pub(crate) fn set_syncer_handle(&mut self, handle: Arc<SegmentSyncerHandle>) {
+        self.syncer_handle = Some(handle);
     }
 
     /// Roll the active segment: seal it, build indexes, open a reader for it,
@@ -743,8 +749,14 @@ impl Partition {
         // Create a new segment.
         self.active_writer = SegmentWriter::create(&self.dir, self.next_offset)?;
 
-        // Truncate the WAL — all records prior to this point are in sealed segments.
-        self.wal.truncate()?;
+        // If an async-mode syncer is attached, hand it a clone of the new
+        // active segment's file handle. Without this the syncer would keep
+        // fsyncing the now-sealed (unchanging) segment instead of the new
+        // active one.
+        if let Some(handle) = &self.syncer_handle {
+            let new_file = self.active_writer.try_clone_file()?;
+            handle.set_active_file(new_file);
+        }
 
         // Send sealed-segment notification (non-blocking, best-effort).
         if let Some(ref tx) = self.seal_tx {

@@ -88,8 +88,9 @@ impl AppenderHandle {
 /// caller uses to send append requests. The task runs until the handle (and
 /// all clones) are dropped — which closes the channel.
 ///
-/// `mode` controls whether each batch flush calls `sync_data` on the WAL.
-/// In `Async` mode the `WalSyncer` task handles periodic fsyncs separately.
+/// `mode` controls whether each batch flush calls `sync_data` on the active
+/// segment. In `Async` mode the `WalSyncer` task handles periodic fsyncs
+/// separately.
 pub fn spawn(
     partition: Arc<Mutex<Partition>>,
     config: AppenderConfig,
