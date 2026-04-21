@@ -7,7 +7,7 @@ const MAX_MSG_ID_BYTES: usize = 256;
 
 /// A single record inside a PublishBatch request.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BatchRecord {
+pub struct PublishBatchRecord {
     pub subject: String,
     pub key: Option<Bytes>,
     pub msg_id: Option<String>,
@@ -19,7 +19,7 @@ pub struct BatchRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishBatchRequest {
     pub stream: String,
-    pub records: Vec<BatchRecord>,
+    pub records: Vec<PublishBatchRecord>,
 }
 
 /// Per-record outcome in the PUBLISH_BATCH_OK response.
@@ -142,7 +142,7 @@ impl PublishBatchRequest {
                     .map_err(|e| ProtocolError::Decode(format!("invalid header val: {e}")))?;
                 headers.push((hk, hv));
             }
-            records.push(BatchRecord { subject, key, msg_id, value, headers });
+            records.push(PublishBatchRecord { subject, key, msg_id, value, headers });
         }
         Ok(PublishBatchRequest { stream, records })
     }
@@ -216,14 +216,14 @@ mod tests {
         let req = PublishBatchRequest {
             stream: "orders".into(),
             records: vec![
-                BatchRecord {
+                PublishBatchRecord {
                     subject: "orders.placed".into(),
                     key: None,
                     msg_id: None,
                     value: Bytes::from_static(b"{\"a\":1}"),
                     headers: vec![],
                 },
-                BatchRecord {
+                PublishBatchRecord {
                     subject: "orders.placed".into(),
                     key: Some(Bytes::from_static(b"ord-123")),
                     msg_id: Some("m-1".into()),
