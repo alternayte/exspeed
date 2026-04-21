@@ -15,6 +15,11 @@ use exspeed_common::Metrics;
 use exspeed_protocol::messages::{ClientMessage, ServerMessage};
 use exspeed_streams::StorageEngine;
 
+/// Default delivery mpsc buffer capacity. Callers that want to accept the
+/// default pass this constant; callers with an explicit user-facing setting
+/// (e.g. the `--delivery-buffer` CLI flag) pass their value directly.
+pub const DEFAULT_DELIVERY_BUFFER: usize = 8192;
+
 pub struct Broker {
     pub storage: Arc<dyn StorageEngine>,
     pub broker_append: Arc<BrokerAppend>,
@@ -27,6 +32,8 @@ pub struct Broker {
     pub(crate) max_delivery_attempts: u16,
     pub(crate) nack_attempts: RwLock<HashMap<(String, u64), u16>>,
     pub metrics: Arc<Metrics>,
+    /// mpsc buffer capacity for per-subscription delivery channels.
+    pub(crate) delivery_buffer: usize,
     /// Set to `true` once all startup dedup rebuild tasks complete.
     pub dedup_ready: Arc<AtomicBool>,
     /// Leader-side replication coordinator. `None` on single-pod / file-
@@ -43,6 +50,7 @@ impl Broker {
         work_coordinator: Arc<dyn crate::work_coordinator::WorkCoordinator>,
         lease: Arc<dyn LeaderLease>,
         metrics: Arc<Metrics>,
+        delivery_buffer: usize,
     ) -> Self {
         Self {
             storage,
@@ -56,6 +64,7 @@ impl Broker {
             max_delivery_attempts: 5,
             nack_attempts: RwLock::new(HashMap::new()),
             metrics,
+            delivery_buffer,
             dedup_ready: Arc::new(AtomicBool::new(false)),
             replication_coordinator: None,
         }
@@ -184,7 +193,7 @@ impl Broker {
         }
 
         // Create mpsc channel for delivery records.
-        let (tx, rx) = mpsc::channel::<DeliveryRecord>(1000);
+        let (tx, rx) = mpsc::channel::<DeliveryRecord>(self.delivery_buffer);
         // Cancel channel kept inside the broker (dropped on unsubscribe).
         let (cancel_tx_store, cancel_rx_store) = oneshot::channel::<()>();
         // Cancel channel returned to the caller (dropped on disconnect).
@@ -298,6 +307,7 @@ mod tests {
             work_coordinator,
             lease,
             metrics,
+            DEFAULT_DELIVERY_BUFFER,
         );
         (broker, dir)
     }

@@ -176,6 +176,9 @@ pub fn benchmarks_md(r: &BenchResult) -> String {
     if let Some(e) = &r.scenarios.exql {
         let _ = writeln!(s, "## ExQL\n");
         let _ = writeln!(s, "Query: `{}`\n", e.query);
+        if let Some(w) = &e.warning {
+            let _ = writeln!(s, "> WARNING: `{w}`. The binary search did not find any rate the broker could sustain.\n");
+        }
         let _ = writeln!(
             s,
             "Sustained input rate with payload {} B and {} distinct subjects: **{} msg/s**.\n",

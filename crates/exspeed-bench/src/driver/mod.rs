@@ -1,4 +1,5 @@
 pub mod exspeed;
+pub mod publisher;
 #[cfg(feature = "comparison")]
 pub mod kafka;
 

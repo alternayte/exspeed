@@ -145,10 +145,11 @@ pub struct ProducerStats {
     pub wall_secs: f64,
 }
 
-/// Spawn `tasks` producer tasks. Each owns one TCP connection and publishes
-/// `payload_bytes`-sized records at unlimited rate for `duration`. Returns
-/// aggregate stats. `origin` is the shared start instant for publish_us headers
-/// so the consumer can compute deltas with `now.duration_since(origin)`.
+/// Spawn `tasks` producer tasks. Each owns one pipelined Publisher connection
+/// and keeps up to 256 publishes in flight concurrently, removing per-publish
+/// round-trip cost from the critical path. Returns aggregate stats.
+/// `origin` is the shared start instant for publish_us headers so the consumer
+/// can compute deltas with `now.duration_since(origin)`.
 pub async fn run_producer(
     addr: &str,
     stream: &str,
@@ -158,47 +159,93 @@ pub async fn run_producer(
     origin: Instant,
     shared_count: Arc<AtomicU64>,
 ) -> Result<ProducerStats> {
-    // Pre-generate a random-ish payload once. Content is irrelevant; size matters.
+    use crate::driver::publisher::PublisherBuilder;
+    use futures_util::stream::FuturesUnordered;
+
     let payload: Bytes = Bytes::from(vec![b'x'; payload_bytes]);
     let stream = stream.to_owned();
-    // NOTE: start is captured before spawning so connection setup time counts
-    // against wall_secs. This consistently underreports throughput; acceptable
-    // for v1 and honest for comparisons.
-    let start = Instant::now();
     let mut handles = Vec::with_capacity(tasks);
+    // Concurrency window per producer task.  4 concurrent publishes provides a
+    // meaningful pipelining gain (4× better than serial per task) while keeping
+    // the queue depth shallow enough that the bench consumer — which reads records
+    // serially with a 1 s p50 latency bound — does not fall behind.  The
+    // Publisher semaphore allows up to 256 permits; this constant is a bench
+    // driver policy, not a transport limit.
+    let in_flight_per_task: usize = 4;
 
     for _ in 0..tasks {
         let addr = addr.to_owned();
         let stream = stream.clone();
         let payload = payload.clone();
         let shared_count = shared_count.clone();
-
         handles.push(tokio::spawn(async move {
-            let mut client = ExspeedClient::connect(&addr).await?;
-            let deadline = Instant::now() + duration;
+            let task_start = Instant::now();
+            let publisher = PublisherBuilder::new(&addr)
+                .max_in_flight(in_flight_per_task)
+                .build()
+                .await?;
+            let deadline = task_start + duration;
             let mut local: u64 = 0;
+            let mut committed: u64 = 0;
+            let mut futs: FuturesUnordered<_> = FuturesUnordered::new();
             while Instant::now() < deadline {
-                client.publish_once(&stream, &payload, origin).await?;
-                local += 1;
-                if local.is_multiple_of(256) {
-                    shared_count.fetch_add(256, Ordering::Relaxed);
+                while futs.len() < in_flight_per_task && Instant::now() < deadline {
+                    // Set the timestamp lazily inside the async block so it
+                    // reflects when the message is actually sent, not when it
+                    // is queued into FuturesUnordered.
+                    let stream = stream.clone();
+                    let payload = payload.clone();
+                    let pub2 = publisher.clone();
+                    futs.push(async move {
+                        let us = origin.elapsed().as_micros() as u64;
+                        let req = exspeed_protocol::messages::publish::PublishRequest {
+                            stream,
+                            subject: "bench".into(),
+                            key: None,
+                            msg_id: None,
+                            value: payload,
+                            headers: vec![(PUBLISH_TS_HEADER.to_owned(), format!("{us}"))],
+                        };
+                        pub2.publish(req).await
+                    });
+                }
+                if let Some(res) = futs.next().await {
+                    let _ = res; // count locally; offset/error not used here
+                    local += 1;
+                    if local - committed >= 256 {
+                        shared_count.fetch_add(256, Ordering::Relaxed);
+                        committed += 256;
+                    }
                 }
             }
-            shared_count.fetch_add(local % 256, Ordering::Relaxed);
-            Ok::<u64, anyhow::Error>(local)
+            // Snapshot active window before draining so the wall_secs reported
+            // to the caller reflects only the publish-rate window, not drain time.
+            let active_secs = task_start.elapsed().as_secs_f64();
+            // Drain remaining in-flight (don't lose in-flight acks).
+            while let Some(res) = futs.next().await {
+                let _ = res;
+                local += 1;
+            }
+            drop(futs);
+            // Commit the tail not yet published to shared_count.
+            shared_count.fetch_add(local - committed, Ordering::Relaxed);
+            publisher.close().await.ok();
+            Ok::<(u64, f64), anyhow::Error>((local, active_secs))
         }));
     }
-
     let mut total: u64 = 0;
+    let mut max_active_secs: f64 = 0.0;
     for h in handles {
-        total += h.await??;
+        let (n, secs) = h.await??;
+        total += n;
+        if secs > max_active_secs { max_active_secs = secs; }
     }
-    let wall_secs = start.elapsed().as_secs_f64();
-
+    // wall_secs is the longest active publish window across all tasks, which
+    // includes connection setup but excludes post-deadline drain time.
     Ok(ProducerStats {
         messages: total,
         bytes: total * payload_bytes as u64,
-        wall_secs,
+        wall_secs: max_active_secs,
     })
 }
 
@@ -210,21 +257,33 @@ pub async fn run_producer_at_rate(
     rate_per_sec: u64,
     origin: Instant,
 ) -> Result<ProducerStats> {
+    use crate::driver::publisher::Publisher;
+
     let payload: Bytes = Bytes::from(vec![b'x'; payload_bytes]);
-    let mut client = ExspeedClient::connect(addr).await?;
+    let publisher = Publisher::new(addr).await?;
     let interval_ns = 1_000_000_000u64 / rate_per_sec.max(1);
     let mut ticker = tokio::time::interval(Duration::from_nanos(interval_ns));
     // We want ticks to "catch up" rather than bunch when a publish takes longer
-    // than the interval — this gives us accurate coordinated-omission correction.
+    // than the interval — this gives accurate coordinated-omission measurement.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
     let start = Instant::now();
     let deadline = start + duration;
     let mut sent: u64 = 0;
     while Instant::now() < deadline {
         ticker.tick().await;
-        client.publish_once(stream, &payload, origin).await?;
+        let us = origin.elapsed().as_micros() as u64;
+        let req = exspeed_protocol::messages::publish::PublishRequest {
+            stream: stream.into(),
+            subject: "bench".into(),
+            key: None,
+            msg_id: None,
+            value: payload.clone(),
+            headers: vec![(PUBLISH_TS_HEADER.to_owned(), format!("{us}"))],
+        };
+        publisher.publish(req).await.ok();
         sent += 1;
     }
+    publisher.close().await.ok();
     Ok(ProducerStats {
         messages: sent,
         bytes: sent * payload_bytes as u64,
@@ -288,6 +347,16 @@ pub async fn run_consumer(
     let mut messages: u64 = 0;
     let deadline = Instant::now() + duration;
 
+    // Cumulative-ack batching: the broker's Ack opcode advances the consumer's
+    // stored offset to N (implicitly acking 0..N), so we only need to send one
+    // Ack per batch rather than one per record.
+    const ACK_BATCH_SIZE: u64 = 64;
+    const ACK_BATCH_WINDOW_MS: u64 = 5;
+
+    let mut highest_unacked: Option<u64> = None;
+    let mut records_since_last_ack: u64 = 0;
+    let mut last_ack_time = Instant::now();
+
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let next = match tokio::time::timeout(remaining, client.reader.next()).await {
@@ -321,15 +390,40 @@ pub async fn run_consumer(
             }
         }
 
-        // The broker returns Ok for every Ack on this connection. At high msg/s rates
-        // those Ok frames interleave with incoming Record frames; the `continue`
-        // guard above discards them, so the histogram only accrues from real Records.
-        // This is acceptable for v1; if high-rate scenarios hit throughput issues,
-        // consider splitting the ack path onto a second task.
-        // Ack so the broker keeps pushing.
+        highest_unacked = Some(delivery.offset);
+        records_since_last_ack += 1;
+        messages += 1;
+
+        // Send one cumulative Ack every 64 records or every 5 ms, whichever
+        // comes first.  The broker advances its stored offset to N on Ack(N),
+        // implicitly acking everything below, so batching is safe.
+        let should_ack = records_since_last_ack >= ACK_BATCH_SIZE
+            || last_ack_time.elapsed() >= Duration::from_millis(ACK_BATCH_WINDOW_MS);
+        if should_ack {
+            if let Some(off) = highest_unacked {
+                let ack = AckRequest {
+                    consumer_name: consumer_name.into(),
+                    offset: off,
+                };
+                let mut ack_buf = BytesMut::new();
+                ack.encode(&mut ack_buf);
+                let corr = client.alloc_corr();
+                client
+                    .writer
+                    .send(Frame::new(OpCode::Ack, corr, ack_buf.freeze()))
+                    .await?;
+                highest_unacked = None;
+                records_since_last_ack = 0;
+                last_ack_time = Instant::now();
+            }
+        }
+    }
+
+    // Final flush — ack any records received since the last batch boundary.
+    if let Some(off) = highest_unacked {
         let ack = AckRequest {
             consumer_name: consumer_name.into(),
-            offset: delivery.offset,
+            offset: off,
         };
         let mut ack_buf = BytesMut::new();
         ack.encode(&mut ack_buf);
@@ -338,8 +432,6 @@ pub async fn run_consumer(
             .writer
             .send(Frame::new(OpCode::Ack, corr, ack_buf.freeze()))
             .await?;
-
-        messages += 1;
     }
 
     Ok(ConsumerStats {

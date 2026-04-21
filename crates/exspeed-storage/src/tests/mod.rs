@@ -2,6 +2,10 @@
 
 mod file_tests;
 mod trait_tests;
+mod wal_appender_tests;
+
+#[cfg(test)]
+mod wal_syncer_tests;
 
 mod memory_tests {
     use super::trait_tests;

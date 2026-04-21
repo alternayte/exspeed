@@ -571,3 +571,49 @@ async fn read_below_earliest_after_retention_returns_out_of_range() {
     assert!(!recs.is_empty());
     assert_eq!(recs[0].offset.0, new_earliest);
 }
+
+#[test]
+fn append_batch_assigns_sequential_offsets_and_persists_via_one_wal_sync() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut p = Partition::create(tmp.path(), "test-stream", 0).unwrap();
+
+    let mk = |body: &'static [u8]| Record {
+        subject: "bench".into(),
+        key: None,
+        value: Bytes::from_static(body),
+        headers: vec![],
+        timestamp_ns: None,
+    };
+    let records = vec![mk(b"a"), mk(b"b"), mk(b"c")];
+    let results = p.append_batch(&records, /*sync_now=*/ true).unwrap();
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0].0, Offset(0));
+    assert_eq!(results[1].0, Offset(1));
+    assert_eq!(results[2].0, Offset(2));
+    assert!(results[0].1 <= results[1].1);
+    assert!(results[1].1 <= results[2].1);
+
+    let read = p.read(Offset(0), 10).unwrap();
+    assert_eq!(read.len(), 3);
+    assert_eq!(read[0].value, Bytes::from_static(b"a"));
+    assert_eq!(read[1].value, Bytes::from_static(b"b"));
+    assert_eq!(read[2].value, Bytes::from_static(b"c"));
+}
+
+#[test]
+fn append_batch_empty_is_noop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut p = Partition::create(tmp.path(), "s", 0).unwrap();
+    let results = p.append_batch(&[], /*sync_now=*/ true).unwrap();
+    assert!(results.is_empty());
+    // No state should have changed — first real append still gets Offset(0).
+    let r = Record {
+        subject: "x".into(),
+        key: None,
+        value: Bytes::from_static(b"x"),
+        headers: vec![],
+        timestamp_ns: None,
+    };
+    let (offset, _ts) = p.append(&r).unwrap();
+    assert_eq!(offset, Offset(0));
+}

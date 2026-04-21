@@ -48,6 +48,7 @@ fn sample() -> BenchResult {
                 payload_bytes: 1024,
                 subjects: 8,
                 sustained_input_rate: 75_000,
+                warning: None,
             }),
         },
     }
@@ -77,4 +78,16 @@ fn renderer_refuses_to_overwrite_readme_from_local_profile() {
     s.profile = ProfileKind::Local;
     let err = renderer::readme_snippet_strict(&s).unwrap_err();
     assert!(err.to_string().contains("local"));
+}
+
+#[test]
+fn benchmarks_md_shows_warning_when_exql_no_candidate_passed() {
+    let mut r = sample();
+    if let Some(ref mut e) = r.scenarios.exql {
+        e.sustained_input_rate = 0;
+        e.warning = Some("no-candidate-passed".to_string());
+    }
+    let s = renderer::benchmarks_md(&r);
+    assert!(s.contains("WARNING"));
+    assert!(s.contains("no-candidate-passed"));
 }

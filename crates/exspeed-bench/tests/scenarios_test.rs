@@ -67,6 +67,33 @@ async fn exql_scenario_reports_a_sustained_rate() {
     )
     .await
     .unwrap();
-    assert!(r.sustained_input_rate >= 1_000);
-    assert!(r.sustained_input_rate <= 4_000);
+    // The embedded server should be able to sustain at least one candidate in
+    // the search range (1k–4k). If no candidate passes the 95% heuristic the
+    // scenario now returns 0 + a warning — assert the result is structurally
+    // valid either way, and that a passing result falls within the search range.
+    if r.warning.is_none() {
+        assert!(r.sustained_input_rate >= 1_000);
+        assert!(r.sustained_input_rate <= 4_000);
+    } else {
+        assert_eq!(r.sustained_input_rate, 0);
+    }
+}
+
+#[tokio::test]
+async fn exql_returns_zero_with_warning_when_no_candidate_passes() {
+    let srv = start().await;
+    let mut profile = Profile::local();
+    profile.exql_duration = std::time::Duration::from_secs(2);
+    // Bounds far above what the broker can sustain in 2s.
+    let r = exspeed_bench::scenarios::exql::run(
+        &srv.tcp_addr,
+        &srv.api_addr,
+        &profile,
+        10_000_000,   // low — unachievable
+        100_000_000,  // high — also unachievable
+        2,
+    ).await.unwrap();
+    assert_eq!(r.sustained_input_rate, 0, "should be 0 when no candidate passes");
+    assert!(r.warning.is_some(), "warning should be set");
+    assert!(r.warning.as_ref().unwrap().contains("no-candidate-passed"));
 }

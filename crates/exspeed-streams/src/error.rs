@@ -25,6 +25,9 @@ pub enum StorageError {
         "offset {requested} is below earliest retained offset {earliest} (records trimmed by retention)"
     )]
     OffsetOutOfRange { requested: u64, earliest: u64 },
+
+    #[error("internal channel closed (writer task exited unexpectedly)")]
+    ChannelClosed,
 }
 
 #[cfg(test)]

@@ -1,4 +1,6 @@
 export { ExspeedClient } from "./client.js";
+export { Publisher } from "./publisher.js";
+export type { PublisherOptions } from "./publisher.js";
 export { Subscription, Message } from "./subscription.js";
 export {
   ExspeedError,

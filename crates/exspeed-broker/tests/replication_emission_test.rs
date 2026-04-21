@@ -41,6 +41,7 @@ fn make_broker(
         work_coordinator,
         lease,
         metrics,
+        exspeed_broker::broker::DEFAULT_DELIVERY_BUFFER,
     )
     .with_replication_coordinator(coord);
     (broker, dir)

@@ -145,6 +145,16 @@ where
     Ok(())
 }
 
+/// Storage durability mode for the `--storage-sync` CLI flag.
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+pub enum StorageSyncArg {
+    /// Group commit + fsync per batch (default, strongest durability).
+    Sync,
+    /// Batch writes immediately; fsync fires on a timer. Up to
+    /// `--storage-sync-interval-ms` of acked data may be lost on crash.
+    Async,
+}
+
 #[derive(Args)]
 pub struct ServerArgs {
     /// Address to bind to
@@ -177,6 +187,40 @@ pub struct ServerArgs {
     /// Path to PEM-encoded private key. Must be set with --tls-cert.
     #[arg(long, env = "EXSPEED_TLS_KEY")]
     pub tls_key: Option<PathBuf>,
+
+    /// Storage durability mode. `sync` = group commit + fsync per batch (safe default).
+    /// `async` = batch without fsync, periodic fsync on `--storage-sync-interval-ms`.
+    #[arg(long, value_enum, default_value = "sync", env = "EXSPEED_STORAGE_SYNC")]
+    pub storage_sync: StorageSyncArg,
+
+    /// Appender flush window in microseconds. Incoming appends are coalesced
+    /// into a batch for up to this many µs before being committed to disk.
+    #[arg(long, default_value_t = 500, env = "EXSPEED_FLUSH_WINDOW_US")]
+    pub storage_flush_window_us: u64,
+
+    /// Flush the appender batch early when this many records are queued.
+    #[arg(long, default_value_t = 256, env = "EXSPEED_FLUSH_THRESHOLD_RECORDS")]
+    pub storage_flush_threshold_records: usize,
+
+    /// Flush the appender batch early when this many bytes are queued.
+    #[arg(long, default_value_t = 1_048_576, env = "EXSPEED_FLUSH_THRESHOLD_BYTES")]
+    pub storage_flush_threshold_bytes: usize,
+
+    /// Interval in milliseconds between periodic fsyncs in async sync mode.
+    /// Only relevant when `--storage-sync=async`.
+    #[arg(long, default_value_t = 10, env = "EXSPEED_SYNC_INTERVAL_MS")]
+    pub storage_sync_interval_ms: u64,
+
+    /// Unflushed-bytes threshold to trigger an early fsync in async sync mode.
+    /// Currently reserved for future use — timer-only in this release.
+    #[arg(long, default_value_t = 4 * 1024 * 1024, env = "EXSPEED_SYNC_BYTES")]
+    pub storage_sync_bytes: usize,
+
+    /// mpsc channel capacity for per-subscription delivery tasks. Larger values
+    /// tolerate burstier producers at the cost of more memory per subscription.
+    /// Wired through ServerArgs now; consumed by the broker in a future task.
+    #[arg(long, default_value_t = 8192, env = "EXSPEED_DELIVERY_BUFFER")]
+    pub delivery_buffer: usize,
 }
 
 pub async fn run(args: ServerArgs) -> Result<()> {
@@ -298,8 +342,43 @@ where
     let lock = crate::cli::server_lock::acquire_data_dir_lock(&args.data_dir)?;
     Box::leak(Box::new(lock));
 
+    // Build storage sync mode from CLI args.
+    let storage_sync_mode = match args.storage_sync {
+        StorageSyncArg::Sync => exspeed_storage::file::StorageSyncMode::Sync,
+        StorageSyncArg::Async => exspeed_storage::file::StorageSyncMode::Async {
+            interval: std::time::Duration::from_millis(args.storage_sync_interval_ms),
+            threshold_bytes: args.storage_sync_bytes,
+        },
+    };
+    if matches!(args.storage_sync, StorageSyncArg::Async) {
+        tracing::warn!(
+            interval_ms = args.storage_sync_interval_ms,
+            "storage sync mode is async; up to {} ms of acked data may be lost on crash",
+            args.storage_sync_interval_ms
+        );
+    }
+
+    // Build appender config from CLI args.
+    let appender_config = exspeed_storage::file::wal_appender::AppenderConfig {
+        flush_window: std::time::Duration::from_micros(args.storage_flush_window_us),
+        flush_threshold_records: args.storage_flush_threshold_records,
+        flush_threshold_bytes: args.storage_flush_threshold_bytes,
+    };
+
+    // Set delivery_buffer env var so Task 8 (broker mpsc bump) can pick it up.
+    // SAFETY: single-threaded at this point in startup; no other thread reads this var yet.
+    // LINT: set_var is deprecated in edition 2024 for unsafe reasons but acceptable here.
+    #[allow(deprecated)]
+    unsafe {
+        std::env::set_var("EXSPEED_DELIVERY_BUFFER", args.delivery_buffer.to_string());
+    }
+
     // Create storage
-    let file_storage = Arc::new(FileStorage::open(&args.data_dir)?);
+    let file_storage = Arc::new(FileStorage::open_with_mode(
+        &args.data_dir,
+        storage_sync_mode,
+        appender_config,
+    )?);
     // Check for S3 tiered storage
     let storage: Arc<dyn StorageEngine> = match exspeed_storage::s3::config::S3Config::from_env() {
         Ok(Some(s3_config)) => {
@@ -524,6 +603,7 @@ where
         work_coordinator.clone(),
         lease.clone(),
         metrics.clone(),
+        args.delivery_buffer,
     );
     let broker = Arc::new(match replication_coordinator.as_ref() {
         Some(coord) => broker_builder.with_replication_coordinator(coord.clone()),

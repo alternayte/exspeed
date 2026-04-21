@@ -88,6 +88,7 @@ pub async fn make_state_with_leader(leader: bool) -> Arc<exspeed_api::AppState> 
         wc,
         lease.clone(),
         metrics.clone(),
+        exspeed_broker::broker::DEFAULT_DELIVERY_BUFFER,
     ));
     // Mark dedup rebuild as complete — the helper represents a fully started
     // server for test purposes. Tests that want to exercise the not-ready

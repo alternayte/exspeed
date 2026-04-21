@@ -271,6 +271,78 @@ impl Partition {
         Ok((offset, timestamp))
     }
 
+    /// Append N records in one shot. Performs ONE WAL write for the whole
+    /// batch via `WalWriter::append_batch`, then writes each record to the
+    /// active segment. Single-record `append` remains for the slow path.
+    ///
+    /// `sync_now` controls whether `sync_data` is called on the WAL after
+    /// the batch write. In `Sync` mode this is `true` (group-commit + fsync).
+    /// In `Async` mode this is `false` — the `WalSyncer` task handles the
+    /// periodic fsync.
+    ///
+    /// On `Err`, the entire batch should be considered failed from the caller's
+    /// perspective. Some records may already be durable in the WAL (and will be
+    /// replayed on next `Partition::open`); the returned `results` Vec is dropped
+    /// and never observable. Do not retry individual records from a failed batch
+    /// without restarting the partition first.
+    pub fn append_batch(&mut self, records: &[Record], sync_now: bool) -> io::Result<Vec<(Offset, u64)>> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Phase 1: assign offsets + timestamps.
+        let mut assignments: Vec<(String, u32, Offset, u64, Record)> =
+            Vec::with_capacity(records.len());
+        let mut results: Vec<(Offset, u64)> = Vec::with_capacity(records.len());
+        for record in records {
+            let offset = Offset(self.next_offset);
+            let timestamp = record.timestamp_ns.unwrap_or_else(now_nanos);
+            assignments.push((
+                self.stream_name.clone(),
+                self.partition_id,
+                offset,
+                timestamp,
+                record.clone(),
+            ));
+            results.push((offset, timestamp));
+            self.next_offset += 1;
+        }
+
+        // Phase 2: ONE WAL append + optional sync_data.
+        if let Err(e) = self.wal.append_batch(&assignments, sync_now) {
+            log_write_error(&self.stream_name, self.partition_id, "WAL batch write failed", &e);
+            // Roll back next_offset so the offset space stays gap-free.
+            self.next_offset -= records.len() as u64;
+            return Err(e);
+        }
+
+        // Phase 3: segment writes (no fsync per record — flushed on segment roll).
+        for (i, (_, _, offset, timestamp, record)) in assignments.iter().enumerate() {
+            if let Err(e) = self.active_writer.append(*offset, *timestamp, record) {
+                log_write_error(
+                    &self.stream_name,
+                    self.partition_id,
+                    "segment write failed in batch (records ahead in batch are durable in WAL)",
+                    &e,
+                );
+                results.truncate(i);
+                // Rewind the unwritten offsets so the next call doesn't skip them.
+                // Records 0..i ARE durable in segment+WAL; records i..N are durable
+                // in WAL only and will be replayed on next Partition::open. We must
+                // walk back next_offset to match what the segment actually contains.
+                self.next_offset -= (records.len() - i) as u64;
+                return Err(e);
+            }
+        }
+
+        // Roll segment if needed (after the whole batch).
+        if self.active_writer.bytes_written() >= self.segment_max_bytes {
+            self.roll_segment()?;
+        }
+
+        Ok(results)
+    }
+
     /// Read records from this partition starting at `from_offset`.
     ///
     /// Reads from sealed segments first, then from the active segment.
@@ -642,6 +714,21 @@ impl Partition {
     /// need to force segment rolling without writing 256MB of data.
     pub fn set_segment_max_bytes(&mut self, max: u64) {
         self.segment_max_bytes = max;
+    }
+
+    /// Force a `sync_data` on the WAL. Called by `WalSyncer` in async mode.
+    pub(crate) fn sync_wal_now(&mut self) -> io::Result<()> {
+        self.wal.sync_data()
+    }
+
+    /// Stream name accessor for `WalSyncer` logging.
+    pub(crate) fn stream_name(&self) -> &str {
+        &self.stream_name
+    }
+
+    /// Partition ID accessor for `WalSyncer` logging.
+    pub(crate) fn partition_id(&self) -> u32 {
+        self.partition_id
     }
 
     /// Roll the active segment: seal it, build indexes, open a reader for it,

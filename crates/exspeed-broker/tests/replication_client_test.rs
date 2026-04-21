@@ -541,7 +541,10 @@ async fn trims_on_retention_trimmed_event() {
         "earliest to advance to 5",
     )
     .await;
-    let all = storage.read(&name, Offset(0), 100).await.unwrap();
+    // Read from the new earliest — the storage layer errors on reads
+    // below earliest, so we can't hardcode Offset(0) after a retention trim.
+    let (earliest, _) = storage.stream_bounds(&name).await.unwrap();
+    let all = storage.read(&name, earliest, 100).await.unwrap();
     assert!(
         all.iter().all(|r| r.offset.0 >= 5),
         "all records must be >= 5, got: {:?}",
