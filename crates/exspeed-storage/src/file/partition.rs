@@ -703,19 +703,13 @@ impl Partition {
         self.segment_max_bytes = max;
     }
 
-    /// Force a `sync_data` on the WAL. Called by `WalSyncer` in async mode.
-    pub(crate) fn sync_wal_now(&mut self) -> io::Result<()> {
-        self.wal.sync_data()
-    }
-
-    /// Stream name accessor for `WalSyncer` logging.
-    pub(crate) fn stream_name(&self) -> &str {
-        &self.stream_name
-    }
-
-    /// Partition ID accessor for `WalSyncer` logging.
-    pub(crate) fn partition_id(&self) -> u32 {
-        self.partition_id
+    /// Clone the WAL file handle so `WalSyncer` can issue `sync_data`
+    /// without holding the per-partition `Mutex<Partition>` that serializes
+    /// writes. Both handles share the same kernel fd — concurrent fsync on
+    /// the syncer's handle does not block writes through the WalWriter's
+    /// handle, which is exactly the async-storage-mode semantic.
+    pub(crate) fn try_clone_wal_file(&self) -> io::Result<std::fs::File> {
+        self.wal.try_clone_file()
     }
 
     /// Roll the active segment: seal it, build indexes, open a reader for it,

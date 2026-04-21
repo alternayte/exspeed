@@ -37,6 +37,14 @@ pub struct WalWriter {
 }
 
 impl WalWriter {
+    /// Clone the underlying `File` handle so a separate task can issue
+    /// `sync_data` on the same kernel fd without holding the caller's lock.
+    /// Used by `WalSyncer` in async storage mode to fsync without blocking
+    /// the per-partition `Mutex<Partition>` that serializes writes.
+    pub fn try_clone_file(&self) -> io::Result<File> {
+        self.file.try_clone()
+    }
+
     /// Open or create the WAL file at `path` in append mode.
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new()

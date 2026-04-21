@@ -162,12 +162,20 @@ impl FileStorage {
                     };
 
                     let partition = Partition::open(&part_path, &stream_name, part_id)?;
+                    // Clone the WAL file handle BEFORE wrapping in Arc<Mutex>
+                    // so the syncer task owns an independent File that it
+                    // can sync_data() on without holding the partition mutex.
+                    let wal_clone = if let StorageSyncMode::Async { .. } = mode {
+                        Some(partition.try_clone_wal_file()?)
+                    } else {
+                        None
+                    };
                     let key = (stream_name.clone(), part_id);
                     let partition_arc = Arc::new(Mutex::new(partition));
                     let appender =
                         wal_appender::spawn(partition_arc.clone(), appender_config, appender_mode);
-                    if let StorageSyncMode::Async { interval, .. } = mode {
-                        let syncer = wal_syncer::spawn(partition_arc.clone(), interval);
+                    if let (Some(f), StorageSyncMode::Async { interval, .. }) = (wal_clone, mode) {
+                        let syncer = wal_syncer::spawn(f, stream_name.clone(), part_id, interval);
                         syncers.insert(key.clone(), syncer);
                     }
                     appenders.insert(key.clone(), appender);
@@ -291,6 +299,15 @@ impl FileStorage {
             new_partition.set_seal_notifier(tx);
         }
 
+        // Clone the WAL file handle BEFORE wrapping in Arc<Mutex> so the
+        // syncer task owns an independent File that it can sync_data() on
+        // without holding the partition mutex.
+        let wal_clone = if let StorageSyncMode::Async { .. } = self.inner.storage_sync_mode {
+            Some(new_partition.try_clone_wal_file()?)
+        } else {
+            None
+        };
+
         let key = (stream.to_string(), partition_id);
         let partition_arc = Arc::new(Mutex::new(new_partition));
         let appender_mode = match self.inner.storage_sync_mode {
@@ -299,10 +316,11 @@ impl FileStorage {
         };
         let appender =
             wal_appender::spawn(partition_arc.clone(), self.inner.appender_config, appender_mode);
-        let syncer = if let StorageSyncMode::Async { interval, .. } = self.inner.storage_sync_mode {
-            Some(wal_syncer::spawn(partition_arc.clone(), interval))
-        } else {
-            None
+        let syncer = match (wal_clone, self.inner.storage_sync_mode) {
+            (Some(f), StorageSyncMode::Async { interval, .. }) => {
+                Some(wal_syncer::spawn(f, stream.to_string(), partition_id, interval))
+            }
+            _ => None,
         };
 
         self.inner.partitions.insert(key.clone(), partition_arc);
@@ -399,6 +417,15 @@ impl FileStorage {
             partition.set_seal_notifier(tx.clone());
         }
 
+        // Clone the WAL file handle BEFORE wrapping in Arc<Mutex> so the
+        // syncer task owns an independent File that it can sync_data() on
+        // without holding the partition mutex.
+        let wal_clone = if let StorageSyncMode::Async { .. } = self.inner.storage_sync_mode {
+            Some(partition.try_clone_wal_file()?)
+        } else {
+            None
+        };
+
         let partition_arc = Arc::new(Mutex::new(partition));
         let appender_mode = match self.inner.storage_sync_mode {
             StorageSyncMode::Sync => AppenderMode::Sync,
@@ -406,10 +433,11 @@ impl FileStorage {
         };
         let appender =
             wal_appender::spawn(partition_arc.clone(), self.inner.appender_config, appender_mode);
-        let syncer = if let StorageSyncMode::Async { interval, .. } = self.inner.storage_sync_mode {
-            Some(wal_syncer::spawn(partition_arc.clone(), interval))
-        } else {
-            None
+        let syncer = match (wal_clone, self.inner.storage_sync_mode) {
+            (Some(f), StorageSyncMode::Async { interval, .. }) => {
+                Some(wal_syncer::spawn(f, stream.as_str().to_string(), 0, interval))
+            }
+            _ => None,
         };
 
         // Atomic check-and-insert: use entry() API to guard against a race where
