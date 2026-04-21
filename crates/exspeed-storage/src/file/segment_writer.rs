@@ -348,7 +348,17 @@ mod tests {
         };
         writer.append(Offset(0), 1, &rec).unwrap();
         cloned.sync_data().unwrap();
-        // Test just verifies clone + sync on clone doesn't error.
+
+        // Prove the clone actually points at the same inode AND that sync through
+        // the clone flushed the writer's buffered bytes: on-disk size must exceed
+        // just the header.
+        let on_disk_len = std::fs::metadata(writer.path()).unwrap().len();
+        assert!(
+            on_disk_len > SEGMENT_HEADER_SIZE as u64,
+            "on-disk length {} should exceed SEGMENT_HEADER_SIZE ({}) after sync via clone",
+            on_disk_len,
+            SEGMENT_HEADER_SIZE,
+        );
     }
 
     #[test]
@@ -363,6 +373,51 @@ mod tests {
             headers: vec![], timestamp_ns: None,
         };
         writer.append(Offset(0), 100, &rec).unwrap();
-        writer.sync_data().unwrap(); // Just verify no error.
+        writer.sync_data().unwrap();
+
+        // After sync_data the bytes written through `writer` must be visible on
+        // disk — the file's metadata length should be at least bytes_written().
+        let on_disk_len = std::fs::metadata(writer.path()).unwrap().len();
+        assert!(
+            on_disk_len >= writer.bytes_written(),
+            "on-disk length {} should be >= bytes_written {} after sync_data",
+            on_disk_len,
+            writer.bytes_written(),
+        );
+    }
+
+    #[test]
+    fn append_batch_without_sync_is_persisted_after_drop() {
+        use bytes::Bytes;
+        use tempfile::tempdir;
+
+        let tmp = tempdir().unwrap();
+        let mut writer = SegmentWriter::create(tmp.path(), 0).unwrap();
+
+        let rec = Record {
+            subject: "s".into(),
+            key: None,
+            value: Bytes::from_static(b"v"),
+            headers: vec![],
+            timestamp_ns: None,
+        };
+        let entries: Vec<(Offset, u64, Record)> = (0..5)
+            .map(|i| (Offset(i), 1000 + i, rec.clone()))
+            .collect();
+
+        // sync_now = false: async-syncer path. Durability should come from the
+        // Drop impl's best-effort sync_all.
+        writer.append_batch(&entries, /*sync_now=*/ false).unwrap();
+        drop(writer);
+
+        // Round-trip via SegmentReader to confirm all records reached disk.
+        let seg_path = tmp.path().join("00000000000000000000.seg");
+        let reader = SegmentReader::open(&seg_path).unwrap();
+        let records = reader.read_from(0, 100).unwrap();
+        assert_eq!(records.len(), 5, "all 5 records should be durable after drop");
+        for (i, r) in records.iter().enumerate() {
+            assert_eq!(r.offset.0, i as u64);
+            assert_eq!(r.timestamp, 1000 + i as u64);
+        }
     }
 }
