@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use bytes::{Buf, Bytes, BytesMut};
+use futures_util::stream::FuturesUnordered;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -145,9 +146,10 @@ pub struct ProducerStats {
     pub wall_secs: f64,
 }
 
-/// Spawn `tasks` producer tasks. Each owns one pipelined Publisher connection
-/// and keeps up to 256 publishes in flight concurrently, removing per-publish
-/// round-trip cost from the critical path. Returns aggregate stats.
+/// Spawn `tasks` producer loops all sharing one coalescing Publisher. Each task
+/// keeps `in_flight_per_task` publishes in-flight simultaneously via
+/// FuturesUnordered, giving the Publisher's flusher `tasks × in_flight_per_task`
+/// concurrent enqueues and enabling fat-batch coalescing.
 /// `origin` is the shared start instant for publish_us headers so the consumer
 /// can compute deltas with `now.duration_since(origin)`.
 pub async fn run_producer(
@@ -160,92 +162,76 @@ pub async fn run_producer(
     shared_count: Arc<AtomicU64>,
 ) -> Result<ProducerStats> {
     use crate::driver::publisher::PublisherBuilder;
-    use futures_util::stream::FuturesUnordered;
 
     let payload: Bytes = Bytes::from(vec![b'x'; payload_bytes]);
     let stream = stream.to_owned();
+    let start = Instant::now();
+
+    // Shared Publisher across all tasks: coalesces cross-task concurrent publishes.
+    let publisher = PublisherBuilder::new(addr)
+        .max_batch_records(512)
+        .batch_window(Duration::from_micros(100))
+        .max_in_flight(8192) // enough for tasks × in_flight_per_task
+        .build()
+        .await?;
+
+    let in_flight_per_task: usize = 64;
     let mut handles = Vec::with_capacity(tasks);
-    // Concurrency window per producer task.  4 concurrent publishes provides a
-    // meaningful pipelining gain (4× better than serial per task) while keeping
-    // the queue depth shallow enough that the bench consumer — which reads records
-    // serially with a 1 s p50 latency bound — does not fall behind.  The
-    // Publisher semaphore allows up to 256 permits; this constant is a bench
-    // driver policy, not a transport limit.
-    let in_flight_per_task: usize = 4;
 
     for _ in 0..tasks {
-        let addr = addr.to_owned();
+        let publisher = publisher.clone();
         let stream = stream.clone();
         let payload = payload.clone();
         let shared_count = shared_count.clone();
         handles.push(tokio::spawn(async move {
-            let task_start = Instant::now();
-            let publisher = PublisherBuilder::new(&addr)
-                .max_in_flight(in_flight_per_task)
-                .build()
-                .await?;
-            let deadline = task_start + duration;
+            let deadline = Instant::now() + duration;
             let mut local: u64 = 0;
-            let mut committed: u64 = 0;
-            let mut futs: FuturesUnordered<_> = FuturesUnordered::new();
+            let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+
             while Instant::now() < deadline {
-                while futs.len() < in_flight_per_task && Instant::now() < deadline {
-                    // Set the timestamp lazily inside the async block so it
-                    // reflects when the message is actually sent, not when it
-                    // is queued into FuturesUnordered.
-                    let stream = stream.clone();
-                    let payload = payload.clone();
-                    let pub2 = publisher.clone();
-                    futs.push(async move {
-                        let us = origin.elapsed().as_micros() as u64;
-                        let req = exspeed_protocol::messages::publish::PublishRequest {
-                            stream,
-                            subject: "bench".into(),
-                            key: None,
-                            msg_id: None,
-                            value: payload,
-                            headers: vec![(PUBLISH_TS_HEADER.to_owned(), format!("{us}"))],
-                        };
-                        pub2.publish(req).await
-                    });
+                // Top up in-flight window.
+                while in_flight.len() < in_flight_per_task && Instant::now() < deadline {
+                    let us = origin.elapsed().as_micros() as u64;
+                    let req = exspeed_protocol::messages::publish::PublishRequest {
+                        stream: stream.clone(),
+                        subject: "bench".into(),
+                        key: None,
+                        msg_id: None,
+                        value: payload.clone(),
+                        headers: vec![(PUBLISH_TS_HEADER.to_owned(), format!("{us}"))],
+                    };
+                    in_flight.push(publisher.publish(req));
                 }
-                if let Some(res) = futs.next().await {
-                    let _ = res; // count locally; offset/error not used here
+                // Drain one completion before topping up again.
+                if let Some(_result) = in_flight.next().await {
                     local += 1;
-                    if local - committed >= 256 {
+                    if local.is_multiple_of(256) {
                         shared_count.fetch_add(256, Ordering::Relaxed);
-                        committed += 256;
                     }
                 }
             }
-            // Snapshot active window before draining so the wall_secs reported
-            // to the caller reflects only the publish-rate window, not drain time.
-            let active_secs = task_start.elapsed().as_secs_f64();
-            // Drain remaining in-flight (don't lose in-flight acks).
-            while let Some(res) = futs.next().await {
-                let _ = res;
+
+            // Drain remaining in-flight.
+            while let Some(_result) = in_flight.next().await {
                 local += 1;
+                if local.is_multiple_of(256) {
+                    shared_count.fetch_add(256, Ordering::Relaxed);
+                }
             }
-            drop(futs);
-            // Commit the tail not yet published to shared_count.
-            shared_count.fetch_add(local - committed, Ordering::Relaxed);
-            publisher.close().await.ok();
-            Ok::<(u64, f64), anyhow::Error>((local, active_secs))
+            shared_count.fetch_add(local % 256, Ordering::Relaxed);
+
+            Ok::<u64, anyhow::Error>(local)
         }));
     }
+
     let mut total: u64 = 0;
-    let mut max_active_secs: f64 = 0.0;
-    for h in handles {
-        let (n, secs) = h.await??;
-        total += n;
-        if secs > max_active_secs { max_active_secs = secs; }
-    }
-    // wall_secs is the longest active publish window across all tasks, which
-    // includes connection setup but excludes post-deadline drain time.
+    for h in handles { total += h.await??; }
+    publisher.close().await.ok();
+
     Ok(ProducerStats {
         messages: total,
         bytes: total * payload_bytes as u64,
-        wall_secs: max_active_secs,
+        wall_secs: start.elapsed().as_secs_f64(),
     })
 }
 
@@ -257,14 +243,14 @@ pub async fn run_producer_at_rate(
     rate_per_sec: u64,
     origin: Instant,
 ) -> Result<ProducerStats> {
-    use crate::driver::publisher::Publisher;
-
+    use crate::driver::publisher::PublisherBuilder;
     let payload: Bytes = Bytes::from(vec![b'x'; payload_bytes]);
-    let publisher = Publisher::new(addr).await?;
+    let publisher = PublisherBuilder::new(addr)
+        .batch_window(Duration::from_micros(100))
+        .build()
+        .await?;
     let interval_ns = 1_000_000_000u64 / rate_per_sec.max(1);
     let mut ticker = tokio::time::interval(Duration::from_nanos(interval_ns));
-    // We want ticks to "catch up" rather than bunch when a publish takes longer
-    // than the interval — this gives accurate coordinated-omission measurement.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
     let start = Instant::now();
     let deadline = start + duration;
@@ -280,7 +266,7 @@ pub async fn run_producer_at_rate(
             value: payload.clone(),
             headers: vec![(PUBLISH_TS_HEADER.to_owned(), format!("{us}"))],
         };
-        publisher.publish(req).await.ok();
+        let _ = publisher.publish(req).await;
         sent += 1;
     }
     publisher.close().await.ok();
@@ -365,34 +351,47 @@ pub async fn run_consumer(
             Ok(None) => break,
             Err(_) => break, // deadline reached
         };
-        if next.opcode != OpCode::Record {
-            continue;
-        }
-        let delivery = RecordDelivery::decode(next.payload)?;
+        // Dispatch: accept both Record (0x82) and RecordsBatch (0x83); skip everything else.
+        let deliveries: Vec<(u64, Vec<(String, String)>)> =
+            if next.opcode == OpCode::Record {
+                let d = RecordDelivery::decode(next.payload)?;
+                vec![(d.offset, d.headers)]
+            } else if next.opcode == OpCode::RecordsBatch {
+                use exspeed_protocol::messages::records_batch::RecordsBatch;
+                let batch = RecordsBatch::decode(next.payload)?;
+                batch
+                    .records
+                    .into_iter()
+                    .map(|r| (r.offset, r.headers))
+                    .collect()
+            } else {
+                continue;
+            };
 
-        // Find publish_us header; ignore records without it (shouldn't happen in bench runs).
-        if let Some(v) = delivery
-            .headers
-            .iter()
-            .find(|(k, _)| k == PUBLISH_TS_HEADER)
-            .map(|(_, v)| v)
-        {
-            match v.parse::<u64>() {
-                Ok(sent_us) => {
-                    let now_us = origin.elapsed().as_micros() as u64;
-                    if now_us > sent_us {
-                        let _ = hist.record(now_us - sent_us);
+        for (offset, headers) in deliveries {
+            // Find publish_us header; ignore records without it (shouldn't happen in bench runs).
+            if let Some(v) = headers
+                .iter()
+                .find(|(k, _)| k == PUBLISH_TS_HEADER)
+                .map(|(_, v)| v)
+            {
+                match v.parse::<u64>() {
+                    Ok(sent_us) => {
+                        let now_us = origin.elapsed().as_micros() as u64;
+                        if now_us > sent_us {
+                            let _ = hist.record(now_us - sent_us);
+                        }
+                    }
+                    Err(_) => {
+                        // Malformed header — skip rather than poison the histogram.
                     }
                 }
-                Err(_) => {
-                    // Malformed header — skip rather than poison the histogram.
-                }
             }
-        }
 
-        highest_unacked = Some(delivery.offset);
-        records_since_last_ack += 1;
-        messages += 1;
+            highest_unacked = Some(offset);
+            records_since_last_ack += 1;
+            messages += 1;
+        }
 
         // Send one cumulative Ack every 64 records or every 5 ms, whichever
         // comes first.  The broker advances its stored offset to N on Ack(N),

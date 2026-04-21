@@ -82,4 +82,19 @@ pub trait StorageEngine: Send + Sync {
         stream: &StreamName,
         drop_from: Offset,
     ) -> Result<(), StorageError>;
+
+    /// Append N records. Default implementation serializes via `append`;
+    /// FileStorage overrides this to use a single WAL batch.
+    async fn append_batch(
+        &self,
+        stream: &StreamName,
+        records: Vec<Record>,
+    ) -> Result<Vec<(Offset, u64)>, StorageError> {
+        let mut out = Vec::with_capacity(records.len());
+        for record in records {
+            let (offset, ts) = self.append(stream, &record).await?;
+            out.push((offset, ts));
+        }
+        Ok(out)
+    }
 }

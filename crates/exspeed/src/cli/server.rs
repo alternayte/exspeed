@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, info_span, warn, Instrument};
 
 use exspeed_broker::broker_append::BrokerAppend;
-use exspeed_broker::consumer_state::DeliveryRecord;
+use exspeed_broker::consumer_state::DeliveryBatch;
 use exspeed_broker::replication::{ReplicationClient, ReplicationCoordinator, ReplicationServer};
 use exspeed_broker::Broker;
 use exspeed_common::auth::{Action, CredentialStore, Identity, Permission, StreamGlob};
@@ -1203,7 +1203,7 @@ where
     // old stream, but the broker tears down the delivery task in that
     // case so the invariant holds end-to-end.
     let mut active_sub_stream: Option<StreamName> = None;
-    let mut delivery_rx: Option<mpsc::Receiver<DeliveryRecord>> = None;
+    let mut delivery_rx: Option<mpsc::Receiver<DeliveryBatch>> = None;
     let mut cancel_tx: Option<oneshot::Sender<()>> = None;
 
     loop {
@@ -1356,6 +1356,117 @@ where
                                     .await;
                                 framed_write
                                     .send(response.into_frame(correlation_id))
+                                    .await?;
+                            }
+                            Ok(ClientMessage::PublishBatch(req)) => {
+                                use exspeed_protocol::messages::publish_batch::{
+                                    BatchResult, PublishBatchOkResponse,
+                                };
+                                use exspeed_streams::record::Record;
+
+                                let Some(id) = identity.as_ref() else {
+                                    reject_unauthenticated(
+                                        &mut framed_write,
+                                        correlation_id,
+                                        &metrics,
+                                        "PublishBatch",
+                                    )
+                                    .await?;
+                                    continue;
+                                };
+
+                                let stream_name = match StreamName::try_from(req.stream.as_str()) {
+                                    Ok(n) => n,
+                                    Err(_) => {
+                                        let response = ServerMessage::Error {
+                                            code: 400,
+                                            message: "invalid stream name".into(),
+                                        }
+                                        .into_frame(correlation_id);
+                                        framed_write.send(response).await?;
+                                        continue;
+                                    }
+                                };
+
+                                if !id.authorize(Action::Publish, &stream_name) {
+                                    reject_forbidden(
+                                        &mut framed_write,
+                                        correlation_id,
+                                        &metrics,
+                                        "PublishBatch",
+                                    )
+                                    .await?;
+                                    continue;
+                                }
+
+                                // Convert PublishBatchRecord -> Record, injecting msg_id
+                                // into headers as "x-idempotency-key" (mirrors single-publish).
+                                const IDEMPOTENCY_HEADER: &str = "x-idempotency-key";
+                                let records: Vec<Record> = req
+                                    .records
+                                    .into_iter()
+                                    .map(|br| {
+                                        let mut headers = br.headers;
+                                        if let Some(id) = br.msg_id {
+                                            headers.push((
+                                                IDEMPOTENCY_HEADER.to_owned(),
+                                                id,
+                                            ));
+                                        }
+                                        Record {
+                                            subject: br.subject,
+                                            key: br.key,
+                                            value: br.value,
+                                            headers,
+                                            timestamp_ns: None,
+                                        }
+                                    })
+                                    .collect();
+
+                                let results = match broker
+                                    .broker_append
+                                    .append_batch(&stream_name, records)
+                                    .await
+                                {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        let response = ServerMessage::Error {
+                                            code: 500,
+                                            message: format!("{e}"),
+                                        }
+                                        .into_frame(correlation_id);
+                                        framed_write.send(response).await?;
+                                        continue;
+                                    }
+                                };
+
+                                let batch_results: Vec<BatchResult> = results
+                                    .into_iter()
+                                    .map(|r| match r {
+                                        exspeed_broker::broker_append::AppendResult::Written(
+                                            offset,
+                                            _ts,
+                                        ) => BatchResult::Written { offset: offset.0 },
+                                        exspeed_broker::broker_append::AppendResult::Duplicate(
+                                            offset,
+                                        ) => BatchResult::Duplicate {
+                                            offset: offset.0,
+                                            duplicate_of: offset.0,
+                                        },
+                                    })
+                                    .collect();
+
+                                let resp = PublishBatchOkResponse {
+                                    results: batch_results,
+                                };
+                                let mut buf = bytes::BytesMut::new();
+                                resp.encode(&mut buf);
+                                framed_write
+                                    .send(exspeed_protocol::frame::Frame::new(
+                                        exspeed_protocol::opcodes::OpCode::PublishBatchOk,
+                                        correlation_id,
+                                        buf.freeze(),
+                                    ))
                                     .await?;
                             }
                             Ok(ClientMessage::Fetch(req)) => {
@@ -1779,40 +1890,68 @@ where
                 }
             }
 
-            // Branch 2: outgoing delivery record from active subscription
+            // Branch 2: outgoing delivery batch from active subscription
             delivery = async {
                 match delivery_rx.as_mut() {
                     Some(rx) => rx.recv().await,
                     None => std::future::pending().await,
                 }
             } => {
-                if let Some(delivery_record) = delivery {
-                    let consumer_name = match active_subscription.as_ref() {
-                        Some((name, _)) => name.clone(),
-                        None => {
-                            warn!(
-                                %peer,
-                                offset = delivery_record.record.offset.0,
-                                "received delivery after subscription was cleared; \
-                                 dropping record and tearing down delivery channel"
-                            );
-                            delivery_rx = None;
-                            drop(cancel_tx.take());
-                            continue;
-                        }
-                    };
-                    let record_delivery = RecordDelivery {
-                        consumer_name,
-                        offset: delivery_record.record.offset.0,
-                        timestamp: delivery_record.record.timestamp,
-                        subject: delivery_record.record.subject.clone(),
-                        delivery_attempt: delivery_record.delivery_attempt,
-                        key: delivery_record.record.key.clone(),
-                        value: delivery_record.record.value.clone(),
-                        headers: delivery_record.record.headers.clone(),
-                    };
-                    let response = ServerMessage::Record(record_delivery);
-                    framed_write.send(response.into_frame(0)).await?;
+                if let Some(batch) = delivery {
+                    // Guard: check if subscription is still active without cloning.
+                    if active_subscription.is_none() {
+                        warn!(
+                            %peer,
+                            "received delivery batch after subscription was cleared; \
+                             dropping batch and tearing down delivery channel"
+                        );
+                        delivery_rx = None;
+                        drop(cancel_tx.take());
+                        continue;
+                    }
+
+                    if batch.records.len() == 1 {
+                        // Single-record path: one Record frame (0x82). Grouped consumers
+                        // always deliver size-1 batches; this keeps that path allocation-free.
+                        // Clone consumer_name only here where it's used.
+                        let consumer_name = match active_subscription.as_ref() {
+                            Some((name, _)) => name.clone(),
+                            None => unreachable!("guarded above"),
+                        };
+                        let d = batch.records.into_iter().next().unwrap();
+                        let record_delivery = RecordDelivery {
+                            consumer_name,
+                            offset: d.record.offset.0,
+                            timestamp: d.record.timestamp,
+                            subject: d.record.subject,
+                            delivery_attempt: d.delivery_attempt,
+                            key: d.record.key,
+                            value: d.record.value,
+                            headers: d.record.headers,
+                        };
+                        let response = ServerMessage::Record(record_delivery);
+                        framed_write.send(response.into_frame(0)).await?;
+                    } else {
+                        // Batch path: one RecordsBatch frame (0x83) for the whole batch.
+                        // Moves payload Bytes out of each DeliveryRecord — no extra clones.
+                        use exspeed_protocol::messages::records_batch::{BatchRecord, RecordsBatch};
+
+                        let records: Vec<BatchRecord> = batch
+                            .records
+                            .into_iter()
+                            .map(|d| BatchRecord {
+                                offset: d.record.offset.0,
+                                timestamp: d.record.timestamp,
+                                subject: d.record.subject,
+                                key: d.record.key,
+                                value: d.record.value,
+                                headers: d.record.headers,
+                            })
+                            .collect();
+
+                        let response = ServerMessage::RecordsBatch(RecordsBatch { records });
+                        framed_write.send(response.into_frame(0)).await?;
+                    }
                 } else {
                     // Channel closed — delivery task stopped
                     delivery_rx = None;

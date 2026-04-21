@@ -41,6 +41,9 @@ bincode = "1"
 thiserror = "2"
 anyhow = "1"
 
+# Concurrent maps
+dashmap = "6"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

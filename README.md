@@ -53,21 +53,24 @@ exspeed query "SELECT payload->>'region' AS region, COUNT(*) FROM orders GROUP B
 
 ## Benchmarks
 
-On a single MacBook (8 vCPU, 16 GB RAM, APFS+NVMe), Exspeed sustains:
+On a single MacBook (8 vCPU, 16 GB RAM, APFS+NVMe), Exspeed v0.3 sustains:
 
-| Workload                | Sync (default, durable)       | Async (opt-in)                |
-|-------------------------|-------------------------------|-------------------------------|
-| Publish, 1 KB payload   | ~593 msg/s                    | ~1,425 msg/s                  |
-| E2E latency @ 10k/s     | p50 105 ms / p99 250 ms       | p50 255 ms / p99 739 ms       |
-| Fan-out, 4 consumers    | ~95 msg/s aggregate           | ~93 msg/s aggregate           |
-| ExQL continuous query   | see note                      | see note                      |
+| Workload                | Sync (default, durable) | Async (opt-in)         |
+|-------------------------|-------------------------|------------------------|
+| Publish, 1 KB payload   | ~7,406 msg/s            | ~43,382 msg/s          |
+| E2E latency @ 10k/s     | p50 33 ms / p99 66 ms   | p50 41 ms / p99 87 ms  |
+| Fan-out, 4 consumers    | ~97 msg/s aggregate     | ~90 msg/s aggregate    |
 
-Numbers refreshed 2026-04-21 on git `238ac71`. macOS APFS fsync is inherently slower than Linux+NVMe — Linux reference numbers (pending a Hetzner run) will be significantly higher. The async mode 2.4× publish uplift (593 → 1,425 msg/s) demonstrates the group-commit + async-syncer path working as designed.
+Sync mode beats NATS JetStream's sync mode (~6,500 msg/s) on the same
+hardware. Async mode closes to within ~2.4× of NATS's async (~106k msg/s).
+
+Numbers refreshed 2026-04-21 on git `29c50d4`.
 
 > **ExQL note:** The binary-search found no candidate that sustained ≥95% of any target rate above the 5,000 msg/s floor on macOS. This reflects APFS write overhead under the dual publish+query load, not a bug in the query engine.
 
-Full methodology, per-scenario tables, and reproduction steps in [BENCHMARKS.md](BENCHMARKS.md).
-A reproducible comparison kit lives in [`bench/README.md`](bench/README.md).
+Full methodology, per-scenario tables, comparison data, and reproduction
+steps in [BENCHMARKS.md](BENCHMARKS.md).
+A reproducible comparison kit (Kafka included) lives in [`bench/README.md`](bench/README.md).
 
 ### Operational tuning
 

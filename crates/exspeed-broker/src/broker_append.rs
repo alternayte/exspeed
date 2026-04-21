@@ -376,6 +376,120 @@ impl BrokerAppend {
         Ok(AppendResult::Written(offset, timestamp_ns))
     }
 
+    /// Append N records in one shot. For records without `msg_id`, passes straight
+    /// to storage.append_batch (fast path, no dedup mutex). For records with
+    /// `msg_id`, runs per-record dedup under the per-stream mutex before delegating
+    /// non-duplicates to storage.append_batch. Returns Vec<AppendResult> preserving
+    /// input order.
+    pub async fn append_batch(
+        &self,
+        stream: &StreamName,
+        records: Vec<Record>,
+    ) -> Result<Vec<AppendResult>, StorageError> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Fast path: no records have msg_id → bypass dedup lock entirely.
+        let any_have_msg_id = records
+            .iter()
+            .any(|r| r.headers.iter().any(|(k, _)| k == IDEMPOTENCY_HEADER));
+        if !any_have_msg_id {
+            let results = self
+                .storage
+                .append_batch(stream, records)
+                .await
+                .inspect_err(|e| self.record_write_error(stream, e))?;
+            return Ok(results
+                .into_iter()
+                .map(|(o, t)| AppendResult::Written(o, t))
+                .collect());
+        }
+
+        // Slow path: some records have msg_id. Process under per-stream mutex.
+        let mutex = self.per_stream_lock(stream).await;
+        let _guard = mutex.lock().await;
+
+        let mut to_append: Vec<(usize, Record)> = Vec::new();
+        let mut results: Vec<Option<AppendResult>> = vec![None; records.len()];
+
+        for (i, record) in records.into_iter().enumerate() {
+            let idemp_key = record
+                .headers
+                .iter()
+                .find(|(k, _)| k == IDEMPOTENCY_HEADER)
+                .map(|(_, v)| v.clone());
+
+            let Some(key) = idemp_key else {
+                // No msg_id on this record — queue it for storage directly.
+                to_append.push((i, record));
+                continue;
+            };
+
+            let body_hash = hash_body(&record.value);
+
+            let mut maps = self.dedup_maps.write().await;
+            let map = maps
+                .entry(stream.clone())
+                .or_insert_with(|| DedupMap::new(self.default_window, self.default_max_entries));
+
+            match map.check(&key, body_hash) {
+                DedupCheckResult::HitSameBody { offset } => {
+                    results[i] = Some(AppendResult::Duplicate(Offset(offset)));
+                }
+                DedupCheckResult::HitDifferentBody { stored_offset } => {
+                    return Err(StorageError::KeyCollision { stored_offset });
+                }
+                DedupCheckResult::Miss => {
+                    to_append.push((i, record));
+                }
+            }
+        }
+
+        if !to_append.is_empty() {
+            let indices: Vec<usize> = to_append.iter().map(|(i, _)| *i).collect();
+            let records_only: Vec<Record> = to_append.into_iter().map(|(_, r)| r).collect();
+
+            let body_hashes: Vec<u64> = records_only.iter().map(|r| hash_body(&r.value)).collect();
+            let msg_ids: Vec<Option<String>> = records_only
+                .iter()
+                .map(|r| {
+                    r.headers
+                        .iter()
+                        .find(|(k, _)| k == IDEMPOTENCY_HEADER)
+                        .map(|(_, v)| v.clone())
+                })
+                .collect();
+
+            let appended = self
+                .storage
+                .append_batch(stream, records_only)
+                .await
+                .inspect_err(|e| self.record_write_error(stream, e))?;
+
+            let mut maps = self.dedup_maps.write().await;
+            let map = maps
+                .entry(stream.clone())
+                .or_insert_with(|| DedupMap::new(self.default_window, self.default_max_entries));
+
+            for ((idx, (offset, ts)), (msg_id, body_hash)) in indices
+                .iter()
+                .zip(appended.iter())
+                .zip(msg_ids.iter().zip(body_hashes.iter()))
+            {
+                if let Some(key) = msg_id {
+                    map.insert(key.clone(), offset.0, *body_hash);
+                }
+                results[*idx] = Some(AppendResult::Written(*offset, *ts));
+            }
+        }
+
+        Ok(results
+            .into_iter()
+            .map(|r| r.expect("all indices populated"))
+            .collect())
+    }
+
     /// Run periodic eviction of expired dedup entries. Call from a background task.
     pub async fn evict_expired(&self) {
         let mut maps = self.dedup_maps.write().await;
