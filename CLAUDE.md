@@ -45,10 +45,13 @@ git push origin main
 git push origin vX.Y.Z
 
 # 4. Docker image — multi-arch (amd64 + arm64) via cloud builder
+#    Don't pipe through `tee` without `set -o pipefail` — buildx errors get swallowed
+#    (exit code reflects tee, not the build). Let buildx write straight to the terminal,
+#    or wrap the whole line: `set -o pipefail; docker buildx ... 2>&1 | tee build.log`.
 docker buildx build --builder cloud-nayth-projects \
   --platform linux/amd64,linux/arm64 \
-  -t docker.io/alternayte/exspeed:X.Y.Z \
-  -t docker.io/alternayte/exspeed:latest \
+  -t docker.io/nayth/exspeed:X.Y.Z \
+  -t docker.io/nayth/exspeed:latest \
   --push .
 
 # 5. TS SDK
@@ -59,7 +62,7 @@ awk '/^## \[X\.Y\.Z\]/{flag=1;next} /^## \[/{flag=0} flag' CHANGELOG.md > /tmp/n
 gh release create vX.Y.Z --title "vX.Y.Z — headline" --notes-file /tmp/notes.md
 ```
 
-- Docker image: `docker.io/alternayte/exspeed` — tags `latest` + `X.Y.Z`. Always publish both arches; Apple Silicon users need `arm64`.
+- Docker image: `docker.io/nayth/exspeed` — tags `latest` + `X.Y.Z`. Always publish both arches; Apple Silicon users need `arm64`.
 - Default buildx builder (`cloud-nayth-projects`) has dedicated `linux-amd64` and `linux-arm64` cloud nodes — multi-arch builds run in parallel rather than emulated locally.
 - TS SDK publishes as `@exspeed/sdk` on the public npm registry. `publishConfig.access: public` handles scoped-package access.
 
