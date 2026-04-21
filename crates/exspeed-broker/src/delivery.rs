@@ -123,25 +123,21 @@ async fn run_ungrouped(
                 continue;
             }
 
-            let delivery = DeliveryRecord {
-                record: record.clone(),
-                delivery_attempt: 1,
-            };
+            let timestamp = record.timestamp;
+            let next_offset = record.offset.0 + 1;
 
             config.metrics.record_consume_latency(
                 &config.stream_name,
                 &config.consumer_name,
-                consume_latency_secs(record.timestamp),
+                consume_latency_secs(timestamp),
             );
 
-            batch.push(delivery);
-            current_offset = record.offset.0 + 1;
+            batch.push(DeliveryRecord { record, delivery_attempt: 1 });
+            current_offset = next_offset;
         }
 
-        if !batch.is_empty() {
-            if tx.send(DeliveryBatch { records: batch }).await.is_err() {
-                return;
-            }
+        if !batch.is_empty() && tx.send(DeliveryBatch { records: batch }).await.is_err() {
+            return;
         }
     }
 }
