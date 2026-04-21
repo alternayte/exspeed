@@ -165,13 +165,12 @@ pub async fn run_producer(
     let payload: Bytes = Bytes::from(vec![b'x'; payload_bytes]);
     let stream = stream.to_owned();
     let mut handles = Vec::with_capacity(tasks);
-    // Concurrency window per producer task.  4 concurrent publishes provides a
-    // meaningful pipelining gain (4× better than serial per task) while keeping
-    // the queue depth shallow enough that the bench consumer — which reads records
-    // serially with a 1 s p50 latency bound — does not fall behind.  The
-    // Publisher semaphore allows up to 256 permits; this constant is a bench
-    // driver policy, not a transport limit.
-    let in_flight_per_task: usize = 4;
+    // Concurrency window per producer task.  With batch push (Tasks 1-2) and
+    // hot-path hygiene (Tasks 3-5) the consumer drains at broker rate, so we
+    // can saturate the pipeline with 256 concurrent publishes per task.
+    // The Publisher semaphore ceiling is also 256 permits; this constant is a
+    // bench driver policy, not a transport limit.
+    let in_flight_per_task: usize = 256;
 
     for _ in 0..tasks {
         let addr = addr.to_owned();

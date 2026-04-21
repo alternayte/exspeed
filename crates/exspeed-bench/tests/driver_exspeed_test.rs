@@ -73,7 +73,9 @@ async fn consumer_records_latency_for_pushed_records() {
     let cstats = consumer.await.unwrap().unwrap();
     assert!(cstats.messages > 0, "consumer received 0");
     let p50 = cstats.latency_histogram.value_at_percentile(50.0);
-    assert!(p50 > 0 && p50 < 1_000_000, "p50 {p50} us outside sanity range");
+    // With 256 in-flight publishes the queue depth is deeper; allow up to the
+    // full 3 s consumer window before declaring the result unreasonable.
+    assert!(p50 > 0 && p50 < 3_000_000, "p50 {p50} us outside sanity range");
 }
 
 #[tokio::test]
