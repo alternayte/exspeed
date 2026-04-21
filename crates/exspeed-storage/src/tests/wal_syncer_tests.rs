@@ -21,10 +21,14 @@ fn mk(body: &'static [u8]) -> Record {
 async fn async_mode_acks_immediately_then_syncs_on_timer() {
     let tmp = tempdir().unwrap();
     let storage = Arc::new(
-        FileStorage::open_with_mode(tmp.path(), StorageSyncMode::Async {
-            interval: Duration::from_millis(50),
-            threshold_bytes: 4 * 1024 * 1024,
-        }).unwrap()
+        FileStorage::open_with_mode(
+            tmp.path(),
+            StorageSyncMode::Async {
+                interval: Duration::from_millis(50),
+                threshold_bytes: 4 * 1024 * 1024,
+            },
+            crate::file::wal_appender::AppenderConfig::default(),
+        ).unwrap()
     );
     let stream: StreamName = "s".try_into().unwrap();
     storage.create_stream(&stream, 0, 0).await.unwrap();

@@ -27,6 +27,13 @@ async fn tls_cert_without_key_refuses_to_start() {
         credentials_file: None,
         tls_cert: Some(fake_cert),
         tls_key: None,
+            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+            storage_flush_window_us: 500,
+            storage_flush_threshold_records: 256,
+            storage_flush_threshold_bytes: 1_048_576,
+            storage_sync_interval_ms: 10,
+            storage_sync_bytes: 4 * 1024 * 1024,
+            delivery_buffer: 8192,
     };
 
     let result = exspeed::cli::server::run(args).await;
@@ -52,6 +59,13 @@ async fn tls_key_without_cert_refuses_to_start() {
         credentials_file: None,
         tls_cert: None,
         tls_key: Some(fake_key),
+            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+            storage_flush_window_us: 500,
+            storage_flush_threshold_records: 256,
+            storage_flush_threshold_bytes: 1_048_576,
+            storage_sync_interval_ms: 10,
+            storage_sync_bytes: 4 * 1024 * 1024,
+            delivery_buffer: 8192,
     };
 
     let result = exspeed::cli::server::run(args).await;
@@ -96,6 +110,13 @@ async fn tls_enabled_tcp_handshakes_with_rustls() {
         credentials_file: None,
         tls_cert: Some(cert_path.clone()),
         tls_key: Some(key_path),
+            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+            storage_flush_window_us: 500,
+            storage_flush_threshold_records: 256,
+            storage_flush_threshold_bytes: 1_048_576,
+            storage_sync_interval_ms: 10,
+            storage_sync_bytes: 4 * 1024 * 1024,
+            delivery_buffer: 8192,
     };
 
     tokio::spawn(async move {
@@ -158,6 +179,13 @@ async fn tls_enabled_http_responds_to_rustls_request() {
         credentials_file: None,
         tls_cert: Some(cert_path.clone()),
         tls_key: Some(key_path),
+            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+            storage_flush_window_us: 500,
+            storage_flush_threshold_records: 256,
+            storage_flush_threshold_bytes: 1_048_576,
+            storage_sync_interval_ms: 10,
+            storage_sync_bytes: 4 * 1024 * 1024,
+            delivery_buffer: 8192,
     };
 
     tokio::spawn(async move {
@@ -193,6 +221,13 @@ async fn auth_and_tls_together_end_to_end() {
         credentials_file: None,
         tls_cert: Some(cert_path.clone()),
         tls_key: Some(key_path),
+            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+            storage_flush_window_us: 500,
+            storage_flush_threshold_records: 256,
+            storage_flush_threshold_bytes: 1_048_576,
+            storage_sync_interval_ms: 10,
+            storage_sync_bytes: 4 * 1024 * 1024,
+            delivery_buffer: 8192,
     };
 
     tokio::spawn(async move {

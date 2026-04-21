@@ -101,23 +101,28 @@ impl FileStorage {
     /// Uses the default `StorageSyncMode::Sync` durability mode. To opt into
     /// async-sync mode use [`FileStorage::open_with_mode`].
     pub fn open(data_dir: &Path) -> io::Result<Self> {
-        Self::open_with_mode(data_dir, StorageSyncMode::default())
+        Self::open_with_mode(data_dir, StorageSyncMode::default(), AppenderConfig::default())
     }
 
-    /// Open an existing `FileStorage` with an explicit durability mode.
+    /// Open an existing `FileStorage` with an explicit durability mode and appender config.
     ///
     /// - `StorageSyncMode::Sync` — group commit + fsync per batch (default).
     /// - `StorageSyncMode::Async { interval, .. }` — writes are acked without
     ///   fsync; a `WalSyncer` task fires every `interval` to call `sync_data`.
     ///   On crash, up to `interval` of acked data may be lost.
+    /// - `appender_config` — batching tunables (flush window, record count threshold,
+    ///   byte threshold). Use [`AppenderConfig::default()`] for standard settings.
     ///
     /// Creates `data_dir` if it does not exist.
-    pub fn open_with_mode(data_dir: &Path, mode: StorageSyncMode) -> io::Result<Self> {
+    pub fn open_with_mode(
+        data_dir: &Path,
+        mode: StorageSyncMode,
+        appender_config: AppenderConfig,
+    ) -> io::Result<Self> {
         fs::create_dir_all(data_dir)?;
 
         let mut partitions: HashMap<(String, u32), Arc<Mutex<Partition>>> = HashMap::new();
         let mut appenders: HashMap<(String, u32), AppenderHandle> = HashMap::new();
-        let appender_config = AppenderConfig::default();
         let appender_mode = match mode {
             StorageSyncMode::Sync => AppenderMode::Sync,
             StorageSyncMode::Async { .. } => AppenderMode::Async,

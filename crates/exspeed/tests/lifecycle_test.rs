@@ -47,6 +47,13 @@ async fn start_test_server(max_conns: u32) -> (String, tempfile::TempDir) {
             credentials_file: None,
             tls_cert: None,
             tls_key: None,
+            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+            storage_flush_window_us: 500,
+            storage_flush_threshold_records: 256,
+            storage_flush_threshold_bytes: 1_048_576,
+            storage_sync_interval_ms: 10,
+            storage_sync_bytes: 4 * 1024 * 1024,
+            delivery_buffer: 8192,
         })
         .await
         .unwrap();
@@ -108,6 +115,13 @@ async fn sigterm_signal_token_stops_accept_loop() {
                 credentials_file: None,
                 tls_cert: None,
                 tls_key: None,
+            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+            storage_flush_window_us: 500,
+            storage_flush_threshold_records: 256,
+            storage_flush_threshold_bytes: 1_048_576,
+            storage_sync_interval_ms: 10,
+            storage_sync_bytes: 4 * 1024 * 1024,
+            delivery_buffer: 8192,
             },
             async {
                 let _ = rx.await;
@@ -164,6 +178,13 @@ async fn readyz_returns_503_when_data_dir_unwritable() {
             credentials_file: None,
             tls_cert: None,
             tls_key: None,
+            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+            storage_flush_window_us: 500,
+            storage_flush_threshold_records: 256,
+            storage_flush_threshold_bytes: 1_048_576,
+            storage_sync_interval_ms: 10,
+            storage_sync_bytes: 4 * 1024 * 1024,
+            delivery_buffer: 8192,
         })
         .await
         .unwrap();
