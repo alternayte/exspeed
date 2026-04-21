@@ -32,6 +32,37 @@ npm run typecheck    # tsc --noEmit
 docker-compose up -d   # Postgres (5432), RabbitMQ (5672/15672), MinIO (9000/9001)
 ```
 
+### Releasing
+
+Published artifacts: Docker Hub image, npm-registry TS SDK, GitHub release.
+
+```bash
+# 1. Version bump: workspace + all per-crate Cargo.toml + sdks/typescript/package.json
+# 2. Update CHANGELOG.md; refresh BENCHMARKS.md + README numbers.
+# 3. Tag + push
+git tag -a vX.Y.Z -m "release notes"
+git push origin main
+git push origin vX.Y.Z
+
+# 4. Docker image — multi-arch (amd64 + arm64) via cloud builder
+docker buildx build --builder cloud-nayth-projects \
+  --platform linux/amd64,linux/arm64 \
+  -t docker.io/alternayte/exspeed:X.Y.Z \
+  -t docker.io/alternayte/exspeed:latest \
+  --push .
+
+# 5. TS SDK
+cd sdks/typescript && npm publish   # prepublishOnly runs typecheck + test + build
+
+# 6. GitHub release — body is the CHANGELOG section for this version
+awk '/^## \[X\.Y\.Z\]/{flag=1;next} /^## \[/{flag=0} flag' CHANGELOG.md > /tmp/notes.md
+gh release create vX.Y.Z --title "vX.Y.Z — headline" --notes-file /tmp/notes.md
+```
+
+- Docker image: `docker.io/alternayte/exspeed` — tags `latest` + `X.Y.Z`. Always publish both arches; Apple Silicon users need `arm64`.
+- Default buildx builder (`cloud-nayth-projects`) has dedicated `linux-amd64` and `linux-arm64` cloud nodes — multi-arch builds run in parallel rather than emulated locally.
+- TS SDK publishes as `@exspeed/sdk` on the public npm registry. `publishConfig.access: public` handles scoped-package access.
+
 ### Operator env vars (Plan A hardening)
 - `LOG_FORMAT=json|text` — tracing output format (default `text`).
 - `EXSPEED_MAX_CONNS` — concurrent TCP connection cap (default `1024`); rejections logged + counted in `exspeed_connections_rejected_total`.
@@ -49,7 +80,7 @@ exspeed-common          Shared types (StreamName, Offset), subject matching, met
 exspeed-streams         StorageEngine trait, Record/StoredRecord types
     ↓
 exspeed-protocol        Wire protocol: Frame codec, OpCodes, ClientMessage/ServerMessage
-exspeed-storage         File-based storage: segments, offset/time indexes, WAL, retention
+exspeed-storage         File-based storage: segments, offset/time indexes, tail-scan recovery, retention
     ↓
 exspeed-broker          Stream management, consumer state, delivery pipeline, ack/nack
 exspeed-connectors      Source/sink connector framework + builtins (Postgres, RabbitMQ, S3)
@@ -72,7 +103,7 @@ exspeed                 Binary: CLI + server orchestration (TCP accept loop + HT
 - **Connector lifecycle**: `SourceConnector`/`SinkConnector` traits with start/poll/commit/stop. ConnectorManager loads from TOML configs in `{data_dir}/connectors.d/`, supports hot-reload via filesystem watcher.
 
 ### Server Startup Sequence
-1. Open FileStorage (WAL replay + recovery)
+1. Open FileStorage (CRC-validating tail-scan recovery of the active segment)
 2. Create Broker, load persisted consumers from `{data_dir}/consumers/*.json`
 3. Create ConnectorManager, load all connector configs
 4. Create ExqlEngine, load query registry, resume continuous queries
