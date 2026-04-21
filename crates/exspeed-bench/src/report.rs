@@ -65,6 +65,8 @@ pub struct ExqlResult {
     pub payload_bytes: usize,
     pub subjects: u32,
     pub sustained_input_rate: u64,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub warning: Option<String>,
 }
 
 #[cfg(test)]

@@ -74,6 +74,7 @@ pub async fn run(
     let mut lo = low;
     let mut hi = high;
     let mut best = lo;
+    let mut any_passed = false;
 
     for _ in 0..iterations {
         let candidate = (lo + hi) / 2;
@@ -99,15 +100,23 @@ pub async fn run(
         if passed {
             best = candidate;
             lo = candidate;
+            any_passed = true;
         } else {
             hi = candidate;
         }
     }
 
+    let (sustained, warning) = if any_passed {
+        (best, None)
+    } else {
+        (0, Some("no-candidate-passed".to_string()))
+    };
+
     Ok(ExqlResult {
         query: query_sql,
         payload_bytes,
         subjects,
-        sustained_input_rate: best,
+        sustained_input_rate: sustained,
+        warning,
     })
 }
