@@ -137,18 +137,11 @@ unification; v0.2.0 is what ships now.
 
 ## Comparison to NATS JetStream
 
-On the same laptop, NATS JetStream 2.12.7 (default file storage, async fsync):
+To compare Exspeed v0.2.0 to NATS JetStream on your hardware, see
+[`bench/README.md`](bench/README.md) for methodology. We don't publish
+comparison numbers in this file — run your own measurement.
 
-| Workload                | Exspeed v0.2.0 async  | NATS JetStream  | Ratio             |
-|-------------------------|-----------------------|-----------------|-------------------|
-| Publish, 1 KB, pipelined| ~69,728 msg/s         | ~106,000 msg/s  | ~1.5× behind NATS |
-| Publish, 1 KB, sync     | ~7,010 msg/s          | ~6,500 msg/s    | beats NATS        |
-
-Methodology: NATS `bench js pub sync/async` on a fresh JetStream stream with
-file storage; Exspeed `exspeed-bench publish` with `--profile local`.
-
-Exspeed's **sync** mode (group-commit + fsync per batch) outperforms NATS JetStream's
-"sync" mode on this hardware because NATS JetStream sync ≈ wait-for-in-memory-ack
-whereas Exspeed sync is a genuine durable group-commit + fsync-per-batch.
-Exspeed's async mode is the apples-to-apples comparison to NATS async, and 0.2.0
-closes that gap meaningfully versus v0.3 (was ~2.4× behind, now ~1.5× behind).
+Note on mode semantics: Exspeed **sync** mode is a genuine durable
+group-commit + fsync-per-batch, whereas NATS JetStream's "sync" mode is
+closer to wait-for-in-memory-ack. Exspeed **async** mode (fsync on a timer)
+is the apples-to-apples comparison to NATS JetStream's default async fsync.

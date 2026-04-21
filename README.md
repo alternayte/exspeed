@@ -68,9 +68,8 @@ milestone. Sync throughput is flat — it is bounded by APFS `F_FULLFSYNC`
 (~5 ms per fsync), which the v0.2 group-commit writer had already
 amortized. See [CHANGELOG.md](CHANGELOG.md) for the full story.
 
-Sync mode still beats NATS JetStream's sync mode (~6,500 msg/s) on the
-same hardware. Async mode now closes to within ~1.5× of NATS's async
-(~106k msg/s), down from ~2.4× in the prior milestone.
+To compare against NATS JetStream or Kafka on your hardware, see
+[bench/README.md](bench/README.md) for the comparison kit.
 
 Numbers refreshed 2026-04-21 on git `9782c1d`.
 
