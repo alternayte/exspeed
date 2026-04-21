@@ -274,6 +274,12 @@ impl Partition {
     /// Append N records in one shot. Performs ONE WAL `sync_data` for the
     /// whole batch via `WalWriter::append_batch`, then writes each record to
     /// the active segment. Single-record `append` remains for the slow path.
+    ///
+    /// On `Err`, the entire batch should be considered failed from the caller's
+    /// perspective. Some records may already be durable in the WAL (and will be
+    /// replayed on next `Partition::open`); the returned `results` Vec is dropped
+    /// and never observable. Do not retry individual records from a failed batch
+    /// without restarting the partition first.
     pub fn append_batch(&mut self, records: &[Record]) -> io::Result<Vec<(Offset, u64)>> {
         if records.is_empty() {
             return Ok(Vec::new());
@@ -315,6 +321,11 @@ impl Partition {
                     &e,
                 );
                 results.truncate(i);
+                // Rewind the unwritten offsets so the next call doesn't skip them.
+                // Records 0..i ARE durable in segment+WAL; records i..N are durable
+                // in WAL only and will be replayed on next Partition::open. We must
+                // walk back next_offset to match what the segment actually contains.
+                self.next_offset -= (records.len() - i) as u64;
                 return Err(e);
             }
         }
