@@ -140,8 +140,17 @@ async fn flush_batch(
     if batch.is_empty() {
         return;
     }
-    // Collect records for the batch call.
-    let records: Vec<Record> = batch.iter().map(|r| r.record.clone()).collect();
+
+    // Drain ownership out of AppendRequest into two parallel Vecs:
+    //   records: owned Record values for Partition::append_batch
+    //   responders: oneshot senders to dispatch results back to callers
+    let mut records: Vec<Record> = Vec::with_capacity(batch.len());
+    let mut responders: Vec<oneshot::Sender<Result<(Offset, u64), StorageError>>> =
+        Vec::with_capacity(batch.len());
+    for req in batch.drain(..) {
+        records.push(req.record);
+        responders.push(req.respond_to);
+    }
 
     // Determine whether to sync the WAL now or defer to WalSyncer.
     let sync_now = matches!(mode, AppenderMode::Sync);
@@ -156,17 +165,15 @@ async fn flush_batch(
 
     match result {
         Ok(assignments) => {
-            for (req, (offset, ts)) in batch.drain(..).zip(assignments) {
-                let _ = req.respond_to.send(Ok((offset, ts)));
+            for (tx, (offset, ts)) in responders.into_iter().zip(assignments.into_iter()) {
+                let _ = tx.send(Ok((offset, ts)));
             }
         }
         Err(e) => {
             // Broadcast the io::Error message to all waiters in this batch.
             let err_msg = e.to_string();
-            for req in batch.drain(..) {
-                let _ = req
-                    .respond_to
-                    .send(Err(StorageError::Io(std::io::Error::other(err_msg.clone()))));
+            for tx in responders {
+                let _ = tx.send(Err(StorageError::Io(std::io::Error::other(err_msg.clone()))));
             }
         }
     }
