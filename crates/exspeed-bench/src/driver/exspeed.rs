@@ -347,6 +347,16 @@ pub async fn run_consumer(
     let mut messages: u64 = 0;
     let deadline = Instant::now() + duration;
 
+    // Cumulative-ack batching: the broker's Ack opcode advances the consumer's
+    // stored offset to N (implicitly acking 0..N), so we only need to send one
+    // Ack per batch rather than one per record.
+    const ACK_BATCH_SIZE: u64 = 64;
+    const ACK_BATCH_WINDOW_MS: u64 = 5;
+
+    let mut highest_unacked: Option<u64> = None;
+    let mut records_since_last_ack: u64 = 0;
+    let mut last_ack_time = Instant::now();
+
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let next = match tokio::time::timeout(remaining, client.reader.next()).await {
@@ -380,15 +390,40 @@ pub async fn run_consumer(
             }
         }
 
-        // The broker returns Ok for every Ack on this connection. At high msg/s rates
-        // those Ok frames interleave with incoming Record frames; the `continue`
-        // guard above discards them, so the histogram only accrues from real Records.
-        // This is acceptable for v1; if high-rate scenarios hit throughput issues,
-        // consider splitting the ack path onto a second task.
-        // Ack so the broker keeps pushing.
+        highest_unacked = Some(delivery.offset);
+        records_since_last_ack += 1;
+        messages += 1;
+
+        // Send one cumulative Ack every 64 records or every 5 ms, whichever
+        // comes first.  The broker advances its stored offset to N on Ack(N),
+        // implicitly acking everything below, so batching is safe.
+        let should_ack = records_since_last_ack >= ACK_BATCH_SIZE
+            || last_ack_time.elapsed() >= Duration::from_millis(ACK_BATCH_WINDOW_MS);
+        if should_ack {
+            if let Some(off) = highest_unacked {
+                let ack = AckRequest {
+                    consumer_name: consumer_name.into(),
+                    offset: off,
+                };
+                let mut ack_buf = BytesMut::new();
+                ack.encode(&mut ack_buf);
+                let corr = client.alloc_corr();
+                client
+                    .writer
+                    .send(Frame::new(OpCode::Ack, corr, ack_buf.freeze()))
+                    .await?;
+                highest_unacked = None;
+                records_since_last_ack = 0;
+                last_ack_time = Instant::now();
+            }
+        }
+    }
+
+    // Final flush — ack any records received since the last batch boundary.
+    if let Some(off) = highest_unacked {
         let ack = AckRequest {
             consumer_name: consumer_name.into(),
-            offset: delivery.offset,
+            offset: off,
         };
         let mut ack_buf = BytesMut::new();
         ack.encode(&mut ack_buf);
@@ -397,8 +432,6 @@ pub async fn run_consumer(
             .writer
             .send(Frame::new(OpCode::Ack, corr, ack_buf.freeze()))
             .await?;
-
-        messages += 1;
     }
 
     Ok(ConsumerStats {
