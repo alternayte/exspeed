@@ -24,6 +24,7 @@ use exspeed_streams::{Record, StorageEngine, StorageError, StoredRecord};
 use crate::file::partition::Partition;
 use crate::file::stream_config::StreamConfig;
 use crate::file::wal_appender::{AppenderConfig, AppenderHandle, AppenderMode};
+use crate::file::wal_syncer::WalSyncerHandle;
 
 /// Storage durability mode. `Sync` = group commit + fsync per batch (default,
 /// strongest durability). `Async` = batch writes immediately, fsync on a timer
@@ -53,13 +54,16 @@ impl Default for StorageSyncMode {
 
 struct FileStorageInner {
     data_dir: PathBuf,
-    /// Appenders MUST be declared before `partitions` so that on Drop, the
-    /// AppenderHandle senders close first — the writer task observes the
-    /// closed channel, drains its in-flight batch, then exits, releasing
-    /// its Arc<Mutex<Partition>>. THEN partitions drops, freeing the
-    /// underlying partition state. (Rust drops struct fields in declaration
-    /// order: first-declared, first-dropped.)
+    /// Drop order matters here — Rust drops struct fields in declaration order
+    /// (first-declared = first-dropped). We want:
+    ///   1. `appenders` dropped first  → writer tasks drain their in-flight
+    ///      batch and exit, releasing their Arc<Mutex<Partition>>.
+    ///   2. `syncers` dropped second   → shutdown signal fires; each syncer
+    ///      task performs a final fsync and exits, releasing its Arc.
+    ///   3. `partitions` dropped last  → by this point all background tasks
+    ///      have released their Arc<Mutex<Partition>> references.
     appenders: RwLock<HashMap<(String, u32), AppenderHandle>>,
+    syncers: RwLock<HashMap<(String, u32), WalSyncerHandle>>,
     partitions: RwLock<HashMap<(String, u32), Arc<Mutex<Partition>>>>,
     appender_config: AppenderConfig,
     storage_sync_mode: StorageSyncMode,
@@ -87,6 +91,7 @@ impl FileStorage {
             inner: Arc::new(FileStorageInner {
                 data_dir: data_dir.to_path_buf(),
                 appenders: RwLock::new(HashMap::new()),
+                syncers: RwLock::new(HashMap::new()),
                 partitions: RwLock::new(HashMap::new()),
                 appender_config: AppenderConfig::default(),
                 storage_sync_mode: StorageSyncMode::default(),
@@ -123,6 +128,7 @@ impl FileStorage {
 
         let mut partitions: HashMap<(String, u32), Arc<Mutex<Partition>>> = HashMap::new();
         let mut appenders: HashMap<(String, u32), AppenderHandle> = HashMap::new();
+        let mut syncers: HashMap<(String, u32), WalSyncerHandle> = HashMap::new();
         let appender_mode = match mode {
             StorageSyncMode::Sync => AppenderMode::Sync,
             StorageSyncMode::Async { .. } => AppenderMode::Async,
@@ -160,7 +166,8 @@ impl FileStorage {
                     let appender =
                         wal_appender::spawn(partition_arc.clone(), appender_config, appender_mode);
                     if let StorageSyncMode::Async { interval, .. } = mode {
-                        wal_syncer::spawn(partition_arc.clone(), interval);
+                        let syncer = wal_syncer::spawn(partition_arc.clone(), interval);
+                        syncers.insert(key.clone(), syncer);
                     }
                     appenders.insert(key.clone(), appender);
                     partitions.insert(key, partition_arc);
@@ -172,6 +179,7 @@ impl FileStorage {
             inner: Arc::new(FileStorageInner {
                 data_dir: data_dir.to_path_buf(),
                 appenders: RwLock::new(appenders),
+                syncers: RwLock::new(syncers),
                 partitions: RwLock::new(partitions),
                 appender_config,
                 storage_sync_mode: mode,
@@ -289,9 +297,11 @@ impl FileStorage {
         };
         let appender =
             wal_appender::spawn(partition_arc.clone(), self.inner.appender_config, appender_mode);
-        if let StorageSyncMode::Async { interval, .. } = self.inner.storage_sync_mode {
-            wal_syncer::spawn(partition_arc.clone(), interval);
-        }
+        let syncer = if let StorageSyncMode::Async { interval, .. } = self.inner.storage_sync_mode {
+            Some(wal_syncer::spawn(partition_arc.clone(), interval))
+        } else {
+            None
+        };
 
         {
             let mut map = self.inner.partitions.write().unwrap();
@@ -299,7 +309,15 @@ impl FileStorage {
         }
         {
             let mut apps = self.inner.appenders.write().unwrap();
-            apps.insert(key, appender);
+            apps.insert(key.clone(), appender);
+        }
+        {
+            let mut syncs = self.inner.syncers.write().unwrap();
+            if let Some(s) = syncer {
+                syncs.insert(key, s);
+            } else {
+                syncs.remove(&key);
+            }
         }
         Ok(())
     }
@@ -391,9 +409,11 @@ impl FileStorage {
         };
         let appender =
             wal_appender::spawn(partition_arc.clone(), self.inner.appender_config, appender_mode);
-        if let StorageSyncMode::Async { interval, .. } = self.inner.storage_sync_mode {
-            wal_syncer::spawn(partition_arc.clone(), interval);
-        }
+        let syncer = if let StorageSyncMode::Async { interval, .. } = self.inner.storage_sync_mode {
+            Some(wal_syncer::spawn(partition_arc.clone(), interval))
+        } else {
+            None
+        };
 
         {
             let mut map = self.inner.partitions.write().unwrap();
@@ -405,7 +425,11 @@ impl FileStorage {
         }
         {
             let mut apps = self.inner.appenders.write().unwrap();
-            apps.insert(key, appender);
+            apps.insert(key.clone(), appender);
+        }
+        if let Some(s) = syncer {
+            let mut syncs = self.inner.syncers.write().unwrap();
+            syncs.insert(key.clone(), s);
         }
 
         // Save stream config
@@ -500,15 +524,22 @@ impl FileStorage {
 
     fn delete_stream_sync(&self, stream: &StreamName) -> Result<(), StorageError> {
         // Idempotent: removing a non-existent stream is Ok.
-        {
-            let mut map = self.inner.partitions.write().unwrap();
-            let key_prefix = stream.as_str().to_string();
-            map.retain(|(name, _), _| name != &key_prefix);
-        }
+        // Drop appenders first (writer tasks drain and exit), then syncers
+        // (shutdown signal fires, final fsync, tasks exit), then partitions.
         {
             let mut apps = self.inner.appenders.write().unwrap();
             let key_prefix = stream.as_str().to_string();
             apps.retain(|(name, _), _| name != &key_prefix);
+        }
+        {
+            let mut syncs = self.inner.syncers.write().unwrap();
+            let key_prefix = stream.as_str().to_string();
+            syncs.retain(|(name, _), _| name != &key_prefix);
+        }
+        {
+            let mut map = self.inner.partitions.write().unwrap();
+            let key_prefix = stream.as_str().to_string();
+            map.retain(|(name, _), _| name != &key_prefix);
         }
 
         let stream_dir = self.inner.data_dir.join("streams").join(stream.as_str());

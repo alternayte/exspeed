@@ -603,6 +603,7 @@ where
         work_coordinator.clone(),
         lease.clone(),
         metrics.clone(),
+        args.delivery_buffer,
     );
     let broker = Arc::new(match replication_coordinator.as_ref() {
         Some(coord) => broker_builder.with_replication_coordinator(coord.clone()),

@@ -78,7 +78,7 @@ A reproducible comparison kit lives in [`bench/README.md`](bench/README.md).
 | `--storage-flush-threshold-records` (`EXSPEED_FLUSH_THRESHOLD_RECORDS`) | `256` | Max records per batch before forced flush. |
 | `--storage-flush-threshold-bytes` (`EXSPEED_FLUSH_THRESHOLD_BYTES`) | `1048576` | Max bytes per batch before forced flush. |
 | `--storage-sync-interval-ms` (`EXSPEED_SYNC_INTERVAL_MS`) | `10` | (async mode) Fsync timer interval. |
-| `--storage-sync-bytes` (`EXSPEED_SYNC_BYTES`) | `4194304` | (async mode) Force fsync after this many unsynced bytes. |
+| `--storage-sync-bytes` (`EXSPEED_SYNC_BYTES`) | `4194304` | (async mode) *Reserved for future use — timer-only in this release.* |
 | `--delivery-buffer` (`EXSPEED_DELIVERY_BUFFER`) | `8192` | mpsc buffer per subscription. |
 
 **`--storage-sync=async`** trades durability for throughput. On a crash, you may lose up to `--storage-sync-interval-ms` of acked data. This matches NATS JetStream's default behavior. Keep `sync` (the default) for production unless throughput is critical and you understand the tradeoff.
