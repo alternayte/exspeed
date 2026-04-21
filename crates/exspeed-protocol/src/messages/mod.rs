@@ -19,6 +19,7 @@ pub use consumer::{
 pub use fetch::FetchRequest;
 pub use ping::{Ping, Pong};
 pub use publish::PublishRequest;
+pub use publish_batch::PublishBatchRequest;
 pub use record_delivery::RecordDelivery;
 pub use records_batch::{BatchRecord, RecordsBatch};
 pub use seek::SeekRequest;
@@ -42,6 +43,7 @@ pub enum ClientMessage {
     Ping,
     CreateStream(CreateStreamRequest),
     Publish(PublishRequest),
+    PublishBatch(PublishBatchRequest),
     Fetch(FetchRequest),
     CreateConsumer(CreateConsumerRequest),
     DeleteConsumer(DeleteConsumerRequest),
@@ -67,6 +69,10 @@ impl ClientMessage {
             OpCode::Publish => {
                 let req = PublishRequest::decode(frame.payload)?;
                 Ok(ClientMessage::Publish(req))
+            }
+            OpCode::PublishBatch => {
+                let req = PublishBatchRequest::decode(frame.payload)?;
+                Ok(ClientMessage::PublishBatch(req))
             }
             OpCode::Fetch => {
                 let req = FetchRequest::decode(frame.payload)?;

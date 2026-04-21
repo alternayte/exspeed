@@ -1358,6 +1358,117 @@ where
                                     .send(response.into_frame(correlation_id))
                                     .await?;
                             }
+                            Ok(ClientMessage::PublishBatch(req)) => {
+                                use exspeed_protocol::messages::publish_batch::{
+                                    BatchResult, PublishBatchOkResponse,
+                                };
+                                use exspeed_streams::record::Record;
+
+                                let Some(id) = identity.as_ref() else {
+                                    reject_unauthenticated(
+                                        &mut framed_write,
+                                        correlation_id,
+                                        &metrics,
+                                        "PublishBatch",
+                                    )
+                                    .await?;
+                                    continue;
+                                };
+
+                                let stream_name = match StreamName::try_from(req.stream.as_str()) {
+                                    Ok(n) => n,
+                                    Err(_) => {
+                                        let response = ServerMessage::Error {
+                                            code: 400,
+                                            message: "invalid stream name".into(),
+                                        }
+                                        .into_frame(correlation_id);
+                                        framed_write.send(response).await?;
+                                        continue;
+                                    }
+                                };
+
+                                if !id.authorize(Action::Publish, &stream_name) {
+                                    reject_forbidden(
+                                        &mut framed_write,
+                                        correlation_id,
+                                        &metrics,
+                                        "PublishBatch",
+                                    )
+                                    .await?;
+                                    continue;
+                                }
+
+                                // Convert PublishBatchRecord -> Record, injecting msg_id
+                                // into headers as "x-idempotency-key" (mirrors single-publish).
+                                const IDEMPOTENCY_HEADER: &str = "x-idempotency-key";
+                                let records: Vec<Record> = req
+                                    .records
+                                    .into_iter()
+                                    .map(|br| {
+                                        let mut headers = br.headers;
+                                        if let Some(id) = br.msg_id {
+                                            headers.push((
+                                                IDEMPOTENCY_HEADER.to_owned(),
+                                                id,
+                                            ));
+                                        }
+                                        Record {
+                                            subject: br.subject,
+                                            key: br.key,
+                                            value: br.value,
+                                            headers,
+                                            timestamp_ns: None,
+                                        }
+                                    })
+                                    .collect();
+
+                                let results = match broker
+                                    .broker_append
+                                    .append_batch(&stream_name, records)
+                                    .await
+                                {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        let response = ServerMessage::Error {
+                                            code: 500,
+                                            message: format!("{e}"),
+                                        }
+                                        .into_frame(correlation_id);
+                                        framed_write.send(response).await?;
+                                        continue;
+                                    }
+                                };
+
+                                let batch_results: Vec<BatchResult> = results
+                                    .into_iter()
+                                    .map(|r| match r {
+                                        exspeed_broker::broker_append::AppendResult::Written(
+                                            offset,
+                                            _ts,
+                                        ) => BatchResult::Written { offset: offset.0 },
+                                        exspeed_broker::broker_append::AppendResult::Duplicate(
+                                            offset,
+                                        ) => BatchResult::Duplicate {
+                                            offset: offset.0,
+                                            duplicate_of: offset.0,
+                                        },
+                                    })
+                                    .collect();
+
+                                let resp = PublishBatchOkResponse {
+                                    results: batch_results,
+                                };
+                                let mut buf = bytes::BytesMut::new();
+                                resp.encode(&mut buf);
+                                framed_write
+                                    .send(exspeed_protocol::frame::Frame::new(
+                                        exspeed_protocol::opcodes::OpCode::PublishBatchOk,
+                                        correlation_id,
+                                        buf.freeze(),
+                                    ))
+                                    .await?;
+                            }
                             Ok(ClientMessage::Fetch(req)) => {
                                 let Some(id) = identity.as_ref() else {
                                     reject_unauthenticated(

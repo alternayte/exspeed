@@ -263,10 +263,12 @@ impl Broker {
             ClientMessage::Ack(req) => handlers::handle_ack(self, req).await,
             ClientMessage::Nack(req) => handlers::handle_nack(self, req).await,
             ClientMessage::Seek(req) => handlers::handle_seek(self, req).await,
-            ClientMessage::Connect(_) | ClientMessage::Ping => ServerMessage::Error {
-                code: 500,
-                message: "message should be handled by connection layer".into(),
-            },
+            ClientMessage::Connect(_) | ClientMessage::Ping | ClientMessage::PublishBatch(_) => {
+                ServerMessage::Error {
+                    code: 500,
+                    message: "message should be handled by connection layer".into(),
+                }
+            }
             ClientMessage::Subscribe(_) | ClientMessage::Unsubscribe(_) => ServerMessage::Error {
                 code: 500,
                 message: "subscribe/unsubscribe handled by connection layer".into(),
