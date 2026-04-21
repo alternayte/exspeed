@@ -42,10 +42,17 @@ impl Default for AppenderConfig {
     }
 }
 
-/// One append request, sent from FileStorage::append to the writer task.
-pub struct AppendRequest {
-    pub record: Record,
-    pub respond_to: oneshot::Sender<Result<(Offset, u64), StorageError>>,
+/// One append request, sent from FileStorage::append / append_batch to the
+/// writer task.
+pub enum AppendRequest {
+    Single {
+        record: Record,
+        respond_to: oneshot::Sender<Result<(Offset, u64), StorageError>>,
+    },
+    Batch {
+        records: Vec<Record>,
+        respond_to: oneshot::Sender<Result<Vec<(Offset, u64)>, StorageError>>,
+    },
 }
 
 /// Handle to a per-partition writer task: holds its mpsc sender.
@@ -56,15 +63,24 @@ pub struct AppenderHandle {
 
 impl AppenderHandle {
     pub async fn append(&self, record: Record) -> Result<(Offset, u64), StorageError> {
-        let (resp_tx, resp_rx) = oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         self.tx
-            .send(AppendRequest {
-                record,
-                respond_to: resp_tx,
-            })
+            .send(AppendRequest::Single { record, respond_to: tx })
             .await
             .map_err(|_| StorageError::ChannelClosed)?;
-        resp_rx.await.map_err(|_| StorageError::ChannelClosed)?
+        rx.await.map_err(|_| StorageError::ChannelClosed)?
+    }
+
+    pub async fn append_batch(
+        &self,
+        records: Vec<Record>,
+    ) -> Result<Vec<(Offset, u64)>, StorageError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(AppendRequest::Batch { records, respond_to: tx })
+            .await
+            .map_err(|_| StorageError::ChannelClosed)?;
+        rx.await.map_err(|_| StorageError::ChannelClosed)?
     }
 }
 
@@ -82,7 +98,7 @@ pub fn spawn(
     let (tx, mut rx) = mpsc::channel::<AppendRequest>(1024);
 
     tokio::spawn(async move {
-        let mut batch: Vec<AppendRequest> = Vec::with_capacity(config.flush_threshold_records);
+        let mut pending_singles: Vec<PendingSingle> = Vec::with_capacity(config.flush_threshold_records);
         let mut batch_bytes: usize = 0;
         let mut batch_started: Option<Instant> = None;
 
@@ -98,30 +114,40 @@ pub fn spawn(
                     match req {
                         None => {
                             // Channel closed and empty; flush whatever we have, then exit.
-                            if !batch.is_empty() {
-                                flush_batch(&partition, &mut batch, mode).await;
+                            if !pending_singles.is_empty() {
+                                flush_singles(&partition, &mut pending_singles, mode).await;
                             }
                             return;
                         }
-                        Some(req) => {
-                            let bytes = req.record.value.len();
-                            batch.push(req);
+                        Some(AppendRequest::Single { record, respond_to }) => {
+                            let bytes = record.value.len();
+                            pending_singles.push(PendingSingle { record, respond_to });
                             batch_bytes += bytes;
                             if batch_started.is_none() {
                                 batch_started = Some(Instant::now());
                             }
-                            if batch.len() >= config.flush_threshold_records
+                            if pending_singles.len() >= config.flush_threshold_records
                                 || batch_bytes >= config.flush_threshold_bytes
                             {
-                                flush_batch(&partition, &mut batch, mode).await;
+                                flush_singles(&partition, &mut pending_singles, mode).await;
                                 batch_bytes = 0;
                                 batch_started = None;
                             }
                         }
+                        Some(AppendRequest::Batch { records, respond_to }) => {
+                            // Flush in-flight singles first to preserve FIFO ordering
+                            // across variants.
+                            if !pending_singles.is_empty() {
+                                flush_singles(&partition, &mut pending_singles, mode).await;
+                                batch_bytes = 0;
+                                batch_started = None;
+                            }
+                            flush_explicit_batch(&partition, records, respond_to, mode).await;
+                        }
                     }
                 }
                 _ = tokio::time::sleep(wait), if batch_started.is_some() => {
-                    flush_batch(&partition, &mut batch, mode).await;
+                    flush_singles(&partition, &mut pending_singles, mode).await;
                     batch_bytes = 0;
                     batch_started = None;
                 }
@@ -132,32 +158,32 @@ pub fn spawn(
     AppenderHandle { tx }
 }
 
-async fn flush_batch(
+/// An accumulated single-record request waiting to be group-committed.
+struct PendingSingle {
+    record: Record,
+    respond_to: oneshot::Sender<Result<(Offset, u64), StorageError>>,
+}
+
+/// Flush the accumulated singles as one group commit, dispatching individual
+/// results back to each caller.
+async fn flush_singles(
     partition: &Arc<Mutex<Partition>>,
-    batch: &mut Vec<AppendRequest>,
+    batch: &mut Vec<PendingSingle>,
     mode: AppenderMode,
 ) {
     if batch.is_empty() {
         return;
     }
 
-    // Drain ownership out of AppendRequest into two parallel Vecs:
-    //   records: owned Record values for Partition::append_batch
-    //   responders: oneshot senders to dispatch results back to callers
     let mut records: Vec<Record> = Vec::with_capacity(batch.len());
     let mut responders: Vec<oneshot::Sender<Result<(Offset, u64), StorageError>>> =
         Vec::with_capacity(batch.len());
-    for req in batch.drain(..) {
-        records.push(req.record);
-        responders.push(req.respond_to);
+    for p in batch.drain(..) {
+        records.push(p.record);
+        responders.push(p.respond_to);
     }
 
-    // Determine whether to sync the WAL now or defer to WalSyncer.
     let sync_now = matches!(mode, AppenderMode::Sync);
-
-    // Lock the partition and call append_batch. This is sync I/O under the
-    // tokio Mutex — acceptable for the short duration of a WAL write (and
-    // fsync in Sync mode).
     let result = {
         let mut p = partition.lock().await;
         p.append_batch(&records, sync_now)
@@ -170,11 +196,28 @@ async fn flush_batch(
             }
         }
         Err(e) => {
-            // Broadcast the io::Error message to all waiters in this batch.
             let err_msg = e.to_string();
             for tx in responders {
                 let _ = tx.send(Err(StorageError::Io(std::io::Error::other(err_msg.clone()))));
             }
         }
     }
+}
+
+/// Flush an explicit batch request (from `AppenderHandle::append_batch`),
+/// returning a `Vec` of `(Offset, u64)` to the caller.
+async fn flush_explicit_batch(
+    partition: &Arc<Mutex<Partition>>,
+    records: Vec<Record>,
+    respond_to: oneshot::Sender<Result<Vec<(Offset, u64)>, StorageError>>,
+    mode: AppenderMode,
+) {
+    let sync_now = matches!(mode, AppenderMode::Sync);
+    let result = {
+        let mut p = partition.lock().await;
+        p.append_batch(&records, sync_now)
+    };
+    let _ = respond_to.send(
+        result.map_err(|e| StorageError::Io(std::io::Error::other(format!("{e}")))),
+    );
 }
