@@ -5,7 +5,7 @@ use tokio::sync::mpsc;
 use exspeed_common::{subject_matches, Metrics, Offset, StreamName};
 use exspeed_streams::{StorageEngine, StorageError};
 
-use crate::consumer_state::DeliveryRecord;
+use crate::consumer_state::{DeliveryBatch, DeliveryRecord};
 use crate::work_coordinator::WorkCoordinator;
 
 // ---------------------------------------------------------------------------
@@ -45,7 +45,7 @@ fn consume_latency_secs(record_timestamp_nanos: u64) -> f64 {
 pub async fn run_delivery(
     config: DeliveryConfig,
     storage: Arc<dyn StorageEngine>,
-    tx: mpsc::Sender<DeliveryRecord>,
+    tx: mpsc::Sender<DeliveryBatch>,
 ) {
     let stream_name = match StreamName::try_from(config.stream_name.as_str()) {
         Ok(sn) => sn,
@@ -85,7 +85,7 @@ async fn run_ungrouped(
     config: DeliveryConfig,
     stream_name: StreamName,
     storage: Arc<dyn StorageEngine>,
-    tx: mpsc::Sender<DeliveryRecord>,
+    tx: mpsc::Sender<DeliveryBatch>,
     batch_size: usize,
 ) {
     let mut current_offset = config.start_offset;
@@ -114,6 +114,7 @@ async fn run_ungrouped(
             continue;
         }
 
+        let mut batch: Vec<DeliveryRecord> = Vec::with_capacity(records.len());
         for record in records {
             if !config.subject_filter.is_empty()
                 && !subject_matches(&record.subject, &config.subject_filter)
@@ -133,11 +134,14 @@ async fn run_ungrouped(
                 consume_latency_secs(record.timestamp),
             );
 
-            if tx.send(delivery).await.is_err() {
+            batch.push(delivery);
+            current_offset = record.offset.0 + 1;
+        }
+
+        if !batch.is_empty() {
+            if tx.send(DeliveryBatch { records: batch }).await.is_err() {
                 return;
             }
-
-            current_offset = record.offset.0 + 1;
         }
     }
 }
@@ -152,7 +156,7 @@ async fn run_grouped(
     config: DeliveryConfig,
     stream_name: StreamName,
     storage: Arc<dyn StorageEngine>,
-    tx: mpsc::Sender<DeliveryRecord>,
+    tx: mpsc::Sender<DeliveryBatch>,
     batch_size: usize,
     ack_timeout_secs: u64,
     max_ack_pending: usize,
@@ -259,7 +263,7 @@ async fn run_grouped(
                 consume_latency_secs(record_timestamp),
             );
 
-            if tx.send(delivery).await.is_err() {
+            if tx.send(DeliveryBatch::single(delivery)).await.is_err() {
                 // Subscriber gone — do not ack; let it expire + be redelivered.
                 return;
             }

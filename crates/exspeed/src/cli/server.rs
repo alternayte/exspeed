@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, info_span, warn, Instrument};
 
 use exspeed_broker::broker_append::BrokerAppend;
-use exspeed_broker::consumer_state::DeliveryRecord;
+use exspeed_broker::consumer_state::DeliveryBatch;
 use exspeed_broker::replication::{ReplicationClient, ReplicationCoordinator, ReplicationServer};
 use exspeed_broker::Broker;
 use exspeed_common::auth::{Action, CredentialStore, Identity, Permission, StreamGlob};
@@ -1203,7 +1203,7 @@ where
     // old stream, but the broker tears down the delivery task in that
     // case so the invariant holds end-to-end.
     let mut active_sub_stream: Option<StreamName> = None;
-    let mut delivery_rx: Option<mpsc::Receiver<DeliveryRecord>> = None;
+    let mut delivery_rx: Option<mpsc::Receiver<DeliveryBatch>> = None;
     let mut cancel_tx: Option<oneshot::Sender<()>> = None;
 
     loop {
@@ -1779,40 +1779,43 @@ where
                 }
             }
 
-            // Branch 2: outgoing delivery record from active subscription
+            // Branch 2: outgoing delivery batch from active subscription
             delivery = async {
                 match delivery_rx.as_mut() {
                     Some(rx) => rx.recv().await,
                     None => std::future::pending().await,
                 }
             } => {
-                if let Some(delivery_record) = delivery {
+                if let Some(batch) = delivery {
                     let consumer_name = match active_subscription.as_ref() {
                         Some((name, _)) => name.clone(),
                         None => {
                             warn!(
                                 %peer,
-                                offset = delivery_record.record.offset.0,
-                                "received delivery after subscription was cleared; \
-                                 dropping record and tearing down delivery channel"
+                                "received delivery batch after subscription was cleared; \
+                                 dropping batch and tearing down delivery channel"
                             );
                             delivery_rx = None;
                             drop(cancel_tx.take());
                             continue;
                         }
                     };
-                    let record_delivery = RecordDelivery {
-                        consumer_name,
-                        offset: delivery_record.record.offset.0,
-                        timestamp: delivery_record.record.timestamp,
-                        subject: delivery_record.record.subject.clone(),
-                        delivery_attempt: delivery_record.delivery_attempt,
-                        key: delivery_record.record.key.clone(),
-                        value: delivery_record.record.value.clone(),
-                        headers: delivery_record.record.headers.clone(),
-                    };
-                    let response = ServerMessage::Record(record_delivery);
-                    framed_write.send(response.into_frame(0)).await?;
+                    // Task 1: send each record in the batch individually.
+                    // Task 2 will replace this with a single RecordsBatch frame.
+                    for delivery_record in batch.records {
+                        let record_delivery = RecordDelivery {
+                            consumer_name: consumer_name.clone(),
+                            offset: delivery_record.record.offset.0,
+                            timestamp: delivery_record.record.timestamp,
+                            subject: delivery_record.record.subject.clone(),
+                            delivery_attempt: delivery_record.delivery_attempt,
+                            key: delivery_record.record.key.clone(),
+                            value: delivery_record.record.value.clone(),
+                            headers: delivery_record.record.headers.clone(),
+                        };
+                        let response = ServerMessage::Record(record_delivery);
+                        framed_write.send(response.into_frame(0)).await?;
+                    }
                 } else {
                     // Channel closed — delivery task stopped
                     delivery_rx = None;

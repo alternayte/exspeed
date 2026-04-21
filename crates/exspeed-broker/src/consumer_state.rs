@@ -32,14 +32,28 @@ pub struct DeliveryRecord {
     pub delivery_attempt: u16,
 }
 
+/// A batch of records sent atomically through the delivery channel. Produced
+/// by `run_delivery`, consumed by the TCP writer which encodes one
+/// `RecordsBatch` frame per `DeliveryBatch`. Empty batches are not sent.
+#[derive(Debug, Clone)]
+pub struct DeliveryBatch {
+    pub records: Vec<DeliveryRecord>,
+}
+
+impl DeliveryBatch {
+    pub fn single(record: DeliveryRecord) -> Self {
+        Self { records: vec![record] }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ConsumerState — runtime state (not persisted)
 // ---------------------------------------------------------------------------
 
 /// Runtime state for a single active subscriber of a consumer.
 pub struct SubscriberState {
-    /// Channel sender used to deliver records to this subscriber.
-    pub delivery_tx: mpsc::Sender<DeliveryRecord>,
+    /// Channel sender used to deliver record batches to this subscriber.
+    pub delivery_tx: mpsc::Sender<DeliveryBatch>,
     /// Oneshot sender; dropping it signals the delivery task to stop.
     pub cancel_tx: tokio::sync::oneshot::Sender<()>,
 }

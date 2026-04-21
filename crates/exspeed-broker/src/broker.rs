@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::broker_append::BrokerAppend;
-use crate::consumer_state::{ConsumerGroup, ConsumerState, DeliveryRecord};
+use crate::consumer_state::{ConsumerGroup, ConsumerState, DeliveryBatch};
 use crate::delivery::{run_delivery, DeliveryConfig};
 use crate::handlers;
 use crate::lease::LeaderLease;
@@ -169,7 +169,7 @@ impl Broker {
         &self,
         consumer_name: &str,
         subscriber_id: &str,
-    ) -> Result<(mpsc::Receiver<DeliveryRecord>, oneshot::Sender<()>), String> {
+    ) -> Result<(mpsc::Receiver<DeliveryBatch>, oneshot::Sender<()>), String> {
         if subscriber_id.is_empty() {
             return Err("subscriber_id is required".to_string());
         }
@@ -192,8 +192,8 @@ impl Broker {
             ));
         }
 
-        // Create mpsc channel for delivery records.
-        let (tx, rx) = mpsc::channel::<DeliveryRecord>(self.delivery_buffer);
+        // Create mpsc channel for delivery batches.
+        let (tx, rx) = mpsc::channel::<DeliveryBatch>(self.delivery_buffer);
         // Cancel channel kept inside the broker (dropped on unsubscribe).
         let (cancel_tx_store, cancel_rx_store) = oneshot::channel::<()>();
         // Cancel channel returned to the caller (dropped on disconnect).
