@@ -19,8 +19,27 @@ pub enum ConsumerStoreError {
 
 #[async_trait]
 pub trait ConsumerStore: Send + Sync {
-    /// Save a consumer config (insert or update).
+    /// Save a consumer config (insert or update). Returns after the write
+    /// reaches disk. Use this at create/delete time where the client expects
+    /// a synchronous commit.
     async fn save(&self, config: &ConsumerConfig) -> Result<(), ConsumerStoreError>;
+
+    /// Persist a consumer config, potentially deferred for coalescing. Unlike
+    /// `save`, this may return before the write reaches disk — implementations
+    /// are free to coalesce rapid successive calls for the same consumer name
+    /// into a single disk write on a timer.
+    ///
+    /// Used for the Ack/Nack hot path where per-record `save` would cost a
+    /// disk syscall per message. The coalescing window is implementation-
+    /// defined; the `FileConsumerStore` default is 100 ms. Data acked within
+    /// that window is lost on crash — symmetric with the async-storage-mode
+    /// tradeoff we already ship.
+    ///
+    /// Default impl just forwards to `save` so backends without explicit
+    /// batching (Postgres, Redis, S3) preserve synchronous semantics.
+    async fn save_debounced(&self, config: ConsumerConfig) -> Result<(), ConsumerStoreError> {
+        self.save(&config).await
+    }
 
     /// Load a single consumer by name. Returns None if not found.
     async fn load(&self, name: &str) -> Result<Option<ConsumerConfig>, ConsumerStoreError>;

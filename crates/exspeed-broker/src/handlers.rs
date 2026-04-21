@@ -445,10 +445,14 @@ pub async fn handle_ack(broker: &Broker, req: AckRequest) -> ServerMessage {
         }
     };
 
-    if let Err(e) = broker.consumer_store.save(&config_to_save).await {
+    // Debounced save: acks are per-record hot path. The store coalesces
+    // rapid updates for the same consumer into a single disk write. On
+    // crash, up to one debounce window of ack progress can be lost —
+    // symmetric with the async-storage-mode tradeoff.
+    if let Err(e) = broker.consumer_store.save_debounced(config_to_save).await {
         return ServerMessage::Error {
             code: 500,
-            message: format!("failed to persist consumer offset: {e}"),
+            message: format!("failed to enqueue consumer offset persist: {e}"),
         };
     }
 
@@ -603,7 +607,9 @@ pub async fn handle_nack(broker: &Broker, req: NackRequest) -> ServerMessage {
                 })
             };
             if let Some(cfg) = config_to_save {
-                let _ = broker.consumer_store.save(&cfg).await;
+                // Debounced: nack DLQ routing is a hot path when retries
+                // exhaust frequently. Same coalescing semantics as Ack.
+                let _ = broker.consumer_store.save_debounced(cfg).await;
             }
             let mut nack_attempts = broker.nack_attempts.write().unwrap();
             nack_attempts.remove(&(req.consumer_name.clone(), req.offset));
