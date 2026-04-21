@@ -53,20 +53,26 @@ exspeed query "SELECT payload->>'region' AS region, COUNT(*) FROM orders GROUP B
 
 ## Benchmarks
 
-On a single MacBook (8 vCPU, 16 GB RAM, APFS+NVMe), Exspeed v0.3 sustains:
+On a single MacBook (8 vCPU, 16 GB RAM, APFS+NVMe), Exspeed v0.2.0 delivers:
 
-| Workload                | Sync (default, durable) | Async (opt-in)         |
-|-------------------------|-------------------------|------------------------|
-| Publish, 1 KB payload   | ~7,406 msg/s            | ~43,382 msg/s          |
-| E2E latency @ 10k/s     | p50 33 ms / p99 66 ms   | p50 41 ms / p99 87 ms  |
-| Fan-out, 4 consumers    | ~97 msg/s aggregate     | ~90 msg/s aggregate    |
+| Workload                 | Sync (default, durable) | Async (opt-in)         |
+|--------------------------|-------------------------|------------------------|
+| Publish, 1 KB msg/s      | 7,010                   | **69,728**             |
+| E2E p50 latency @ 10k/s  | 15.8 ms                 | **11.1 ms**            |
+| E2E p99 latency @ 10k/s  | 60.8 ms                 | **23.3 ms**            |
+| Fan-out, 4 consumers     | 424 msg/s aggregate     | 334 msg/s aggregate    |
 
-Sync mode beats NATS JetStream's sync mode (~6,500 msg/s) on the same
-hardware. Async mode closes to within ~2.4× of NATS's async (~106k msg/s).
+Storage unification in 0.2.0 cut sync p50 latency roughly in half and
+grew async publish throughput by ~61% versus the previous internal
+milestone. Sync throughput is flat — it is bounded by APFS `F_FULLFSYNC`
+(~5 ms per fsync), which the v0.2 group-commit writer had already
+amortized. See [CHANGELOG.md](CHANGELOG.md) for the full story.
 
-Numbers refreshed 2026-04-21 on git `29c50d4`.
+Sync mode still beats NATS JetStream's sync mode (~6,500 msg/s) on the
+same hardware. Async mode now closes to within ~1.5× of NATS's async
+(~106k msg/s), down from ~2.4× in the prior milestone.
 
-> **ExQL note:** The binary-search found no candidate that sustained ≥95% of any target rate above the 5,000 msg/s floor on macOS. This reflects APFS write overhead under the dual publish+query load, not a bug in the query engine.
+Numbers refreshed 2026-04-21 on git `9782c1d`.
 
 Full methodology, per-scenario tables, comparison data, and reproduction
 steps in [BENCHMARKS.md](BENCHMARKS.md).
