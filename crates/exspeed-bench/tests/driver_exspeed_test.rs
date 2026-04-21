@@ -6,6 +6,84 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[tokio::test]
+async fn publisher_coalesces_concurrent_publishes_into_batches() {
+    let srv = start().await;
+    let mut setup = ExspeedClient::connect(&srv.tcp_addr).await.unwrap();
+    setup.ensure_stream("coal-stream").await.unwrap();
+
+    let publisher = exspeed_bench::driver::publisher::PublisherBuilder::new(&srv.tcp_addr)
+        .batch_window(Duration::from_millis(1))
+        .max_batch_records(256)
+        .build().await.unwrap();
+
+    let mut handles = Vec::new();
+    for i in 0..100 {
+        let p = publisher.clone();
+        handles.push(tokio::spawn(async move {
+            let req = exspeed_protocol::messages::publish::PublishRequest {
+                stream: "coal-stream".into(),
+                subject: "s".into(),
+                key: None,
+                msg_id: None,
+                value: bytes::Bytes::from(format!("rec-{i}").into_bytes()),
+                headers: vec![],
+            };
+            p.publish(req).await
+        }));
+    }
+    let mut offsets = Vec::with_capacity(100);
+    for h in handles {
+        offsets.push(h.await.unwrap().unwrap().0);
+    }
+    offsets.sort();
+    assert_eq!(offsets, (0..100).collect::<Vec<u64>>());
+    publisher.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn publisher_batch_window_zero_disables_coalescing() {
+    let srv = start().await;
+    let mut setup = ExspeedClient::connect(&srv.tcp_addr).await.unwrap();
+    setup.ensure_stream("zw-stream").await.unwrap();
+
+    let publisher = exspeed_bench::driver::publisher::PublisherBuilder::new(&srv.tcp_addr)
+        .batch_window(Duration::ZERO)
+        .build().await.unwrap();
+
+    let offset = publisher.publish(exspeed_protocol::messages::publish::PublishRequest {
+        stream: "zw-stream".into(),
+        subject: "s".into(),
+        key: None, msg_id: None,
+        value: bytes::Bytes::from_static(b"x"),
+        headers: vec![],
+    }).await.unwrap();
+    assert_eq!(offset.0, 0);
+    publisher.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn publisher_explicit_publish_batch() {
+    let srv = start().await;
+    let mut setup = ExspeedClient::connect(&srv.tcp_addr).await.unwrap();
+    setup.ensure_stream("eb-stream").await.unwrap();
+
+    let publisher = exspeed_bench::driver::publisher::Publisher::new(&srv.tcp_addr).await.unwrap();
+    let reqs: Vec<_> = (0..10).map(|i| exspeed_protocol::messages::publish::PublishRequest {
+        stream: "eb-stream".into(),
+        subject: "s".into(),
+        key: None, msg_id: None,
+        value: bytes::Bytes::from(format!("r{i}").into_bytes()),
+        headers: vec![],
+    }).collect();
+    let results = publisher.publish_batch(reqs).await;
+    assert_eq!(results.len(), 10);
+    for (i, r) in results.iter().enumerate() {
+        assert_eq!(r.as_ref().unwrap().0, i as u64);
+    }
+    publisher.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn connects_and_ensures_stream_is_idempotent() {
     let srv = start().await;
     let mut client = ExspeedClient::connect(&srv.tcp_addr).await.unwrap();
