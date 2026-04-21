@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{anyhow, Result};
 use bytes::BytesMut;
@@ -122,6 +123,10 @@ struct PublisherInner {
     max_batch_records: usize,
     coalesce_queue: Mutex<Vec<QueuedPublish>>,
     flush_notify: Notify,
+    /// Number of records taken from coalesce_queue but not yet inserted into
+    /// pending (i.e., between mem::take and pending.insert). flush() must wait
+    /// for this to reach 0 to avoid the TOCTOU window (C2).
+    flusher_in_flight: AtomicUsize,
 }
 
 impl Publisher {
@@ -176,6 +181,7 @@ impl Publisher {
             max_batch_records,
             coalesce_queue: Mutex::new(Vec::new()),
             flush_notify: Notify::new(),
+            flusher_in_flight: AtomicUsize::new(0),
         });
 
         spawn_reader(framed_reader, inner.clone());
@@ -297,18 +303,26 @@ impl Publisher {
         results
     }
 
-    /// Wait until the coalescing queue is empty AND the pending-ack map is
-    /// empty (i.e., all in-flight records have been acknowledged).
+    /// Wait until the coalescing queue is empty, the flusher is not currently
+    /// mid-batch (flusher_in_flight == 0), AND the pending-ack map is empty
+    /// (i.e., all in-flight records have been acknowledged).
+    ///
+    /// The three-way check closes the TOCTOU window where the flusher has
+    /// already drained the coalesce_queue but hasn't yet inserted the batch
+    /// into pending — without flusher_in_flight, flush() could see both maps
+    /// empty and return before the batch was sent (C2).
     pub async fn flush(&self) -> Result<(), PublisherError> {
         loop {
             let queue_empty = self.inner.coalesce_queue.lock().await.is_empty();
+            let in_flight_zero =
+                self.inner.flusher_in_flight.load(Ordering::Acquire) == 0;
             let pending_empty = self.inner.pending.lock().await.is_empty();
-            if queue_empty && pending_empty {
+            if queue_empty && in_flight_zero && pending_empty {
                 break;
             }
             // Poke the flusher so it drains the queue if anything is queued.
             self.inner.flush_notify.notify_one();
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         Ok(())
     }
@@ -377,6 +391,13 @@ fn spawn_flusher(inner: Arc<PublisherInner>) {
                 std::mem::take(&mut *q)
             };
 
+            // C2: bump the in-flight counter immediately after taking the queue
+            // and before touching `pending`. flush() will spin until this
+            // reaches 0 again, closing the TOCTOU window.
+            inner
+                .flusher_in_flight
+                .fetch_add(drained.len(), Ordering::Release);
+
             // Group by stream so each stream gets exactly one frame.
             let mut by_stream: HashMap<String, Vec<QueuedPublish>> = HashMap::new();
             for qp in drained {
@@ -386,7 +407,14 @@ fn spawn_flusher(inner: Arc<PublisherInner>) {
                     .push(qp);
             }
 
-            for (stream, group) in by_stream {
+            // C1: collect into a Vec so that on write_tx failure we can
+            // iterate over the remainder and drain it with Closed errors.
+            let groups: Vec<(String, Vec<QueuedPublish>)> = by_stream.into_iter().collect();
+            let mut groups_iter = groups.into_iter();
+
+            while let Some((stream, group)) = groups_iter.next() {
+                let group_size = group.len();
+
                 let records: Vec<PublishBatchRecord> = group
                     .iter()
                     .map(|qp| PublishBatchRecord {
@@ -411,6 +439,12 @@ fn spawn_flusher(inner: Arc<PublisherInner>) {
                     p.insert(corr, PendingBatch { responders });
                 }
 
+                // C2: this group is now in `pending`; the reader task will
+                // handle its responders on connection loss, so decrement here.
+                inner
+                    .flusher_in_flight
+                    .fetch_sub(group_size, Ordering::Release);
+
                 if inner
                     .write_tx
                     .send(WriteCmd::Frame(Frame::new(
@@ -421,13 +455,29 @@ fn spawn_flusher(inner: Arc<PublisherInner>) {
                     .await
                     .is_err()
                 {
-                    // Writer gone — clean up and stop.
-                    let mut p = inner.pending.lock().await;
-                    if let Some(batch) = p.remove(&corr) {
-                        for tx in batch.responders {
-                            let _ = tx.send(Err(PublisherError::Closed));
+                    // Writer gone — drain all remaining groups in this batch
+                    // (C1) so their callers don't block forever on rx.await.
+                    for (_, remaining_group) in groups_iter {
+                        let remaining_size = remaining_group.len();
+                        for qp in remaining_group {
+                            let _ = qp.respond_to.send(Err(PublisherError::Closed));
                         }
+                        // C2: decrement for groups that never reached pending.
+                        inner
+                            .flusher_in_flight
+                            .fetch_sub(remaining_size, Ordering::Release);
                     }
+
+                    // Also drain anything that arrived in coalesce_queue after
+                    // we did mem::take but before we exit (C1 defensive).
+                    let late: Vec<QueuedPublish> = {
+                        let mut q = inner.coalesce_queue.lock().await;
+                        std::mem::take(&mut *q)
+                    };
+                    for qp in late {
+                        let _ = qp.respond_to.send(Err(PublisherError::Closed));
+                    }
+
                     return;
                 }
             }
