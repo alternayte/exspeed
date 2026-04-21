@@ -98,6 +98,55 @@ impl SegmentWriter {
         self.file.sync_data()
     }
 
+    /// Append N records in one `write_all`. Performs `sync_data` once at the
+    /// end IFF `sync_now` is true. Used by:
+    /// - `Partition::append_batch` in sync mode (`sync_now = true`).
+    /// - `SegmentAppender`'s async mode (`sync_now = false`; `SegmentSyncer`
+    ///   handles the periodic fsync on a cloned file handle).
+    pub fn append_batch(
+        &mut self,
+        records: &[(Offset, u64, Record)],
+        sync_now: bool,
+    ) -> io::Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        // Best-effort pre-size: ~64 bytes per record including framing.
+        let mut combined: Vec<u8> = Vec::with_capacity(records.len() * 64);
+        let mut payload: Vec<u8> = Vec::new();
+
+        for (offset, timestamp, record) in records {
+            payload.clear();
+            encode_record(*offset, *timestamp, record, &mut payload);
+            let framed = wrap_with_crc(&payload);
+            combined.extend_from_slice(&framed);
+        }
+
+        let n = combined.len() as u64;
+        self.file.write_all(&combined)?;
+        self.bytes_written += n;
+        self.record_count += records.len() as u64;
+        if sync_now {
+            self.file.sync_data()?;
+        }
+        Ok(())
+    }
+
+    /// Clone the underlying `File` handle so a separate task can issue
+    /// `sync_data` on the same kernel fd without holding the `Partition`
+    /// mutex. Used by `SegmentSyncer` in async storage mode.
+    pub fn try_clone_file(&self) -> io::Result<File> {
+        self.file.try_clone()
+    }
+
+    /// Force a `sync_data` on the segment file. Used by `SegmentSyncer` (via
+    /// its cloned handle) or directly by `Partition` when it needs to commit
+    /// the current batch in sync mode.
+    pub fn sync_data(&mut self) -> io::Result<()> {
+        self.file.sync_data()
+    }
+
     /// Total bytes written to the file so far (including the 16-byte header).
     pub fn bytes_written(&self) -> u64 {
         self.bytes_written
@@ -140,6 +189,7 @@ impl Drop for SegmentWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file::segment_reader::SegmentReader;
     use bytes::Bytes;
     use exspeed_streams::record::Record;
     use tempfile::TempDir;
@@ -235,5 +285,84 @@ mod tests {
             "filename '{}' should end with .seg",
             filename
         );
+    }
+
+    #[test]
+    fn append_batch_writes_all_records_with_one_sync() {
+        use bytes::Bytes;
+        use exspeed_streams::record::Record;
+        use tempfile::tempdir;
+
+        let tmp = tempdir().unwrap();
+        let mut writer = SegmentWriter::create(tmp.path(), 0).unwrap();
+
+        let rec = Record {
+            subject: "s".into(),
+            key: None,
+            value: Bytes::from_static(b"v"),
+            headers: vec![],
+            timestamp_ns: None,
+        };
+        let entries: Vec<(Offset, u64, Record)> = (0..5)
+            .map(|i| (Offset(i), 1000 + i, rec.clone()))
+            .collect();
+
+        writer.append_batch(&entries, /*sync_now=*/ true).unwrap();
+        assert!(writer.bytes_written() > 5 * 8); // at least 5 framed records
+        drop(writer);
+
+        // Verify round-trip via SegmentReader.
+        let seg_path = tmp.path().join("00000000000000000000.seg");
+        let reader = SegmentReader::open(&seg_path).unwrap();
+        let records = reader.read_from(0, 100).unwrap();
+        assert_eq!(records.len(), 5);
+        for (i, r) in records.iter().enumerate() {
+            assert_eq!(r.offset.0, i as u64);
+            assert_eq!(r.timestamp, 1000 + i as u64);
+        }
+    }
+
+    #[test]
+    fn append_batch_empty_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut writer = SegmentWriter::create(tmp.path(), 0).unwrap();
+        let before = writer.bytes_written();
+        writer.append_batch(&[], false).unwrap();
+        assert_eq!(writer.bytes_written(), before);
+    }
+
+    #[test]
+    fn try_clone_file_returns_independent_handle() {
+        use bytes::Bytes;
+        use exspeed_streams::record::Record;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut writer = SegmentWriter::create(tmp.path(), 0).unwrap();
+        let cloned = writer.try_clone_file().unwrap();
+
+        // Both handles refer to the same kernel fd. Writing through the writer
+        // and sync'ing through the clone should flush the write.
+        let rec = Record {
+            subject: "s".into(), key: None, value: Bytes::from_static(b"v"),
+            headers: vec![], timestamp_ns: None,
+        };
+        writer.append(Offset(0), 1, &rec).unwrap();
+        cloned.sync_data().unwrap();
+        // Test just verifies clone + sync on clone doesn't error.
+    }
+
+    #[test]
+    fn sync_data_method_flushes_pending_write() {
+        use bytes::Bytes;
+        use exspeed_streams::record::Record;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut writer = SegmentWriter::create(tmp.path(), 0).unwrap();
+        let rec = Record {
+            subject: "s".into(), key: None, value: Bytes::from_static(b"hello"),
+            headers: vec![], timestamp_ns: None,
+        };
+        writer.append(Offset(0), 100, &rec).unwrap();
+        writer.sync_data().unwrap(); // Just verify no error.
     }
 }
