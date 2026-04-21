@@ -53,18 +53,35 @@ exspeed query "SELECT payload->>'region' AS region, COUNT(*) FROM orders GROUP B
 
 ## Benchmarks
 
-_Reference numbers pending the first Hetzner CCX33 refresh run — check back after the next tagged release, or run the harness locally:_
+On a single MacBook (8 vCPU, 16 GB RAM, APFS+NVMe), Exspeed sustains:
 
-```bash
-cargo run --release -p exspeed -- server --data-dir /tmp/exspeed-bench
-# in another terminal
-cargo run --release -p exspeed-bench -- all --profile local --output bench/results/local.json
-cargo run --release -p exspeed-bench -- render bench/results/local.json --out /tmp/BENCHMARKS.md
-```
+| Workload                | Sync (default, durable)       | Async (opt-in)                |
+|-------------------------|-------------------------------|-------------------------------|
+| Publish, 1 KB payload   | ~593 msg/s                    | ~1,425 msg/s                  |
+| E2E latency @ 10k/s     | p50 105 ms / p99 250 ms       | p50 255 ms / p99 739 ms       |
+| Fan-out, 4 consumers    | ~95 msg/s aggregate           | ~93 msg/s aggregate           |
+| ExQL continuous query   | see note                      | see note                      |
+
+Numbers refreshed 2026-04-21 on git `238ac71`. macOS APFS fsync is inherently slower than Linux+NVMe — Linux reference numbers (pending a Hetzner run) will be significantly higher. The async mode 2.4× publish uplift (593 → 1,425 msg/s) demonstrates the group-commit + async-syncer path working as designed.
+
+> **ExQL note:** The binary-search found no candidate that sustained ≥95% of any target rate above the 5,000 msg/s floor on macOS. This reflects APFS write overhead under the dual publish+query load, not a bug in the query engine.
 
 Full methodology, per-scenario tables, and reproduction steps in [BENCHMARKS.md](BENCHMARKS.md).
+A reproducible comparison kit lives in [`bench/README.md`](bench/README.md).
 
-A reproducible comparison kit (docker-compose + drivers for other brokers) lives in [`bench/README.md`](bench/README.md).
+### Operational tuning
+
+| Flag (env) | Default | Effect |
+|---|---|---|
+| `--storage-sync` (`EXSPEED_STORAGE_SYNC`) | `sync` | `sync` = group-commit + fsync per batch (durable). `async` = fsync on a timer (faster, may lose ms of data on crash). |
+| `--storage-flush-window-us` (`EXSPEED_FLUSH_WINDOW_US`) | `500` | Max time the WAL appender waits to fill a batch in `sync` mode. |
+| `--storage-flush-threshold-records` (`EXSPEED_FLUSH_THRESHOLD_RECORDS`) | `256` | Max records per batch before forced flush. |
+| `--storage-flush-threshold-bytes` (`EXSPEED_FLUSH_THRESHOLD_BYTES`) | `1048576` | Max bytes per batch before forced flush. |
+| `--storage-sync-interval-ms` (`EXSPEED_SYNC_INTERVAL_MS`) | `10` | (async mode) Fsync timer interval. |
+| `--storage-sync-bytes` (`EXSPEED_SYNC_BYTES`) | `4194304` | (async mode) Force fsync after this many unsynced bytes. |
+| `--delivery-buffer` (`EXSPEED_DELIVERY_BUFFER`) | `8192` | mpsc buffer per subscription. |
+
+**`--storage-sync=async`** trades durability for throughput. On a crash, you may lose up to `--storage-sync-interval-ms` of acked data. This matches NATS JetStream's default behavior. Keep `sync` (the default) for production unless throughput is critical and you understand the tradeoff.
 
 ## CLI Reference
 

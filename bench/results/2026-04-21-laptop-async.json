@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "profile": "local",
+  "exspeed_version": "0.1.1",
+  "git_sha": "238ac71",
+  "host": {
+    "sku": "macbook-laptop-async",
+    "vcpu": 8,
+    "ram_gb": 16,
+    "storage": "apfs-nvme-async",
+    "kernel": "25.2.0",
+    "os": "macOS 26.2"
+  },
+  "run_timestamp": "2026-04-21T09:40:28.665948Z",
+  "scenarios": {
+    "publish": [
+      {
+        "payload_bytes": 1024,
+        "msg_per_sec": 1425.1691833273012,
+        "mb_per_sec": 1.4593732437271565,
+        "duration_sec": 5.001511458
+      }
+    ],
+    "latency": {
+      "payload_bytes": 1024,
+      "target_rate": 10000,
+      "duration_sec": 10.0,
+      "latency_us": {
+        "p50": 255359,
+        "p90": 572415,
+        "p99": 739327,
+        "p999": 811519,
+        "p9999": 811519,
+        "max": 811519
+      }
+    },
+    "fanout": [
+      {
+        "consumers": 1,
+        "producer_rate": 5000,
+        "aggregate_consumer_rate": 50.57911166649499,
+        "max_lag_msgs": 0
+      },
+      {
+        "consumers": 4,
+        "producer_rate": 5000,
+        "aggregate_consumer_rate": 92.73449159471467,
+        "max_lag_msgs": 0
+      }
+    ],
+    "exql": {
+      "query": "CREATE VIEW \"bench-exql-output\" AS SELECT subject, COUNT(*) FROM \"bench-exql-source\" GROUP BY subject EMIT CHANGES",
+      "payload_bytes": 1024,
+      "subjects": 1,
+      "sustained_input_rate": 5000
+    }
+  }
+}
