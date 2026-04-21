@@ -26,14 +26,14 @@ use crate::file::wal_appender::{AppenderConfig, AppenderHandle};
 
 struct FileStorageInner {
     data_dir: PathBuf,
-    // Partitions are now shared between the writer task (exclusive write access
-    // during flush) and read-side callers. Arc<Mutex<Partition>> is the bridge.
-    partitions: RwLock<HashMap<(String, u32), Arc<Mutex<Partition>>>>,
-    // One appender handle per (stream, partition). Drop order matters:
-    // appenders must be declared AFTER partitions so they are dropped FIRST
-    // (Rust drops struct fields in declaration order). The appender task will
-    // flush its in-flight batch before exiting when the channel closes.
+    /// Appenders MUST be declared before `partitions` so that on Drop, the
+    /// AppenderHandle senders close first — the writer task observes the
+    /// closed channel, drains its in-flight batch, then exits, releasing
+    /// its Arc<Mutex<Partition>>. THEN partitions drops, freeing the
+    /// underlying partition state. (Rust drops struct fields in declaration
+    /// order: first-declared, first-dropped.)
     appenders: RwLock<HashMap<(String, u32), AppenderHandle>>,
+    partitions: RwLock<HashMap<(String, u32), Arc<Mutex<Partition>>>>,
     appender_config: AppenderConfig,
     seal_tx: std::sync::Mutex<Option<mpsc::UnboundedSender<partition::SealedSegmentInfo>>>,
 }
@@ -58,8 +58,8 @@ impl FileStorage {
         Ok(Self {
             inner: Arc::new(FileStorageInner {
                 data_dir: data_dir.to_path_buf(),
-                partitions: RwLock::new(HashMap::new()),
                 appenders: RwLock::new(HashMap::new()),
+                partitions: RwLock::new(HashMap::new()),
                 appender_config: AppenderConfig::default(),
                 seal_tx: std::sync::Mutex::new(None),
             }),
@@ -115,8 +115,8 @@ impl FileStorage {
         Ok(Self {
             inner: Arc::new(FileStorageInner {
                 data_dir: data_dir.to_path_buf(),
-                partitions: RwLock::new(partitions),
                 appenders: RwLock::new(appenders),
+                partitions: RwLock::new(partitions),
                 appender_config,
                 seal_tx: std::sync::Mutex::new(None),
             }),
@@ -184,7 +184,7 @@ impl FileStorage {
     ///
     /// Called once at startup before any appenders begin producing, so
     /// `try_lock` is expected to succeed immediately for all partitions.
-    pub fn set_seal_notifier(&self, tx: mpsc::UnboundedSender<partition::SealedSegmentInfo>) {
+    pub(crate) fn set_seal_notifier(&self, tx: mpsc::UnboundedSender<partition::SealedSegmentInfo>) {
         // Set on all existing partitions.
         let map = self.inner.partitions.read().unwrap();
         for partition_arc in map.values() {
@@ -216,7 +216,7 @@ impl FileStorage {
             let map = self.inner.partitions.read().unwrap();
             let key = (stream.to_string(), partition_id);
             map.get(&key)
-                .and_then(|p| p.blocking_lock().seal_tx_clone())
+                .and_then(|p| tokio::task::block_in_place(|| p.blocking_lock().seal_tx_clone()))
         };
 
         let mut new_partition = Partition::open(&dir, stream, partition_id)?;
@@ -245,6 +245,12 @@ impl FileStorage {
     /// Override the segment max bytes threshold for a specific stream.
     /// Returns `false` if the stream is unknown. Intended for tests that
     /// need to force segment rolling without producing 256 MiB of data.
+    /// # Panics
+    ///
+    /// Panics if the partition lock is already held (e.g. a flush is in
+    /// progress). Safe to call from tests where flush timing is controlled.
+    /// Not intended for production call sites; called by `exspeed-broker`
+    /// integration tests to force segment rolling without producing real data.
     pub fn set_stream_segment_max_bytes(&self, stream: &str, max: u64) -> bool {
         let map = self.inner.partitions.read().unwrap();
         let key = (stream.to_string(), 0u32);
@@ -270,9 +276,11 @@ impl FileStorage {
             let stream_dir = self.inner.data_dir.join("streams").join(stream_name);
             let config = StreamConfig::load(&stream_dir)?;
 
-            let stats = partition_arc
-                .blocking_lock()
-                .enforce_retention(config.max_age_secs, config.max_bytes)?;
+            let stats = tokio::task::block_in_place(|| {
+                partition_arc
+                    .blocking_lock()
+                    .enforce_retention(config.max_age_secs, config.max_bytes)
+            })?;
             if stats.segments_deleted > 0 {
                 tracing::info!(
                     stream = stream_name.as_str(),
