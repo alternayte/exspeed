@@ -1,6 +1,7 @@
 // Built in Task 4
 
 mod file_tests;
+mod segment_recovery_tests;
 mod trait_tests;
 mod wal_appender_tests;
 

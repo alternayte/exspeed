@@ -17,7 +17,7 @@ use crate::file::offset_index::OffsetIndex;
 use crate::file::segment_reader::SegmentReader;
 use crate::file::segment_writer::SegmentWriter;
 use crate::file::time_index::{self, TimeIndex};
-use crate::file::wal::{replay_wal, WalWriter};
+use crate::file::wal::WalWriter;
 
 /// Default maximum segment size before rolling: 256 MiB.
 const DEFAULT_SEGMENT_MAX_BYTES: u64 = 256 * 1024 * 1024;
@@ -114,12 +114,17 @@ pub struct Partition {
 }
 
 impl Partition {
-    /// Create a brand-new partition directory with its first segment and WAL.
+    /// Create a brand-new partition directory with its first segment.
+    ///
+    /// v0.2.0 removes the separate WAL file. The `wal` field is a transitional
+    /// placeholder pointing at `wal.log.unused`; Task 4 deletes the field. The
+    /// placeholder filename is deliberately distinct from `wal.log` so that
+    /// `Partition::open`'s legacy-WAL fail-fast check does not trip itself.
     pub fn create(dir: &Path, stream_name: &str, partition_id: u32) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
 
         let writer = SegmentWriter::create(dir, 0)?;
-        let wal = WalWriter::open(&dir.join("wal.log"))?;
+        let wal = WalWriter::open(&dir.join("wal.log.unused"))?;
 
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -134,9 +139,29 @@ impl Partition {
         })
     }
 
-    /// Open an existing partition directory, recovering state from segment
-    /// files and replaying the WAL.
+    /// Open an existing partition directory, recovering state via a
+    /// CRC-validating tail scan of the active segment.
+    ///
+    /// v0.2.0 removed the separate `wal.log` file — recovery is now unified
+    /// through `SegmentWriter::recover_tail`, which walks the active segment
+    /// from the header forward and truncates any torn/corrupt tail. If a
+    /// legacy `wal.log` is present the open fails fast rather than silently
+    /// ignoring durable data the caller expected to be replayed.
     pub fn open(dir: &Path, stream_name: &str, partition_id: u32) -> io::Result<Self> {
+        // Fail-fast if a legacy WAL is present. Pre-v0.2.0 data is unsupported.
+        let legacy_wal = dir.join("wal.log");
+        if legacy_wal.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "legacy wal.log found at {}; v0.2.0 removed the separate \
+                     WAL file. Either delete your data dir (fresh start) or \
+                     downgrade to exspeed 0.1.1.",
+                    legacy_wal.display()
+                ),
+            ));
+        }
+
         // Find all .seg files, sorted by name (which sorts by base_offset
         // due to zero-padded filenames).
         let mut seg_paths: Vec<PathBuf> = fs::read_dir(dir)?
@@ -163,56 +188,45 @@ impl Partition {
             sealed_readers.push(SegmentReader::open(path)?);
         }
 
-        // Read metadata from the last segment to derive base_offset and next_offset.
-        let last_seg_path = &seg_paths[seg_paths.len() - 1];
-        let last_reader = SegmentReader::open(last_seg_path)?;
-        let base_offset = last_reader.base_offset();
-
-        // Derive next_offset from the last offset across all segments.
+        // Derive next_offset from sealed segments first.
         let mut next_offset: u64 = 0;
         for reader in &sealed_readers {
             if let Some(last) = reader.last_offset()? {
                 next_offset = next_offset.max(last + 1);
             }
         }
-        if let Some(last) = last_reader.last_offset()? {
-            next_offset = next_offset.max(last + 1);
+
+        // Tail-scan the active segment: validate every frame's CRC and
+        // truncate at the first torn/corrupt record. Replaces WAL replay.
+        let last_seg_path = &seg_paths[seg_paths.len() - 1];
+        let (max_offset_in_active, _max_ts, current_size) =
+            SegmentWriter::recover_tail(last_seg_path)?;
+
+        if let Some(m) = max_offset_in_active {
+            next_offset = next_offset.max(m + 1);
         }
 
-        // Open the WAL and replay any records that weren't flushed to segments.
-        let wal_path = dir.join("wal.log");
-        let wal_records = replay_wal(&wal_path)?;
+        info!(
+            stream = stream_name,
+            partition = partition_id,
+            segment = %last_seg_path.display(),
+            current_size,
+            next_offset,
+            "partition recovery complete (tail-scan)"
+        );
 
-        let mut wal = WalWriter::open(&wal_path)?;
-
-        // Open the last segment as the active writer and replay WAL records
-        // that are not yet in any segment.
-        let replay_base = next_offset;
-        let current_size = fs::metadata(last_seg_path)?.len();
-        let mut active_writer =
+        // Open the active segment for append at the post-recovery length.
+        let last_reader = SegmentReader::open(last_seg_path)?;
+        let base_offset = last_reader.base_offset();
+        let active_writer =
             SegmentWriter::open_append(last_seg_path, base_offset, current_size)?;
 
-        let mut replayed = 0usize;
-        for wal_rec in &wal_records {
-            if wal_rec.offset.0 >= replay_base {
-                active_writer.append(wal_rec.offset, wal_rec.timestamp, &wal_rec.record)?;
-                next_offset = wal_rec.offset.0 + 1;
-                replayed += 1;
-            }
-        }
-
-        if replayed > 0 {
-            active_writer.sync()?;
-            info!(
-                stream = stream_name,
-                partition = partition_id,
-                replayed,
-                "WAL replay complete"
-            );
-        }
-
-        // Truncate the WAL now that all records are in segments.
-        wal.truncate()?;
+        // WAL removed in v0.2.0. Transitional placeholder retained so the
+        // struct construction shape matches `create`. Task 4 deletes the
+        // wal field entirely; until then this file is written to but never
+        // read. Its name is deliberately distinct from `wal.log` so the
+        // legacy-WAL check above does not trip itself on reopen.
+        let wal = WalWriter::open(&dir.join("wal.log.unused"))?;
 
         Ok(Self {
             dir: dir.to_path_buf(),
