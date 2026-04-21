@@ -275,8 +275,8 @@ impl FileStorage {
         }
 
         // Preserve seal notifier from existing partition.
-        // Clone the Arc out of the DashMap guard before acquiring the partition Mutex,
-        // to avoid holding two locks simultaneously.
+        // Drop the DashMap shard lock (via .map that clones the Arc out of the Ref)
+        // before entering blocking_lock on the partition's inner Mutex.
         let seal_tx = {
             let key = (stream.to_string(), partition_id);
             self.inner
@@ -329,13 +329,12 @@ impl FileStorage {
     /// integration tests to force segment rolling without producing real data.
     pub fn set_stream_segment_max_bytes(&self, stream: &str, max: u64) -> bool {
         let key = (stream.to_string(), 0u32);
-        match self.inner.partitions.get(&key) {
-            Some(r) => {
+        match self.inner.partitions.get(&key).map(|r| r.value().clone()) {
+            Some(arc) => {
                 // Called from tests only (possibly async context). try_lock is
                 // safe here — test code controls the timing and there is no
                 // concurrent flush in progress when this is called.
-                r.value()
-                    .try_lock()
+                arc.try_lock()
                     .expect("partition lock held during set_segment_max_bytes — unexpected")
                     .set_segment_max_bytes(max);
                 true
