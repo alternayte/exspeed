@@ -15,6 +15,15 @@ use exspeed_common::Metrics;
 use exspeed_protocol::messages::{ClientMessage, ServerMessage};
 use exspeed_streams::StorageEngine;
 
+/// Get the delivery mpsc buffer size from env var EXSPEED_DELIVERY_BUFFER,
+/// falling back to 8192 if not set or invalid.
+fn delivery_buffer_size() -> usize {
+    std::env::var("EXSPEED_DELIVERY_BUFFER")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(8192)
+}
+
 pub struct Broker {
     pub storage: Arc<dyn StorageEngine>,
     pub broker_append: Arc<BrokerAppend>,
@@ -184,7 +193,7 @@ impl Broker {
         }
 
         // Create mpsc channel for delivery records.
-        let (tx, rx) = mpsc::channel::<DeliveryRecord>(1000);
+        let (tx, rx) = mpsc::channel::<DeliveryRecord>(delivery_buffer_size());
         // Cancel channel kept inside the broker (dropped on unsubscribe).
         let (cancel_tx_store, cancel_rx_store) = oneshot::channel::<()>();
         // Cancel channel returned to the caller (dropped on disconnect).
