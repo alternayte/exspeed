@@ -145,9 +145,10 @@ pub struct ProducerStats {
     pub wall_secs: f64,
 }
 
-/// Spawn `tasks` producer tasks. Each owns one pipelined Publisher connection
-/// and keeps up to 256 publishes in flight concurrently, removing per-publish
-/// round-trip cost from the critical path. Returns aggregate stats.
+/// Spawn `tasks` producer loops all sharing one coalescing Publisher. Each loop
+/// calls publish().await sequentially; with `tasks` concurrent callers on the
+/// same Publisher the flusher sees `tasks`-wide batches, so throughput scales
+/// with parallelism without any manual FuturesUnordered bookkeeping.
 /// `origin` is the shared start instant for publish_us headers so the consumer
 /// can compute deltas with `now.duration_since(origin)`.
 pub async fn run_producer(
@@ -160,91 +161,57 @@ pub async fn run_producer(
     shared_count: Arc<AtomicU64>,
 ) -> Result<ProducerStats> {
     use crate::driver::publisher::PublisherBuilder;
-    use futures_util::stream::FuturesUnordered;
 
     let payload: Bytes = Bytes::from(vec![b'x'; payload_bytes]);
     let stream = stream.to_owned();
+    let start = Instant::now();
+
+    // One shared Publisher — all task loops coalesce into the same flusher.
+    let publisher = PublisherBuilder::new(addr)
+        .max_batch_records(256)
+        .batch_window(Duration::from_micros(100))
+        .build()
+        .await?;
+
     let mut handles = Vec::with_capacity(tasks);
-    // Concurrency window per producer task.  With batch push (Tasks 1-2) and
-    // hot-path hygiene (Tasks 3-5) the consumer drains at broker rate, so we
-    // can saturate the pipeline with 256 concurrent publishes per task.
-    // The Publisher semaphore ceiling is also 256 permits; this constant is a
-    // bench driver policy, not a transport limit.
-    let in_flight_per_task: usize = 256;
 
     for _ in 0..tasks {
-        let addr = addr.to_owned();
         let stream = stream.clone();
         let payload = payload.clone();
         let shared_count = shared_count.clone();
+        let publisher = publisher.clone();
         handles.push(tokio::spawn(async move {
-            let task_start = Instant::now();
-            let publisher = PublisherBuilder::new(&addr)
-                .max_in_flight(in_flight_per_task)
-                .build()
-                .await?;
-            let deadline = task_start + duration;
+            let deadline = Instant::now() + duration;
             let mut local: u64 = 0;
-            let mut committed: u64 = 0;
-            let mut futs: FuturesUnordered<_> = FuturesUnordered::new();
             while Instant::now() < deadline {
-                while futs.len() < in_flight_per_task && Instant::now() < deadline {
-                    // Set the timestamp lazily inside the async block so it
-                    // reflects when the message is actually sent, not when it
-                    // is queued into FuturesUnordered.
-                    let stream = stream.clone();
-                    let payload = payload.clone();
-                    let pub2 = publisher.clone();
-                    futs.push(async move {
-                        let us = origin.elapsed().as_micros() as u64;
-                        let req = exspeed_protocol::messages::publish::PublishRequest {
-                            stream,
-                            subject: "bench".into(),
-                            key: None,
-                            msg_id: None,
-                            value: payload,
-                            headers: vec![(PUBLISH_TS_HEADER.to_owned(), format!("{us}"))],
-                        };
-                        pub2.publish(req).await
-                    });
-                }
-                if let Some(res) = futs.next().await {
-                    let _ = res; // count locally; offset/error not used here
-                    local += 1;
-                    if local - committed >= 256 {
-                        shared_count.fetch_add(256, Ordering::Relaxed);
-                        committed += 256;
-                    }
-                }
-            }
-            // Snapshot active window before draining so the wall_secs reported
-            // to the caller reflects only the publish-rate window, not drain time.
-            let active_secs = task_start.elapsed().as_secs_f64();
-            // Drain remaining in-flight (don't lose in-flight acks).
-            while let Some(res) = futs.next().await {
-                let _ = res;
+                let us = origin.elapsed().as_micros() as u64;
+                let req = exspeed_protocol::messages::publish::PublishRequest {
+                    stream: stream.clone(),
+                    subject: "bench".into(),
+                    key: None,
+                    msg_id: None,
+                    value: payload.clone(),
+                    headers: vec![(PUBLISH_TS_HEADER.to_owned(), format!("{us}"))],
+                };
+                let _ = publisher.publish(req).await;
                 local += 1;
+                if local.is_multiple_of(256) {
+                    shared_count.fetch_add(256, Ordering::Relaxed);
+                }
             }
-            drop(futs);
-            // Commit the tail not yet published to shared_count.
-            shared_count.fetch_add(local - committed, Ordering::Relaxed);
-            publisher.close().await.ok();
-            Ok::<(u64, f64), anyhow::Error>((local, active_secs))
+            shared_count.fetch_add(local % 256, Ordering::Relaxed);
+            Ok::<u64, anyhow::Error>(local)
         }));
     }
+
     let mut total: u64 = 0;
-    let mut max_active_secs: f64 = 0.0;
-    for h in handles {
-        let (n, secs) = h.await??;
-        total += n;
-        if secs > max_active_secs { max_active_secs = secs; }
-    }
-    // wall_secs is the longest active publish window across all tasks, which
-    // includes connection setup but excludes post-deadline drain time.
+    for h in handles { total += h.await??; }
+    // Flush + close the shared publisher once all tasks are done.
+    publisher.close().await.ok();
     Ok(ProducerStats {
         messages: total,
         bytes: total * payload_bytes as u64,
-        wall_secs: max_active_secs,
+        wall_secs: start.elapsed().as_secs_f64(),
     })
 }
 
@@ -256,14 +223,14 @@ pub async fn run_producer_at_rate(
     rate_per_sec: u64,
     origin: Instant,
 ) -> Result<ProducerStats> {
-    use crate::driver::publisher::Publisher;
-
+    use crate::driver::publisher::PublisherBuilder;
     let payload: Bytes = Bytes::from(vec![b'x'; payload_bytes]);
-    let publisher = Publisher::new(addr).await?;
+    let publisher = PublisherBuilder::new(addr)
+        .batch_window(Duration::from_micros(100))
+        .build()
+        .await?;
     let interval_ns = 1_000_000_000u64 / rate_per_sec.max(1);
     let mut ticker = tokio::time::interval(Duration::from_nanos(interval_ns));
-    // We want ticks to "catch up" rather than bunch when a publish takes longer
-    // than the interval — this gives accurate coordinated-omission measurement.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
     let start = Instant::now();
     let deadline = start + duration;
@@ -279,7 +246,7 @@ pub async fn run_producer_at_rate(
             value: payload.clone(),
             headers: vec![(PUBLISH_TS_HEADER.to_owned(), format!("{us}"))],
         };
-        publisher.publish(req).await.ok();
+        let _ = publisher.publish(req).await;
         sent += 1;
     }
     publisher.close().await.ok();
