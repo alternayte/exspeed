@@ -359,7 +359,7 @@ where
     }
 
     // Build appender config from CLI args.
-    let appender_config = exspeed_storage::file::wal_appender::AppenderConfig {
+    let appender_config = exspeed_storage::file::segment_appender::AppenderConfig {
         flush_window: std::time::Duration::from_micros(args.storage_flush_window_us),
         flush_threshold_records: args.storage_flush_threshold_records,
         flush_threshold_bytes: args.storage_flush_threshold_bytes,

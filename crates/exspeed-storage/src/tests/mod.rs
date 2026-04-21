@@ -3,7 +3,7 @@
 mod file_tests;
 mod segment_recovery_tests;
 mod trait_tests;
-mod wal_appender_tests;
+mod segment_appender_tests;
 
 #[cfg(test)]
 mod wal_syncer_tests;

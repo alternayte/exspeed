@@ -6,7 +6,7 @@ pub mod segment_writer;
 pub mod stream_config;
 pub mod time_index;
 pub mod wal;
-pub mod wal_appender;
+pub mod segment_appender;
 pub mod wal_syncer;
 
 use std::collections::HashMap;
@@ -24,7 +24,7 @@ use exspeed_streams::{Record, StorageEngine, StorageError, StoredRecord};
 
 use crate::file::partition::Partition;
 use crate::file::stream_config::StreamConfig;
-use crate::file::wal_appender::{AppenderConfig, AppenderHandle, AppenderMode};
+use crate::file::segment_appender::{AppenderConfig, AppenderHandle, AppenderMode};
 use crate::file::wal_syncer::WalSyncerHandle;
 
 /// Storage durability mode. `Sync` = group commit + fsync per batch (default,
@@ -173,7 +173,7 @@ impl FileStorage {
                     let key = (stream_name.clone(), part_id);
                     let partition_arc = Arc::new(Mutex::new(partition));
                     let appender =
-                        wal_appender::spawn(partition_arc.clone(), appender_config, appender_mode);
+                        segment_appender::spawn(partition_arc.clone(), appender_config, appender_mode);
                     if let (Some(f), StorageSyncMode::Async { interval, .. }) = (wal_clone, mode) {
                         let syncer = wal_syncer::spawn(f, stream_name.clone(), part_id, interval);
                         syncers.insert(key.clone(), syncer);
@@ -315,7 +315,7 @@ impl FileStorage {
             StorageSyncMode::Async { .. } => AppenderMode::Async,
         };
         let appender =
-            wal_appender::spawn(partition_arc.clone(), self.inner.appender_config, appender_mode);
+            segment_appender::spawn(partition_arc.clone(), self.inner.appender_config, appender_mode);
         let syncer = match (wal_clone, self.inner.storage_sync_mode) {
             (Some(f), StorageSyncMode::Async { interval, .. }) => {
                 Some(wal_syncer::spawn(f, stream.to_string(), partition_id, interval))
@@ -432,7 +432,7 @@ impl FileStorage {
             StorageSyncMode::Async { .. } => AppenderMode::Async,
         };
         let appender =
-            wal_appender::spawn(partition_arc.clone(), self.inner.appender_config, appender_mode);
+            segment_appender::spawn(partition_arc.clone(), self.inner.appender_config, appender_mode);
         let syncer = match (wal_clone, self.inner.storage_sync_mode) {
             (Some(f), StorageSyncMode::Async { interval, .. }) => {
                 Some(wal_syncer::spawn(f, stream.as_str().to_string(), 0, interval))

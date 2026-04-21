@@ -27,7 +27,7 @@ async fn async_mode_acks_immediately_then_syncs_on_timer() {
                 interval: Duration::from_millis(50),
                 threshold_bytes: 4 * 1024 * 1024,
             },
-            crate::file::wal_appender::AppenderConfig::default(),
+            crate::file::segment_appender::AppenderConfig::default(),
         ).unwrap()
     );
     let stream: StreamName = "s".try_into().unwrap();
