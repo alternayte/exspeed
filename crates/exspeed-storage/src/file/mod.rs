@@ -7,6 +7,7 @@ pub mod stream_config;
 pub mod time_index;
 pub mod wal;
 pub mod wal_appender;
+pub mod wal_syncer;
 
 use std::collections::HashMap;
 use std::fs;
@@ -22,7 +23,33 @@ use exspeed_streams::{Record, StorageEngine, StorageError, StoredRecord};
 
 use crate::file::partition::Partition;
 use crate::file::stream_config::StreamConfig;
-use crate::file::wal_appender::{AppenderConfig, AppenderHandle};
+use crate::file::wal_appender::{AppenderConfig, AppenderHandle, AppenderMode};
+
+/// Storage durability mode. `Sync` = group commit + fsync per batch (default,
+/// strongest durability). `Async` = batch writes immediately, fsync on a timer
+/// (faster, may lose up to `interval` of acked data on crash).
+///
+/// # Note on `threshold_bytes`
+/// The `threshold_bytes` field in `Async` is part of the public API for
+/// future use (trigger a mid-interval fsync when unflushed bytes exceed this
+/// value). In the current implementation only the timer fires — byte-threshold
+/// triggering is a planned follow-up.
+#[derive(Debug, Clone, Copy)]
+pub enum StorageSyncMode {
+    Sync,
+    Async {
+        interval: std::time::Duration,
+        /// Future: trigger an early fsync when unflushed bytes exceed this threshold.
+        /// Currently unused — timer-only. TODO: wire up byte-threshold trigger.
+        threshold_bytes: usize,
+    },
+}
+
+impl Default for StorageSyncMode {
+    fn default() -> Self {
+        StorageSyncMode::Sync
+    }
+}
 
 struct FileStorageInner {
     data_dir: PathBuf,
@@ -35,6 +62,7 @@ struct FileStorageInner {
     appenders: RwLock<HashMap<(String, u32), AppenderHandle>>,
     partitions: RwLock<HashMap<(String, u32), Arc<Mutex<Partition>>>>,
     appender_config: AppenderConfig,
+    storage_sync_mode: StorageSyncMode,
     seal_tx: std::sync::Mutex<Option<mpsc::UnboundedSender<partition::SealedSegmentInfo>>>,
 }
 
@@ -61,6 +89,7 @@ impl FileStorage {
                 appenders: RwLock::new(HashMap::new()),
                 partitions: RwLock::new(HashMap::new()),
                 appender_config: AppenderConfig::default(),
+                storage_sync_mode: StorageSyncMode::default(),
                 seal_tx: std::sync::Mutex::new(None),
             }),
         })
@@ -68,12 +97,31 @@ impl FileStorage {
 
     /// Open an existing `FileStorage`, scanning for streams and partitions
     /// on disk and recovering each partition (including WAL replay).
+    ///
+    /// Uses the default `StorageSyncMode::Sync` durability mode. To opt into
+    /// async-sync mode use [`FileStorage::open_with_mode`].
     pub fn open(data_dir: &Path) -> io::Result<Self> {
+        Self::open_with_mode(data_dir, StorageSyncMode::default())
+    }
+
+    /// Open an existing `FileStorage` with an explicit durability mode.
+    ///
+    /// - `StorageSyncMode::Sync` — group commit + fsync per batch (default).
+    /// - `StorageSyncMode::Async { interval, .. }` — writes are acked without
+    ///   fsync; a `WalSyncer` task fires every `interval` to call `sync_data`.
+    ///   On crash, up to `interval` of acked data may be lost.
+    ///
+    /// Creates `data_dir` if it does not exist.
+    pub fn open_with_mode(data_dir: &Path, mode: StorageSyncMode) -> io::Result<Self> {
         fs::create_dir_all(data_dir)?;
 
         let mut partitions: HashMap<(String, u32), Arc<Mutex<Partition>>> = HashMap::new();
         let mut appenders: HashMap<(String, u32), AppenderHandle> = HashMap::new();
         let appender_config = AppenderConfig::default();
+        let appender_mode = match mode {
+            StorageSyncMode::Sync => AppenderMode::Sync,
+            StorageSyncMode::Async { .. } => AppenderMode::Async,
+        };
         let streams_dir = data_dir.join("streams");
 
         if streams_dir.is_dir() {
@@ -105,7 +153,10 @@ impl FileStorage {
                     let key = (stream_name.clone(), part_id);
                     let partition_arc = Arc::new(Mutex::new(partition));
                     let appender =
-                        wal_appender::spawn(partition_arc.clone(), appender_config);
+                        wal_appender::spawn(partition_arc.clone(), appender_config, appender_mode);
+                    if let StorageSyncMode::Async { interval, .. } = mode {
+                        wal_syncer::spawn(partition_arc.clone(), interval);
+                    }
                     appenders.insert(key.clone(), appender);
                     partitions.insert(key, partition_arc);
                 }
@@ -118,6 +169,7 @@ impl FileStorage {
                 appenders: RwLock::new(appenders),
                 partitions: RwLock::new(partitions),
                 appender_config,
+                storage_sync_mode: mode,
                 seal_tx: std::sync::Mutex::new(None),
             }),
         })
@@ -226,8 +278,15 @@ impl FileStorage {
 
         let key = (stream.to_string(), partition_id);
         let partition_arc = Arc::new(Mutex::new(new_partition));
+        let appender_mode = match self.inner.storage_sync_mode {
+            StorageSyncMode::Sync => AppenderMode::Sync,
+            StorageSyncMode::Async { .. } => AppenderMode::Async,
+        };
         let appender =
-            wal_appender::spawn(partition_arc.clone(), self.inner.appender_config);
+            wal_appender::spawn(partition_arc.clone(), self.inner.appender_config, appender_mode);
+        if let StorageSyncMode::Async { interval, .. } = self.inner.storage_sync_mode {
+            wal_syncer::spawn(partition_arc.clone(), interval);
+        }
 
         {
             let mut map = self.inner.partitions.write().unwrap();
@@ -321,7 +380,15 @@ impl FileStorage {
         }
 
         let partition_arc = Arc::new(Mutex::new(partition));
-        let appender = wal_appender::spawn(partition_arc.clone(), self.inner.appender_config);
+        let appender_mode = match self.inner.storage_sync_mode {
+            StorageSyncMode::Sync => AppenderMode::Sync,
+            StorageSyncMode::Async { .. } => AppenderMode::Async,
+        };
+        let appender =
+            wal_appender::spawn(partition_arc.clone(), self.inner.appender_config, appender_mode);
+        if let StorageSyncMode::Async { interval, .. } = self.inner.storage_sync_mode {
+            wal_syncer::spawn(partition_arc.clone(), interval);
+        }
 
         {
             let mut map = self.inner.partitions.write().unwrap();

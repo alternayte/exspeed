@@ -585,7 +585,7 @@ fn append_batch_assigns_sequential_offsets_and_persists_via_one_wal_sync() {
         timestamp_ns: None,
     };
     let records = vec![mk(b"a"), mk(b"b"), mk(b"c")];
-    let results = p.append_batch(&records).unwrap();
+    let results = p.append_batch(&records, /*sync_now=*/ true).unwrap();
     assert_eq!(results.len(), 3);
     assert_eq!(results[0].0, Offset(0));
     assert_eq!(results[1].0, Offset(1));
@@ -604,7 +604,7 @@ fn append_batch_assigns_sequential_offsets_and_persists_via_one_wal_sync() {
 fn append_batch_empty_is_noop() {
     let tmp = tempfile::tempdir().unwrap();
     let mut p = Partition::create(tmp.path(), "s", 0).unwrap();
-    let results = p.append_batch(&[]).unwrap();
+    let results = p.append_batch(&[], /*sync_now=*/ true).unwrap();
     assert!(results.is_empty());
     // No state should have changed — first real append still gets Offset(0).
     let r = Record {

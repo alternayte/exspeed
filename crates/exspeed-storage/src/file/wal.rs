@@ -114,6 +114,11 @@ impl WalWriter {
         Ok(())
     }
 
+    /// Force a `sync_data` on the WAL file. Used by `WalSyncer` in async mode.
+    pub fn sync_data(&mut self) -> io::Result<()> {
+        self.file.sync_data()
+    }
+
     /// Truncate the WAL to zero bytes and seek back to the start.
     pub fn truncate(&mut self) -> io::Result<()> {
         self.file.set_len(0)?;
