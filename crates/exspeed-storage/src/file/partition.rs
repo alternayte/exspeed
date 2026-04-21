@@ -271,6 +271,62 @@ impl Partition {
         Ok((offset, timestamp))
     }
 
+    /// Append N records in one shot. Performs ONE WAL `sync_data` for the
+    /// whole batch via `WalWriter::append_batch`, then writes each record to
+    /// the active segment. Single-record `append` remains for the slow path.
+    pub fn append_batch(&mut self, records: &[Record]) -> io::Result<Vec<(Offset, u64)>> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Phase 1: assign offsets + timestamps.
+        let mut assignments: Vec<(String, u32, Offset, u64, Record)> =
+            Vec::with_capacity(records.len());
+        let mut results: Vec<(Offset, u64)> = Vec::with_capacity(records.len());
+        for record in records {
+            let offset = Offset(self.next_offset);
+            let timestamp = record.timestamp_ns.unwrap_or_else(now_nanos);
+            assignments.push((
+                self.stream_name.clone(),
+                self.partition_id,
+                offset,
+                timestamp,
+                record.clone(),
+            ));
+            results.push((offset, timestamp));
+            self.next_offset += 1;
+        }
+
+        // Phase 2: ONE WAL append + sync_data.
+        if let Err(e) = self.wal.append_batch(&assignments, /*sync_now=*/ true) {
+            log_write_error(&self.stream_name, self.partition_id, "WAL batch write failed", &e);
+            // Roll back next_offset so the offset space stays gap-free.
+            self.next_offset -= records.len() as u64;
+            return Err(e);
+        }
+
+        // Phase 3: segment writes (no fsync per record — flushed on segment roll).
+        for (i, (_, _, offset, timestamp, record)) in assignments.iter().enumerate() {
+            if let Err(e) = self.active_writer.append(*offset, *timestamp, record) {
+                log_write_error(
+                    &self.stream_name,
+                    self.partition_id,
+                    "segment write failed in batch (records ahead in batch are durable in WAL)",
+                    &e,
+                );
+                results.truncate(i);
+                return Err(e);
+            }
+        }
+
+        // Roll segment if needed (after the whole batch).
+        if self.active_writer.bytes_written() >= self.segment_max_bytes {
+            self.roll_segment()?;
+        }
+
+        Ok(results)
+    }
+
     /// Read records from this partition starting at `from_offset`.
     ///
     /// Reads from sealed segments first, then from the active segment.
