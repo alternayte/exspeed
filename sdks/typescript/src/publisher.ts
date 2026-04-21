@@ -34,6 +34,7 @@ export class Publisher {
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly batchWindowMs: number;
   private readonly maxBatchRecords: number;
+  private inFlightSends: Set<Promise<void>> = new Set();
 
   constructor(opts: PublisherOptions) {
     this.conn = new Connection({
@@ -112,8 +113,13 @@ export class Publisher {
     this.queue = [];
 
     for (const [stream, group] of byStream) {
-      this.sendBatch(stream, group).catch((e) => {
+      const sendPromise = this.sendBatch(stream, group).catch((e) => {
         for (const q of group) q.reject(e);
+      });
+      // Track in flight; remove when done so flush() can await accurately.
+      this.inFlightSends.add(sendPromise);
+      sendPromise.finally(() => {
+        this.inFlightSends.delete(sendPromise);
       });
     }
   }
@@ -152,7 +158,14 @@ export class Publisher {
   }
 
   async flush(): Promise<void> {
+    // Drain queue into in-flight sends.
     if (this.queue.length > 0) this.flushNow();
+    // Wait for all in-flight batch sends to complete.
+    // Loop in case a flushNow during the await enqueues new sends
+    // (e.g. from concurrent publish() calls racing with close()).
+    while (this.inFlightSends.size > 0) {
+      await Promise.allSettled(Array.from(this.inFlightSends));
+    }
   }
 
   async close(): Promise<void> {

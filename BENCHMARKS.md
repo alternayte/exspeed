@@ -10,6 +10,10 @@ _Last refreshed: **2026-04-21** (git `29c50d4`, exspeed 0.1.1)_
 - **Profile:** `Local`.
 - **git_sha:** `29c50d4`
 
+> **Note (2026-04-20):** Numbers were captured at the intermediate commit above.
+> HEAD since then includes additional Publisher connection-loss robustness fixes
+> (C1/C2: in-flight send tracking in `flush()`) that don't affect measured throughput.
+
 ## How to reproduce
 
 ```bash
