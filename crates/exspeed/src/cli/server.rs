@@ -1787,25 +1787,29 @@ where
                 }
             } => {
                 if let Some(batch) = delivery {
-                    let consumer_name = match active_subscription.as_ref() {
-                        Some((name, _)) => name.clone(),
-                        None => {
-                            warn!(
-                                %peer,
-                                "received delivery batch after subscription was cleared; \
-                                 dropping batch and tearing down delivery channel"
-                            );
-                            delivery_rx = None;
-                            drop(cancel_tx.take());
-                            continue;
-                        }
-                    };
+                    // Guard: check if subscription is still active without cloning.
+                    if active_subscription.is_none() {
+                        warn!(
+                            %peer,
+                            "received delivery batch after subscription was cleared; \
+                             dropping batch and tearing down delivery channel"
+                        );
+                        delivery_rx = None;
+                        drop(cancel_tx.take());
+                        continue;
+                    }
+
                     if batch.records.len() == 1 {
                         // Single-record path: one Record frame (0x82). Grouped consumers
                         // always deliver size-1 batches; this keeps that path allocation-free.
+                        // Clone consumer_name only here where it's used.
+                        let consumer_name = match active_subscription.as_ref() {
+                            Some((name, _)) => name.clone(),
+                            None => unreachable!("guarded above"),
+                        };
                         let d = batch.records.into_iter().next().unwrap();
                         let record_delivery = RecordDelivery {
-                            consumer_name: consumer_name.clone(),
+                            consumer_name,
                             offset: d.record.offset.0,
                             timestamp: d.record.timestamp,
                             subject: d.record.subject,
