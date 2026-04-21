@@ -93,10 +93,13 @@ impl WalWriter {
             return Ok(());
         }
         // Build one big buffer with all framed records, then write once.
-        let mut combined: Vec<u8> = Vec::new();
+        // Best-effort lower bound; eliminates most reallocations for typical
+        // payload sizes without precise pre-encoding.
+        let mut combined: Vec<u8> = Vec::with_capacity(records.len() * 64);
+        let mut payload: Vec<u8> = Vec::new();
         for (stream, partition, offset, timestamp, record) in records {
             let stream_bytes = stream.as_bytes();
-            let mut payload = Vec::new();
+            payload.clear();
             payload.put_u16_le(stream_bytes.len() as u16);
             payload.put_slice(stream_bytes);
             payload.put_u32_le(*partition);
