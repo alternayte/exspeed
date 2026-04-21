@@ -166,7 +166,7 @@ impl FileStorage {
                     // so the syncer task owns an independent File that it
                     // can sync_data() on without holding the partition mutex.
                     let wal_clone = if let StorageSyncMode::Async { .. } = mode {
-                        Some(partition.try_clone_wal_file()?)
+                        Some(partition.try_clone_active_segment_file()?)
                     } else {
                         None
                     };
@@ -303,7 +303,7 @@ impl FileStorage {
         // syncer task owns an independent File that it can sync_data() on
         // without holding the partition mutex.
         let wal_clone = if let StorageSyncMode::Async { .. } = self.inner.storage_sync_mode {
-            Some(new_partition.try_clone_wal_file()?)
+            Some(new_partition.try_clone_active_segment_file()?)
         } else {
             None
         };
@@ -421,7 +421,7 @@ impl FileStorage {
         // syncer task owns an independent File that it can sync_data() on
         // without holding the partition mutex.
         let wal_clone = if let StorageSyncMode::Async { .. } = self.inner.storage_sync_mode {
-            Some(partition.try_clone_wal_file()?)
+            Some(partition.try_clone_active_segment_file()?)
         } else {
             None
         };
