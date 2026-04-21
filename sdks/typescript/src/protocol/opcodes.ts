@@ -9,6 +9,7 @@ export enum OpCode {
   Fetch = 0x07,
   Seek = 0x08,
   RebalanceAck = 0x09,
+  PublishBatch = 0x0A,
   CreateStream = 0x10,
   DeleteStream = 0x11,
   StreamInfo = 0x12,
@@ -29,6 +30,7 @@ export enum OpCode {
   Drain = 0x87,
   PublishOk = 0x88,
   ConnectOk = 0x89,
+  PublishBatchOk = 0x8A,
   Pong = 0xf1,
 }
 
