@@ -5,7 +5,6 @@ pub mod segment_reader;
 pub mod segment_writer;
 pub mod stream_config;
 pub mod time_index;
-pub mod wal;
 pub mod segment_appender;
 pub mod segment_syncer;
 
