@@ -1800,20 +1800,41 @@ where
                             continue;
                         }
                     };
-                    // Task 1: send each record in the batch individually.
-                    // Task 2 will replace this with a single RecordsBatch frame.
-                    for delivery_record in batch.records {
+                    if batch.records.len() == 1 {
+                        // Single-record path: one Record frame (0x82). Grouped consumers
+                        // always deliver size-1 batches; this keeps that path allocation-free.
+                        let d = batch.records.into_iter().next().unwrap();
                         let record_delivery = RecordDelivery {
                             consumer_name: consumer_name.clone(),
-                            offset: delivery_record.record.offset.0,
-                            timestamp: delivery_record.record.timestamp,
-                            subject: delivery_record.record.subject.clone(),
-                            delivery_attempt: delivery_record.delivery_attempt,
-                            key: delivery_record.record.key.clone(),
-                            value: delivery_record.record.value.clone(),
-                            headers: delivery_record.record.headers.clone(),
+                            offset: d.record.offset.0,
+                            timestamp: d.record.timestamp,
+                            subject: d.record.subject,
+                            delivery_attempt: d.delivery_attempt,
+                            key: d.record.key,
+                            value: d.record.value,
+                            headers: d.record.headers,
                         };
                         let response = ServerMessage::Record(record_delivery);
+                        framed_write.send(response.into_frame(0)).await?;
+                    } else {
+                        // Batch path: one RecordsBatch frame (0x83) for the whole batch.
+                        // Moves payload Bytes out of each DeliveryRecord — no extra clones.
+                        use exspeed_protocol::messages::records_batch::{BatchRecord, RecordsBatch};
+
+                        let records: Vec<BatchRecord> = batch
+                            .records
+                            .into_iter()
+                            .map(|d| BatchRecord {
+                                offset: d.record.offset.0,
+                                timestamp: d.record.timestamp,
+                                subject: d.record.subject,
+                                key: d.record.key,
+                                value: d.record.value,
+                                headers: d.record.headers,
+                            })
+                            .collect();
+
+                        let response = ServerMessage::RecordsBatch(RecordsBatch { records });
                         framed_write.send(response.into_frame(0)).await?;
                     }
                 } else {

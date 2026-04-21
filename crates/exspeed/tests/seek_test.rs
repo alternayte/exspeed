@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use bytes::{Buf, Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
@@ -94,20 +96,53 @@ async fn recv_frame(reader: &mut FramedReader, secs: u64) -> Frame {
         .unwrap()
 }
 
-/// Receive a RECORD push frame and decode it as RecordDelivery.
-async fn recv_record(reader: &mut FramedReader, secs: u64) -> RecordDelivery {
+/// Receive one delivered record, handling both `Record` (0x82) and `RecordsBatch` (0x83) frames.
+/// See consumer_test.rs for full rationale.
+async fn recv_record(
+    reader: &mut FramedReader,
+    secs: u64,
+    buf: &mut VecDeque<RecordDelivery>,
+    consumer_name: &str,
+) -> RecordDelivery {
+    if let Some(buffered) = buf.pop_front() {
+        return buffered;
+    }
+
     let frame = recv_frame(reader, secs).await;
-    assert_eq!(
-        frame.opcode,
-        OpCode::Record,
-        "expected Record opcode, got {:?}",
-        frame.opcode
-    );
-    assert_eq!(
-        frame.correlation_id, 0,
-        "Record push should have correlation_id=0"
-    );
-    RecordDelivery::decode(frame.payload).expect("failed to decode RecordDelivery")
+    assert_eq!(frame.correlation_id, 0, "push frame should have correlation_id=0");
+
+    match frame.opcode {
+        OpCode::Record => RecordDelivery::decode(frame.payload).expect("failed to decode Record"),
+        OpCode::RecordsBatch => {
+            let batch = RecordsBatch::decode(frame.payload).expect("failed to decode RecordsBatch");
+            assert!(!batch.records.is_empty(), "received empty RecordsBatch");
+            let mut iter = batch.records.into_iter();
+            let first = iter.next().unwrap();
+            for r in iter {
+                buf.push_back(RecordDelivery {
+                    consumer_name: consumer_name.into(),
+                    offset: r.offset,
+                    timestamp: r.timestamp,
+                    subject: r.subject,
+                    delivery_attempt: 1,
+                    key: r.key,
+                    value: r.value,
+                    headers: r.headers,
+                });
+            }
+            RecordDelivery {
+                consumer_name: consumer_name.into(),
+                offset: first.offset,
+                timestamp: first.timestamp,
+                subject: first.subject,
+                delivery_attempt: 1,
+                key: first.key,
+                value: first.value,
+                headers: first.headers,
+            }
+        }
+        other => panic!("expected Record or RecordsBatch push frame, got {:?}", other),
+    }
 }
 
 fn connect_frame(corr: u32) -> Frame {
@@ -276,9 +311,10 @@ async fn seek_repositions_consumer() {
     let resp = send_recv(&mut writer, &mut reader, subscribe_frame("seeker", 201)).await;
     assert_eq!(resp.opcode, OpCode::Ok, "SUBSCRIBE should return Ok");
 
+    let mut recv_buf = VecDeque::new();
     let mut deliveries = Vec::new();
     for _ in 0..5 {
-        let delivery = recv_record(&mut reader, 5).await;
+        let delivery = recv_record(&mut reader, 5, &mut recv_buf, "seeker").await;
         deliveries.push(delivery);
     }
 
@@ -326,7 +362,7 @@ async fn seek_repositions_consumer() {
     assert_eq!(resp.opcode, OpCode::Ok, "re-SUBSCRIBE should return Ok");
 
     // Receive records and verify they start from at or before offset 2
-    let first_delivery = recv_record(&mut reader, 5).await;
+    let first_delivery = recv_record(&mut reader, 5, &mut recv_buf, "seeker").await;
     assert!(
         first_delivery.offset <= 2,
         "after SEEK, first delivered record should be at or before offset 2, got {}",
@@ -337,7 +373,7 @@ async fn seek_repositions_consumer() {
     let mut redelivered_offsets = vec![first_delivery.offset];
     let records_remaining = (4 - first_delivery.offset) as usize;
     for _ in 0..records_remaining {
-        let delivery = recv_record(&mut reader, 5).await;
+        let delivery = recv_record(&mut reader, 5, &mut recv_buf, "seeker").await;
         redelivered_offsets.push(delivery.offset);
     }
 

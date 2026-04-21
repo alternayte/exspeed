@@ -365,34 +365,47 @@ pub async fn run_consumer(
             Ok(None) => break,
             Err(_) => break, // deadline reached
         };
-        if next.opcode != OpCode::Record {
-            continue;
-        }
-        let delivery = RecordDelivery::decode(next.payload)?;
+        // Dispatch: accept both Record (0x82) and RecordsBatch (0x83); skip everything else.
+        let deliveries: Vec<(u64, Vec<(String, String)>)> =
+            if next.opcode == OpCode::Record {
+                let d = RecordDelivery::decode(next.payload)?;
+                vec![(d.offset, d.headers)]
+            } else if next.opcode == OpCode::RecordsBatch {
+                use exspeed_protocol::messages::records_batch::RecordsBatch;
+                let batch = RecordsBatch::decode(next.payload)?;
+                batch
+                    .records
+                    .into_iter()
+                    .map(|r| (r.offset, r.headers))
+                    .collect()
+            } else {
+                continue;
+            };
 
-        // Find publish_us header; ignore records without it (shouldn't happen in bench runs).
-        if let Some(v) = delivery
-            .headers
-            .iter()
-            .find(|(k, _)| k == PUBLISH_TS_HEADER)
-            .map(|(_, v)| v)
-        {
-            match v.parse::<u64>() {
-                Ok(sent_us) => {
-                    let now_us = origin.elapsed().as_micros() as u64;
-                    if now_us > sent_us {
-                        let _ = hist.record(now_us - sent_us);
+        for (offset, headers) in deliveries {
+            // Find publish_us header; ignore records without it (shouldn't happen in bench runs).
+            if let Some(v) = headers
+                .iter()
+                .find(|(k, _)| k == PUBLISH_TS_HEADER)
+                .map(|(_, v)| v)
+            {
+                match v.parse::<u64>() {
+                    Ok(sent_us) => {
+                        let now_us = origin.elapsed().as_micros() as u64;
+                        if now_us > sent_us {
+                            let _ = hist.record(now_us - sent_us);
+                        }
+                    }
+                    Err(_) => {
+                        // Malformed header — skip rather than poison the histogram.
                     }
                 }
-                Err(_) => {
-                    // Malformed header — skip rather than poison the histogram.
-                }
             }
-        }
 
-        highest_unacked = Some(delivery.offset);
-        records_since_last_ack += 1;
-        messages += 1;
+            highest_unacked = Some(offset);
+            records_since_last_ack += 1;
+            messages += 1;
+        }
 
         // Send one cumulative Ack every 64 records or every 5 ms, whichever
         // comes first.  The broker advances its stored offset to N on Ack(N),
