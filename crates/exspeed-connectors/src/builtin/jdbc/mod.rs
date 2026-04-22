@@ -1,3 +1,4 @@
+pub mod backend;
 pub mod dialect;
 pub mod postgres;
 pub mod mysql;
