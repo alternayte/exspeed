@@ -1305,6 +1305,8 @@ name = "exspeed"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "bb8",
+ "bb8-tiberius",
  "bincode",
  "bytes",
  "clap",
@@ -1330,12 +1332,14 @@ dependencies = [
  "sqlx",
  "tar",
  "tempfile",
+ "tiberius",
  "tokio",
  "tokio-postgres",
  "tokio-rustls 0.26.4",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 
