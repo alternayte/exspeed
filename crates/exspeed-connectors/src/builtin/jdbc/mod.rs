@@ -11,8 +11,10 @@ use tracing::{error, info, warn};
 use crate::config::ConnectorConfig;
 use crate::traits::{ConnectorError, HealthStatus, SinkBatch, SinkConnector, SinkRecord, WriteResult};
 
+use self::backend::{BackendError, Param, SinkBackend};
 use self::dialect::{dialect_for, ColumnSpec, Dialect, DialectKind};
 use self::schema::{is_valid_ident, parse_schema};
+use self::sqlx_backend::SqlxBackend;
 
 enum WriteStepError {
     Skip { reason: &'static str },
@@ -27,7 +29,8 @@ pub struct JdbcSinkConnector {
     auto_create_table: bool,
     schema_cols: Option<Vec<ColumnSpec>>,
     dialect: Box<dyn Dialect>,
-    pool: Option<sqlx::AnyPool>,
+    kind: DialectKind,
+    backend: Option<Box<dyn SinkBackend>>,
     connector_name: String,
     stream_name: String,
     metrics: Option<std::sync::Arc<exspeed_common::Metrics>>,
@@ -111,7 +114,8 @@ impl JdbcSinkConnector {
             auto_create_table,
             schema_cols,
             dialect,
-            pool: None,
+            kind,
+            backend: None,
             connector_name: config.name.clone(),
             stream_name: config.stream.clone(),
             metrics: None,
@@ -136,14 +140,14 @@ impl JdbcSinkConnector {
         }
     }
 
-    fn record_write_error(&self) {
+    fn record_write_error(&self, sqlstate: &str) {
         if let Some(m) = &self.metrics {
             m.connector_write_errors_total.add(
                 1,
                 &[
                     opentelemetry::KeyValue::new("connector", self.connector_name.clone()),
                     opentelemetry::KeyValue::new("stream", self.stream_name.clone()),
-                    opentelemetry::KeyValue::new("sqlstate", ""),
+                    opentelemetry::KeyValue::new("sqlstate", sqlstate.to_string()),
                 ],
             );
         }
@@ -163,7 +167,7 @@ impl JdbcSinkConnector {
 
     async fn write_blob(
         &self,
-        pool: &sqlx::AnyPool,
+        backend: &dyn SinkBackend,
         record: &SinkRecord,
         json: &serde_json::Value,
     ) -> Result<(), WriteStepError> {
@@ -174,26 +178,35 @@ impl JdbcSinkConnector {
             self.dialect.insert_sql(&self.table, &cols)
         };
 
-        let subject_opt = if record.subject.is_empty() { None } else { Some(record.subject.clone()) };
-        let key_opt = record.key.as_ref().map(|b| String::from_utf8_lossy(b).into_owned());
-        let value_str = serde_json::to_string(json)
-            .unwrap_or_else(|_| "null".to_string());
+        let subject_param = if record.subject.is_empty() {
+            Param::Null
+        } else {
+            Param::Text(record.subject.clone())
+        };
+        let key_param = match &record.key {
+            Some(b) => Param::Text(String::from_utf8_lossy(b).into_owned()),
+            None => Param::Null,
+        };
+        let value_param = Param::JsonText(
+            serde_json::to_string(json).unwrap_or_else(|_| "null".to_string()),
+        );
 
-        let q = sqlx::query(&sql)
-            .bind(record.offset as i64)
-            .bind(subject_opt)
-            .bind(key_opt)
-            .bind(value_str);
+        let params = vec![
+            Param::I64(record.offset as i64),
+            subject_param,
+            key_param,
+            value_param,
+        ];
 
-        q.execute(pool).await.map_err(|e| WriteStepError::Halt {
-            msg: format!("execute failed: {e}"),
-        })?;
-        Ok(())
+        backend
+            .execute_row(&sql, &params)
+            .await
+            .map_err(backend_err_to_halt)
     }
 
     async fn write_typed(
         &self,
-        pool: &sqlx::AnyPool,
+        backend: &dyn SinkBackend,
         record: &SinkRecord,
         json: &serde_json::Value,
         cols: &[ColumnSpec],
@@ -220,49 +233,56 @@ impl JdbcSinkConnector {
             self.dialect.insert_sql(&self.table, &col_names)
         };
 
-        let mut q = sqlx::query(&sql);
+        let mut params: Vec<Param> = Vec::with_capacity(cols.len());
         for c in cols {
             let value = obj.get(&c.name);
-            match bind_json_as_type(q, c, value) {
-                Ok(next) => q = next,
-                Err(e) => {
-                    match &e {
-                        BindError::TypeMismatch { field, expected, got } => {
-                            warn!(offset = record.offset, %field, %expected, %got, "jdbc sink: type mismatch");
-                            return Err(WriteStepError::Skip { reason: "type_mismatch" });
-                        }
-                        BindError::TimestampParse { field, .. } => {
-                            warn!(offset = record.offset, %field, "jdbc sink: unparseable timestamp");
-                            return Err(WriteStepError::Skip { reason: "timestamp_parse" });
-                        }
-                        BindError::MissingRequired { field } => {
-                            warn!(offset = record.offset, %field, "jdbc sink: missing required");
-                            return Err(WriteStepError::Skip { reason: "missing_required_field" });
-                        }
+            match bind_json_as_type(c, value) {
+                Ok(p) => params.push(p),
+                Err(e) => match &e {
+                    BindError::TypeMismatch { field, expected, got } => {
+                        warn!(offset = record.offset, %field, %expected, %got, "jdbc sink: type mismatch");
+                        return Err(WriteStepError::Skip { reason: "type_mismatch" });
                     }
-                }
+                    BindError::TimestampParse { field, .. } => {
+                        warn!(offset = record.offset, %field, "jdbc sink: unparseable timestamp");
+                        return Err(WriteStepError::Skip { reason: "timestamp_parse" });
+                    }
+                    BindError::MissingRequired { field } => {
+                        warn!(offset = record.offset, %field, "jdbc sink: missing required");
+                        return Err(WriteStepError::Skip { reason: "missing_required_field" });
+                    }
+                },
             }
         }
 
-        q.execute(pool).await.map_err(|e| WriteStepError::Halt {
-            msg: format!("execute failed: {e}"),
-        })?;
-        Ok(())
+        backend
+            .execute_row(&sql, &params)
+            .await
+            .map_err(backend_err_to_halt)
     }
+
+    async fn build_backend(&self) -> Result<Box<dyn SinkBackend>, ConnectorError> {
+        // Phase 1: always SqlxBackend. Phase 4 adds MSSQL routing here.
+        let _ = self.kind;
+        let b = SqlxBackend::connect(&self.connection_string)
+            .await
+            .map_err(|e| ConnectorError::Connection(format!("jdbc sink: {e}")))?;
+        Ok(Box::new(b))
+    }
+}
+
+fn backend_err_to_halt(e: BackendError) -> WriteStepError {
+    WriteStepError::Halt { msg: format!("execute failed: {e}") }
 }
 
 #[async_trait]
 impl SinkConnector for JdbcSinkConnector {
     async fn start(&mut self) -> Result<(), ConnectorError> {
-        sqlx::any::install_default_drivers();
-
-        let pool = match sqlx::AnyPool::connect(&self.connection_string).await {
-            Ok(p) => p,
+        let backend = match self.build_backend().await {
+            Ok(b) => b,
             Err(e) => {
                 self.record_start_error();
-                return Err(ConnectorError::Connection(format!(
-                    "jdbc sink: failed to connect: {e}"
-                )));
+                return Err(e);
             }
         };
 
@@ -275,7 +295,7 @@ impl SinkConnector for JdbcSinkConnector {
                 }
                 None => self.dialect.create_table_blob_sql(&self.table),
             };
-            if let Err(e) = sqlx::query(&sql).execute(&pool).await {
+            if let Err(e) = backend.execute_ddl(&sql).await {
                 self.record_start_error();
                 return Err(ConnectorError::Connection(format!(
                     "jdbc sink: auto_create_table failed: {e}\nSQL: {sql}"
@@ -292,16 +312,16 @@ impl SinkConnector for JdbcSinkConnector {
             "jdbc sink started"
         );
 
-        self.pool = Some(pool);
+        self.backend = Some(backend);
         Ok(())
     }
 
     async fn write(&mut self, batch: SinkBatch) -> Result<WriteResult, ConnectorError> {
-        let pool = match &self.pool {
-            Some(p) => p,
+        let backend = match self.backend.as_deref() {
+            Some(b) => b,
             None => {
                 return Ok(WriteResult::AllFailed(
-                    "jdbc sink: pool not initialised — call start() first".into(),
+                    "jdbc sink: backend not initialised — call start() first".into(),
                 ))
             }
         };
@@ -323,9 +343,9 @@ impl SinkConnector for JdbcSinkConnector {
             };
 
             let result = if let Some(cols) = self.schema_cols.clone() {
-                self.write_typed(pool, record, &json, &cols).await
+                self.write_typed(backend, record, &json, &cols).await
             } else {
-                self.write_blob(pool, record, &json).await
+                self.write_blob(backend, record, &json).await
             };
 
             match result {
@@ -341,7 +361,7 @@ impl SinkConnector for JdbcSinkConnector {
                 }
                 Err(WriteStepError::Halt { msg }) => {
                     error!(offset = record.offset, "jdbc sink: {msg}");
-                    self.record_write_error();
+                    self.record_write_error("");
                     first_fail = Some(msg);
                     break 'records;
                 }
@@ -366,17 +386,17 @@ impl SinkConnector for JdbcSinkConnector {
     }
 
     async fn stop(&mut self) -> Result<(), ConnectorError> {
-        if let Some(pool) = self.pool.take() {
-            pool.close().await;
+        if let Some(backend) = self.backend.take() {
+            backend.close().await;
         }
         Ok(())
     }
 
     async fn health(&self) -> HealthStatus {
-        if self.pool.is_some() {
+        if self.backend.is_some() {
             HealthStatus::Healthy
         } else {
-            HealthStatus::Unhealthy("jdbc sink: pool not initialised".into())
+            HealthStatus::Unhealthy("jdbc sink: backend not initialised".into())
         }
     }
 }
