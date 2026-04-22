@@ -34,17 +34,21 @@ docker-compose up -d   # Postgres (5432), RabbitMQ (5672/15672), MinIO (9000/900
 
 ### Releasing
 
-Published artifacts: Docker Hub image, npm-registry TS SDK, GitHub release.
+Published artifacts: Docker Hub image, npm-registry TS SDK, GitHub release with prebuilt binaries.
+
+**The GitHub release is driven by cargo-dist** (`.github/workflows/release.yml` + `dist-workspace.toml`). Pushing a `vX.Y.Z` tag auto-fires the workflow, which builds binaries for aarch64/x86_64 macOS, Linux, Windows, generates install scripts (`exspeed-installer.sh` / `.ps1`), computes SHA256s, and creates the GitHub Release with release notes extracted from `CHANGELOG.md`. **Do NOT `gh release create` manually — it races the workflow and causes `a release with the same tag name already exists: vX.Y.Z` at the end of the workflow.**
 
 ```bash
 # 1. Version bump: workspace + all per-crate Cargo.toml + sdks/typescript/package.json
-# 2. Update CHANGELOG.md; refresh BENCHMARKS.md + README numbers.
-# 3. Tag + push
+# 2. Update CHANGELOG.md (format `## [X.Y.Z] — YYYY-MM-DD` — cargo-dist extracts by this heading);
+#    refresh BENCHMARKS.md + README numbers.
+# 3. Tag + push — this alone triggers cargo-dist and creates the GitHub Release.
 git tag -a vX.Y.Z -m "release notes"
 git push origin main
 git push origin vX.Y.Z
+# Watch: gh run watch $(gh run list --workflow=release.yml --limit 1 --json databaseId -q '.[0].databaseId')
 
-# 4. Docker image — multi-arch (amd64 + arm64) via cloud builder
+# 4. Docker image — multi-arch (amd64 + arm64) via cloud builder.
 #    Don't pipe through `tee` without `set -o pipefail` — buildx errors get swallowed
 #    (exit code reflects tee, not the build). Let buildx write straight to the terminal,
 #    or wrap the whole line: `set -o pipefail; docker buildx ... 2>&1 | tee build.log`.
@@ -56,15 +60,12 @@ docker buildx build --builder cloud-nayth-projects \
 
 # 5. TS SDK
 cd sdks/typescript && npm publish   # prepublishOnly runs typecheck + test + build
-
-# 6. GitHub release — body is the CHANGELOG section for this version
-awk '/^## \[X\.Y\.Z\]/{flag=1;next} /^## \[/{flag=0} flag' CHANGELOG.md > /tmp/notes.md
-gh release create vX.Y.Z --title "vX.Y.Z — headline" --notes-file /tmp/notes.md
 ```
 
 - Docker image: `docker.io/nayth/exspeed` — tags `latest` + `X.Y.Z`. Always publish both arches; Apple Silicon users need `arm64`.
 - Default buildx builder (`cloud-nayth-projects`) has dedicated `linux-amd64` and `linux-arm64` cloud nodes — multi-arch builds run in parallel rather than emulated locally.
 - TS SDK publishes as `@exspeed/sdk` on the public npm registry. `publishConfig.access: public` handles scoped-package access.
+- If the release workflow does fail at the `host` step (e.g. because a manual release pre-existed or a previous run left a partial release): delete the release with `gh release delete vX.Y.Z --yes --cleanup-tag=false`, then `gh run rerun <run-id> --failed` — build artifacts are cached so only the `host` job re-runs.
 
 ### Operator env vars (Plan A hardening)
 - `LOG_FORMAT=json|text` — tracing output format (default `text`).
