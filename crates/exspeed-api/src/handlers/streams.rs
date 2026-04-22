@@ -487,3 +487,61 @@ pub async fn publish_to_stream(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// DELETE /api/v1/streams/:name
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct DeleteStreamQuery {
+    #[serde(default)]
+    pub force: bool,
+}
+
+pub async fn delete_stream(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<DeleteStreamQuery>,
+    identity: Option<Extension<Arc<Identity>>>,
+) -> Response {
+    let stream_name = match StreamName::try_from(name.as_str()) {
+        Ok(n) => n,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    if let Some(Extension(id)) = identity {
+        if let Some(resp) = super::require_scoped_admin(&id, &stream_name) {
+            return resp;
+        }
+    }
+
+    if state.storage.stream_storage_bytes(&name).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("stream '{}' not found", name)})),
+        )
+            .into_response();
+    }
+
+    // Reference-checking and force path land in later tasks.
+    let _ = q.force;
+
+    match state.broker.delete_stream(&stream_name).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({"deleted": name, "cascaded": {"consumers":[],"connectors":[],"queries":[],"subscriptions_dropped":0}})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
