@@ -142,14 +142,61 @@ impl JdbcSinkConnector {
 
     async fn write_typed(
         &self,
-        _pool: &sqlx::AnyPool,
-        _record: &SinkRecord,
-        _json: &serde_json::Value,
-        _cols: &[ColumnSpec],
+        pool: &sqlx::AnyPool,
+        record: &SinkRecord,
+        json: &serde_json::Value,
+        cols: &[ColumnSpec],
     ) -> Result<(), WriteStepError> {
-        Err(WriteStepError::Halt {
-            msg: "typed-mode write path not yet implemented (task 15)".into(),
-        })
+        use self::schema::{bind_json_as_type, BindError};
+
+        let obj = match json.as_object() {
+            Some(o) => o,
+            None => return Err(WriteStepError::Skip { reason: "non_object_json" }),
+        };
+
+        for c in cols {
+            if !c.nullable && !obj.contains_key(&c.name) {
+                warn!(offset = record.offset, field = %c.name, "jdbc sink: missing required field");
+                return Err(WriteStepError::Skip { reason: "missing_required_field" });
+            }
+        }
+
+        let col_names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+        let sql = if self.mode == "upsert" {
+            let key_refs: Vec<&str> = self.upsert_keys.iter().map(|s| s.as_str()).collect();
+            self.dialect.upsert_sql(&self.table, &col_names, &key_refs)
+        } else {
+            self.dialect.insert_sql(&self.table, &col_names)
+        };
+
+        let mut q = sqlx::query(&sql);
+        for c in cols {
+            let value = obj.get(&c.name);
+            match bind_json_as_type(q, c, value) {
+                Ok(next) => q = next,
+                Err(e) => {
+                    match &e {
+                        BindError::TypeMismatch { field, expected, got } => {
+                            warn!(offset = record.offset, %field, %expected, %got, "jdbc sink: type mismatch");
+                            return Err(WriteStepError::Skip { reason: "type_mismatch" });
+                        }
+                        BindError::TimestampParse { field, .. } => {
+                            warn!(offset = record.offset, %field, "jdbc sink: unparseable timestamp");
+                            return Err(WriteStepError::Skip { reason: "timestamp_parse" });
+                        }
+                        BindError::MissingRequired { field } => {
+                            warn!(offset = record.offset, %field, "jdbc sink: missing required");
+                            return Err(WriteStepError::Skip { reason: "missing_required_field" });
+                        }
+                    }
+                }
+            }
+        }
+
+        q.execute(pool).await.map_err(|e| WriteStepError::Halt {
+            msg: format!("execute failed: {e}"),
+        })?;
+        Ok(())
     }
 }
 
