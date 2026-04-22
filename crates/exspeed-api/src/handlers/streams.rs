@@ -529,13 +529,34 @@ pub async fn delete_stream(
             .into_response();
     }
 
-    // Reference-checking and force path land in later tasks.
-    let _ = q.force;
+    let blockers = collect_blockers(&state, &name).await;
+
+    if !q.force && !blockers.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "stream has active references; retry with ?force=true to cascade",
+                "blockers": blockers.to_json(),
+            })),
+        )
+            .into_response();
+    }
+
+    if q.force {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({"error": "force not yet implemented"})),
+        )
+            .into_response();
+    }
 
     match state.broker.delete_stream(&stream_name).await {
         Ok(()) => (
             StatusCode::OK,
-            Json(json!({"deleted": name, "cascaded": {"consumers":[],"connectors":[],"queries":[],"subscriptions_dropped":0}})),
+            Json(json!({
+                "deleted": name,
+                "cascaded": {"consumers": [], "connectors": [], "queries": [], "subscriptions_dropped": 0}
+            })),
         )
             .into_response(),
         Err(e) => (
@@ -544,4 +565,58 @@ pub async fn delete_stream(
         )
             .into_response(),
     }
+}
+
+#[derive(Default)]
+struct Blockers {
+    consumers: Vec<String>,
+    connectors: Vec<String>,
+    queries: Vec<String>,
+    subscriptions: usize,
+}
+
+impl Blockers {
+    fn is_empty(&self) -> bool {
+        self.consumers.is_empty()
+            && self.connectors.is_empty()
+            && self.queries.is_empty()
+            && self.subscriptions == 0
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        json!({
+            "consumers": self.consumers,
+            "connectors": self.connectors,
+            "queries": self.queries,
+            "subscriptions": self.subscriptions,
+        })
+    }
+}
+
+async fn collect_blockers(state: &Arc<AppState>, stream: &str) -> Blockers {
+    let mut b = Blockers::default();
+
+    {
+        let guard = state.broker.consumers.read().unwrap();
+        for (name, cs) in guard.iter() {
+            if cs.config.stream == stream {
+                b.consumers.push(name.clone());
+                b.subscriptions += cs.subscribers.len();
+            }
+        }
+    }
+
+    for info in state.connector_manager.list().await {
+        if info.stream == stream {
+            b.connectors.push(info.name);
+        }
+    }
+
+    for q in state.exql.list_queries() {
+        if q.target_stream == stream {
+            b.queries.push(q.id);
+        }
+    }
+
+    b
 }
