@@ -1445,13 +1445,13 @@ The binary is at `target/release/exspeed`. Copy it anywhere — it's a single st
 
 ### Database-backed integration tests
 
-The JDBC sink has full E2E tests that require a real Postgres or MySQL. They
-skip silently when their env var is unset, so `cargo test --workspace` still
-passes without Docker.
+The JDBC sink has full E2E tests that require a real Postgres, MySQL, or SQL
+Server. They skip silently when their env var is unset, so
+`cargo test --workspace` still passes without Docker.
 
 ```bash
-# Spin up the databases (Postgres :5432, MySQL :3306).
-docker-compose up -d postgres mysql
+# Spin up the databases (Postgres :5432, MySQL :3306, SQL Server :1433).
+docker-compose up -d postgres mysql mssql
 
 # Run the Postgres E2E suite.
 EXSPEED_POSTGRES_URL="postgres://testuser:testpass@localhost:5432/testdb" \
@@ -1460,4 +1460,17 @@ EXSPEED_POSTGRES_URL="postgres://testuser:testpass@localhost:5432/testdb" \
 # Run the MySQL E2E suite.
 EXSPEED_MYSQL_URL="mysql://exspeed:exspeed@localhost:3306/exspeed" \
     cargo test -p exspeed --test jdbc_sink_mysql_test
+
+# Run the SQL Server E2E suite.
+EXSPEED_MSSQL_URL="mssql://sa:Exspeed_Test!1@localhost:1433/master?trust_server_certificate=true" \
+    cargo test -p exspeed --test jdbc_sink_mssql_test
 ```
+
+`trust_server_certificate=true` is required for the default docker-compose
+MSSQL service (self-signed cert). For production, supply a URL without that
+flag; tiberius will use the system trust store.
+
+**Apple Silicon note:** Microsoft does not publish an arm64 image for
+`mcr.microsoft.com/mssql/server`. The compose file pins `platform: linux/amd64`
+and runs under Docker Desktop's emulation — expect a ~30s first boot to
+healthy.
