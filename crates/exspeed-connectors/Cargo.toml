@@ -33,6 +33,7 @@ tiberius = { workspace = true }
 bb8 = { workspace = true }
 bb8-tiberius = { workspace = true }
 url = "2"
+percent-encoding = "2"
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,5 +1,6 @@
 pub mod backend;
 pub(super) mod sqlx_backend;
+pub(super) mod tiberius_backend;
 pub mod dialect;
 pub mod postgres;
 pub mod mysql;
@@ -263,12 +264,20 @@ impl JdbcSinkConnector {
     }
 
     async fn build_backend(&self) -> Result<Box<dyn SinkBackend>, ConnectorError> {
-        // Phase 1: always SqlxBackend. Phase 4 adds MSSQL routing here.
-        let _ = self.kind;
-        let b = SqlxBackend::connect(&self.connection_string)
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("jdbc sink: {e}")))?;
-        Ok(Box::new(b))
+        match self.kind {
+            DialectKind::Postgres | DialectKind::MySql => {
+                let b = SqlxBackend::connect(&self.connection_string)
+                    .await
+                    .map_err(|e| ConnectorError::Connection(format!("jdbc sink: {e}")))?;
+                Ok(Box::new(b))
+            }
+            DialectKind::Mssql => {
+                let b = self::tiberius_backend::TiberiusBackend::connect(&self.connection_string)
+                    .await
+                    .map_err(|e| ConnectorError::Connection(format!("jdbc sink: {e}")))?;
+                Ok(Box::new(b))
+            }
+        }
     }
 }
 
