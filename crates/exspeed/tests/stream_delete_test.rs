@@ -221,3 +221,83 @@ async fn delete_with_connector_rejects_409() {
         body
     );
 }
+
+#[tokio::test]
+async fn force_delete_cascades() {
+    let (_tcp, http) = start_server().await;
+    let client = reqwest::Client::new();
+
+    client
+        .post(format!("{}/api/v1/streams", http))
+        .json(&serde_json::json!({"name": "cascade-target"}))
+        .send()
+        .await
+        .unwrap();
+
+    client
+        .post(format!("{}/api/v1/connectors", http))
+        .json(&serde_json::json!({
+            "name": "hook-c",
+            "type": "source",
+            "plugin": "http_webhook",
+            "stream": "cascade-target",
+            "subject_template": "x",
+            "settings": {"path": "/webhooks/hc", "auth_type": "none"}
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client
+        .delete(format!("{}/api/v1/streams/cascade-target?force=true", http))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "force-delete should succeed: body={:?}", resp.text().await);
+
+    // Connector should be gone.
+    let resp = client
+        .get(format!("{}/api/v1/connectors", http))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    let arr = body.as_array().unwrap();
+    assert!(arr.iter().all(|c| c["name"] != "hook-c"),
+        "hook-c should have been removed, got: {:?}", arr);
+
+    // Stream should be gone.
+    let resp = client
+        .get(format!("{}/api/v1/streams/cascade-target", http))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn force_delete_idempotent_second_call_is_404() {
+    let (_tcp, http) = start_server().await;
+    let client = reqwest::Client::new();
+
+    client
+        .post(format!("{}/api/v1/streams", http))
+        .json(&serde_json::json!({"name": "double-delete"}))
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client
+        .delete(format!("{}/api/v1/streams/double-delete?force=true", http))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = client
+        .delete(format!("{}/api/v1/streams/double-delete?force=true", http))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}

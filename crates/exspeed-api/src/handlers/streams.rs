@@ -543,11 +543,65 @@ pub async fn delete_stream(
     }
 
     if q.force {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(json!({"error": "force not yet implemented"})),
-        )
-            .into_response();
+        let cascaded_connectors = blockers.connectors.clone();
+        for name in &cascaded_connectors {
+            if let Err(e) = state.connector_manager.delete(name).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("cascade: failed to delete connector '{name}': {e}")})),
+                )
+                    .into_response();
+            }
+        }
+
+        let cascaded_queries = blockers.queries.clone();
+        for id in &cascaded_queries {
+            if let Err(e) = state.exql.remove_query(id) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("cascade: failed to remove query '{id}': {e}")})),
+                )
+                    .into_response();
+            }
+        }
+
+        let cascaded_consumers = blockers.consumers.clone();
+        for cname in &cascaded_consumers {
+            use exspeed_protocol::messages::{ClientMessage, DeleteConsumerRequest};
+            let _ = state
+                .broker
+                .handle_message(ClientMessage::DeleteConsumer(DeleteConsumerRequest {
+                    name: cname.clone(),
+                }))
+                .await;
+        }
+
+        let dropped_subs = blockers.subscriptions;
+
+        match state.broker.delete_stream(&stream_name).await {
+            Ok(()) => {
+                return (
+                    StatusCode::OK,
+                    Json(json!({
+                        "deleted": name,
+                        "cascaded": {
+                            "consumers": cascaded_consumers,
+                            "connectors": cascaded_connectors,
+                            "queries": cascaded_queries,
+                            "subscriptions_dropped": dropped_subs,
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": e.to_string()})),
+                )
+                    .into_response();
+            }
+        }
     }
 
     match state.broker.delete_stream(&stream_name).await {
