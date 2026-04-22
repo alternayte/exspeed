@@ -11,6 +11,7 @@ use serde_json::json;
 use exspeed_broker::broker_append::AppendResult;
 use exspeed_common::auth::Identity;
 use exspeed_common::StreamName;
+use exspeed_protocol::messages::{ClientMessage, DeleteConsumerRequest, ServerMessage};
 use exspeed_storage::file::stream_config::StreamConfig;
 use exspeed_streams::{Record, StorageError, StorageEngine};
 
@@ -567,13 +568,20 @@ pub async fn delete_stream(
 
         let cascaded_consumers = blockers.consumers.clone();
         for cname in &cascaded_consumers {
-            use exspeed_protocol::messages::{ClientMessage, DeleteConsumerRequest};
-            let _ = state
+            let resp = state
                 .broker
                 .handle_message(ClientMessage::DeleteConsumer(DeleteConsumerRequest {
                     name: cname.clone(),
                 }))
                 .await;
+            if let ServerMessage::Error { code, message } = resp {
+                tracing::warn!(
+                    consumer = %cname,
+                    error_code = code,
+                    error = %message,
+                    "cascade: consumer delete returned error, continuing"
+                );
+            }
         }
 
         let dropped_subs = blockers.subscriptions;
