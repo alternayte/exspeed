@@ -46,6 +46,19 @@ pub struct Metrics {
     /// Storage write failures. Labeled by `stream` and `kind`
     /// (`"storage_full"` or `"other"`).
     pub storage_write_errors: Counter<u64>,
+
+    // -- connector sink observability -----------------------------------------
+    /// Counts records dropped by a sink connector before any SQL was executed.
+    /// Labels: `connector`, `stream`, `reason` (one of `non_json_object`,
+    /// `type_mismatch`, `missing_required_field`, `timestamp_parse`).
+    pub connector_records_skipped_total: Counter<u64>,
+    /// Counts SQL-side write errors (DB rejected the statement). Labels:
+    /// `connector`, `stream`, `sqlstate` (best-effort; empty when the driver
+    /// didn't give one).
+    pub connector_write_errors_total: Counter<u64>,
+    /// Counts connector start failures (e.g. CREATE TABLE failed, connection
+    /// refused). Labels: `connector`, `stream`.
+    pub connector_start_errors_total: Counter<u64>,
     /// Fill ratio (0.0–1.0) of the per-subscription delivery mpsc channel.
     /// Labeled by `consumer` and `subscriber`.
     pub subscription_queue_fill_ratio: Gauge<f64>,
@@ -278,6 +291,44 @@ impl Metrics {
         replication_connect_attempts_total.add(0, &[KeyValue::new("result", "ok")]);
         replication_connect_attempts_total.add(0, &[KeyValue::new("result", "err")]);
 
+        // -- connector sink instruments --------------------------------------
+        let connector_records_skipped_total = meter
+            .u64_counter("exspeed_connector_records_skipped_total")
+            .with_description("Records dropped by a sink connector (by reason)")
+            .build();
+        let connector_write_errors_total = meter
+            .u64_counter("exspeed_connector_write_errors_total")
+            .with_description("SQL-side write errors from sink connectors")
+            .build();
+        let connector_start_errors_total = meter
+            .u64_counter("exspeed_connector_start_errors_total")
+            .with_description("Connector start failures (connect or CREATE TABLE)")
+            .build();
+
+        connector_records_skipped_total.add(
+            0,
+            &[
+                KeyValue::new("connector", "__init__"),
+                KeyValue::new("stream", "__init__"),
+                KeyValue::new("reason", "non_json_object"),
+            ],
+        );
+        connector_write_errors_total.add(
+            0,
+            &[
+                KeyValue::new("connector", "__init__"),
+                KeyValue::new("stream", "__init__"),
+                KeyValue::new("sqlstate", ""),
+            ],
+        );
+        connector_start_errors_total.add(
+            0,
+            &[
+                KeyValue::new("connector", "__init__"),
+                KeyValue::new("stream", "__init__"),
+            ],
+        );
+
         // Keep the provider alive — dropping it shuts down the metrics pipeline.
         std::mem::forget(provider);
 
@@ -297,6 +348,9 @@ impl Metrics {
             publish_latency_seconds,
             consume_latency_seconds,
             storage_write_errors,
+            connector_records_skipped_total,
+            connector_write_errors_total,
+            connector_start_errors_total,
             subscription_queue_fill_ratio,
             dedup_map_entries,
             dedup_writes_total,
