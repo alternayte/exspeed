@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -501,7 +501,7 @@ pub struct DeleteStreamQuery {
 pub async fn delete_stream(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-    axum::extract::Query(q): axum::extract::Query<DeleteStreamQuery>,
+    Query(q): Query<DeleteStreamQuery>,
     identity: Option<Extension<Arc<Identity>>>,
 ) -> Response {
     let stream_name = match StreamName::try_from(name.as_str()) {

@@ -69,6 +69,12 @@ async fn delete_with_no_references_succeeds() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "delete should return 200");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["deleted"], "empty-stream");
+    assert_eq!(body["cascaded"]["consumers"].as_array().unwrap().len(), 0);
+    assert_eq!(body["cascaded"]["connectors"].as_array().unwrap().len(), 0);
+    assert_eq!(body["cascaded"]["queries"].as_array().unwrap().len(), 0);
+    assert_eq!(body["cascaded"]["subscriptions_dropped"], 0);
 
     // GET should now 404.
     let resp = client
