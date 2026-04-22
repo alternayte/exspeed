@@ -93,9 +93,20 @@ pub async fn update(
 }
 
 /// Delete a stream via the HTTP API.
-pub async fn delete(client: &CliClient, name: &str) -> Result<()> {
-    let path = format!("/api/v1/streams/{}", name);
-    client.delete(&path).await?;
+///
+/// When `force` is true, the request cascades through connectors, queries,
+/// and consumers that reference this stream.
+pub async fn delete(client: &CliClient, name: &str, force: bool) -> Result<()> {
+    let path = if force {
+        format!("/api/v1/streams/{}?force=true", name)
+    } else {
+        format!("/api/v1/streams/{}", name)
+    };
+    let (status, body) = client.delete_parsed(&path).await?;
+    if !(200..300).contains(&status) {
+        let msg = body["error"].as_str().unwrap_or("unknown error").to_string();
+        return Err(anyhow!("failed to delete stream: {msg}"));
+    }
     println!("Stream '{}' deleted", name);
     Ok(())
 }

@@ -48,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
-        cli::Command::Delete { name } => cli::stream::delete(&client, &name).await,
+        cli::Command::Delete { name, force } => cli::stream::delete(&client, &name, force).await,
         cli::Command::Streams => cli::stream::list(&client, json).await,
         cli::Command::Info { name } => cli::stream::info(&client, &name, json).await,
         cli::Command::Pub {
