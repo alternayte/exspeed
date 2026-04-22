@@ -1,4 +1,5 @@
 pub mod backend;
+pub(super) mod sqlx_backend;
 pub mod dialect;
 pub mod postgres;
 pub mod mysql;
