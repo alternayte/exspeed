@@ -113,17 +113,31 @@ impl SinkConnector for JdbcSinkConnector {
 
         let pool = sqlx::AnyPool::connect(&self.connection_string)
             .await
-            .map_err(|e| {
-                ConnectorError::Connection(format!("jdbc sink: failed to connect: {e}"))
-            })?;
+            .map_err(|e| ConnectorError::Connection(format!("jdbc sink: failed to connect: {e}")))?;
 
-        // Task 13 will add auto-create CREATE TABLE here.
+        if self.auto_create_table {
+            let sql = match &self.schema_cols {
+                Some(cols) => {
+                    let pk_refs: Vec<&str> = self.upsert_keys.iter().map(|s| s.as_str()).collect();
+                    self.dialect
+                        .create_table_typed_sql(&self.table, cols, &pk_refs)
+                }
+                None => self.dialect.create_table_blob_sql(&self.table),
+            };
+            sqlx::query(&sql).execute(&pool).await.map_err(|e| {
+                ConnectorError::Connection(format!(
+                    "jdbc sink: auto_create_table failed: {e}\nSQL: {sql}"
+                ))
+            })?;
+        }
+
         info!(
             table = %self.table,
             mode = %self.mode,
             auto_create_table = self.auto_create_table,
             schema_mode = if self.schema_cols.is_some() { "typed" } else { "blob" },
-            "jdbc sink connected"
+            columns = self.schema_cols.as_ref().map(|c| c.len()).unwrap_or(0),
+            "jdbc sink started"
         );
 
         self.pool = Some(pool);
