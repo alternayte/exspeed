@@ -1,6 +1,7 @@
 pub mod dialect;
 pub mod postgres;
 pub mod mysql;
+pub mod schema;
 
 use async_trait::async_trait;
 use tracing::{info, warn};
