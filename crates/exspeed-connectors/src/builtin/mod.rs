@@ -1,7 +1,7 @@
 pub mod http_poll;
 pub mod http_sink;
 pub mod http_webhook;
-pub mod jdbc_sink;
+pub mod jdbc;
 pub mod pgoutput;
 pub mod postgres;
 pub mod postgres_outbox;
@@ -33,7 +33,7 @@ pub fn create_sink(
 ) -> Result<Box<dyn SinkConnector>, ConnectorError> {
     match plugin {
         "http_sink" => Ok(Box::new(http_sink::HttpSinkConnector::new(config)?)),
-        "jdbc" => Ok(Box::new(jdbc_sink::JdbcSinkConnector::new(config)?)),
+        "jdbc" => Ok(Box::new(jdbc::JdbcSinkConnector::new(config)?)),
         "rabbitmq" => Ok(Box::new(rabbitmq_sink::RabbitmqSink::new(config)?)),
         "s3" => Ok(Box::new(s3_sink::S3SinkConnector::new(config)?)),
         other => Err(ConnectorError::Config(format!(
