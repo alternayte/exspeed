@@ -26,6 +26,9 @@ pub struct JdbcSinkConnector {
     schema_cols: Option<Vec<ColumnSpec>>,
     dialect: Box<dyn Dialect>,
     pool: Option<sqlx::AnyPool>,
+    connector_name: String,
+    stream_name: String,
+    metrics: Option<std::sync::Arc<exspeed_common::Metrics>>,
 }
 
 impl JdbcSinkConnector {
@@ -107,7 +110,53 @@ impl JdbcSinkConnector {
             schema_cols,
             dialect,
             pool: None,
+            connector_name: config.name.clone(),
+            stream_name: config.stream.clone(),
+            metrics: None,
         })
+    }
+
+    pub fn with_metrics(mut self, m: std::sync::Arc<exspeed_common::Metrics>) -> Self {
+        self.metrics = Some(m);
+        self
+    }
+
+    fn record_skip(&self, reason: &'static str) {
+        if let Some(m) = &self.metrics {
+            m.connector_records_skipped_total.add(
+                1,
+                &[
+                    opentelemetry::KeyValue::new("connector", self.connector_name.clone()),
+                    opentelemetry::KeyValue::new("stream", self.stream_name.clone()),
+                    opentelemetry::KeyValue::new("reason", reason),
+                ],
+            );
+        }
+    }
+
+    fn record_write_error(&self) {
+        if let Some(m) = &self.metrics {
+            m.connector_write_errors_total.add(
+                1,
+                &[
+                    opentelemetry::KeyValue::new("connector", self.connector_name.clone()),
+                    opentelemetry::KeyValue::new("stream", self.stream_name.clone()),
+                    opentelemetry::KeyValue::new("sqlstate", ""),
+                ],
+            );
+        }
+    }
+
+    fn record_start_error(&self) {
+        if let Some(m) = &self.metrics {
+            m.connector_start_errors_total.add(
+                1,
+                &[
+                    opentelemetry::KeyValue::new("connector", self.connector_name.clone()),
+                    opentelemetry::KeyValue::new("stream", self.stream_name.clone()),
+                ],
+            );
+        }
     }
 
     async fn write_blob(
@@ -205,9 +254,15 @@ impl SinkConnector for JdbcSinkConnector {
     async fn start(&mut self) -> Result<(), ConnectorError> {
         sqlx::any::install_default_drivers();
 
-        let pool = sqlx::AnyPool::connect(&self.connection_string)
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("jdbc sink: failed to connect: {e}")))?;
+        let pool = match sqlx::AnyPool::connect(&self.connection_string).await {
+            Ok(p) => p,
+            Err(e) => {
+                self.record_start_error();
+                return Err(ConnectorError::Connection(format!(
+                    "jdbc sink: failed to connect: {e}"
+                )));
+            }
+        };
 
         if self.auto_create_table {
             let sql = match &self.schema_cols {
@@ -218,11 +273,12 @@ impl SinkConnector for JdbcSinkConnector {
                 }
                 None => self.dialect.create_table_blob_sql(&self.table),
             };
-            sqlx::query(&sql).execute(&pool).await.map_err(|e| {
-                ConnectorError::Connection(format!(
+            if let Err(e) = sqlx::query(&sql).execute(&pool).await {
+                self.record_start_error();
+                return Err(ConnectorError::Connection(format!(
                     "jdbc sink: auto_create_table failed: {e}\nSQL: {sql}"
-                ))
-            })?;
+                )));
+            }
         }
 
         info!(
@@ -257,6 +313,7 @@ impl SinkConnector for JdbcSinkConnector {
                 Ok(v) => v,
                 Err(_) => {
                     warn!(offset = record.offset, reason = "non_json", "jdbc sink: skipping record");
+                    self.record_skip("non_json_object");
                     last_successful = Some(record.offset);
                     any_success = true;
                     continue 'records;
@@ -276,11 +333,13 @@ impl SinkConnector for JdbcSinkConnector {
                 }
                 Err(WriteStepError::Skip { reason }) => {
                     warn!(offset = record.offset, %reason, "jdbc sink: skipping record");
+                    self.record_skip(reason);
                     last_successful = Some(record.offset);
                     any_success = true;
                 }
                 Err(WriteStepError::Halt { msg }) => {
                     error!(offset = record.offset, "jdbc sink: {msg}");
+                    self.record_write_error();
                     first_fail = Some(msg);
                     break 'records;
                 }

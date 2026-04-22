@@ -28,6 +28,7 @@ rust-s3 = { workspace = true }
 notify = { workspace = true }
 redis = { workspace = true }
 pgwire-replication = { workspace = true }
+opentelemetry = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
