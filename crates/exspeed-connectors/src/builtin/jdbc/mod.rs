@@ -4,10 +4,13 @@ pub mod mysql;
 pub mod schema;
 
 use async_trait::async_trait;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::config::ConnectorConfig;
 use crate::traits::{ConnectorError, HealthStatus, SinkBatch, SinkConnector, WriteResult};
+
+use self::dialect::{dialect_for, ColumnSpec, Dialect, DialectKind};
+use self::schema::{is_valid_ident, parse_schema};
 
 pub struct JdbcSinkConnector {
     connection_string: String,
@@ -15,6 +18,8 @@ pub struct JdbcSinkConnector {
     mode: String,
     upsert_keys: Vec<String>,
     auto_create_table: bool,
+    schema_cols: Option<Vec<ColumnSpec>>,
+    dialect: Box<dyn Dialect>,
     pool: Option<sqlx::AnyPool>,
 }
 
@@ -30,6 +35,12 @@ impl JdbcSinkConnector {
             .map_err(ConnectorError::Config)?
             .to_string();
 
+        if !is_valid_ident(&table) {
+            return Err(ConnectorError::Config(format!(
+                "jdbc sink: invalid table name '{table}' (must match [A-Za-z_][A-Za-z0-9_]*)"
+            )));
+        }
+
         let mode = config.setting_or("mode", "upsert");
 
         let upsert_keys_str = config.setting_or("upsert_keys", "");
@@ -42,10 +53,45 @@ impl JdbcSinkConnector {
                 .filter(|s| !s.is_empty())
                 .collect()
         };
+        for k in &upsert_keys {
+            if !is_valid_ident(k) {
+                return Err(ConnectorError::Config(format!(
+                    "jdbc sink: invalid upsert_keys entry '{k}'"
+                )));
+            }
+        }
 
         let auto_create_table = config
             .setting_or("auto_create_table", "false")
             .eq_ignore_ascii_case("true");
+
+        let schema_raw = config.setting_or("schema", "");
+        let schema_cols = if schema_raw.trim().is_empty() {
+            None
+        } else {
+            Some(parse_schema(&schema_raw).map_err(|e| {
+                ConnectorError::Config(format!("jdbc sink: schema DSL error: {e}"))
+            })?)
+        };
+
+        if schema_cols.is_some() && mode == "upsert" && upsert_keys.is_empty() {
+            return Err(ConnectorError::Config(
+                "jdbc sink: upsert_keys must be set when mode=upsert and schema is declared".into(),
+            ));
+        }
+
+        if let Some(cols) = &schema_cols {
+            for k in &upsert_keys {
+                if !cols.iter().any(|c| &c.name == k) {
+                    return Err(ConnectorError::Config(format!(
+                        "jdbc sink: upsert_keys entry '{k}' is not in declared schema"
+                    )));
+                }
+            }
+        }
+
+        let kind = DialectKind::from_url(&connection_string)?;
+        let dialect = dialect_for(kind);
 
         Ok(Self {
             connection_string,
@@ -53,6 +99,8 @@ impl JdbcSinkConnector {
             mode,
             upsert_keys,
             auto_create_table,
+            schema_cols,
+            dialect,
             pool: None,
         })
     }
@@ -61,21 +109,21 @@ impl JdbcSinkConnector {
 #[async_trait]
 impl SinkConnector for JdbcSinkConnector {
     async fn start(&mut self) -> Result<(), ConnectorError> {
-        // Must be called before creating Any pool — registers Postgres + MySQL drivers.
         sqlx::any::install_default_drivers();
 
         let pool = sqlx::AnyPool::connect(&self.connection_string)
             .await
             .map_err(|e| {
-                ConnectorError::Connection(format!("JDBC sink: failed to connect: {e}"))
+                ConnectorError::Connection(format!("jdbc sink: failed to connect: {e}"))
             })?;
 
+        // Task 13 will add auto-create CREATE TABLE here.
         info!(
-            connection = %self.connection_string,
             table = %self.table,
             mode = %self.mode,
             auto_create_table = self.auto_create_table,
-            "JDBC sink connected"
+            schema_mode = if self.schema_cols.is_some() { "typed" } else { "blob" },
+            "jdbc sink connected"
         );
 
         self.pool = Some(pool);
@@ -87,26 +135,21 @@ impl SinkConnector for JdbcSinkConnector {
             Some(p) => p,
             None => {
                 return Ok(WriteResult::AllFailed(
-                    "JDBC sink: pool not initialised — call start() first".into(),
+                    "jdbc sink: pool not initialised — call start() first".into(),
                 ))
             }
         };
 
-        let mut last_successful_offset: Option<u64> = None;
+        let mut last_successful: Option<u64> = None;
         let mut any_success = false;
         let mut first_fail: Option<String> = None;
 
         'records: for record in &batch.records {
-            // Parse value as JSON object.
             let json: serde_json::Value = match serde_json::from_slice(&record.value) {
                 Ok(v) => v,
                 Err(e) => {
-                    warn!(
-                        offset = record.offset,
-                        "JDBC sink: skipping non-JSON record: {e}"
-                    );
-                    // Treat parse failures as "advanced past" (poisoned data).
-                    last_successful_offset = Some(record.offset);
+                    warn!(offset = record.offset, "jdbc sink: skipping non-JSON record: {e}");
+                    last_successful = Some(record.offset);
                     any_success = true;
                     continue 'records;
                 }
@@ -115,158 +158,49 @@ impl SinkConnector for JdbcSinkConnector {
             let obj = match json.as_object() {
                 Some(o) => o,
                 None => {
-                    warn!(
-                        offset = record.offset,
-                        "JDBC sink: skipping non-object JSON record"
-                    );
-                    last_successful_offset = Some(record.offset);
+                    warn!(offset = record.offset, "jdbc sink: skipping non-object JSON record");
+                    last_successful = Some(record.offset);
                     any_success = true;
                     continue 'records;
                 }
             };
 
-            // Extract ordered (col, value) pairs.
-            let pairs: Vec<(String, String)> = obj
-                .iter()
-                .map(|(k, v)| {
-                    let s = match v {
-                        serde_json::Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    };
-                    (k.clone(), s)
-                })
-                .collect();
-
-            if pairs.is_empty() {
-                last_successful_offset = Some(record.offset);
-                any_success = true;
-                continue 'records;
-            }
-
-            let cols: Vec<&str> = pairs.iter().map(|(c, _)| c.as_str()).collect();
-            let vals: Vec<&str> = pairs.iter().map(|(_, v)| v.as_str()).collect();
-
-            // sqlx::Any uses `?` placeholders for all drivers.
-            let placeholders: Vec<String> = (0..cols.len()).map(|_| "?".to_string()).collect();
-
-            let sql = match self.mode.as_str() {
-                "insert" => {
-                    format!(
-                        "INSERT INTO {} ({}) VALUES ({})",
-                        self.table,
-                        cols.join(", "),
-                        placeholders.join(", ")
-                    )
-                }
-                "upsert" => {
-                    let keys = if self.upsert_keys.is_empty() {
-                        // Fall back to first column if no keys configured.
-                        vec![cols[0].to_string()]
+            let (sql, bind_plan): (String, Vec<(String, serde_json::Value)>) = {
+                let cols: Vec<String> = obj.keys().cloned().collect();
+                let col_refs: Vec<&str> = cols.iter().map(|s| s.as_str()).collect();
+                let sql = if self.mode == "upsert" {
+                    let keys: Vec<String> = if self.upsert_keys.is_empty() {
+                        vec![cols[0].clone()]
                     } else {
                         self.upsert_keys.clone()
                     };
-                    let update_set: Vec<String> = cols
-                        .iter()
-                        .filter(|c| !keys.contains(&c.to_string()))
-                        .map(|c| format!("{c} = EXCLUDED.{c}"))
-                        .collect();
-                    if update_set.is_empty() {
-                        // All columns are key columns — nothing to update; treat as INSERT IGNORE.
-                        format!(
-                            "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO NOTHING",
-                            self.table,
-                            cols.join(", "),
-                            placeholders.join(", "),
-                            keys.join(", ")
-                        )
-                    } else {
-                        format!(
-                            "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO UPDATE SET {}",
-                            self.table,
-                            cols.join(", "),
-                            placeholders.join(", "),
-                            keys.join(", "),
-                            update_set.join(", ")
-                        )
-                    }
-                }
-                "update" => {
-                    let keys = if self.upsert_keys.is_empty() {
-                        vec![cols[0].to_string()]
-                    } else {
-                        self.upsert_keys.clone()
-                    };
-                    let set_parts: Vec<String> = cols
-                        .iter()
-                        .filter(|c| !keys.contains(&c.to_string()))
-                        .map(|c| format!("{c} = ?"))
-                        .collect();
-                    let where_parts: Vec<String> =
-                        keys.iter().map(|k| format!("{k} = ?")).collect();
-
-                    if set_parts.is_empty() {
-                        // Nothing to update — skip.
-                        last_successful_offset = Some(record.offset);
-                        any_success = true;
-                        continue 'records;
-                    }
-
-                    format!(
-                        "UPDATE {} SET {} WHERE {}",
-                        self.table,
-                        set_parts.join(", "),
-                        where_parts.join(" AND ")
-                    )
-                }
-                unknown => {
-                    let msg = format!("JDBC sink: unknown mode '{unknown}'");
-                    warn!("{}", msg);
-                    first_fail = Some(msg);
-                    break 'records;
-                }
-            };
-
-            // Build the bind sequence.
-            // For "update" the bind order is: non-key values first, then key values.
-            let bind_vals: Vec<&str> = if self.mode == "update" {
-                let keys = if self.upsert_keys.is_empty() {
-                    vec![cols[0].to_string()]
+                    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+                    self.dialect.upsert_sql(&self.table, &col_refs, &key_refs)
                 } else {
-                    self.upsert_keys.clone()
+                    self.dialect.insert_sql(&self.table, &col_refs)
                 };
-                let mut non_key: Vec<&str> = pairs
-                    .iter()
-                    .filter(|(c, _)| !keys.contains(c))
-                    .map(|(_, v)| v.as_str())
-                    .collect();
-                let key_vals: Vec<&str> = pairs
-                    .iter()
-                    .filter(|(c, _)| keys.contains(c))
-                    .map(|(_, v)| v.as_str())
-                    .collect();
-                non_key.extend(key_vals);
-                non_key
-            } else {
-                vals.clone()
+                let plan: Vec<(String, serde_json::Value)> =
+                    obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                (sql, plan)
             };
 
-            // Dynamically bind all values as strings.
-            let mut query = sqlx::query(&sql);
-            for v in &bind_vals {
-                query = query.bind(*v);
+            let mut q = sqlx::query(&sql);
+            for (_name, value) in &bind_plan {
+                let s = match value {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                q = q.bind(s);
             }
 
-            match query.execute(pool).await {
+            match q.execute(pool).await {
                 Ok(_) => {
-                    last_successful_offset = Some(record.offset);
+                    last_successful = Some(record.offset);
                     any_success = true;
                 }
                 Err(e) => {
-                    let msg = format!(
-                        "JDBC sink: execute failed for offset {}: {e}",
-                        record.offset
-                    );
-                    warn!("{}", msg);
+                    let msg = format!("jdbc sink: execute failed for offset {}: {e}", record.offset);
+                    error!("{msg}");
                     first_fail = Some(msg);
                     break 'records;
                 }
@@ -274,10 +208,8 @@ impl SinkConnector for JdbcSinkConnector {
         }
 
         if first_fail.is_some() {
-            if let Some(offset) = last_successful_offset {
-                Ok(WriteResult::PartialSuccess {
-                    last_successful_offset: offset,
-                })
+            if let Some(offset) = last_successful {
+                Ok(WriteResult::PartialSuccess { last_successful_offset: offset })
             } else {
                 Ok(WriteResult::AllFailed(first_fail.unwrap_or_default()))
             }
@@ -303,7 +235,7 @@ impl SinkConnector for JdbcSinkConnector {
         if self.pool.is_some() {
             HealthStatus::Healthy
         } else {
-            HealthStatus::Unhealthy("JDBC sink: pool not initialised".into())
+            HealthStatus::Unhealthy("jdbc sink: pool not initialised".into())
         }
     }
 }
@@ -333,41 +265,95 @@ mod tests {
 
     #[test]
     fn config_required_fields() {
-        // Missing both required fields.
-        let config = make_config(HashMap::new());
-        assert!(JdbcSinkConnector::new(&config).is_err());
+        assert!(JdbcSinkConnector::new(&make_config(HashMap::new())).is_err());
 
-        // Missing table.
-        let config = make_config(HashMap::from([(
+        let cfg = make_config(HashMap::from([(
             "connection".into(),
             "postgres://localhost/test".into(),
         )]));
-        assert!(JdbcSinkConnector::new(&config).is_err());
+        assert!(JdbcSinkConnector::new(&cfg).is_err());
 
-        // Both required fields present.
-        let config = make_config(HashMap::from([
+        let cfg = make_config(HashMap::from([
             ("connection".into(), "postgres://localhost/test".into()),
             ("table".into(), "events".into()),
         ]));
-        let connector = JdbcSinkConnector::new(&config).unwrap();
-        assert_eq!(connector.table, "events");
-        assert_eq!(connector.mode, "upsert");
-        assert!(!connector.auto_create_table);
-        assert!(connector.upsert_keys.is_empty());
+        let c = JdbcSinkConnector::new(&cfg).unwrap();
+        assert_eq!(c.table, "events");
+        assert_eq!(c.mode, "upsert");
+        assert!(!c.auto_create_table);
+        assert!(c.upsert_keys.is_empty());
+        assert!(c.schema_cols.is_none());
     }
 
     #[test]
-    fn config_optional_fields() {
-        let config = make_config(HashMap::from([
+    fn config_rejects_unsupported_scheme() {
+        let cfg = make_config(HashMap::from([
+            ("connection".into(), "sqlite:///tmp/test.db".into()),
+            ("table".into(), "events".into()),
+        ]));
+        assert!(JdbcSinkConnector::new(&cfg).is_err());
+    }
+
+    #[test]
+    fn config_rejects_table_name_injection() {
+        let cfg = make_config(HashMap::from([
+            ("connection".into(), "postgres://localhost/test".into()),
+            ("table".into(), "foo; DROP TABLE users".into()),
+        ]));
+        assert!(JdbcSinkConnector::new(&cfg).is_err());
+    }
+
+    #[test]
+    fn config_typed_upsert_requires_upsert_keys() {
+        let cfg = make_config(HashMap::from([
+            ("connection".into(), "postgres://localhost/test".into()),
+            ("table".into(), "events".into()),
+            ("mode".into(), "upsert".into()),
+            ("schema".into(), "id:bigint, email:text".into()),
+        ]));
+        match JdbcSinkConnector::new(&cfg) {
+            Err(ConnectorError::Config(msg)) => assert!(msg.contains("upsert_keys")),
+            Err(e) => panic!("expected Config error, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn config_typed_upsert_keys_must_be_in_schema() {
+        let cfg = make_config(HashMap::from([
+            ("connection".into(), "postgres://localhost/test".into()),
+            ("table".into(), "events".into()),
+            ("mode".into(), "upsert".into()),
+            ("upsert_keys".into(), "missing_col".into()),
+            ("schema".into(), "id:bigint, email:text".into()),
+        ]));
+        assert!(JdbcSinkConnector::new(&cfg).is_err());
+    }
+
+    #[test]
+    fn config_typed_mode_insert_without_upsert_keys_is_ok() {
+        let cfg = make_config(HashMap::from([
+            ("connection".into(), "postgres://localhost/test".into()),
+            ("table".into(), "events".into()),
+            ("mode".into(), "insert".into()),
+            ("schema".into(), "id:bigint, email:text".into()),
+        ]));
+        let c = JdbcSinkConnector::new(&cfg).unwrap();
+        assert_eq!(c.schema_cols.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn config_optional_fields_roundtrip() {
+        let cfg = make_config(HashMap::from([
             ("connection".into(), "mysql://localhost/test".into()),
             ("table".into(), "orders".into()),
             ("mode".into(), "insert".into()),
             ("upsert_keys".into(), "id, tenant_id".into()),
             ("auto_create_table".into(), "true".into()),
         ]));
-        let connector = JdbcSinkConnector::new(&config).unwrap();
-        assert_eq!(connector.mode, "insert");
-        assert_eq!(connector.upsert_keys, vec!["id", "tenant_id"]);
-        assert!(connector.auto_create_table);
+        let c = JdbcSinkConnector::new(&cfg).unwrap();
+        assert_eq!(c.mode, "insert");
+        assert_eq!(c.upsert_keys, vec!["id", "tenant_id"]);
+        assert!(c.auto_create_table);
     }
 }
