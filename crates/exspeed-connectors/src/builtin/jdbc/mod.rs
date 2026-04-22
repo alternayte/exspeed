@@ -7,10 +7,15 @@ use async_trait::async_trait;
 use tracing::{error, info, warn};
 
 use crate::config::ConnectorConfig;
-use crate::traits::{ConnectorError, HealthStatus, SinkBatch, SinkConnector, WriteResult};
+use crate::traits::{ConnectorError, HealthStatus, SinkBatch, SinkConnector, SinkRecord, WriteResult};
 
 use self::dialect::{dialect_for, ColumnSpec, Dialect, DialectKind};
 use self::schema::{is_valid_ident, parse_schema};
+
+enum WriteStepError {
+    Skip { reason: &'static str },
+    Halt { msg: String },
+}
 
 pub struct JdbcSinkConnector {
     connection_string: String,
@@ -104,6 +109,48 @@ impl JdbcSinkConnector {
             pool: None,
         })
     }
+
+    async fn write_blob(
+        &self,
+        pool: &sqlx::AnyPool,
+        record: &SinkRecord,
+        json: &serde_json::Value,
+    ) -> Result<(), WriteStepError> {
+        let cols = ["offset", "subject", "key", "value"];
+        let sql = if self.mode == "upsert" {
+            self.dialect.upsert_sql(&self.table, &cols, &["offset"])
+        } else {
+            self.dialect.insert_sql(&self.table, &cols)
+        };
+
+        let subject_opt = if record.subject.is_empty() { None } else { Some(record.subject.clone()) };
+        let key_opt = record.key.as_ref().map(|b| String::from_utf8_lossy(b).into_owned());
+        let value_str = serde_json::to_string(json)
+            .unwrap_or_else(|_| "null".to_string());
+
+        let q = sqlx::query(&sql)
+            .bind(record.offset as i64)
+            .bind(subject_opt)
+            .bind(key_opt)
+            .bind(value_str);
+
+        q.execute(pool).await.map_err(|e| WriteStepError::Halt {
+            msg: format!("execute failed: {e}"),
+        })?;
+        Ok(())
+    }
+
+    async fn write_typed(
+        &self,
+        _pool: &sqlx::AnyPool,
+        _record: &SinkRecord,
+        _json: &serde_json::Value,
+        _cols: &[ColumnSpec],
+    ) -> Result<(), WriteStepError> {
+        Err(WriteStepError::Halt {
+            msg: "typed-mode write path not yet implemented (task 15)".into(),
+        })
+    }
 }
 
 #[async_trait]
@@ -161,60 +208,32 @@ impl SinkConnector for JdbcSinkConnector {
         'records: for record in &batch.records {
             let json: serde_json::Value = match serde_json::from_slice(&record.value) {
                 Ok(v) => v,
-                Err(e) => {
-                    warn!(offset = record.offset, "jdbc sink: skipping non-JSON record: {e}");
+                Err(_) => {
+                    warn!(offset = record.offset, reason = "non_json", "jdbc sink: skipping record");
                     last_successful = Some(record.offset);
                     any_success = true;
                     continue 'records;
                 }
             };
 
-            let obj = match json.as_object() {
-                Some(o) => o,
-                None => {
-                    warn!(offset = record.offset, "jdbc sink: skipping non-object JSON record");
-                    last_successful = Some(record.offset);
-                    any_success = true;
-                    continue 'records;
-                }
+            let result = if let Some(cols) = self.schema_cols.clone() {
+                self.write_typed(pool, record, &json, &cols).await
+            } else {
+                self.write_blob(pool, record, &json).await
             };
 
-            let (sql, bind_plan): (String, Vec<(String, serde_json::Value)>) = {
-                let cols: Vec<String> = obj.keys().cloned().collect();
-                let col_refs: Vec<&str> = cols.iter().map(|s| s.as_str()).collect();
-                let sql = if self.mode == "upsert" {
-                    let keys: Vec<String> = if self.upsert_keys.is_empty() {
-                        vec![cols[0].clone()]
-                    } else {
-                        self.upsert_keys.clone()
-                    };
-                    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-                    self.dialect.upsert_sql(&self.table, &col_refs, &key_refs)
-                } else {
-                    self.dialect.insert_sql(&self.table, &col_refs)
-                };
-                let plan: Vec<(String, serde_json::Value)> =
-                    obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                (sql, plan)
-            };
-
-            let mut q = sqlx::query(&sql);
-            for (_name, value) in &bind_plan {
-                let s = match value {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                q = q.bind(s);
-            }
-
-            match q.execute(pool).await {
-                Ok(_) => {
+            match result {
+                Ok(()) => {
                     last_successful = Some(record.offset);
                     any_success = true;
                 }
-                Err(e) => {
-                    let msg = format!("jdbc sink: execute failed for offset {}: {e}", record.offset);
-                    error!("{msg}");
+                Err(WriteStepError::Skip { reason }) => {
+                    warn!(offset = record.offset, %reason, "jdbc sink: skipping record");
+                    last_successful = Some(record.offset);
+                    any_success = true;
+                }
+                Err(WriteStepError::Halt { msg }) => {
+                    error!(offset = record.offset, "jdbc sink: {msg}");
                     first_fail = Some(msg);
                     break 'records;
                 }
