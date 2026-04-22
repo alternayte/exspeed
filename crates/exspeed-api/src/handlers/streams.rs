@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -11,6 +11,7 @@ use serde_json::json;
 use exspeed_broker::broker_append::AppendResult;
 use exspeed_common::auth::Identity;
 use exspeed_common::StreamName;
+use exspeed_protocol::messages::{ClientMessage, DeleteConsumerRequest, ServerMessage};
 use exspeed_storage::file::stream_config::StreamConfig;
 use exspeed_streams::{Record, StorageError, StorageEngine};
 
@@ -486,4 +487,198 @@ pub async fn publish_to_stream(
                 .into_response()
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /api/v1/streams/:name
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct DeleteStreamQuery {
+    #[serde(default)]
+    pub force: bool,
+}
+
+pub async fn delete_stream(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(q): Query<DeleteStreamQuery>,
+    identity: Option<Extension<Arc<Identity>>>,
+) -> Response {
+    let stream_name = match StreamName::try_from(name.as_str()) {
+        Ok(n) => n,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    if let Some(Extension(id)) = identity {
+        if let Some(resp) = super::require_scoped_admin(&id, &stream_name) {
+            return resp;
+        }
+    }
+
+    if state.storage.stream_storage_bytes(&name).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("stream '{}' not found", name)})),
+        )
+            .into_response();
+    }
+
+    let blockers = collect_blockers(&state, &name).await;
+
+    if !q.force && !blockers.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "stream has active references; retry with ?force=true to cascade",
+                "blockers": blockers.to_json(),
+            })),
+        )
+            .into_response();
+    }
+
+    if q.force {
+        let cascaded_connectors = blockers.connectors.clone();
+        for name in &cascaded_connectors {
+            if let Err(e) = state.connector_manager.delete(name).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("cascade: failed to delete connector '{name}': {e}")})),
+                )
+                    .into_response();
+            }
+        }
+
+        let cascaded_queries = blockers.queries.clone();
+        for id in &cascaded_queries {
+            if let Err(e) = state.exql.remove_query(id) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("cascade: failed to remove query '{id}': {e}")})),
+                )
+                    .into_response();
+            }
+        }
+
+        let cascaded_consumers = blockers.consumers.clone();
+        for cname in &cascaded_consumers {
+            let resp = state
+                .broker
+                .handle_message(ClientMessage::DeleteConsumer(DeleteConsumerRequest {
+                    name: cname.clone(),
+                }))
+                .await;
+            if let ServerMessage::Error { code, message } = resp {
+                tracing::warn!(
+                    consumer = %cname,
+                    error_code = code,
+                    error = %message,
+                    "cascade: consumer delete returned error, continuing"
+                );
+            }
+        }
+
+        let dropped_subs = blockers.subscriptions;
+
+        match state.broker.delete_stream(&stream_name).await {
+            Ok(()) => {
+                return (
+                    StatusCode::OK,
+                    Json(json!({
+                        "deleted": name,
+                        "cascaded": {
+                            "consumers": cascaded_consumers,
+                            "connectors": cascaded_connectors,
+                            "queries": cascaded_queries,
+                            "subscriptions_dropped": dropped_subs,
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": e.to_string()})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    match state.broker.delete_stream(&stream_name).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({
+                "deleted": name,
+                "cascaded": {"consumers": [], "connectors": [], "queries": [], "subscriptions_dropped": 0}
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Default)]
+struct Blockers {
+    consumers: Vec<String>,
+    connectors: Vec<String>,
+    queries: Vec<String>,
+    subscriptions: usize,
+}
+
+impl Blockers {
+    fn is_empty(&self) -> bool {
+        self.consumers.is_empty()
+            && self.connectors.is_empty()
+            && self.queries.is_empty()
+            && self.subscriptions == 0
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        json!({
+            "consumers": self.consumers,
+            "connectors": self.connectors,
+            "queries": self.queries,
+            "subscriptions": self.subscriptions,
+        })
+    }
+}
+
+async fn collect_blockers(state: &Arc<AppState>, stream: &str) -> Blockers {
+    let mut b = Blockers::default();
+
+    {
+        let guard = state.broker.consumers.read().unwrap();
+        for (name, cs) in guard.iter() {
+            if cs.config.stream == stream {
+                b.consumers.push(name.clone());
+                b.subscriptions += cs.subscribers.len();
+            }
+        }
+    }
+
+    for info in state.connector_manager.list().await {
+        if info.stream == stream {
+            b.connectors.push(info.name);
+        }
+    }
+
+    for q in state.exql.list_queries() {
+        if q.target_stream == stream {
+            b.queries.push(q.id);
+        }
+    }
+
+    b
 }

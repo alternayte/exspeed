@@ -124,7 +124,8 @@ async fn dry_run(path: &Path) -> Result<()> {
             }
         }
         "sink" => {
-            let mut sink = create_sink(&plugin, &config)
+            let (metrics, _registry) = exspeed_common::Metrics::new();
+            let mut sink = create_sink(&plugin, &config, std::sync::Arc::new(metrics))
                 .map_err(|e| anyhow!("failed to create sink connector: {e}"))?;
             sink.start()
                 .await

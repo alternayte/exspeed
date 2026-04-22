@@ -20,13 +20,15 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 reqwest = { workspace = true }
 tokio-postgres = { workspace = true }
-sqlx = { workspace = true }
+sqlx = { workspace = true, features = ["chrono", "json"] }
+chrono = { workspace = true }
 lapin = { workspace = true }
 futures-util = { workspace = true }
 rust-s3 = { workspace = true }
 notify = { workspace = true }
 redis = { workspace = true }
 pgwire-replication = { workspace = true }
+opentelemetry = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

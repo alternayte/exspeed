@@ -153,4 +153,22 @@ impl CliClient {
 
         Ok(body)
     }
+
+    /// DELETE `path`, returning `(status_code, response_body)`.
+    ///
+    /// Does **not** treat non-2xx as an automatic error — callers decide.
+    /// Empty or non-JSON bodies are normalized to an empty object.
+    pub async fn delete_parsed(&self, path: &str) -> Result<(u16, Value)> {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self
+            .client
+            .delete(&url)
+            .send()
+            .await
+            .with_context(|| format!("failed to connect to {url}"))?;
+
+        let status = resp.status().as_u16();
+        let body: Value = resp.json().await.unwrap_or_else(|_| serde_json::json!({}));
+        Ok((status, body))
+    }
 }

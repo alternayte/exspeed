@@ -96,7 +96,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/v1/streams/{name}",
-            get(streams::get_stream).patch(streams::patch_stream),
+            get(streams::get_stream)
+                .patch(streams::patch_stream)
+                .delete(streams::delete_stream),
         )
         .route(
             "/api/v1/streams/{name}/publish",

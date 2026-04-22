@@ -667,7 +667,7 @@ impl ConnectorManager {
         let name = config.name.clone();
 
         // Create the sink connector via plugin registry
-        let mut sink = match builtin::create_sink(&config.plugin, &config) {
+        let mut sink = match builtin::create_sink(&config.plugin, &config, self.metrics.clone()) {
             Ok(s) => s,
             Err(e) => {
                 return Err(format!("failed to create sink: {e}"));

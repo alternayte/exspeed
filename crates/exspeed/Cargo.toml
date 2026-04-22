@@ -57,3 +57,6 @@ exspeed-protocol = { path = "../exspeed-protocol" }
 # Replication integration tests build ReplicateResume payloads directly;
 # bincode is the wire format the client/server use.
 bincode = { workspace = true }
+# DB-gated integration tests (Postgres + MySQL) use sqlx for fixture
+# setup/teardown. Workspace features already enable postgres + mysql + any.
+sqlx = { workspace = true }

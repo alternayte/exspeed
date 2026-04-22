@@ -1442,3 +1442,22 @@ cargo test
 ```
 
 The binary is at `target/release/exspeed`. Copy it anywhere — it's a single static binary (dynamically links glibc).
+
+### Database-backed integration tests
+
+The JDBC sink has full E2E tests that require a real Postgres or MySQL. They
+skip silently when their env var is unset, so `cargo test --workspace` still
+passes without Docker.
+
+```bash
+# Spin up the databases (Postgres :5432, MySQL :3306).
+docker-compose up -d postgres mysql
+
+# Run the Postgres E2E suite.
+EXSPEED_POSTGRES_URL="postgres://testuser:testpass@localhost:5432/testdb" \
+    cargo test -p exspeed --test jdbc_sink_postgres_test
+
+# Run the MySQL E2E suite.
+EXSPEED_MYSQL_URL="mysql://exspeed:exspeed@localhost:3306/exspeed" \
+    cargo test -p exspeed --test jdbc_sink_mysql_test
+```

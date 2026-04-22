@@ -48,5 +48,22 @@ services:
       - "9000:9000"
       - "9001:9001"
 
+  mysql:
+    image: mysql:8.0
+    container_name: exspeed-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: exspeed
+      MYSQL_DATABASE: exspeed
+      MYSQL_USER: exspeed
+      MYSQL_PASSWORD: exspeed
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uexspeed", "-pexspeed"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    command: ["--default-authentication-plugin=mysql_native_password"]
+
 volumes:
   exspeed-data:

@@ -79,6 +79,9 @@ pub enum Command {
     Delete {
         /// Stream name
         name: String,
+        /// Cascade through connectors, queries, and consumers that reference this stream.
+        #[arg(long)]
+        force: bool,
     },
     /// List all streams
     Streams,
