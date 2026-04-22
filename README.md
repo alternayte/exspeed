@@ -1454,7 +1454,7 @@ passes without Docker.
 docker-compose up -d postgres mysql
 
 # Run the Postgres E2E suite.
-EXSPEED_POSTGRES_URL="postgres://exspeed:exspeed@localhost:5432/exspeed" \
+EXSPEED_POSTGRES_URL="postgres://testuser:testpass@localhost:5432/testdb" \
     cargo test -p exspeed --test jdbc_sink_postgres_test
 
 # Run the MySQL E2E suite.
