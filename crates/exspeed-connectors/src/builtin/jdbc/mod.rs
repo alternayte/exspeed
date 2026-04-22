@@ -3,6 +3,7 @@ pub(super) mod sqlx_backend;
 pub mod dialect;
 pub mod postgres;
 pub mod mysql;
+pub mod mssql;
 pub mod schema;
 
 use async_trait::async_trait;

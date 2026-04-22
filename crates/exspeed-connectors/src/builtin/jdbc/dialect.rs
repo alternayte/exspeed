@@ -11,20 +11,24 @@ use crate::traits::ConnectorError;
 pub enum DialectKind {
     Postgres,
     MySql,
+    Mssql,
 }
 
 impl DialectKind {
     /// Infer the dialect from a connection URL's scheme.
-    /// `postgres://` and `postgresql://` → Postgres; `mysql://` → MySql.
+    /// `postgres://` and `postgresql://` → Postgres; `mysql://` → MySql;
+    /// `mssql://` and `sqlserver://` → Mssql.
     pub fn from_url(url: &str) -> Result<Self, ConnectorError> {
         let lower = url.trim_start().to_ascii_lowercase();
         if lower.starts_with("postgres://") || lower.starts_with("postgresql://") {
             Ok(Self::Postgres)
         } else if lower.starts_with("mysql://") {
             Ok(Self::MySql)
+        } else if lower.starts_with("mssql://") || lower.starts_with("sqlserver://") {
+            Ok(Self::Mssql)
         } else {
             Err(ConnectorError::Config(format!(
-                "jdbc sink: unsupported connection URL scheme; expected postgres:// or mysql://, got: {}",
+                "jdbc sink: unsupported connection URL scheme; expected postgres://, mysql://, or mssql://, got: {}",
                 url.split("://").next().unwrap_or(url)
             )))
         }
@@ -35,6 +39,7 @@ pub fn dialect_for(kind: DialectKind) -> Box<dyn Dialect> {
     match kind {
         DialectKind::Postgres => Box::new(super::postgres::PostgresDialect),
         DialectKind::MySql => Box::new(super::mysql::MysqlDialect),
+        DialectKind::Mssql => Box::new(super::mssql::MssqlDialect),
     }
 }
 
@@ -118,8 +123,23 @@ mod tests {
     #[test]
     fn kind_rejects_unsupported() {
         assert!(DialectKind::from_url("sqlite:///tmp/x.db").is_err());
-        assert!(DialectKind::from_url("mssql://u:p@h/d").is_err());
         assert!(DialectKind::from_url("not-a-url").is_err());
+    }
+
+    #[test]
+    fn kind_from_mssql_url() {
+        assert_eq!(
+            DialectKind::from_url("mssql://u:p@h:1433/d").unwrap(),
+            DialectKind::Mssql
+        );
+        assert_eq!(
+            DialectKind::from_url("sqlserver://u:p@h:1433/d").unwrap(),
+            DialectKind::Mssql
+        );
+        assert_eq!(
+            DialectKind::from_url("MSSQL://u:p@h/d").unwrap(),
+            DialectKind::Mssql
+        );
     }
 
     #[test]
