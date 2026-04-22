@@ -301,3 +301,63 @@ async fn force_delete_idempotent_second_call_is_404() {
         .unwrap();
     assert_eq!(resp.status(), 404);
 }
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+#[tokio::test]
+async fn delete_during_inflight_publish_is_safe() {
+    let (_tcp, http) = start_server().await;
+    let client = reqwest::Client::new();
+
+    client
+        .post(format!("{}/api/v1/streams", http))
+        .json(&serde_json::json!({"name": "racy"}))
+        .send()
+        .await
+        .unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_c = stop.clone();
+    let http_c = http.clone();
+    let publisher = tokio::spawn(async move {
+        let c = reqwest::Client::new();
+        let mut published = 0u64;
+        while !stop_c.load(Ordering::Relaxed) {
+            let _ = c
+                .post(format!("{}/api/v1/streams/racy/publish", http_c))
+                .json(&serde_json::json!({"data": {"n": published}}))
+                .send()
+                .await;
+            published += 1;
+            if published % 50 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+        published
+    });
+
+    // Let the publisher rack up some traffic.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Force-delete while publishes are in flight.
+    let resp = client
+        .delete(format!("{}/api/v1/streams/racy?force=true", http))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    stop.store(true, Ordering::Relaxed);
+    let total = publisher.await.unwrap();
+    assert!(total > 0, "publisher should have emitted at least one record");
+
+    // Server still healthy: create a new stream, publish, delete — full loop.
+    let resp = client
+        .post(format!("{}/api/v1/streams", http))
+        .json(&serde_json::json!({"name": "post-race"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "server must survive the race");
+}
