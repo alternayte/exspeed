@@ -3,8 +3,10 @@
 //! Periodically polls a relational table for rows whose `tracking_column`
 //! exceeds the last-seen value, emitting each row as a JSON record.
 //!
-//! Backed by `sqlx::AnyPool` — supports Postgres, MySQL, and SQLite. For
-//! SQL Server, prefer a separate CDC-based source (uses tiberius).
+//! Supports Postgres, MySQL, SQLite (via `sqlx::AnyPool`) and SQL Server
+//! (via `tiberius` + `bb8-tiberius`). For SQL Server CDC semantics
+//! (insert/update/delete capture with operation type) use `mssql_cdc`
+//! instead.
 //!
 //! Required config (`settings`):
 //! - `connection`: the DB URL (dialect inferred from scheme).
@@ -18,21 +20,30 @@
 //! string via the standard `OffsetStore`. Restart resumes from that value.
 
 use async_trait::async_trait;
+use bb8::Pool;
+use bb8_tiberius::ConnectionManager;
 use bytes::Bytes;
 use sqlx::{any::AnyRow, AnyPool, Row};
+use tiberius::Query;
 use tracing::{info, warn};
+use url::Url;
 
 use crate::builtin::jdbc::dialect::{ColumnSpec, DialectKind, JsonType};
 use crate::builtin::jdbc::schema::{is_valid_ident, parse_schema};
 use crate::config::ConnectorConfig;
 use crate::traits::{ConnectorError, HealthStatus, SourceBatch, SourceConnector, SourceRecord};
 
+enum Backend {
+    Sqlx(AnyPool),
+    Tiberius(Pool<ConnectionManager>),
+}
+
 pub struct JdbcPollSource {
     connection_string: String,
     table: String,
     tracking_column: String,
     schema_cols: Vec<ColumnSpec>,
-    pool: Option<AnyPool>,
+    backend: Option<Backend>,
     last_value: i64,
     kind: DialectKind,
     subject_template: String,
@@ -84,20 +95,12 @@ impl JdbcPollSource {
         let kind = DialectKind::from_url(&connection_string)
             .map_err(|e| ConnectorError::Config(format!("jdbc_poll: {e:?}")))?;
 
-        // MSSQL uses a different driver (tiberius); polling via sqlx::AnyPool
-        // won't work. Reject clearly rather than fail at connect time.
-        if matches!(kind, DialectKind::Mssql) {
-            return Err(ConnectorError::Config(
-                "jdbc_poll: SQL Server not supported — use a dedicated MSSQL CDC source".into(),
-            ));
-        }
-
         Ok(Self {
             connection_string,
             table,
             tracking_column,
             schema_cols,
-            pool: None,
+            backend: None,
             last_value: 0,
             kind,
             subject_template: config.subject_template.clone(),
@@ -112,20 +115,21 @@ impl JdbcPollSource {
             .collect();
         let table_q = quote_ident(self.kind, &self.table);
         let tc_q = quote_ident(self.kind, &self.tracking_column);
-        let placeholder = match self.kind {
-            DialectKind::Postgres => "$1".to_string(),
-            DialectKind::MySql | DialectKind::Sqlite => "?".to_string(),
-            DialectKind::Mssql => unreachable!("MSSQL rejected in new()"),
-        };
-        format!(
-            "SELECT {} FROM {} WHERE {} > {} ORDER BY {} ASC LIMIT {}",
-            cols_sql.join(", "),
-            table_q,
-            tc_q,
-            placeholder,
-            tc_q,
-            batch_size.max(1),
-        )
+        let batch = batch_size.max(1);
+        match self.kind {
+            DialectKind::Postgres => format!(
+                "SELECT {} FROM {} WHERE {} > $1 ORDER BY {} ASC LIMIT {}",
+                cols_sql.join(", "), table_q, tc_q, tc_q, batch
+            ),
+            DialectKind::MySql | DialectKind::Sqlite => format!(
+                "SELECT {} FROM {} WHERE {} > ? ORDER BY {} ASC LIMIT {}",
+                cols_sql.join(", "), table_q, tc_q, tc_q, batch
+            ),
+            DialectKind::Mssql => format!(
+                "SELECT TOP ({}) {} FROM {} WHERE {} > @P1 ORDER BY {} ASC",
+                batch, cols_sql.join(", "), table_q, tc_q, tc_q
+            ),
+        }
     }
 }
 
@@ -137,9 +141,8 @@ fn quote_ident(kind: DialectKind, name: &str) -> String {
     }
 }
 
-/// Decode a single row column into a `serde_json::Value` based on the
-/// declared `JsonType`. Errors/missing decode as `Value::Null`.
-fn decode_cell(row: &AnyRow, idx: usize, ty: JsonType) -> serde_json::Value {
+/// Decode a sqlx::AnyRow column into `serde_json::Value`.
+fn decode_sqlx_cell(row: &AnyRow, idx: usize, ty: JsonType) -> serde_json::Value {
     use serde_json::Value;
     match ty {
         JsonType::Bigint => row
@@ -167,7 +170,6 @@ fn decode_cell(row: &AnyRow, idx: usize, ty: JsonType) -> serde_json::Value {
             .map(Value::String)
             .unwrap_or(Value::Null),
         JsonType::Jsonb => {
-            // Try String first (MySQL + SQLite), then fall through to Null.
             let s: Option<String> = row.try_get::<Option<String>, _>(idx).ok().flatten();
             match s {
                 Some(s) => serde_json::from_str::<Value>(&s).unwrap_or(Value::String(s)),
@@ -177,15 +179,109 @@ fn decode_cell(row: &AnyRow, idx: usize, ty: JsonType) -> serde_json::Value {
     }
 }
 
+/// Decode a tiberius row column by name.
+fn decode_tiberius_cell(row: &tiberius::Row, col: &str, ty: JsonType) -> serde_json::Value {
+    use serde_json::Value;
+    match ty {
+        JsonType::Bigint => row
+            .try_get::<i64, _>(col)
+            .ok()
+            .flatten()
+            .map(|v| Value::Number(v.into()))
+            .or_else(|| {
+                row.try_get::<i32, _>(col)
+                    .ok()
+                    .flatten()
+                    .map(|v| Value::Number((v as i64).into()))
+            })
+            .unwrap_or(Value::Null),
+        JsonType::Double => row
+            .try_get::<f64, _>(col)
+            .ok()
+            .flatten()
+            .and_then(|v| serde_json::Number::from_f64(v).map(Value::Number))
+            .unwrap_or(Value::Null),
+        JsonType::Boolean => row
+            .try_get::<bool, _>(col)
+            .ok()
+            .flatten()
+            .map(Value::Bool)
+            .unwrap_or(Value::Null),
+        JsonType::Text | JsonType::Timestamptz | JsonType::Jsonb => row
+            .try_get::<&str, _>(col)
+            .ok()
+            .flatten()
+            .map(|s| {
+                if matches!(ty, JsonType::Jsonb) {
+                    serde_json::from_str::<Value>(s).unwrap_or(Value::String(s.to_string()))
+                } else {
+                    Value::String(s.to_string())
+                }
+            })
+            .unwrap_or(Value::Null),
+    }
+}
+
+fn parse_mssql_url(raw: &str) -> Result<tiberius::Config, ConnectorError> {
+    let normalized = if raw.to_ascii_lowercase().starts_with("mssql://") {
+        format!("sqlserver://{}", &raw[8..])
+    } else {
+        raw.to_string()
+    };
+    let u = Url::parse(&normalized)
+        .map_err(|e| ConnectorError::Config(format!("jdbc_poll url parse: {e}")))?;
+
+    let mut cfg = tiberius::Config::new();
+    if let Some(h) = u.host_str() { cfg.host(h); }
+    cfg.port(u.port().unwrap_or(1433));
+    if !u.username().is_empty() {
+        let user = percent_encoding::percent_decode_str(u.username())
+            .decode_utf8_lossy()
+            .into_owned();
+        let pass = u
+            .password()
+            .map(|p| {
+                percent_encoding::percent_decode_str(p)
+                    .decode_utf8_lossy()
+                    .into_owned()
+            })
+            .unwrap_or_default();
+        cfg.authentication(tiberius::AuthMethod::sql_server(&user, &pass));
+    }
+    let db = u.path().trim_start_matches('/');
+    if !db.is_empty() { cfg.database(db); }
+    for (k, v) in u.query_pairs() {
+        if k.eq_ignore_ascii_case("trust_server_certificate") && v.eq_ignore_ascii_case("true") {
+            cfg.trust_cert();
+        }
+    }
+    Ok(cfg)
+}
+
 #[async_trait]
 impl SourceConnector for JdbcPollSource {
     async fn start(&mut self, last_position: Option<String>) -> Result<(), ConnectorError> {
-        sqlx::any::install_default_drivers();
-        let pool = AnyPool::connect(&self.connection_string)
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("jdbc_poll connect: {e}")))?;
+        let backend = match self.kind {
+            DialectKind::Postgres | DialectKind::MySql | DialectKind::Sqlite => {
+                sqlx::any::install_default_drivers();
+                let pool = AnyPool::connect(&self.connection_string)
+                    .await
+                    .map_err(|e| ConnectorError::Connection(format!("jdbc_poll connect: {e}")))?;
+                Backend::Sqlx(pool)
+            }
+            DialectKind::Mssql => {
+                let cfg = parse_mssql_url(&self.connection_string)?;
+                let mgr = ConnectionManager::build(cfg)
+                    .map_err(|e| ConnectorError::Connection(format!("jdbc_poll bb8 build: {e}")))?;
+                let pool = Pool::builder()
+                    .max_size(4)
+                    .build(mgr)
+                    .await
+                    .map_err(|e| ConnectorError::Connection(format!("jdbc_poll pool: {e}")))?;
+                Backend::Tiberius(pool)
+            }
+        };
 
-        // Resume from persisted offset if provided.
         if let Some(s) = last_position {
             if let Ok(v) = s.parse::<i64>() {
                 self.last_value = v;
@@ -205,55 +301,81 @@ impl SourceConnector for JdbcPollSource {
             "jdbc_poll source started"
         );
 
-        self.pool = Some(pool);
+        self.backend = Some(backend);
         Ok(())
     }
 
     async fn poll(&mut self, max_batch: usize) -> Result<SourceBatch, ConnectorError> {
-        let pool = match &self.pool {
-            Some(p) => p,
+        let sql = self.build_select_sql(max_batch);
+        let backend = match &self.backend {
+            Some(b) => b,
             None => return Err(ConnectorError::Connection("jdbc_poll: not started".into())),
         };
-        let sql = self.build_select_sql(max_batch);
-        let rows = sqlx::query(&sql)
-            .bind(self.last_value)
-            .fetch_all(pool)
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("jdbc_poll query: {e}")))?;
 
-        let mut out: Vec<SourceRecord> = Vec::with_capacity(rows.len());
+        let mut out: Vec<SourceRecord> = Vec::with_capacity(max_batch);
         let mut high_water = self.last_value;
 
-        for row in &rows {
-            let mut obj = serde_json::Map::with_capacity(self.schema_cols.len());
-            for (idx, col) in self.schema_cols.iter().enumerate() {
-                let v = decode_cell(row, idx, col.json_type);
-                obj.insert(col.name.clone(), v);
-            }
-
-            // Extract the tracking column value to update our cursor.
-            if let Some(tc_idx) = self.schema_cols.iter().position(|c| c.name == self.tracking_column) {
-                if let Ok(Some(v)) = row.try_get::<Option<i64>, _>(tc_idx) {
-                    if v > high_water {
-                        high_water = v;
+        match backend {
+            Backend::Sqlx(pool) => {
+                let rows = sqlx::query(&sql)
+                    .bind(self.last_value)
+                    .fetch_all(pool)
+                    .await
+                    .map_err(|e| ConnectorError::Connection(format!("jdbc_poll sqlx query: {e}")))?;
+                for row in &rows {
+                    let mut obj = serde_json::Map::with_capacity(self.schema_cols.len());
+                    for (idx, col) in self.schema_cols.iter().enumerate() {
+                        obj.insert(col.name.clone(), decode_sqlx_cell(row, idx, col.json_type));
                     }
+                    if let Some(tc_idx) = self
+                        .schema_cols
+                        .iter()
+                        .position(|c| c.name == self.tracking_column)
+                    {
+                        if let Ok(Some(v)) = row.try_get::<Option<i64>, _>(tc_idx) {
+                            if v > high_water {
+                                high_water = v;
+                            }
+                        }
+                    }
+                    out.push(self.build_record(obj));
                 }
             }
-
-            let value = Bytes::from(
-                serde_json::to_vec(&obj).unwrap_or_else(|_| b"null".to_vec()),
-            );
-            let subject = if self.subject_template.is_empty() {
-                format!("jdbc_poll.{}", self.table)
-            } else {
-                self.subject_template.clone()
-            };
-            out.push(SourceRecord {
-                key: None,
-                value,
-                subject,
-                headers: Vec::new(),
-            });
+            Backend::Tiberius(pool) => {
+                let mut conn = pool
+                    .get()
+                    .await
+                    .map_err(|e| ConnectorError::Connection(format!("jdbc_poll pool get: {e}")))?;
+                let mut q = Query::new(sql);
+                q.bind(self.last_value);
+                let stream = q.query(&mut *conn).await.map_err(|e| {
+                    ConnectorError::Connection(format!("jdbc_poll tiberius query: {e}"))
+                })?;
+                let rows = stream.into_first_result().await.map_err(|e| {
+                    ConnectorError::Connection(format!("jdbc_poll tiberius result: {e}"))
+                })?;
+                for row in &rows {
+                    let mut obj = serde_json::Map::with_capacity(self.schema_cols.len());
+                    for col in &self.schema_cols {
+                        obj.insert(
+                            col.name.clone(),
+                            decode_tiberius_cell(row, &col.name, col.json_type),
+                        );
+                    }
+                    // Update high-water mark from the tracking column.
+                    if let Ok(Some(v)) = row.try_get::<i64, _>(self.tracking_column.as_str()) {
+                        if v > high_water {
+                            high_water = v;
+                        }
+                    } else if let Ok(Some(v)) = row.try_get::<i32, _>(self.tracking_column.as_str()) {
+                        let v = v as i64;
+                        if v > high_water {
+                            high_water = v;
+                        }
+                    }
+                    out.push(self.build_record(obj));
+                }
+            }
         }
 
         let position = if high_water != self.last_value {
@@ -267,23 +389,42 @@ impl SourceConnector for JdbcPollSource {
     }
 
     async fn commit(&mut self, _position: String) -> Result<(), ConnectorError> {
-        // No server-side ack — sqlx polling is idempotent given a monotone
-        // tracking column. Offset persistence is handled by the manager.
         Ok(())
     }
 
     async fn stop(&mut self) -> Result<(), ConnectorError> {
-        if let Some(pool) = self.pool.take() {
-            pool.close().await;
+        match self.backend.take() {
+            Some(Backend::Sqlx(pool)) => pool.close().await,
+            Some(Backend::Tiberius(_)) => {
+                // bb8 pool drops connections when the pool is dropped.
+            }
+            None => {}
         }
         Ok(())
     }
 
     async fn health(&self) -> HealthStatus {
-        if self.pool.is_some() {
+        if self.backend.is_some() {
             HealthStatus::Healthy
         } else {
             HealthStatus::Unhealthy("jdbc_poll: not started".into())
+        }
+    }
+}
+
+impl JdbcPollSource {
+    fn build_record(&self, obj: serde_json::Map<String, serde_json::Value>) -> SourceRecord {
+        let value = Bytes::from(serde_json::to_vec(&obj).unwrap_or_else(|_| b"null".to_vec()));
+        let subject = if self.subject_template.is_empty() {
+            format!("jdbc_poll.{}", self.table)
+        } else {
+            self.subject_template.clone()
+        };
+        SourceRecord {
+            key: None,
+            value,
+            subject,
+            headers: Vec::new(),
         }
     }
 }
@@ -315,35 +456,30 @@ mod tests {
 
     #[test]
     fn new_requires_connection_and_table_and_tracking_column_and_schema() {
-        // Missing everything.
         assert!(JdbcPollSource::new(&make_config(HashMap::new())).is_err());
 
-        // Missing tracking_column.
         let cfg = make_config(HashMap::from([
             ("connection".into(), "postgres://x".into()),
             ("table".into(), "events".into()),
             ("schema".into(), "id:bigint".into()),
         ]));
-        assert!(JdbcPollSource::new(&cfg).is_err());
+        assert!(JdbcPollSource::new(&cfg).is_err()); // missing tracking_column
 
-        // Missing schema.
         let cfg = make_config(HashMap::from([
             ("connection".into(), "postgres://x".into()),
             ("table".into(), "events".into()),
             ("tracking_column".into(), "id".into()),
         ]));
-        assert!(JdbcPollSource::new(&cfg).is_err());
+        assert!(JdbcPollSource::new(&cfg).is_err()); // missing schema
 
-        // Tracking column not in schema.
         let cfg = make_config(HashMap::from([
             ("connection".into(), "postgres://x".into()),
             ("table".into(), "events".into()),
             ("tracking_column".into(), "id".into()),
             ("schema".into(), "name:text".into()),
         ]));
-        assert!(JdbcPollSource::new(&cfg).is_err());
+        assert!(JdbcPollSource::new(&cfg).is_err()); // tc not in schema
 
-        // Happy path.
         let cfg = make_config(HashMap::from([
             ("connection".into(), "postgres://x".into()),
             ("table".into(), "events".into()),
@@ -354,14 +490,25 @@ mod tests {
     }
 
     #[test]
-    fn new_rejects_mssql() {
+    fn new_accepts_mssql() {
         let cfg = make_config(HashMap::from([
             ("connection".into(), "mssql://sa:pw@host/db".into()),
             ("table".into(), "events".into()),
             ("tracking_column".into(), "id".into()),
             ("schema".into(), "id:bigint".into()),
         ]));
-        assert!(JdbcPollSource::new(&cfg).is_err());
+        assert!(JdbcPollSource::new(&cfg).is_ok());
+    }
+
+    #[test]
+    fn new_accepts_sqlserver_scheme() {
+        let cfg = make_config(HashMap::from([
+            ("connection".into(), "sqlserver://sa:pw@host/db".into()),
+            ("table".into(), "events".into()),
+            ("tracking_column".into(), "id".into()),
+            ("schema".into(), "id:bigint".into()),
+        ]));
+        assert!(JdbcPollSource::new(&cfg).is_ok());
     }
 
     #[test]
@@ -428,5 +575,21 @@ mod tests {
         assert!(sql.contains("\"events\""));
         assert!(sql.contains("> ?"));
         assert!(sql.contains("LIMIT 10"));
+    }
+
+    #[test]
+    fn build_select_sql_mssql_shape() {
+        let cfg = make_config(HashMap::from([
+            ("connection".into(), "mssql://sa:pw@h/db".into()),
+            ("table".into(), "events".into()),
+            ("tracking_column".into(), "id".into()),
+            ("schema".into(), "id:bigint, name:text".into()),
+        ]));
+        let src = JdbcPollSource::new(&cfg).unwrap();
+        let sql = src.build_select_sql(50);
+        assert_eq!(
+            sql,
+            "SELECT TOP (50) [id], [name] FROM [events] WHERE [id] > @P1 ORDER BY [id] ASC"
+        );
     }
 }

@@ -5,6 +5,87 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-04-23
+
+Connector-framework release. Substantially extends the connector surface
+with new dialects, new connectors, and cross-cutting resilience primitives.
+All changes are backwards-compatible — existing connector configs continue
+to parse and run unchanged.
+
+### New connectors + dialects
+
+- **JDBC sink: SQL Server dialect.** New `mssql://` / `sqlserver://` scheme
+  support. MERGE + WITH (HOLDLOCK) upsert grammar, ISJSON check-constraint
+  on JSON columns, DATETIMEOFFSET for timestamptz. Backed by `tiberius` +
+  `bb8-tiberius` (sqlx does not support MSSQL). E2E coverage against
+  SQL Server 2022 Developer edition.
+- **JDBC sink: SQLite dialect.** New `sqlite:` scheme support via sqlx's
+  native SQLite driver. Standard `ON CONFLICT ... DO UPDATE` upsert
+  (SQLite 3.24+).
+- **`jdbc_poll` source (new connector).** Periodically polls a SQL table
+  for rows whose `tracking_column` exceeds the last-seen value, emitting
+  each row as JSON. Supports Postgres, MySQL, SQLite (via sqlx), and SQL
+  Server (via tiberius). Uses dialect-specific SQL (`LIMIT` vs `TOP(N)`).
+- **`mssql_cdc` source (new connector).** Streams insert/update/delete
+  events from SQL Server tables with Change Data Capture enabled. Reads
+  from `[cdc].[fn_cdc_get_all_changes_<capture_instance>]`; persists the
+  last-processed Log Sequence Number as a hex string.
+
+### Connector resilience framework
+
+- **`RetryPolicy` primitive.** Full-jitter exponential backoff; per-
+  connector `[retry]` TOML section configures `max_retries`,
+  `initial_backoff_ms`, `max_backoff_ms`, `multiplier`, `jitter`. Applied
+  by the manager on whole-batch transient failures and on source-poll
+  errors.
+- **Dead Letter Queue (`DlqWriter`).** Routes poison records to a
+  configurable exspeed stream (`dlq_stream` setting) with
+  `exspeed-dlq-*` metadata headers (origin, reason, detail, original
+  offset, timestamp). Original payload preserved byte-identically so the
+  DLQ stream is replay-ready.
+- **`on_transient_exhausted` dispatch.** New config option selects post-
+  exhaustion behavior: `halt` (stop the connector), `dlq_batch` (route
+  the remaining batch to DLQ), or `loop_forever` (default; preserves
+  pre-0.3 behavior).
+- **Enriched `WriteResult`.** Sinks now return `Poison { poison_offset,
+  reason, record, … }` or `TransientFailure { error, … }` instead of
+  the opaque `AllFailed`. Each built-in sink (JDBC, HTTP, RabbitMQ, S3)
+  classifies its errors explicitly.
+- **JDBC sink SQLSTATE classifier.** PK violations (Postgres 23505,
+  MySQL 1062, MSSQL 2627) are treated as duplicate-ignored; NOT NULL
+  (23502), numeric overflow (22003), invalid text (22P02) are routed as
+  `Poison`; anything else is `Transient`.
+- **HTTP sink: retry delegated to manager.** The inline
+  `1 << attempt` backoff loop is removed; 4xx → `Poison`, 5xx/network
+  → `TransientFailure`. Manager applies `RetryPolicy`. Existing
+  `retry_count` setting is deprecated.
+
+### Observability
+
+New OpenTelemetry counters on every connector:
+- `exspeed_connector_dlq_total{connector, reason}`
+- `exspeed_connector_dlq_failures_total{connector}`
+- `exspeed_connector_retry_attempts_total{connector, outcome}`
+- `exspeed_connector_transient_exhausted_total{connector, action}`
+
+### Tests
+
+- 4 always-runnable DLQ + retry E2E tests (axum mock HTTP sink, TCP fetch
+  protocol for DLQ stream inspection).
+- 2 SQLite sink E2E tests.
+- 1 SQLite `jdbc_poll` E2E test.
+- 6 MSSQL sink E2E tests (DB-gated on `EXSPEED_MSSQL_URL`).
+- 1 MSSQL `jdbc_poll` E2E test (DB-gated).
+- 9 SQLSTATE classifier unit tests; 8 RetryPolicy unit tests; 7 DlqWriter
+  and `PoisonReason` unit tests; 8 `jdbc_poll` unit tests; 7 `mssql_cdc`
+  unit tests.
+
+### Breaking (internal only)
+
+- `WriteResult::AllFailed` removed from `exspeed-connectors` public
+  types. Crate is not published to crates.io; the public surface of the
+  `exspeed` binary (TCP wire protocol, HTTP API, CLI) is unchanged.
+
 ## [0.2.0] — 2026-04-21
 
 First public release since 0.1.1. Rolls up multiple internal milestones
