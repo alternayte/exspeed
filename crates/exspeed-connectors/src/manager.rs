@@ -788,7 +788,6 @@ impl ConnectorManager {
         // Spawn sink task
         tokio::spawn(async move {
             let name = name_for_select;
-            #[allow(deprecated)]
             let work = async move {
             // Start the sink
             if let Err(e) = sink.start().await {
@@ -939,8 +938,7 @@ impl ConnectorManager {
                             current_offset = poison_offset + 1;
                             break 'retry;
                         }
-                        Ok(WriteResult::TransientFailure { error, .. })
-                        | Ok(WriteResult::AllFailed(error)) => {
+                        Ok(WriteResult::TransientFailure { error, .. }) => {
                             match retry_policy.delay_for(attempt) {
                                 Some(d) => {
                                     warn!(connector = task_name.as_str(),

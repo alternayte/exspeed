@@ -89,11 +89,6 @@ pub enum WriteResult {
         last_successful_offset: Option<u64>,
         error: String,
     },
-    /// DEPRECATED: kept for compatibility during sink migration. New sinks
-    /// must return `TransientFailure` or `Poison` instead. Removed once all
-    /// builtin sinks are migrated.
-    #[deprecated(note = "use TransientFailure or Poison")]
-    AllFailed(String),
 }
 
 // ---------------------------------------------------------------------------

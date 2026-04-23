@@ -150,11 +150,9 @@ impl SinkConnector for RabbitmqSink {
                         match confirm_handle.await {
                             Err(e) => {
                                 let msg = format!("publisher confirm error: {e}");
-                                return Ok(match last_successful_offset {
-                                    Some(offset) => WriteResult::PartialSuccess {
-                                        last_successful_offset: offset,
-                                    },
-                                    None => WriteResult::AllFailed(msg),
+                                return Ok(WriteResult::TransientFailure {
+                                    last_successful_offset,
+                                    error: msg,
                                 });
                             }
                             Ok(confirm) => {
