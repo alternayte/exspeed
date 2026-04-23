@@ -1443,6 +1443,44 @@ cargo test
 
 The binary is at `target/release/exspeed`. Copy it anywhere — it's a single static binary (dynamically links glibc).
 
+### SQL Server CDC source (`mssql_cdc`)
+
+Streams insert/update/delete events from SQL Server tables with Change
+Data Capture enabled. Each event becomes a JSON record with a `__op`
+field (`insert`, `update_before`, `update_after`, `delete`) and the
+declared business columns.
+
+Prerequisites on the target SQL Server:
+
+```sql
+EXEC sys.sp_cdc_enable_db;
+EXEC sys.sp_cdc_enable_table
+    @source_schema = 'dbo', @source_name = 'orders', @role_name = NULL;
+```
+
+SQL Server Agent must be running — CDC's capture job populates the
+`cdc.dbo_orders_CT` change table asynchronously from the transaction
+log. The default `mcr.microsoft.com/mssql/server:2022-latest` image
+does not start Agent; for local CDC experimentation use a different
+image or enable Agent manually.
+
+```toml
+[connector]
+name = "cdc-orders"
+type = "source"
+plugin = "mssql_cdc"
+stream = "orders-cdc"
+
+[settings]
+connection = "mssql://sa:Exspeed_Test!1@localhost:1433/master?trust_server_certificate=true"
+capture_instance = "dbo_orders"
+schema = "id:bigint, total:bigint, status:text"
+```
+
+LSN (Log Sequence Number) tracking: the connector persists the last-
+processed LSN as a hex string via the standard offset store; restart
+resumes from just past that LSN.
+
 ### Connector resilience: DLQ + retry
 
 Every connector accepts optional config for dead-letter routing and retry
