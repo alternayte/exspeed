@@ -75,7 +75,7 @@ pub async fn execute_query(
         }
         Err(e) => (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": e.to_string()})),
+            Json(e.to_json()),
         )
             .into_response(),
     }
@@ -102,7 +102,7 @@ pub async fn create_continuous(
             .into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": e.to_string()})),
+            Json(e.to_json()),
         )
             .into_response(),
     }
