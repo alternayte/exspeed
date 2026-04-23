@@ -1443,6 +1443,44 @@ cargo test
 
 The binary is at `target/release/exspeed`. Copy it anywhere — it's a single static binary (dynamically links glibc).
 
+### Connector resilience: DLQ + retry
+
+Every connector accepts optional config for dead-letter routing and retry
+behavior. Defaults preserve the pre-0.3 behavior (loop forever on transient
+failure; drop-with-metric on poison records).
+
+```toml
+[connector]
+# ... standard connector fields ...
+on_transient_exhausted = "halt"   # "halt" | "dlq_batch" | "loop_forever" (default)
+
+[settings]
+# ... plugin-specific settings ...
+dlq_stream = "events-dlq"         # optional — unset = drop-with-metric
+
+[retry]
+max_retries = 5
+initial_backoff_ms = 100
+max_backoff_ms = 30000
+multiplier = 2.0
+jitter = true
+```
+
+When a record is unrecoverable (bad JSON, type mismatch, 4xx from HTTP sink,
+etc.) and `dlq_stream` is set, the original payload is written to that stream
+with metadata headers:
+
+| Header | Value |
+|---|---|
+| `exspeed-dlq-origin` | connector name that rejected the record |
+| `exspeed-dlq-reason` | stable label (`type_mismatch`, `http_client_error`, …) |
+| `exspeed-dlq-detail` | human-readable error string |
+| `exspeed-dlq-original-offset` | original offset on the source stream |
+| `exspeed-dlq-timestamp` | original record timestamp |
+
+The record body is byte-identical to the original, so you can replay the DLQ
+stream through a fixed connector without translation.
+
 ### Database-backed integration tests
 
 The JDBC sink has full E2E tests that require a real Postgres, MySQL, or SQL
