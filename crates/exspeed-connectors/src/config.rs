@@ -5,6 +5,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::retry::RetryPolicy;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectorConfig {
     pub name: String,
@@ -30,6 +32,34 @@ pub struct ConnectorConfig {
     pub dedup_window_secs: u64,
     #[serde(default)]
     pub transform_sql: String,
+
+    // ---- DLQ + retry (all optional with backwards-compatible defaults) ----
+    /// Behavior when `RetryPolicy` exhausts on a `TransientFailure`. Default
+    /// `LoopForever` preserves today's behavior.
+    #[serde(default)]
+    pub on_transient_exhausted: OnTransientExhausted,
+
+    /// Retry policy for transient (whole-batch) failures. Missing = default.
+    #[serde(default)]
+    pub retry: RetryPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnTransientExhausted {
+    /// Put the connector into `Failed` status; offset does not advance.
+    /// Requires manual restart to resume.
+    Halt,
+    /// Route the current batch to the DLQ stream (if configured) and
+    /// advance past it. Falls back to `Halt` if `dlq_stream` is unset.
+    DlqBatch,
+    /// Keep retrying forever (today's behavior). Ignores `max_retries`
+    /// post-exhaustion — loops with `poll_interval_ms` between attempts.
+    LoopForever,
+}
+
+impl Default for OnTransientExhausted {
+    fn default() -> Self { Self::LoopForever }
 }
 
 fn default_batch_size() -> u32 {
@@ -105,6 +135,8 @@ struct TomlConnector {
     settings: HashMap<String, String>,
     #[serde(default)]
     transform: Option<TomlTransform>,
+    #[serde(default)]
+    retry: RetryPolicy,
 }
 
 #[derive(Deserialize)]
@@ -133,6 +165,8 @@ struct TomlConnectorSection {
     dedup_key: String,
     #[serde(default = "default_dedup_window")]
     dedup_window_secs: u64,
+    #[serde(default)]
+    on_transient_exhausted: OnTransientExhausted,
 }
 
 impl TomlConnector {
@@ -151,6 +185,8 @@ impl TomlConnector {
             dedup_key: self.connector.dedup_key,
             dedup_window_secs: self.connector.dedup_window_secs,
             transform_sql: self.transform.map(|t| t.sql).unwrap_or_default(),
+            on_transient_exhausted: self.connector.on_transient_exhausted,
+            retry: self.retry,
         }
     }
 }
@@ -218,6 +254,8 @@ mod tests {
             dedup_key: String::new(),
             dedup_window_secs: 86400,
             transform_sql: String::new(),
+            on_transient_exhausted: OnTransientExhausted::default(),
+            retry: RetryPolicy::default_transient(),
         };
 
         config.save_json(&path).unwrap();
@@ -274,6 +312,8 @@ outbox_table = "outbox_events"
             dedup_key: String::new(),
             dedup_window_secs: 86400,
             transform_sql: String::new(),
+            on_transient_exhausted: OnTransientExhausted::default(),
+            retry: RetryPolicy::default_transient(),
         };
         config.resolve_env_vars();
         assert_eq!(config.settings.get("secret").unwrap(), "my-secret-value");
@@ -296,6 +336,8 @@ outbox_table = "outbox_events"
             dedup_key: String::new(),
             dedup_window_secs: 86400,
             transform_sql: String::new(),
+            on_transient_exhausted: OnTransientExhausted::default(),
+            retry: RetryPolicy::default_transient(),
         };
         config.resolve_env_vars();
         assert_eq!(
@@ -313,6 +355,7 @@ outbox_table = "outbox_events"
             settings: HashMap::from([("val".into(), "${EXSPEED_TEST_UNSET_VAR:-fallback_value}".into())]),
             batch_size: 100, poll_interval_ms: 50, dedup_enabled: true,
             dedup_key: String::new(), dedup_window_secs: 86400, transform_sql: String::new(),
+            on_transient_exhausted: OnTransientExhausted::default(), retry: RetryPolicy::default_transient(),
         };
         config.resolve_env_vars();
         assert_eq!(config.settings.get("val").unwrap(), "fallback_value");
@@ -327,6 +370,7 @@ outbox_table = "outbox_events"
             settings: HashMap::from([("val".into(), "${EXSPEED_TEST_SET_VAR:-ignored}".into())]),
             batch_size: 100, poll_interval_ms: 50, dedup_enabled: true,
             dedup_key: String::new(), dedup_window_secs: 86400, transform_sql: String::new(),
+            on_transient_exhausted: OnTransientExhausted::default(), retry: RetryPolicy::default_transient(),
         };
         config.resolve_env_vars();
         assert_eq!(config.settings.get("val").unwrap(), "from_env");
@@ -342,6 +386,7 @@ outbox_table = "outbox_events"
             settings: HashMap::from([("val".into(), "${EXSPEED_TEST_EMPTY_DEFAULT:-}".into())]),
             batch_size: 100, poll_interval_ms: 50, dedup_enabled: true,
             dedup_key: String::new(), dedup_window_secs: 86400, transform_sql: String::new(),
+            on_transient_exhausted: OnTransientExhausted::default(), retry: RetryPolicy::default_transient(),
         };
         config.resolve_env_vars();
         assert_eq!(config.settings.get("val").unwrap(), "");
@@ -363,9 +408,66 @@ outbox_table = "outbox_events"
             dedup_key: String::new(),
             dedup_window_secs: 86400,
             transform_sql: String::new(),
+            on_transient_exhausted: OnTransientExhausted::default(),
+            retry: RetryPolicy::default_transient(),
         };
         assert_eq!(config.setting("url").unwrap(), "http://example.com");
         assert!(config.setting("missing").is_err());
         assert_eq!(config.setting_or("missing", "default"), "default");
+    }
+
+    #[test]
+    fn toml_parsing_with_retry_and_dlq() {
+        let toml = r#"
+[connector]
+name = "test"
+type = "sink"
+plugin = "http_sink"
+stream = "events"
+on_transient_exhausted = "dlq_batch"
+
+[settings]
+url = "https://example.com/hook"
+dlq_stream = "events-dlq"
+
+[retry]
+max_retries = 7
+initial_backoff_ms = 250
+max_backoff_ms = 60000
+multiplier = 1.5
+jitter = false
+"#;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.toml");
+        std::fs::write(&path, toml).unwrap();
+
+        let config = ConnectorConfig::load_toml(&path).unwrap();
+        assert_eq!(config.on_transient_exhausted, OnTransientExhausted::DlqBatch);
+        assert_eq!(config.retry.max_retries, 7);
+        assert_eq!(config.retry.initial_backoff_ms, 250);
+        assert!(!config.retry.jitter);
+        assert_eq!(config.settings.get("dlq_stream").unwrap(), "events-dlq");
+    }
+
+    #[test]
+    fn toml_parsing_without_retry_section_uses_defaults() {
+        let toml = r#"
+[connector]
+name = "test"
+type = "sink"
+plugin = "http_sink"
+stream = "events"
+
+[settings]
+url = "https://example.com/hook"
+"#;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.toml");
+        std::fs::write(&path, toml).unwrap();
+
+        let config = ConnectorConfig::load_toml(&path).unwrap();
+        assert_eq!(config.on_transient_exhausted, OnTransientExhausted::LoopForever);
+        assert_eq!(config.retry.max_retries, 5);
+        assert!(config.retry.jitter);
     }
 }
