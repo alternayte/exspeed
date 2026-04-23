@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use exspeed_common::{Offset, StreamName};
-use exspeed_streams::{StorageEngine, StoredRecord};
+use exspeed_common::StreamName;
+use exspeed_streams::StorageEngine;
 
 /// Boxed future returned by the recursive `build_operator` helper.
 type BuildOperatorFuture<'a> =
@@ -68,12 +68,22 @@ pub async fn execute_bounded_with_mv(
     // 4. Build operator tree
     let mut root = build_operator(&plan, storage, connections, mv_registry).await?;
 
-    // 5. Pull all rows from the root operator
+    // 5. Pull all rows from the root operator.
+    //
+    // ScanOperator::next() uses tokio::task::block_in_place internally.
+    // block_in_place requires a multi-threaded runtime, so we always drain
+    // the operator tree on a dedicated blocking thread via spawn_blocking.
+    // This works on both multi-threaded and current-thread runtimes.
     let columns = root.columns();
-    let mut rows = Vec::new();
-    while let Some(row) = root.next() {
-        rows.push(row);
-    }
+    let (columns, rows) = tokio::task::spawn_blocking(move || {
+        let mut rows = Vec::new();
+        while let Some(row) = root.next() {
+            rows.push(row);
+        }
+        (columns, rows)
+    })
+    .await
+    .map_err(|e| ExqlError::Execution(format!("operator drain panicked: {e}")))?;
 
     let elapsed = start.elapsed().as_millis() as u64;
 
@@ -93,11 +103,11 @@ fn build_operator<'a>(
 ) -> BuildOperatorFuture<'a> {
     Box::pin(async move {
     match plan {
-        PhysicalPlan::SeqScan { stream, alias, .. } => {
+        PhysicalPlan::SeqScan { stream, alias, required_columns } => {
             // Check materialized views first
             if let Some(mv_reg) = mv_registry {
                 if let Some((_columns, rows)) = mv_reg.get_rows(stream) {
-                    return Ok(Box::new(ScanOperator::new(rows)) as Box<dyn Operator>);
+                    return Ok(Box::new(ScanOperator::from_rows(rows)) as Box<dyn Operator>);
                 }
             }
 
@@ -105,34 +115,12 @@ fn build_operator<'a>(
                 ExqlError::Storage(format!("invalid stream name '{}': {}", stream, e))
             })?;
 
-            // Load all records from storage. We read in batches to avoid
-            // requesting an absurdly large single read, but still load
-            // everything for v1.
-            let mut all_records: Vec<StoredRecord> = Vec::new();
-            let batch_size = 10_000;
-            let mut from = Offset(0);
-            loop {
-                let batch = storage
-                    .read(&stream_name, from, batch_size)
-                    .await
-                    .map_err(|e| ExqlError::Storage(e.to_string()))?;
-                if batch.is_empty() {
-                    break;
-                }
-                let last_offset = batch.last().unwrap().offset.0;
-                all_records.extend(batch);
-                from = Offset(last_offset + 1);
-            }
-
-            // Convert StoredRecord → Row
-            let rows: Vec<Row> = all_records
-                .iter()
-                .map(|r| crate::runtime::row_builder::stored_record_to_row(
-                    r, alias.as_deref(), &crate::planner::column_set::ColumnSet::needs_everything()
-                ))
-                .collect();
-
-            Ok(Box::new(ScanOperator::new(rows)) as Box<dyn Operator>)
+            Ok(Box::new(ScanOperator::streaming(
+                storage.clone(),
+                stream_name,
+                alias.clone(),
+                required_columns.clone(),
+            )) as Box<dyn Operator>)
         }
 
         PhysicalPlan::ExternalScan {
