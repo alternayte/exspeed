@@ -27,7 +27,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 
 # Byte buffers (zero-copy, reference-counted)
-bytes = "1"
+bytes = { version = "1", features = ["serde"] }
 
 # Date/time types for LeaseInfo.expires_at
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }

@@ -1,5 +1,6 @@
 use std::fmt;
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 /// A dynamically-typed value that can flow through ExQL pipelines.
@@ -11,6 +12,7 @@ pub enum Value {
     Float(f64),
     Text(String),
     Json(serde_json::Value),
+    RawJson(Bytes),
     /// Epoch milliseconds.
     Timestamp(u64),
 }
@@ -46,9 +48,15 @@ impl Value {
     }
 
     /// Try to extract a JSON value reference.
-    pub fn as_json(&self) -> Option<&serde_json::Value> {
+    ///
+    /// Returns `Cow::Borrowed` for `Json` (zero-copy) and `Cow::Owned` for
+    /// `RawJson` (parses on demand).
+    pub fn as_json(&self) -> Option<std::borrow::Cow<'_, serde_json::Value>> {
         match self {
-            Value::Json(v) => Some(v),
+            Value::Json(v) => Some(std::borrow::Cow::Borrowed(v)),
+            Value::RawJson(b) => {
+                serde_json::from_slice::<serde_json::Value>(b).ok().map(std::borrow::Cow::Owned)
+            }
             _ => None,
         }
     }
@@ -118,6 +126,11 @@ impl Value {
                 key.extend_from_slice(&v.to_be_bytes());
                 key
             }
+            Value::RawJson(b) => {
+                let mut key = vec![7];
+                key.extend_from_slice(b);
+                key
+            }
         }
     }
 }
@@ -131,6 +144,10 @@ impl fmt::Display for Value {
             Value::Float(v) => write!(f, "{v}"),
             Value::Text(s) => write!(f, "{s}"),
             Value::Json(v) => write!(f, "{v}"),
+            Value::RawJson(b) => match std::str::from_utf8(b) {
+                Ok(s) => write!(f, "{s}"),
+                Err(_) => write!(f, "<invalid utf8>"),
+            },
             Value::Timestamp(v) => write!(f, "{v}"),
         }
     }
@@ -216,7 +233,7 @@ mod tests {
         // Json
         let j = serde_json::json!({"key": "val"});
         let v = Value::Json(j.clone());
-        assert_eq!(v.as_json(), Some(&j));
+        assert_eq!(v.as_json().as_deref(), Some(&j));
 
         // Timestamp
         let v = Value::Timestamp(1_700_000_000_000);
@@ -232,6 +249,32 @@ mod tests {
         assert_eq!(Value::Float(2.5).to_string(), "2.5");
         assert_eq!(Value::Text("hello".into()).to_string(), "hello");
         assert_eq!(Value::Timestamp(123).to_string(), "123");
+    }
+
+    #[test]
+    fn raw_json_display() {
+        let v = Value::RawJson(bytes::Bytes::from_static(b"{\"a\":1}"));
+        assert_eq!(v.to_string(), "{\"a\":1}");
+    }
+
+    #[test]
+    fn raw_json_invalid_utf8_display_is_placeholder() {
+        let v = Value::RawJson(bytes::Bytes::from_static(&[0xFF, 0xFE]));
+        assert_eq!(v.to_string(), "<invalid utf8>");
+    }
+
+    #[test]
+    fn raw_json_sort_key_stable() {
+        let a = Value::RawJson(bytes::Bytes::from_static(b"{\"a\":1}"));
+        let b = Value::RawJson(bytes::Bytes::from_static(b"{\"a\":2}"));
+        assert_ne!(a.to_sort_key(), b.to_sort_key());
+        assert!(!a.to_sort_key().is_empty());
+    }
+
+    #[test]
+    fn raw_json_is_not_null() {
+        let v = Value::RawJson(bytes::Bytes::from_static(b"null"));
+        assert!(!v.is_null()); // holds JSON "null" literal, not the Null variant
     }
 
     #[test]
