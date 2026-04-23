@@ -159,3 +159,18 @@ Root cause (`crates/exspeed-processing/src/runtime/bounded.rs:108-125`): the
 bounded executor loads the entire stream and eager-parses every payload to
 `serde_json::Value` before `LimitOperator` ever runs. 82 MB ÷ 36 s ≈ 2.3 MB/s,
 well below disk throughput — CPU-bound JSON parse + allocation.
+
+## ExQL bounded scan (post-streaming)
+
+Streaming scan + lazy payload rewrite landed in plan
+`docs/superpowers/plans/2026-04-23-exql-streaming-scan-lazy-payload.md`.
+Benchmarks run on a 500k-record in-memory stream with ~164-byte JSON payloads.
+
+| Case | Wall-clock (mean) |
+|------|-------------------|
+| `SELECT * FROM s LIMIT 5` | 357 µs |
+| `SELECT offset FROM s LIMIT 1000` | 266 µs |
+| `SELECT payload->>'status' FROM s WHERE payload->>'type' = 'A' LIMIT 100` | 286 µs |
+| `SELECT * FROM s` (full scan) | 316 ms |
+
+Reproduce: `cargo bench -p exspeed-processing --bench scan`.
