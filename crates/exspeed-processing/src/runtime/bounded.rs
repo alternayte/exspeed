@@ -21,7 +21,7 @@ use crate::runtime::operators::project::ProjectOperator;
 use crate::runtime::operators::scan::ScanOperator;
 use crate::runtime::operators::sort::SortOperator;
 use crate::runtime::operators::Operator;
-use crate::types::{ResultSet, Row, Value};
+use crate::types::{ResultSet, Row};
 
 /// Execute a bounded (batch) SQL query against storage, returning a ResultSet.
 pub async fn execute_bounded(
@@ -127,7 +127,9 @@ fn build_operator<'a>(
             // Convert StoredRecord → Row
             let rows: Vec<Row> = all_records
                 .iter()
-                .map(|r| stored_record_to_row(r, alias.as_deref()))
+                .map(|r| crate::runtime::row_builder::stored_record_to_row(
+                    r, alias.as_deref(), &crate::planner::column_set::ColumnSet::needs_everything()
+                ))
                 .collect();
 
             Ok(Box::new(ScanOperator::new(rows)) as Box<dyn Operator>)
@@ -280,68 +282,6 @@ async fn dispatch_external_query(
     }
 }
 
-/// Convert a StoredRecord into a Row with virtual columns.
-fn stored_record_to_row(record: &StoredRecord, alias: Option<&str>) -> Row {
-    let payload_json = serde_json::from_slice::<serde_json::Value>(&record.value).unwrap_or(
-        serde_json::Value::String(String::from_utf8_lossy(&record.value).into()),
-    );
-
-    let headers_json = serde_json::Value::Object(
-        record
-            .headers
-            .iter()
-            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-            .collect(),
-    );
-
-    let prefix = alias.map(|a| format!("{a}.")).unwrap_or_default();
-
-    let base_columns = vec![
-        format!("{prefix}offset"),
-        format!("{prefix}timestamp"),
-        format!("{prefix}key"),
-        format!("{prefix}subject"),
-        format!("{prefix}payload"),
-        format!("{prefix}headers"),
-    ];
-
-    let base_values = vec![
-        Value::Int(record.offset.0 as i64),
-        Value::Timestamp(record.timestamp),
-        record
-            .key
-            .as_ref()
-            .map(|k| Value::Text(String::from_utf8_lossy(k).to_string()))
-            .unwrap_or(Value::Null),
-        Value::Text(record.subject.clone()),
-        Value::Json(payload_json),
-        Value::Json(headers_json),
-    ];
-
-    let mut columns = base_columns;
-    let mut values = base_values.clone();
-
-    // Add unprefixed columns when an alias is present so that both
-    // `alias.key` and `key` resolve correctly.
-    if alias.is_some() {
-        columns.extend(
-            [
-                "offset",
-                "timestamp",
-                "key",
-                "subject",
-                "payload",
-                "headers",
-            ]
-            .iter()
-            .map(|s| s.to_string()),
-        );
-        values.extend(base_values);
-    }
-
-    Row { columns, values }
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -350,6 +290,7 @@ fn stored_record_to_row(record: &StoredRecord, alias: Option<&str>) -> Row {
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use crate::types::Value;
     use exspeed_storage::memory::MemoryStorage;
     use exspeed_streams::Record;
 

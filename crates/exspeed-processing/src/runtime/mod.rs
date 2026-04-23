@@ -5,3 +5,4 @@ pub mod continuous;
 pub mod eval;
 pub mod functions;
 pub mod operators;
+pub mod row_builder;
