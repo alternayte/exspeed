@@ -1,19 +1,87 @@
-use super::Operator;
+use std::collections::VecDeque;
+use std::sync::Arc;
+
+use exspeed_common::{Offset, StreamName};
+use exspeed_streams::StorageEngine;
+
+use crate::planner::column_set::ColumnSet;
+use crate::runtime::row_builder::stored_record_to_row;
+use crate::runtime::operators::Operator;
 use crate::types::Row;
 
-/// Yields pre-loaded rows one at a time.
+const BATCH_SIZE: usize = 1024;
+
+/// ScanOperator produces rows either:
+/// (a) from a pre-materialised `Vec<Row>` (used by the materialised-view path), or
+/// (b) by pulling 1024-record batches from storage on demand.
 pub struct ScanOperator {
-    rows: Vec<Row>,
-    position: usize,
+    mode: Mode,
     column_names: Vec<String>,
 }
 
+enum Mode {
+    Rows { rows: Vec<Row>, position: usize },
+    Streaming(StreamingState),
+}
+
+struct StreamingState {
+    storage: Arc<dyn StorageEngine>,
+    stream: StreamName,
+    alias: Option<String>,
+    required: ColumnSet,
+    cursor: Offset,
+    buf: VecDeque<Row>,
+    exhausted: bool,
+}
+
 impl ScanOperator {
-    pub fn new(rows: Vec<Row>) -> Self {
+    /// Construct from a pre-materialised row list (legacy/MV path).
+    pub fn from_rows(rows: Vec<Row>) -> Self {
         let column_names = rows.first().map(|r| r.columns.clone()).unwrap_or_default();
         Self {
-            rows,
-            position: 0,
+            mode: Mode::Rows { rows, position: 0 },
+            column_names,
+        }
+    }
+
+    /// Backward-compatible alias so existing callers compile without changes.
+    pub fn new(rows: Vec<Row>) -> Self {
+        Self::from_rows(rows)
+    }
+
+    /// Construct a streaming scan that pulls batches from storage on demand.
+    pub fn streaming(
+        storage: Arc<dyn StorageEngine>,
+        stream: StreamName,
+        alias: Option<String>,
+        required: ColumnSet,
+    ) -> Self {
+        // Compute the column names by building a dummy row from an empty
+        // record — cheap and keeps `.columns()` consistent with what scan
+        // will actually emit. For empty streams this still produces the
+        // expected column schema.
+        let column_names = {
+            use exspeed_streams::StoredRecord;
+            let dummy = StoredRecord {
+                offset: Offset(0),
+                timestamp: 0,
+                key: None,
+                subject: String::new(),
+                value: bytes::Bytes::from_static(b"{}"),
+                headers: vec![],
+            };
+            stored_record_to_row(&dummy, alias.as_deref(), &required).columns
+        };
+        Self {
+            mode: Mode::Streaming(StreamingState {
+                storage,
+                stream,
+                alias,
+                required,
+                cursor: Offset(0),
+                buf: VecDeque::new(),
+                exhausted: false,
+            }),
             column_names,
         }
     }
@@ -21,12 +89,43 @@ impl ScanOperator {
 
 impl Operator for ScanOperator {
     fn next(&mut self) -> Option<Row> {
-        if self.position < self.rows.len() {
-            let row = self.rows[self.position].clone();
-            self.position += 1;
-            Some(row)
-        } else {
-            None
+        match &mut self.mode {
+            Mode::Rows { rows, position } => {
+                if *position < rows.len() {
+                    let row = rows[*position].clone();
+                    *position += 1;
+                    Some(row)
+                } else {
+                    None
+                }
+            }
+            Mode::Streaming(s) => loop {
+                if let Some(row) = s.buf.pop_front() {
+                    return Some(row);
+                }
+                if s.exhausted {
+                    return None;
+                }
+                let batch = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(s.storage.read(&s.stream, s.cursor, BATCH_SIZE))
+                });
+                let batch = match batch {
+                    Ok(b) => b,
+                    Err(_) => {
+                        s.exhausted = true;
+                        return None;
+                    }
+                };
+                if batch.is_empty() {
+                    s.exhausted = true;
+                    return None;
+                }
+                s.cursor = Offset(batch.last().unwrap().offset.0 + 1);
+                for r in &batch {
+                    s.buf.push_back(stored_record_to_row(r, s.alias.as_deref(), &s.required));
+                }
+            },
         }
     }
 
@@ -38,47 +137,121 @@ impl Operator for ScanOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::planner::column_set::ColumnSet;
     use crate::types::Value;
+    use exspeed_common::StreamName;
+    use exspeed_storage::memory::MemoryStorage;
+    use exspeed_streams::{Record, StorageEngine};
+    use std::sync::Arc;
 
     fn sample_rows() -> Vec<Row> {
-        vec![
-            Row {
-                columns: vec!["id".into(), "name".into()],
-                values: vec![Value::Int(1), Value::Text("Alice".into())],
-            },
-            Row {
-                columns: vec!["id".into(), "name".into()],
-                values: vec![Value::Int(2), Value::Text("Bob".into())],
-            },
-            Row {
-                columns: vec!["id".into(), "name".into()],
-                values: vec![Value::Int(3), Value::Text("Carol".into())],
-            },
-        ]
+        (1..=3)
+            .map(|i| Row {
+                columns: vec!["id".into()],
+                values: vec![Value::Int(i)],
+            })
+            .collect()
+    }
+
+    // ─── from_rows constructor (legacy) ──────────────────────────────────
+
+    #[test]
+    fn from_rows_yields_all_then_none() {
+        let mut scan = ScanOperator::from_rows(sample_rows());
+        assert_eq!(scan.next().unwrap().values[0], Value::Int(1));
+        assert_eq!(scan.next().unwrap().values[0], Value::Int(2));
+        assert_eq!(scan.next().unwrap().values[0], Value::Int(3));
+        assert!(scan.next().is_none());
     }
 
     #[test]
-    fn scan_yields_all_rows_then_none() {
-        let mut scan = ScanOperator::new(sample_rows());
-        assert_eq!(scan.columns(), vec!["id", "name"]);
-
-        let r1 = scan.next().unwrap();
-        assert_eq!(r1.values[0], Value::Int(1));
-
-        let r2 = scan.next().unwrap();
-        assert_eq!(r2.values[0], Value::Int(2));
-
-        let r3 = scan.next().unwrap();
-        assert_eq!(r3.values[0], Value::Int(3));
-
+    fn from_rows_empty() {
+        let mut scan = ScanOperator::from_rows(vec![]);
         assert!(scan.next().is_none());
-        assert!(scan.next().is_none()); // idempotent
+    }
+
+    // ─── streaming constructor ───────────────────────────────────────────
+
+    async fn seed(storage: &Arc<dyn StorageEngine>, stream: &StreamName, n: usize) {
+        storage.create_stream(stream, 0, 0).await.unwrap();
+        for i in 0..n {
+            let rec = Record {
+                key: Some(format!("k{i}").into_bytes().into()),
+                subject: "s.a".into(),
+                value: format!(r#"{{"i":{i}}}"#).into_bytes().into(),
+                headers: vec![],
+                timestamp_ns: None,
+            };
+            storage.append(stream, &rec).await.unwrap();
+        }
+    }
+
+    fn multi_thread_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
     }
 
     #[test]
-    fn scan_empty() {
-        let mut scan = ScanOperator::new(vec![]);
-        assert!(scan.columns().is_empty());
-        assert!(scan.next().is_none());
+    fn streaming_empty_stream() {
+        let rt = multi_thread_runtime();
+        rt.block_on(async {
+            let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+            let stream = StreamName::try_from("t1").unwrap();
+            storage.create_stream(&stream, 0, 0).await.unwrap();
+            let cs = ColumnSet::needs_everything();
+            let mut scan = ScanOperator::streaming(storage, stream, None, cs);
+            assert!(tokio::task::block_in_place(|| scan.next()).is_none());
+        });
+    }
+
+    #[test]
+    fn streaming_yields_every_record_across_batches() {
+        let rt = multi_thread_runtime();
+        rt.block_on(async {
+            let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+            let stream = StreamName::try_from("t2").unwrap();
+            seed(&storage, &stream, 2500).await; // > 2 batches of 1024
+            let cs = ColumnSet::needs_everything();
+            let mut scan = ScanOperator::streaming(storage, stream, None, cs);
+            let mut count = 0;
+            while tokio::task::block_in_place(|| scan.next()).is_some() {
+                count += 1;
+            }
+            assert_eq!(count, 2500);
+        });
+    }
+
+    #[test]
+    fn streaming_payload_not_referenced_omits_payload_column() {
+        let rt = multi_thread_runtime();
+        rt.block_on(async {
+            let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+            let stream = StreamName::try_from("t3").unwrap();
+            seed(&storage, &stream, 5).await;
+            let mut cs = ColumnSet::default();
+            cs.virtual_cols.insert("offset".into());
+            let mut scan = ScanOperator::streaming(storage, stream, None, cs);
+            let row = tokio::task::block_in_place(|| scan.next()).unwrap();
+            assert_eq!(row.columns, vec!["offset"]);
+            assert!(!row.columns.contains(&"payload".to_string()));
+        });
+    }
+
+    #[test]
+    fn streaming_exhaustion_is_idempotent() {
+        let rt = multi_thread_runtime();
+        rt.block_on(async {
+            let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+            let stream = StreamName::try_from("t4").unwrap();
+            seed(&storage, &stream, 1).await;
+            let cs = ColumnSet::needs_everything();
+            let mut scan = ScanOperator::streaming(storage, stream, None, cs);
+            assert!(tokio::task::block_in_place(|| scan.next()).is_some());
+            assert!(tokio::task::block_in_place(|| scan.next()).is_none());
+            assert!(tokio::task::block_in_place(|| scan.next()).is_none());
+        });
     }
 }
