@@ -12,10 +12,11 @@ pub enum Value {
     Float(f64),
     Text(String),
     Json(serde_json::Value),
-    /// Raw JSON bytes held before parsing. NOTE: the currently-derived
-    /// Serialize emits a u8 array, not JSON — Task 2 replaces the derive
-    /// with a custom impl. Until then, don't construct RawJson values in
-    /// paths that flow to HTTP responses.
+    /// Raw JSON bytes held before parsing. The custom `Serialize` impl emits
+    /// the bytes as bare JSON (not wrapped in a `{"Json": ...}` envelope like
+    /// `Value::Json`); `PartialEq` normalizes whitespace and compares equal
+    /// to the equivalent `Json` variant. Only constructed by the row builder
+    /// in `runtime::row_builder` — `Deserialize` (derived) never produces it.
     RawJson(Bytes),
     /// Epoch milliseconds.
     Timestamp(u64),
