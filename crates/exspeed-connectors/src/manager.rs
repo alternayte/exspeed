@@ -482,6 +482,9 @@ impl ConnectorManager {
         let transform_sql = config.transform_sql.clone();
         let task_name = name.clone();
         let name_for_select = name.clone();
+        let source_retry_policy: RetryPolicy = config.retry.clone();
+        let source_cfg_for_dlq = config.clone();
+        let broker_append_for_source_dlq = self.broker_append.clone();
 
         // Insert into map before spawning
         {
@@ -518,6 +521,25 @@ impl ConnectorManager {
                 return;
             }
 
+            // Build the DLQ writer (None if dlq_stream unset).
+            let source_dlq = match DlqWriter::from_config(
+                broker_append_for_source_dlq.clone(),
+                &source_cfg_for_dlq,
+            ) {
+                Ok(w) => w,
+                Err(e) => {
+                    error!(connector = task_name.as_str(), error = %e,
+                           "source DLQ writer init failed");
+                    None
+                }
+            };
+            if let Some(w) = &source_dlq {
+                if let Err(e) = broker_append_for_source_dlq.ensure_stream(w.stream()).await {
+                    error!(connector = task_name.as_str(), error = %e,
+                           "source DLQ stream auto-create failed");
+                }
+            }
+
             let stream_name = match StreamName::try_from(stream_str.as_str()) {
                 Ok(s) => s,
                 Err(e) => {
@@ -550,13 +572,34 @@ impl ConnectorManager {
             };
 
             loop {
-                // Poll for records
-                let batch = match source.poll(batch_size).await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        error!(connector = task_name.as_str(), error = %e, "source poll failed");
-                        tokio::time::sleep(poll_interval).await;
-                        continue;
+                // Poll for records with RetryPolicy for transient errors.
+                let mut poll_attempt: u32 = 0;
+                let batch = loop {
+                    match source.poll(batch_size).await {
+                        Ok(b) => break b,
+                        Err(e) => {
+                            match source_retry_policy.delay_for(poll_attempt) {
+                                Some(d) => {
+                                    warn!(connector = task_name.as_str(),
+                                          attempt = poll_attempt, error = %e,
+                                          "source poll error; retrying");
+                                    tokio::time::sleep(d).await;
+                                    poll_attempt += 1;
+                                }
+                                None => {
+                                    error!(connector = task_name.as_str(), error = %e,
+                                           "source poll retries exhausted; looping with poll_interval");
+                                    metrics.connector_transient_exhausted_total.add(1, &[
+                                        opentelemetry::KeyValue::new(
+                                            "connector", task_name.to_string()),
+                                        opentelemetry::KeyValue::new(
+                                            "action", "source_loop_forever"),
+                                    ]);
+                                    tokio::time::sleep(poll_interval).await;
+                                    poll_attempt = 0;
+                                }
+                            }
+                        }
                     }
                 };
 
@@ -627,8 +670,37 @@ impl ConnectorManager {
                             error!(
                                 connector = task_name.as_str(),
                                 error = %e,
-                                "failed to append record"
+                                "failed to append source record"
                             );
+                            if let Some(dlq) = &source_dlq {
+                                let reason = PoisonReason::SinkRejected {
+                                    detail: format!("source broker append failed: {e}"),
+                                };
+                                let sink_rec = SinkRecord {
+                                    offset: 0,
+                                    timestamp: 0,
+                                    subject: record.subject.clone(),
+                                    key: record.key.clone(),
+                                    value: record.value.clone(),
+                                    headers: record.headers.clone(),
+                                };
+                                if let Err(dlqerr) = dlq.write(&sink_rec, &reason).await {
+                                    error!(connector = task_name.as_str(),
+                                           error = %dlqerr,
+                                           "source DLQ write failed");
+                                    metrics.connector_dlq_failures_total.add(1, &[
+                                        opentelemetry::KeyValue::new(
+                                            "connector", task_name.to_string()),
+                                    ]);
+                                } else {
+                                    metrics.connector_dlq_total.add(1, &[
+                                        opentelemetry::KeyValue::new(
+                                            "connector", task_name.to_string()),
+                                        opentelemetry::KeyValue::new(
+                                            "reason", reason.label()),
+                                    ]);
+                                }
+                            }
                         }
                     }
                 }
