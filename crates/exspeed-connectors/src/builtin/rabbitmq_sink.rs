@@ -140,11 +140,9 @@ impl SinkConnector for RabbitmqSink {
             match publish_result {
                 Err(e) => {
                     let msg = format!("basic_publish error: {e}");
-                    return Ok(match last_successful_offset {
-                        Some(offset) => WriteResult::PartialSuccess {
-                            last_successful_offset: offset,
-                        },
-                        None => WriteResult::AllFailed(msg),
+                    return Ok(WriteResult::TransientFailure {
+                        last_successful_offset,
+                        error: msg,
                     });
                 }
                 Ok(confirm_handle) => {
@@ -162,11 +160,9 @@ impl SinkConnector for RabbitmqSink {
                             Ok(confirm) => {
                                 if !confirm.is_ack() {
                                     let msg = "message nacked by broker".to_string();
-                                    return Ok(match last_successful_offset {
-                                        Some(offset) => WriteResult::PartialSuccess {
-                                            last_successful_offset: offset,
-                                        },
-                                        None => WriteResult::AllFailed(msg),
+                                    return Ok(WriteResult::TransientFailure {
+                                        last_successful_offset,
+                                        error: msg,
                                     });
                                 }
                             }
