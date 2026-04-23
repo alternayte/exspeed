@@ -1871,6 +1871,15 @@ where
                                     .send(ServerMessage::Ok.into_frame(correlation_id))
                                     .await?;
                             }
+                            Ok(ClientMessage::Query(_sql)) => {
+                                // Query execution will be wired up in a later task.
+                                let response = ServerMessage::Error {
+                                    code: 501,
+                                    message: "query not yet implemented over wire protocol".into(),
+                                }
+                                .into_frame(correlation_id);
+                                framed_write.send(response).await?;
+                            }
                             Err(e) => {
                                 warn!(%peer, "unhandled message: {}", e);
                                 let response = ServerMessage::Error {

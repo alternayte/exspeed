@@ -52,6 +52,7 @@ pub enum ClientMessage {
     Ack(AckRequest),
     Nack(NackRequest),
     Seek(SeekRequest),
+    Query(String),
 }
 
 impl ClientMessage {
@@ -91,6 +92,11 @@ impl ClientMessage {
             OpCode::Ack => Ok(Self::Ack(AckRequest::decode(frame.payload)?)),
             OpCode::Nack => Ok(Self::Nack(NackRequest::decode(frame.payload)?)),
             OpCode::Seek => Ok(Self::Seek(SeekRequest::decode(frame.payload)?)),
+            OpCode::Query => {
+                let sql = String::from_utf8(frame.payload.to_vec())
+                    .map_err(|e| ProtocolError::Decode(format!("Query payload not UTF-8: {e}")))?;
+                Ok(ClientMessage::Query(sql))
+            }
             other => Err(ProtocolError::Decode(format!(
                 "unhandled client opcode: {:?}",
                 other
@@ -111,6 +117,7 @@ pub enum ServerMessage {
     ConnectOk(ConnectResponse),
     RecordsBatch(RecordsBatch),
     Record(RecordDelivery),
+    QueryResult(bytes::Bytes),
 }
 
 impl ServerMessage {
@@ -168,6 +175,9 @@ impl ServerMessage {
                 let mut payload = BytesMut::new();
                 delivery.encode(&mut payload);
                 Frame::new(OpCode::Record, 0, payload.freeze()) // correlation_id=0 for push
+            }
+            ServerMessage::QueryResult(payload) => {
+                Frame::new(OpCode::QueryResult, correlation_id, payload)
             }
         }
     }
@@ -228,6 +238,7 @@ impl ServerMessage {
             OpCode::Record => Ok(ServerMessage::Record(RecordDelivery::decode(
                 frame.payload,
             )?)),
+            OpCode::QueryResult => Ok(ServerMessage::QueryResult(frame.payload)),
             other => Err(ProtocolError::Decode(format!(
                 "unhandled server opcode: {other:?}"
             ))),
@@ -628,5 +639,33 @@ mod tests {
             ServerMessage::from_frame(frame).unwrap(),
             ServerMessage::Ok
         ));
+    }
+
+    // --- Task 6: Query / QueryResult wire message tests ---
+
+    #[test]
+    fn query_frame_to_client_message() {
+        let sql = "SELECT * FROM orders";
+        let payload = Bytes::from(sql.as_bytes().to_vec());
+        let frame = Frame::new(OpCode::Query, 200, payload);
+        let msg = ClientMessage::from_frame(frame).unwrap();
+        match msg {
+            ClientMessage::Query(sql_str) => assert_eq!(sql_str, "SELECT * FROM orders"),
+            other => panic!("expected Query, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn query_result_to_frame_and_back() {
+        let json_payload = Bytes::from(
+            r#"{"columns":["id"],"rows":[[1]],"row_count":1,"execution_time_ms":5}"#,
+        );
+        let frame = ServerMessage::QueryResult(json_payload.clone()).into_frame(200);
+        assert_eq!(frame.opcode, OpCode::QueryResult);
+        assert_eq!(frame.correlation_id, 200);
+        match ServerMessage::from_frame(frame).unwrap() {
+            ServerMessage::QueryResult(payload) => assert_eq!(payload, json_payload),
+            other => panic!("expected QueryResult, got {:?}", other),
+        }
     }
 }

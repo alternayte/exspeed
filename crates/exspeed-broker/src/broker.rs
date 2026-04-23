@@ -273,6 +273,10 @@ impl Broker {
                 code: 500,
                 message: "subscribe/unsubscribe handled by connection layer".into(),
             },
+            ClientMessage::Query(_) => ServerMessage::Error {
+                code: 500,
+                message: "query handled by connection layer".into(),
+            },
         }
     }
 }
