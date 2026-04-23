@@ -331,11 +331,9 @@ fn annotate_with_seed(plan: PhysicalPlan, seed: ColumnSet) -> PhysicalPlan {
             }
         }
         PhysicalPlan::HashAggregate { input, group_by, select_items } => {
-            // Only the GROUP BY keys are needed from the scan; aggregate function
-            // arguments (e.g. the `*` in count(*)) are evaluated after grouping
-            // and do not imply scan-level column reads.
             let mut cs = ColumnSet::default();
             for g in &group_by { collect_columns(g, &mut cs); }
+            collect_from_projection(&select_items, &mut cs);
             PhysicalPlan::HashAggregate {
                 input: Box::new(annotate_with_seed(*input, cs)),
                 group_by,
@@ -345,9 +343,9 @@ fn annotate_with_seed(plan: PhysicalPlan, seed: ColumnSet) -> PhysicalPlan {
         PhysicalPlan::WindowedAggregate {
             input, window_size, group_by, select_items, emit_mode,
         } => {
-            // Same logic as HashAggregate: only GROUP BY keys reference scan columns.
             let mut cs = ColumnSet::default();
             for g in &group_by { collect_columns(g, &mut cs); }
+            collect_from_projection(&select_items, &mut cs);
             PhysicalPlan::WindowedAggregate {
                 input: Box::new(annotate_with_seed(*input, cs)),
                 window_size, group_by, select_items, emit_mode,
@@ -824,5 +822,15 @@ mod annotate_tests {
         let cs = find_scan(&p);
         assert!(cs.virtual_cols.contains("key"));
         assert!(!cs.payload_referenced);
+    }
+
+    #[test]
+    fn aggregate_on_payload_field_marks_payload() {
+        // SUM over a payload path should flip payload_referenced despite being in
+        // an aggregate. count(*) must stay harmless.
+        let p = plan_for("SELECT key, SUM(payload->>'amount') FROM events GROUP BY key");
+        let cs = find_scan(&p);
+        assert!(cs.payload_referenced, "SUM(payload->>...) should mark payload");
+        assert!(cs.virtual_cols.contains("key"));
     }
 }

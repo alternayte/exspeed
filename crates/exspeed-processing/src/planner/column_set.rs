@@ -113,7 +113,12 @@ pub fn collect_columns(expr: &Expr, out: &mut ColumnSet) {
             out.merge(&ColumnSet::needs_everything());
         }
         Expr::Aggregate { expr, .. } => {
-            collect_columns(expr, out);
+            // `count(*)` is idiomatic for "count rows"; the Wildcard inside does
+            // NOT mean "all columns" at the scan level. Skip the recursion in that
+            // case so count(*) doesn't incorrectly flip `select_star` on the scan.
+            if !matches!(expr.as_ref(), Expr::Wildcard { .. }) {
+                collect_columns(expr, out);
+            }
         }
         Expr::Interval { .. } => {}
     }
@@ -241,5 +246,36 @@ mod tests {
         assert!(e.select_star);
         assert!(e.payload_referenced);
         assert_eq!(e.virtual_cols.len(), 4);
+    }
+
+    #[test]
+    fn count_star_does_not_flip_select_star() {
+        let e = Expr::Aggregate {
+            func: crate::parser::ast::AggregateFunc::Count,
+            expr: Box::new(Expr::Wildcard { table: None }),
+            distinct: false,
+        };
+        let mut out = cs();
+        collect_columns(&e, &mut out);
+        assert!(!out.select_star);
+        assert!(!out.payload_referenced);
+        assert!(out.virtual_cols.is_empty());
+    }
+
+    #[test]
+    fn aggregate_over_json_access_marks_payload() {
+        // SUM(payload->>'amount')
+        let e = Expr::Aggregate {
+            func: crate::parser::ast::AggregateFunc::Sum,
+            expr: Box::new(Expr::JsonAccess {
+                expr: Box::new(col("payload")),
+                field: "amount".into(),
+                as_text: true,
+            }),
+            distinct: false,
+        };
+        let mut out = cs();
+        collect_columns(&e, &mut out);
+        assert!(out.payload_referenced);
     }
 }
