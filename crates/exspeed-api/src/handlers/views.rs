@@ -31,6 +31,7 @@ fn value_to_json(v: &Value) -> serde_json::Value {
         Value::Float(f) => json!(f),
         Value::Text(s) => serde_json::Value::String(s.clone()),
         Value::Json(j) => j.clone(),
+        Value::RawJson(b) => serde_json::from_slice(b).unwrap_or(serde_json::Value::Null),
         Value::Timestamp(ts) => json!(ts),
     }
 }
