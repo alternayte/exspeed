@@ -9,7 +9,7 @@ import { decodeCreateStream } from "../src/protocol/stream.js";
 import { encodeRecord } from "../src/protocol/record.js";
 import { Connection } from "../src/connection.js";
 import { encodeErrorFrame } from "../src/protocol/error-frame.js";
-import { KeyCollisionError, DedupMapFullError } from "../src/errors.js";
+import { KeyCollisionError, DedupMapFullError, QueryError } from "../src/errors.js";
 
 function createTestServer(
   handler: (frame: { opcode: OpCode; correlationId: number; payload: Buffer }, socket: net.Socket) => void,
@@ -792,6 +792,92 @@ describe("idempotent publish error handling", () => {
     expect(caughtErr).toBeDefined();
     expect(caughtErr!.storedOffset).toBe(99n);
     expect(caughtErr!.msgId).toBe("my-msg-id");
+
+    await client.close();
+  });
+});
+
+describe("query()", () => {
+  let testServer: ReturnType<typeof createTestServer>;
+
+  afterEach(async () => {
+    if (testServer) await testServer.stop();
+  });
+
+  it("sends Query opcode and parses QueryResult", async () => {
+    let capturedSql: string | undefined;
+    testServer = createTestServer((frame, socket) => {
+      if (frame.opcode === OpCode.Connect) {
+        replyOk(socket, frame.correlationId);
+      } else if (frame.opcode === OpCode.Query) {
+        capturedSql = frame.payload.toString("utf8");
+        const result = JSON.stringify({
+          columns: ["id", "name"],
+          rows: [[1, "alice"], [2, "bob"]],
+          row_count: 2,
+          execution_time_ms: 7,
+        });
+        socket.write(encodeFrame({
+          version: PROTOCOL_VERSION,
+          opcode: OpCode.QueryResult,
+          correlationId: frame.correlationId,
+          payload: Buffer.from(result),
+        }));
+      }
+    });
+    const port = await testServer.start();
+
+    const client = new ExspeedClient({ host: "127.0.0.1", port, clientId: "test", reconnect: false });
+    await client.connect();
+
+    const result = await client.query('SELECT * FROM "orders"');
+    expect(capturedSql).toBe('SELECT * FROM "orders"');
+    expect(result.columns).toEqual(["id", "name"]);
+    expect(result.rows).toEqual([[1, "alice"], [2, "bob"]]);
+    expect(result.rowCount).toBe(2);
+    expect(result.executionTimeMs).toBe(7);
+
+    await client.close();
+  });
+
+  it("throws QueryError on server error", async () => {
+    testServer = createTestServer((frame, socket) => {
+      if (frame.opcode === OpCode.Connect) {
+        replyOk(socket, frame.correlationId);
+      } else if (frame.opcode === OpCode.Query) {
+        const errorJson = JSON.stringify({
+          error: "unsupported: UNION",
+          code: "UNSUPPORTED",
+          hint: "ExQL supports SELECT",
+        });
+        const msgBytes = Buffer.from(errorJson, "utf8");
+        const buf = Buffer.alloc(2 + 2 + msgBytes.length);
+        buf.writeUInt16LE(400, 0);
+        buf.writeUInt16LE(msgBytes.length, 2);
+        msgBytes.copy(buf, 4);
+        socket.write(encodeFrame({
+          version: PROTOCOL_VERSION,
+          opcode: OpCode.Error,
+          correlationId: frame.correlationId,
+          payload: buf,
+        }));
+      }
+    });
+    const port = await testServer.start();
+
+    const client = new ExspeedClient({ host: "127.0.0.1", port, clientId: "test", reconnect: false });
+    await client.connect();
+
+    let caughtErr: QueryError | undefined;
+    try {
+      await client.query("SELECT UNION");
+    } catch (err) {
+      if (err instanceof QueryError) caughtErr = err;
+    }
+
+    expect(caughtErr).toBeDefined();
+    expect(caughtErr!.code).toBe("UNSUPPORTED");
+    expect(caughtErr!.hint).toBe("ExQL supports SELECT");
 
     await client.close();
   });

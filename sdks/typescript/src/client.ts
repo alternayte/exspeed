@@ -8,11 +8,11 @@ import {
   type Frame, DEFAULT_PORT, START_FROM_EARLIEST, START_FROM_LATEST, START_FROM_OFFSET,
 } from "./protocol/index.js";
 import { Subscription } from "./subscription.js";
-import { ServerError, ValidationError, KeyCollisionError, DedupMapFullError } from "./errors.js";
+import { ServerError, ValidationError, KeyCollisionError, DedupMapFullError, QueryError } from "./errors.js";
 import type {
   BrokerEndpoint, ClientOptions, PublishOptions, PublishResult, CreateStreamOptions,
   CreateConsumerOptions, SubscribeOptions, FetchOptions, FetchRecord,
-  SeekOptions, SeekResult,
+  SeekOptions, SeekResult, QueryResult,
 } from "./types.js";
 
 export class ExspeedClient extends EventEmitter {
@@ -270,6 +270,35 @@ export class ExspeedClient extends EventEmitter {
     const start = performance.now();
     await this.mainConn.request(OpCode.Ping, Buffer.alloc(0));
     return performance.now() - start;
+  }
+
+  async query(sql: string): Promise<QueryResult> {
+    const payload = Buffer.from(sql, "utf8");
+    try {
+      const resp = await this.mainConn.request(OpCode.Query, payload);
+      const body = JSON.parse(resp.payload.toString("utf8"));
+      return {
+        columns: body.columns,
+        rows: body.rows,
+        rowCount: body.row_count,
+        executionTimeMs: body.execution_time_ms,
+      };
+    } catch (err) {
+      if (err instanceof ServerError) {
+        try {
+          const parsed = JSON.parse(err.message);
+          throw new QueryError(
+            parsed.error ?? err.message,
+            parsed.code ?? "UNKNOWN",
+            { line: parsed.line, column: parsed.column, hint: parsed.hint },
+          );
+        } catch (parseErr) {
+          if (parseErr instanceof QueryError) throw parseErr;
+          throw new QueryError(err.message, "UNKNOWN");
+        }
+      }
+      throw err;
+    }
   }
 
   private createConnection(): Connection {
