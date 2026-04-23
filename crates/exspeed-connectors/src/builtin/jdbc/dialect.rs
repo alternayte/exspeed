@@ -12,12 +12,13 @@ pub enum DialectKind {
     Postgres,
     MySql,
     Mssql,
+    Sqlite,
 }
 
 impl DialectKind {
     /// Infer the dialect from a connection URL's scheme.
     /// `postgres://` and `postgresql://` → Postgres; `mysql://` → MySql;
-    /// `mssql://` and `sqlserver://` → Mssql.
+    /// `mssql://` and `sqlserver://` → Mssql; `sqlite:` → Sqlite.
     pub fn from_url(url: &str) -> Result<Self, ConnectorError> {
         let lower = url.trim_start().to_ascii_lowercase();
         if lower.starts_with("postgres://") || lower.starts_with("postgresql://") {
@@ -26,9 +27,11 @@ impl DialectKind {
             Ok(Self::MySql)
         } else if lower.starts_with("mssql://") || lower.starts_with("sqlserver://") {
             Ok(Self::Mssql)
+        } else if lower.starts_with("sqlite:") {
+            Ok(Self::Sqlite)
         } else {
             Err(ConnectorError::Config(format!(
-                "jdbc sink: unsupported connection URL scheme; expected postgres://, mysql://, or mssql://, got: {}",
+                "jdbc sink: unsupported connection URL scheme; expected postgres://, mysql://, mssql://, or sqlite:, got: {}",
                 url.split("://").next().unwrap_or(url)
             )))
         }
@@ -40,6 +43,7 @@ pub fn dialect_for(kind: DialectKind) -> Box<dyn Dialect> {
         DialectKind::Postgres => Box::new(super::postgres::PostgresDialect),
         DialectKind::MySql => Box::new(super::mysql::MysqlDialect),
         DialectKind::Mssql => Box::new(super::mssql::MssqlDialect),
+        DialectKind::Sqlite => Box::new(super::sqlite::SqliteDialect),
     }
 }
 
@@ -122,8 +126,15 @@ mod tests {
 
     #[test]
     fn kind_rejects_unsupported() {
-        assert!(DialectKind::from_url("sqlite:///tmp/x.db").is_err());
         assert!(DialectKind::from_url("not-a-url").is_err());
+        assert!(DialectKind::from_url("oracle://u:p@h/d").is_err());
+    }
+
+    #[test]
+    fn kind_from_sqlite_url() {
+        assert_eq!(DialectKind::from_url("sqlite:///tmp/x.db").unwrap(), DialectKind::Sqlite);
+        assert_eq!(DialectKind::from_url("sqlite::memory:").unwrap(), DialectKind::Sqlite);
+        assert_eq!(DialectKind::from_url("SQLITE:data.db").unwrap(), DialectKind::Sqlite);
     }
 
     #[test]
