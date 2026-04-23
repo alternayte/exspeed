@@ -112,7 +112,8 @@ impl Operator for ScanOperator {
                 });
                 let batch = match batch {
                     Ok(b) => b,
-                    Err(_) => {
+                    Err(e) => {
+                        tracing::warn!(stream = %s.stream, error = %e, "scan: storage.read failed, treating as end-of-stream");
                         s.exhausted = true;
                         return None;
                     }
