@@ -103,11 +103,17 @@ fn build_operator<'a>(
 ) -> BuildOperatorFuture<'a> {
     Box::pin(async move {
     match plan {
-        PhysicalPlan::SeqScan { stream, alias, required_columns } => {
+        PhysicalPlan::SeqScan { stream, alias, required_columns, predicate } => {
             // Check materialized views first
             if let Some(mv_reg) = mv_registry {
                 if let Some((_columns, rows)) = mv_reg.get_rows(stream) {
-                    return Ok(Box::new(ScanOperator::from_rows(rows)) as Box<dyn Operator>);
+                    let scan: Box<dyn Operator> = Box::new(ScanOperator::from_rows(rows));
+                    // If predicate was pushed down, re-apply as a FilterOperator
+                    // since MV rows bypass storage-level filtering.
+                    if let Some(pred) = predicate {
+                        return Ok(Box::new(FilterOperator::new(scan, pred.clone())) as Box<dyn Operator>);
+                    }
+                    return Ok(scan);
                 }
             }
 
@@ -115,11 +121,12 @@ fn build_operator<'a>(
                 ExqlError::Storage(format!("invalid stream name '{}': {}", stream, e))
             })?;
 
-            Ok(Box::new(ScanOperator::streaming(
+            Ok(Box::new(ScanOperator::streaming_with_predicate(
                 storage.clone(),
                 stream_name,
                 alias.clone(),
                 required_columns.clone(),
+                predicate.clone(),
             )) as Box<dyn Operator>)
         }
 

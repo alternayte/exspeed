@@ -624,7 +624,14 @@ fn decompose_plan(plan: &PhysicalPlan) -> Result<ContinuousPipeline, String> {
                 filter = Some(predicate.clone());
                 current = input;
             }
-            PhysicalPlan::SeqScan { stream, alias, .. } => {
+            PhysicalPlan::SeqScan { stream, alias, predicate, .. } => {
+                // If predicate pushdown absorbed a filter into the scan,
+                // recover it for the continuous pipeline.
+                if filter.is_none() {
+                    if let Some(pred) = predicate {
+                        filter = Some(pred.clone());
+                    }
+                }
                 source_stream = Some((stream.clone(), alias.clone()));
                 break;
             }

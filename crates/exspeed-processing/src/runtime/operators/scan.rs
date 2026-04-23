@@ -4,7 +4,9 @@ use std::sync::Arc;
 use exspeed_common::{Offset, StreamName};
 use exspeed_streams::StorageEngine;
 
+use crate::parser::ast::Expr;
 use crate::planner::column_set::ColumnSet;
+use crate::runtime::eval::eval_expr;
 use crate::runtime::row_builder::stored_record_to_row;
 use crate::runtime::operators::Operator;
 use crate::types::Row;
@@ -29,6 +31,7 @@ struct StreamingState {
     stream: StreamName,
     alias: Option<String>,
     required: ColumnSet,
+    predicate: Option<Expr>,
     cursor: Offset,
     buf: VecDeque<Row>,
     exhausted: bool,
@@ -49,12 +52,14 @@ impl ScanOperator {
         Self::from_rows(rows)
     }
 
-    /// Construct a streaming scan that pulls batches from storage on demand.
-    pub fn streaming(
+    /// Construct a streaming scan that pulls batches from storage on demand,
+    /// optionally applying a pushed-down predicate during batch conversion.
+    pub fn streaming_with_predicate(
         storage: Arc<dyn StorageEngine>,
         stream: StreamName,
         alias: Option<String>,
         required: ColumnSet,
+        predicate: Option<Expr>,
     ) -> Self {
         // Compute the column names by building a dummy row from an empty
         // record — cheap and keeps `.columns()` consistent with what scan
@@ -78,12 +83,23 @@ impl ScanOperator {
                 stream,
                 alias,
                 required,
+                predicate,
                 cursor: Offset(0),
                 buf: VecDeque::new(),
                 exhausted: false,
             }),
             column_names,
         }
+    }
+
+    /// Construct a streaming scan that pulls batches from storage on demand.
+    pub fn streaming(
+        storage: Arc<dyn StorageEngine>,
+        stream: StreamName,
+        alias: Option<String>,
+        required: ColumnSet,
+    ) -> Self {
+        Self::streaming_with_predicate(storage, stream, alias, required, None)
     }
 }
 
@@ -124,7 +140,13 @@ impl Operator for ScanOperator {
                 }
                 s.cursor = Offset(batch.last().unwrap().offset.0 + 1);
                 for r in &batch {
-                    s.buf.push_back(stored_record_to_row(r, s.alias.as_deref(), &s.required));
+                    let row = stored_record_to_row(r, s.alias.as_deref(), &s.required);
+                    if let Some(ref pred) = s.predicate {
+                        if eval_expr(pred, &row) != crate::types::Value::Bool(true) {
+                            continue;
+                        }
+                    }
+                    s.buf.push_back(row);
                 }
             },
         }
@@ -238,6 +260,35 @@ mod tests {
             let row = tokio::task::block_in_place(|| scan.next()).unwrap();
             assert_eq!(row.columns, vec!["offset"]);
             assert!(!row.columns.contains(&"payload".to_string()));
+        });
+    }
+
+    #[test]
+    fn streaming_with_predicate_filters_rows() {
+        use crate::parser::ast::{BinaryOperator, Expr, LiteralValue};
+
+        let rt = multi_thread_runtime();
+        rt.block_on(async {
+            let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+            let stream = StreamName::try_from("t_filter").unwrap();
+            seed(&storage, &stream, 100).await;
+
+            let predicate = Expr::BinaryOp {
+                left: Box::new(Expr::Column { table: None, name: "offset".into() }),
+                op: BinaryOperator::Lt,
+                right: Box::new(Expr::Literal(LiteralValue::Int(5))),
+            };
+
+            let cs = ColumnSet::needs_everything();
+            let mut scan = ScanOperator::streaming_with_predicate(
+                storage, stream, None, cs, Some(predicate),
+            );
+
+            let mut count = 0;
+            while tokio::task::block_in_place(|| scan.next()).is_some() {
+                count += 1;
+            }
+            assert_eq!(count, 5);
         });
     }
 
