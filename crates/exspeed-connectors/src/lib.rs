@@ -1,10 +1,12 @@
 pub mod builtin;
 pub mod config;
 pub mod dedup;
+pub mod dlq;
 pub mod file_watcher;
 pub mod manager;
 pub mod offset;
 pub mod offset_store;
+pub mod retry;
 pub mod traits;
 pub mod transform;
 

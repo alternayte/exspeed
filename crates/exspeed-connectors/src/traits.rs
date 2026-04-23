@@ -73,7 +73,22 @@ pub struct SinkBatch {
 pub enum WriteResult {
     AllSuccess,
     PartialSuccess { last_successful_offset: u64 },
-    AllFailed(String),
+    /// A single record is unrecoverable. Manager routes to DLQ (if configured)
+    /// and advances past `poison_offset`. Prior records in the same batch were
+    /// already written by the sink (it returns `Poison` after completing
+    /// partial work up to `last_successful_offset`).
+    Poison {
+        last_successful_offset: Option<u64>,
+        poison_offset: u64,
+        reason: PoisonReason,
+        record: SinkRecord,
+    },
+    /// Whole-batch transient failure. Manager applies `RetryPolicy`; exhaustion
+    /// dispatches on `on_transient_exhausted`.
+    TransientFailure {
+        last_successful_offset: Option<u64>,
+        error: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -118,4 +133,86 @@ pub trait SinkConnector: Send + Sync {
 
     /// Check the health of the connector.
     async fn health(&self) -> HealthStatus;
+}
+
+// ---------------------------------------------------------------------------
+// Poison classification
+// ---------------------------------------------------------------------------
+
+/// Stable classification of why a single record was unrecoverable.
+///
+/// Used by `WriteResult::Poison`. The variant carries any structured context
+/// needed by observability; `label()` returns a low-cardinality metric-safe
+/// tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PoisonReason {
+    NonJsonRecord,
+    TypeMismatch { field: String, expected: String, got: String },
+    MissingRequiredField { field: String },
+    TimestampParseFailed { field: String },
+    HttpClientError { status: u16 },
+    SinkRejected { detail: String },
+}
+
+impl PoisonReason {
+    /// Low-cardinality stable label suitable for metric tagging.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::NonJsonRecord => "non_json_record",
+            Self::TypeMismatch { .. } => "type_mismatch",
+            Self::MissingRequiredField { .. } => "missing_required_field",
+            Self::TimestampParseFailed { .. } => "timestamp_parse_failed",
+            Self::HttpClientError { .. } => "http_client_error",
+            Self::SinkRejected { .. } => "sink_rejected",
+        }
+    }
+
+    /// Human-readable detail string for DLQ headers / log lines.
+    pub fn detail(&self) -> String {
+        match self {
+            Self::NonJsonRecord => "record body is not valid JSON".into(),
+            Self::TypeMismatch { field, expected, got } =>
+                format!("field '{field}': expected {expected}, got {got}"),
+            Self::MissingRequiredField { field } =>
+                format!("field '{field}': missing required value"),
+            Self::TimestampParseFailed { field } =>
+                format!("field '{field}': could not parse as RFC3339 timestamp"),
+            Self::HttpClientError { status } =>
+                format!("HTTP client error (status {status})"),
+            Self::SinkRejected { detail } => detail.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod poison_reason_tests {
+    use super::*;
+
+    #[test]
+    fn label_is_stable_per_variant() {
+        assert_eq!(PoisonReason::NonJsonRecord.label(), "non_json_record");
+        assert_eq!(
+            PoisonReason::TypeMismatch {
+                field: "x".into(), expected: "int".into(), got: "str".into()
+            }.label(),
+            "type_mismatch"
+        );
+        assert_eq!(
+            PoisonReason::HttpClientError { status: 404 }.label(),
+            "http_client_error"
+        );
+    }
+
+    #[test]
+    fn detail_includes_structured_fields() {
+        let r = PoisonReason::TypeMismatch {
+            field: "order_id".into(),
+            expected: "bigint".into(),
+            got: "string".into(),
+        };
+        let d = r.detail();
+        assert!(d.contains("order_id"));
+        assert!(d.contains("bigint"));
+        assert!(d.contains("string"));
+    }
 }

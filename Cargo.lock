@@ -1305,6 +1305,7 @@ name = "exspeed"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "axum",
  "bb8",
  "bb8-tiberius",
  "bincode",
@@ -1469,6 +1470,7 @@ dependencies = [
  "opentelemetry",
  "percent-encoding",
  "pgwire-replication",
+ "rand 0.8.5",
  "redis",
  "reqwest",
  "rust-s3",

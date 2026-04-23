@@ -29,6 +29,7 @@ notify = { workspace = true }
 redis = { workspace = true }
 pgwire-replication = { workspace = true }
 opentelemetry = { workspace = true }
+rand = { workspace = true }
 tiberius = { workspace = true }
 bb8 = { workspace = true }
 bb8-tiberius = { workspace = true }

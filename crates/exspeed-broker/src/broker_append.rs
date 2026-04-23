@@ -237,6 +237,20 @@ impl BrokerAppend {
     /// without the per-stream mutex, causing two durable records with the same
     /// msg_id. With the mutex, the second racer blocks on `mutex.lock()` until
     /// the first completes Phase 4's insert, so the second call sees the entry
+    /// Idempotently create the stream if it doesn't exist. Used by the
+    /// connector DLQ writer to auto-create the DLQ stream at connector
+    /// start, and by the source DLQ path for the same reason.
+    pub async fn ensure_stream(&self, stream: &StreamName) -> Result<(), StorageError> {
+        use exspeed_common::Offset;
+        match self.storage.read(stream, Offset(0), 0).await {
+            Ok(_) => Ok(()),
+            Err(StorageError::StreamNotFound(_)) => {
+                self.storage.create_stream(stream, 0, 0).await.map(|_| ())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// at Phase 1 and returns `Duplicate` with the same offset.
     ///
     ///   Phase 1 — optimistic read-lock check (fast path for already-known keys).

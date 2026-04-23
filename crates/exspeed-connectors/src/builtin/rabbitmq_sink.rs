@@ -140,11 +140,9 @@ impl SinkConnector for RabbitmqSink {
             match publish_result {
                 Err(e) => {
                     let msg = format!("basic_publish error: {e}");
-                    return Ok(match last_successful_offset {
-                        Some(offset) => WriteResult::PartialSuccess {
-                            last_successful_offset: offset,
-                        },
-                        None => WriteResult::AllFailed(msg),
+                    return Ok(WriteResult::TransientFailure {
+                        last_successful_offset,
+                        error: msg,
                     });
                 }
                 Ok(confirm_handle) => {
@@ -152,21 +150,17 @@ impl SinkConnector for RabbitmqSink {
                         match confirm_handle.await {
                             Err(e) => {
                                 let msg = format!("publisher confirm error: {e}");
-                                return Ok(match last_successful_offset {
-                                    Some(offset) => WriteResult::PartialSuccess {
-                                        last_successful_offset: offset,
-                                    },
-                                    None => WriteResult::AllFailed(msg),
+                                return Ok(WriteResult::TransientFailure {
+                                    last_successful_offset,
+                                    error: msg,
                                 });
                             }
                             Ok(confirm) => {
                                 if !confirm.is_ack() {
                                     let msg = "message nacked by broker".to_string();
-                                    return Ok(match last_successful_offset {
-                                        Some(offset) => WriteResult::PartialSuccess {
-                                            last_successful_offset: offset,
-                                        },
-                                        None => WriteResult::AllFailed(msg),
+                                    return Ok(WriteResult::TransientFailure {
+                                        last_successful_offset,
+                                        error: msg,
                                     });
                                 }
                             }
@@ -239,6 +233,8 @@ mod tests {
             dedup_key: String::new(),
             dedup_window_secs: 86400,
             transform_sql: String::new(),
+            on_transient_exhausted: crate::config::OnTransientExhausted::default(),
+            retry: crate::retry::RetryPolicy::default_transient(),
         }
     }
 

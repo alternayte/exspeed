@@ -59,6 +59,19 @@ pub struct Metrics {
     /// Counts connector start failures (e.g. CREATE TABLE failed, connection
     /// refused). Labels: `connector`, `stream`.
     pub connector_start_errors_total: Counter<u64>,
+    /// Counts successful DLQ writes for a connector. Labels: `connector`,
+    /// `reason` (`PoisonReason::label()`).
+    pub connector_dlq_total: Counter<u64>,
+    /// Counts DLQ append failures (the poison record could not be written to
+    /// its DLQ stream). Labels: `connector`.
+    pub connector_dlq_failures_total: Counter<u64>,
+    /// Counts retry attempt outcomes on transient sink/source failures.
+    /// Labels: `connector`, `outcome` (`succeeded` | `exhausted`).
+    pub connector_retry_attempts_total: Counter<u64>,
+    /// Counts transient-exhaustion events and the action the manager took.
+    /// Labels: `connector`, `action` (`halt` | `halt_no_dlq` | `dlq_batch` |
+    /// `loop_forever` | `source_loop_forever`).
+    pub connector_transient_exhausted_total: Counter<u64>,
     /// Fill ratio (0.0–1.0) of the per-subscription delivery mpsc channel.
     /// Labeled by `consumer` and `subscriber`.
     pub subscription_queue_fill_ratio: Gauge<f64>,
@@ -304,6 +317,22 @@ impl Metrics {
             .u64_counter("exspeed_connector_start_errors_total")
             .with_description("Connector start failures (connect or CREATE TABLE)")
             .build();
+        let connector_dlq_total = meter
+            .u64_counter("exspeed_connector_dlq_total")
+            .with_description("Records routed to a connector DLQ stream")
+            .build();
+        let connector_dlq_failures_total = meter
+            .u64_counter("exspeed_connector_dlq_failures_total")
+            .with_description("DLQ append failures (record lost)")
+            .build();
+        let connector_retry_attempts_total = meter
+            .u64_counter("exspeed_connector_retry_attempts_total")
+            .with_description("Retry attempt outcomes on transient failures")
+            .build();
+        let connector_transient_exhausted_total = meter
+            .u64_counter("exspeed_connector_transient_exhausted_total")
+            .with_description("Transient-exhaustion events and action taken")
+            .build();
 
         connector_records_skipped_total.add(
             0,
@@ -326,6 +355,31 @@ impl Metrics {
             &[
                 KeyValue::new("connector", "__init__"),
                 KeyValue::new("stream", "__init__"),
+            ],
+        );
+        connector_dlq_total.add(
+            0,
+            &[
+                KeyValue::new("connector", "__init__"),
+                KeyValue::new("reason", "sink_rejected"),
+            ],
+        );
+        connector_dlq_failures_total.add(
+            0,
+            &[KeyValue::new("connector", "__init__")],
+        );
+        connector_retry_attempts_total.add(
+            0,
+            &[
+                KeyValue::new("connector", "__init__"),
+                KeyValue::new("outcome", "succeeded"),
+            ],
+        );
+        connector_transient_exhausted_total.add(
+            0,
+            &[
+                KeyValue::new("connector", "__init__"),
+                KeyValue::new("action", "loop_forever"),
             ],
         );
 
@@ -351,6 +405,10 @@ impl Metrics {
             connector_records_skipped_total,
             connector_write_errors_total,
             connector_start_errors_total,
+            connector_dlq_total,
+            connector_dlq_failures_total,
+            connector_retry_attempts_total,
+            connector_transient_exhausted_total,
             subscription_queue_fill_ratio,
             dedup_map_entries,
             dedup_writes_total,
