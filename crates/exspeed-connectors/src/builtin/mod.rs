@@ -2,6 +2,7 @@ pub mod http_poll;
 pub mod http_sink;
 pub mod http_webhook;
 pub mod jdbc;
+pub mod jdbc_poll;
 pub mod pgoutput;
 pub mod postgres;
 pub mod postgres_outbox;
@@ -23,6 +24,7 @@ pub fn create_source(
     match plugin {
         "postgres_outbox" => Ok(Box::new(postgres_outbox::PostgresOutboxSource::new(config)?)),
         "postgres" => Ok(Box::new(postgres::PostgresSource::new(config)?)),
+        "jdbc_poll" => Ok(Box::new(jdbc_poll::JdbcPollSource::new(config)?)),
         "rabbitmq" => Ok(Box::new(rabbitmq_source::RabbitmqSource::new(config)?)),
         "http_poll" => Ok(Box::new(http_poll::HttpPollSource::new(config)?)),
         other => Err(ConnectorError::Config(format!(
