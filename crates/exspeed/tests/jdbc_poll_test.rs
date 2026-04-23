@@ -1,4 +1,7 @@
-//! jdbc_poll E2E — SQLite only, always runnable.
+//! jdbc_poll E2E — SQLite (always runnable) + MSSQL (DB-gated).
+
+#[path = "common/mod.rs"]
+mod common;
 
 use std::time::Duration;
 
@@ -148,4 +151,98 @@ async fn sqlite_poll_source_emits_new_rows() {
     assert_eq!(recs.len(), 4);
 
     pool.close().await;
+}
+
+async fn mssql_connect(
+    url: &str,
+) -> tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>> {
+    let normalized = if url.to_ascii_lowercase().starts_with("mssql://") {
+        format!("sqlserver://{}", &url[8..])
+    } else {
+        url.to_string()
+    };
+    let u = url::Url::parse(&normalized).unwrap();
+    let mut cfg = tiberius::Config::new();
+    cfg.host(u.host_str().unwrap());
+    cfg.port(u.port().unwrap_or(1433));
+    cfg.authentication(tiberius::AuthMethod::sql_server(
+        u.username(),
+        u.password().unwrap_or(""),
+    ));
+    let db = u.path().trim_start_matches('/');
+    if !db.is_empty() {
+        cfg.database(db);
+    }
+    for (k, v) in u.query_pairs() {
+        if k.eq_ignore_ascii_case("trust_server_certificate") && v.eq_ignore_ascii_case("true") {
+            cfg.trust_cert();
+        }
+    }
+    let tcp = tokio::net::TcpStream::connect(cfg.get_addr()).await.unwrap();
+    tcp.set_nodelay(true).ok();
+    use tokio_util::compat::TokioAsyncWriteCompatExt;
+    tiberius::Client::connect(cfg, tcp.compat_write()).await.unwrap()
+}
+
+#[tokio::test]
+async fn mssql_poll_source_emits_new_rows() {
+    let ms_url = crate::require_mssql!();
+    let table = common::db::unique_table("poll_ms");
+
+    // Create source table via tiberius.
+    {
+        let mut conn = mssql_connect(&ms_url).await;
+        let sql = format!(
+            "IF OBJECT_ID(N'[{t}]', N'U') IS NULL \
+             CREATE TABLE [{t}] (id BIGINT NOT NULL PRIMARY KEY, name NVARCHAR(MAX) NOT NULL)",
+            t = table
+        );
+        conn.simple_query(sql).await.unwrap().into_results().await.unwrap();
+        for (i, n) in [(1i64, "alpha"), (2, "beta"), (3, "gamma")] {
+            let sql = format!(
+                "INSERT INTO [{t}] (id, name) VALUES ({i}, '{n}')",
+                t = table, i = i, n = n
+            );
+            conn.simple_query(sql).await.unwrap().into_results().await.unwrap();
+        }
+    }
+
+    let (tcp, http) = start_server().await;
+    let client = reqwest::Client::new();
+
+    client
+        .post(format!("{http}/api/v1/streams"))
+        .json(&serde_json::json!({"name": "mssql-poll-stream"}))
+        .send().await.unwrap();
+
+    let resp = client
+        .post(format!("{http}/api/v1/connectors"))
+        .json(&serde_json::json!({
+            "name": "poll-mssql",
+            "type": "source",
+            "plugin": "jdbc_poll",
+            "stream": "mssql-poll-stream",
+            "settings": {
+                "connection": ms_url,
+                "table": &table,
+                "tracking_column": "id",
+                "schema": "id:bigint, name:text"
+            }
+        }))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 201, "create: {}", resp.text().await.unwrap());
+
+    let recs = wait_for_records(&tcp, "mssql-poll-stream", 3, 15).await;
+    assert_eq!(recs.len(), 3, "should have emitted 3 rows from MSSQL");
+
+    let parsed: Vec<serde_json::Value> = recs
+        .iter()
+        .map(|(_, v)| serde_json::from_slice(v).unwrap())
+        .collect();
+    let names: Vec<&str> = parsed.iter().map(|v| v["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"alpha"));
+    assert!(names.contains(&"beta"));
+    assert!(names.contains(&"gamma"));
+
+    common::db::drop_table_mssql(&ms_url, &table).await;
 }
