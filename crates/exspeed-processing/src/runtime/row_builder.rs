@@ -29,8 +29,9 @@ pub fn stored_record_to_row(
     }
     if want("timestamp") {
         columns.push(format!("{prefix}timestamp"));
-        // StoredRecord.timestamp is already epoch-milliseconds.
-        values.push(Value::Timestamp(record.timestamp));
+        // StoredRecord.timestamp is epoch-nanoseconds (as stamped by storage);
+        // Value::Timestamp is documented as epoch-milliseconds (types.rs).
+        values.push(Value::Timestamp(record.timestamp / 1_000_000));
     }
     if want("key") {
         columns.push(format!("{prefix}key"));
@@ -53,7 +54,7 @@ pub fn stored_record_to_row(
         // can be partial. Invalid utf-8 falls back to Value::Text lossy
         // conversion (matches the pre-existing fallback in bounded.rs).
         values.push(match std::str::from_utf8(&record.value) {
-            Ok(_) => Value::RawJson(Bytes::copy_from_slice(&record.value)),
+            Ok(_) => Value::RawJson(record.value.clone()),
             Err(_) => Value::Text(String::from_utf8_lossy(&record.value).into()),
         });
     }
@@ -70,8 +71,9 @@ mod tests {
     fn rec(value: &[u8]) -> StoredRecord {
         StoredRecord {
             offset: Offset(7),
-            // StoredRecord.timestamp is epoch-milliseconds.
-            timestamp: 1_700_000_000_000,
+            // StoredRecord.timestamp is epoch-nanoseconds (as stamped by storage).
+            // 1_700_000_000_000_000_000 ns == 1_700_000_000_000 ms (2023-11-14 UTC).
+            timestamp: 1_700_000_000_000_000_000,
             key: Some(Bytes::from_static(b"k1")),
             subject: "s.a".into(),
             value: Bytes::copy_from_slice(value),
@@ -85,6 +87,8 @@ mod tests {
         let r = stored_record_to_row(&rec(br#"{"a":1}"#), None, &cs);
         assert_eq!(r.columns, vec!["offset", "timestamp", "key", "subject", "payload"]);
         assert_eq!(r.values[0], Value::Int(7));
+        // Fixture is 1_700_000_000_000_000_000 ns; divided by 1_000_000 → ms.
+        assert_eq!(r.values[1], Value::Timestamp(1_700_000_000_000));
         assert!(matches!(r.values[4], Value::RawJson(_)));
     }
 
