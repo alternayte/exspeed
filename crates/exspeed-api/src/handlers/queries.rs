@@ -8,7 +8,7 @@ use exspeed_common::auth::Identity;
 use serde::Deserialize;
 use serde_json::json;
 
-use exspeed_processing::types::Value;
+use exspeed_processing::types::value_to_json;
 
 use crate::state::AppState;
 
@@ -20,20 +20,6 @@ pub struct ExecuteQueryRequest {
 #[derive(Deserialize)]
 pub struct CreateContinuousRequest {
     pub sql: String,
-}
-
-/// Convert an ExQL `Value` to a `serde_json::Value`.
-fn value_to_json(v: &Value) -> serde_json::Value {
-    match v {
-        Value::Null => serde_json::Value::Null,
-        Value::Bool(b) => serde_json::Value::Bool(*b),
-        Value::Int(n) => json!(n),
-        Value::Float(f) => json!(f),
-        Value::Text(s) => serde_json::Value::String(s.clone()),
-        Value::Json(j) => j.clone(),
-        Value::RawJson(b) => serde_json::from_slice(b).unwrap_or(serde_json::Value::Null),
-        Value::Timestamp(ts) => json!(ts),
-    }
 }
 
 /// POST /api/v1/queries

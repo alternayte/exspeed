@@ -235,6 +235,20 @@ impl Row {
     }
 }
 
+/// Convert a query Value to a native JSON value for API responses.
+pub fn value_to_json(v: &Value) -> serde_json::Value {
+    match v {
+        Value::Null => serde_json::Value::Null,
+        Value::Bool(b) => serde_json::Value::Bool(*b),
+        Value::Int(n) => serde_json::json!(n),
+        Value::Float(f) => serde_json::json!(f),
+        Value::Text(s) => serde_json::Value::String(s.clone()),
+        Value::Json(j) => j.clone(),
+        Value::RawJson(b) => serde_json::from_slice(b).unwrap_or(serde_json::Value::Null),
+        Value::Timestamp(ts) => serde_json::json!(ts),
+    }
+}
+
 /// The result of executing an ExQL query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResultSet {
