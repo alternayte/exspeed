@@ -145,3 +145,17 @@ Note on mode semantics: Exspeed **sync** mode is a genuine durable
 group-commit + fsync-per-batch, whereas NATS JetStream's "sync" mode is
 closer to wait-for-in-memory-ack. Exspeed **async** mode (fsync on a timer)
 is the apples-to-apples comparison to NATS JetStream's default async fsync.
+
+## ExQL bounded scan (pre-streaming)
+
+Baseline before the streaming-scan / lazy-payload rewrite (plan
+`docs/superpowers/plans/2026-04-23-exql-streaming-scan-lazy-payload.md`).
+
+| Case | Stream size | Baseline |
+|------|-------------|----------|
+| `SELECT * FROM s LIMIT 5` | 500 000 rows / 82 MB (SQL Server CDC payloads) | ~36 000 ms (user-reported) |
+
+Root cause (`crates/exspeed-processing/src/runtime/bounded.rs:108-125`): the
+bounded executor loads the entire stream and eager-parses every payload to
+`serde_json::Value` before `LimitOperator` ever runs. 82 MB ÷ 36 s ≈ 2.3 MB/s,
+well below disk throughput — CPU-bound JSON parse + allocation.
