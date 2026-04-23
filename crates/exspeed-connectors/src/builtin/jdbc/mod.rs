@@ -5,6 +5,7 @@ pub mod dialect;
 pub mod postgres;
 pub mod mysql;
 pub mod mssql;
+pub mod sqlite;
 pub mod schema;
 
 use async_trait::async_trait;
@@ -319,7 +320,7 @@ impl JdbcSinkConnector {
 
     async fn build_backend(&self) -> Result<Box<dyn SinkBackend>, ConnectorError> {
         match self.kind {
-            DialectKind::Postgres | DialectKind::MySql => {
+            DialectKind::Postgres | DialectKind::MySql | DialectKind::Sqlite => {
                 let b = SqlxBackend::connect(&self.connection_string)
                     .await
                     .map_err(|e| ConnectorError::Connection(format!("jdbc sink: {e}")))?;
@@ -558,7 +559,7 @@ mod tests {
     #[test]
     fn config_rejects_unsupported_scheme() {
         let cfg = make_config(HashMap::from([
-            ("connection".into(), "sqlite:///tmp/test.db".into()),
+            ("connection".into(), "oracle://u:p@h/db".into()),
             ("table".into(), "events".into()),
         ]));
         assert!(JdbcSinkConnector::new(&cfg).is_err());

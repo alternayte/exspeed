@@ -72,7 +72,7 @@ sqlparser = "0.61"
 
 # Database
 tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-chrono-0_4"] }
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "mysql", "any"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "mysql", "sqlite", "any"] }
 tiberius     = { version = "0.12", default-features = false, features = ["tds73", "chrono", "rustls"] }
 bb8          = "0.8"
 bb8-tiberius = "0.15"
