@@ -11,7 +11,8 @@ use physical::PhysicalPlan;
 pub fn plan(query: &QueryExpr, emit_mode: EmitMode) -> Result<PhysicalPlan, ParseError> {
     let logical = build_logical(query, emit_mode)?;
     let physical = to_physical(logical);
-    Ok(annotate_scans(physical))
+    let optimized = push_down_filters(physical);
+    Ok(annotate_scans(optimized))
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +196,7 @@ fn to_physical(logical: LogicalPlan) -> PhysicalPlan {
             stream,
             alias,
             required_columns: crate::planner::column_set::ColumnSet::default(),
+            predicate: None,
         },
         LogicalPlan::ExternalScan {
             connection,
@@ -291,8 +293,12 @@ pub fn annotate_scans(plan: PhysicalPlan) -> PhysicalPlan {
 
 fn annotate_with_seed(plan: PhysicalPlan, seed: ColumnSet) -> PhysicalPlan {
     match plan {
-        PhysicalPlan::SeqScan { stream, alias, .. } => {
-            PhysicalPlan::SeqScan { stream, alias, required_columns: seed }
+        PhysicalPlan::SeqScan { stream, alias, predicate, .. } => {
+            let mut cs = seed;
+            if let Some(ref pred) = predicate {
+                collect_columns(pred, &mut cs);
+            }
+            PhysicalPlan::SeqScan { stream, alias, required_columns: cs, predicate }
         }
         PhysicalPlan::ExternalScan { .. } => plan,
         PhysicalPlan::Filter { input, predicate } => {
@@ -374,6 +380,62 @@ fn annotate_with_seed(plan: PhysicalPlan, seed: ColumnSet) -> PhysicalPlan {
 }
 
 // ---------------------------------------------------------------------------
+// Optimisation: predicate pushdown
+// ---------------------------------------------------------------------------
+
+/// When a `Filter` node sits directly on a `SeqScan`, absorb the predicate
+/// into the scan so rows are filtered during batch conversion instead of
+/// after materialisation.
+fn push_down_filters(plan: PhysicalPlan) -> PhysicalPlan {
+    match plan {
+        PhysicalPlan::Filter { input, predicate } => {
+            match *input {
+                PhysicalPlan::SeqScan { stream, alias, required_columns, predicate: None } => {
+                    PhysicalPlan::SeqScan { stream, alias, required_columns, predicate: Some(predicate) }
+                }
+                other => PhysicalPlan::Filter {
+                    input: Box::new(push_down_filters(other)),
+                    predicate,
+                },
+            }
+        }
+        PhysicalPlan::Project { input, items } => PhysicalPlan::Project {
+            input: Box::new(push_down_filters(*input)),
+            items,
+        },
+        PhysicalPlan::Sort { input, order_by } => PhysicalPlan::Sort {
+            input: Box::new(push_down_filters(*input)),
+            order_by,
+        },
+        PhysicalPlan::Limit { input, limit, offset } => PhysicalPlan::Limit {
+            input: Box::new(push_down_filters(*input)),
+            limit,
+            offset,
+        },
+        PhysicalPlan::HashAggregate { input, group_by, select_items } => PhysicalPlan::HashAggregate {
+            input: Box::new(push_down_filters(*input)),
+            group_by,
+            select_items,
+        },
+        PhysicalPlan::WindowedAggregate { input, window_size, group_by, select_items, emit_mode } => PhysicalPlan::WindowedAggregate {
+            input: Box::new(push_down_filters(*input)),
+            window_size, group_by, select_items, emit_mode,
+        },
+        PhysicalPlan::HashJoin { left, right, on, join_type } => PhysicalPlan::HashJoin {
+            left: Box::new(push_down_filters(*left)),
+            right: Box::new(push_down_filters(*right)),
+            on, join_type,
+        },
+        PhysicalPlan::StreamStreamJoin { left, right, on, within, join_type } => PhysicalPlan::StreamStreamJoin {
+            left: Box::new(push_down_filters(*left)),
+            right: Box::new(push_down_filters(*right)),
+            on, within, join_type,
+        },
+        other => other,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -409,19 +471,14 @@ mod tests {
         match stmt {
             ExqlStatement::Query(q) => {
                 let p = plan(&q, EmitMode::Changes).unwrap();
-                // Project → Filter → SeqScan
+                // After predicate pushdown: Project → SeqScan { predicate: Some(..) }
                 match p {
                     PhysicalPlan::Project { input, .. } => match *input {
-                        PhysicalPlan::Filter {
-                            input: inner,
-                            predicate,
-                        } => {
-                            assert!(matches!(predicate, Expr::BinaryOp { .. }));
-                            assert!(
-                                matches!(*inner, PhysicalPlan::SeqScan { ref stream, .. } if stream == "orders")
-                            );
+                        PhysicalPlan::SeqScan { ref predicate, ref stream, .. } => {
+                            assert!(predicate.is_some(), "predicate should be pushed into scan");
+                            assert_eq!(stream, "orders");
                         }
-                        other => panic!("expected Filter, got {other:?}"),
+                        other => panic!("expected SeqScan with pushed predicate, got {other:?}"),
                     },
                     other => panic!("expected Project, got {other:?}"),
                 }
@@ -757,6 +814,51 @@ mod tests {
                 );
             }
             other => panic!("expected Project, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pushdown_filter_into_scan() {
+        let stmt = crate::parser::parse(r#"SELECT * FROM "orders" WHERE key = 'a'"#).unwrap();
+        match stmt {
+            ExqlStatement::Query(q) => {
+                let p = plan(&q, EmitMode::Changes).unwrap();
+                match p {
+                    PhysicalPlan::Project { input, .. } => {
+                        match *input {
+                            PhysicalPlan::SeqScan { ref predicate, ref stream, .. } => {
+                                assert!(predicate.is_some(), "predicate should be pushed into scan");
+                                assert_eq!(stream, "orders");
+                            }
+                            other => panic!("expected SeqScan with pushed predicate, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected Project, got {other:?}"),
+                }
+            }
+            _ => panic!("expected Query"),
+        }
+    }
+
+    #[test]
+    fn no_pushdown_filter_above_join() {
+        let stmt = crate::parser::parse(
+            r#"SELECT * FROM "a" JOIN "b" ON a.key = b.key WHERE a.key = 'x'"#
+        ).unwrap();
+        match stmt {
+            ExqlStatement::Query(q) => {
+                let p = plan(&q, EmitMode::Changes).unwrap();
+                match p {
+                    PhysicalPlan::Project { input, .. } => {
+                        assert!(
+                            matches!(*input, PhysicalPlan::Filter { .. }),
+                            "filter above join should NOT be pushed down, got {:?}", *input
+                        );
+                    }
+                    other => panic!("expected Project, got {other:?}"),
+                }
+            }
+            _ => panic!("expected Query"),
         }
     }
 }

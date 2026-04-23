@@ -6,6 +6,7 @@ pub enum PhysicalPlan {
         stream: String,
         alias: Option<String>,
         required_columns: crate::planner::column_set::ColumnSet,
+        predicate: Option<crate::parser::ast::Expr>,
     },
     ExternalScan {
         connection: String,
