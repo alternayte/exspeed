@@ -708,6 +708,7 @@ where
     // Clone before moving into AppState so the leader supervisor can capture them.
     let connector_manager_for_supervisor = connector_manager.clone();
     let exql_for_supervisor = exql.clone();
+    let exql_for_tcp = exql.clone();
 
     // Readiness flag, flipped to true after the HTTP API server is spawned.
     // Until then, /readyz returns 503 with {"status":"starting"}.
@@ -1092,6 +1093,7 @@ where
                 metrics.connection_opened();
 
                 let broker = broker.clone();
+                let exql = exql_for_tcp.clone();
                 let metrics_clone = metrics.clone();
                 let metrics_for_handler = metrics.clone();
                 let credential_store_clone = credential_store.clone();
@@ -1118,6 +1120,7 @@ where
                                     tls_stream,
                                     peer,
                                     broker,
+                                    exql,
                                     credential_store_clone,
                                     metrics_for_handler,
                                     conn_token,
@@ -1128,6 +1131,7 @@ where
                                     socket,
                                     peer,
                                     broker,
+                                    exql,
                                     credential_store_clone,
                                     metrics_for_handler,
                                     conn_token,
@@ -1176,6 +1180,7 @@ async fn handle_connection<S>(
     socket: S,
     peer: SocketAddr,
     broker: Arc<Broker>,
+    exql: Arc<ExqlEngine>,
     credential_store: Option<Arc<CredentialStore>>,
     metrics: Arc<exspeed_common::Metrics>,
     cancel: CancellationToken,
@@ -1871,14 +1876,37 @@ where
                                     .send(ServerMessage::Ok.into_frame(correlation_id))
                                     .await?;
                             }
-                            Ok(ClientMessage::Query(_sql)) => {
-                                // Query execution will be wired up in a later task.
-                                let response = ServerMessage::Error {
-                                    code: 501,
-                                    message: "query not yet implemented over wire protocol".into(),
-                                }
-                                .into_frame(correlation_id);
-                                framed_write.send(response).await?;
+                            Ok(ClientMessage::Query(sql)) => {
+                                use exspeed_processing::types::value_to_json;
+
+                                let result = exql.execute_bounded(&sql).await;
+                                let response = match result {
+                                    Ok(result_set) => {
+                                        let rows: Vec<Vec<serde_json::Value>> = result_set
+                                            .rows
+                                            .iter()
+                                            .map(|row| row.values.iter().map(value_to_json).collect())
+                                            .collect();
+                                        let row_count = rows.len();
+                                        let json = serde_json::json!({
+                                            "columns": result_set.columns,
+                                            "rows": rows,
+                                            "row_count": row_count,
+                                            "execution_time_ms": result_set.execution_time_ms,
+                                        });
+                                        let payload = serde_json::to_vec(&json).unwrap();
+                                        ServerMessage::QueryResult(bytes::Bytes::from(payload))
+                                    }
+                                    Err(e) => {
+                                        let json = e.to_json();
+                                        let payload = serde_json::to_vec(&json).unwrap();
+                                        ServerMessage::Error {
+                                            code: 400,
+                                            message: String::from_utf8(payload).unwrap(),
+                                        }
+                                    }
+                                };
+                                framed_write.send(response.into_frame(correlation_id)).await?;
                             }
                             Err(e) => {
                                 warn!(%peer, "unhandled message: {}", e);

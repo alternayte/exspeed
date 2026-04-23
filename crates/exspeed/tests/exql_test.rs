@@ -522,3 +522,41 @@ async fn streaming_chained_json_access_correct() {
             .collect::<Vec<_>>()
     );
 }
+
+#[tokio::test]
+async fn tcp_query_returns_result() {
+    let (tcp, http) = start_server().await;
+
+    let records: Vec<(&str, &str)> = vec![
+        ("orders.created", r#"{"total": 100}"#),
+        ("orders.created", r#"{"total": 200}"#),
+        ("orders.created", r#"{"total": 300}"#),
+    ];
+    setup_stream("tcp_query_orders", &records, &tcp, &http).await;
+
+    let (mut reader, mut writer) = connect_to(&tcp).await;
+    let resp = send_recv(&mut writer, &mut reader, connect_frame(1)).await;
+    assert_eq!(resp.opcode, OpCode::ConnectOk);
+
+    let sql = r#"SELECT * FROM "tcp_query_orders""#;
+    let query_frame = Frame::new(OpCode::Query, 100, Bytes::from(sql.as_bytes().to_vec()));
+    let resp = send_recv(&mut writer, &mut reader, query_frame).await;
+    assert_eq!(resp.opcode, OpCode::QueryResult, "expected QueryResult, got {:?}", resp.opcode);
+
+    let body: Value = serde_json::from_slice(&resp.payload).unwrap();
+    assert_eq!(body["row_count"], 3);
+}
+
+#[tokio::test]
+async fn tcp_query_returns_error_for_invalid_sql() {
+    let (tcp, _http) = start_server().await;
+
+    let (mut reader, mut writer) = connect_to(&tcp).await;
+    let resp = send_recv(&mut writer, &mut reader, connect_frame(1)).await;
+    assert_eq!(resp.opcode, OpCode::ConnectOk);
+
+    let sql = "THIS IS NOT VALID SQL";
+    let query_frame = Frame::new(OpCode::Query, 101, Bytes::from(sql.as_bytes().to_vec()));
+    let resp = send_recv(&mut writer, &mut reader, query_frame).await;
+    assert_eq!(resp.opcode, OpCode::Error, "expected Error for invalid SQL");
+}
