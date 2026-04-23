@@ -560,3 +560,34 @@ async fn tcp_query_returns_error_for_invalid_sql() {
     let resp = send_recv(&mut writer, &mut reader, query_frame).await;
     assert_eq!(resp.opcode, OpCode::Error, "expected Error for invalid SQL");
 }
+
+#[tokio::test]
+async fn predicate_pushdown_filtered_limit_is_fast() {
+    let (tcp, http) = start_server().await;
+
+    // Publish 10k records, only 100 have status "active"
+    let records: Vec<(&str, String)> = (0..10_000)
+        .map(|i| {
+            let status = if i % 100 == 0 { "active" } else { "inactive" };
+            let json = format!(r#"{{"i": {i}, "status": "{status}"}}"#);
+            ("orders.created", json)
+        })
+        .collect();
+    setup_stream_bulk("pushdown_perf", &records, &tcp, &http).await;
+
+    // With pushdown, this should not need to scan all 10k rows
+    let start = std::time::Instant::now();
+    let result = query(
+        &http,
+        r#"SELECT * FROM "pushdown_perf" WHERE payload->>'status' = 'active' LIMIT 5"#,
+    )
+    .await;
+    let elapsed = start.elapsed();
+
+    assert_eq!(result["row_count"], 5);
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "filtered LIMIT 5 query took too long: {:?}",
+        elapsed
+    );
+}
