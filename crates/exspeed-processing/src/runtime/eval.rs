@@ -295,20 +295,39 @@ pub fn compare_values(left: &Value, right: &Value) -> Option<Ordering> {
 
 /// Access a field on a JSON value (simulates `->` / `->>` operators).
 fn eval_json_access(val: &Value, field: &str, as_text: bool) -> Value {
-    let json_val = match val {
-        Value::Json(j) => j,
-        Value::Text(s) => {
-            // Try parsing as JSON
-            match serde_json::from_str::<serde_json::Value>(s) {
-                Ok(j) => {
-                    return json_field_to_value(&j, field, as_text);
+    match val {
+        Value::Json(j) => json_field_to_value(j, field, as_text),
+        Value::RawJson(bytes) => {
+            use serde_json::value::RawValue;
+            let map: std::collections::HashMap<&str, &RawValue> =
+                match serde_json::from_slice(bytes) {
+                    Ok(m) => m,
+                    Err(_) => return Value::Null,
+                };
+            let Some(raw) = map.get(field) else {
+                return Value::Null;
+            };
+            let s = raw.get();
+            if as_text {
+                match serde_json::from_str::<serde_json::Value>(s) {
+                    Ok(serde_json::Value::String(t)) => Value::Text(t),
+                    Ok(serde_json::Value::Null) => Value::Null,
+                    Ok(other) => Value::Text(other.to_string()),
+                    Err(_) => Value::Text(s.to_string()),
                 }
-                Err(_) => return Value::Null,
+            } else {
+                match serde_json::from_str::<serde_json::Value>(s) {
+                    Ok(v) => Value::Json(v),
+                    Err(_) => Value::Null,
+                }
             }
         }
-        _ => return Value::Null,
-    };
-    json_field_to_value(json_val, field, as_text)
+        Value::Text(s) => match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(j) => json_field_to_value(&j, field, as_text),
+            Err(_) => Value::Null,
+        },
+        _ => Value::Null,
+    }
 }
 
 fn json_field_to_value(json: &serde_json::Value, field: &str, as_text: bool) -> Value {
@@ -898,5 +917,70 @@ mod tests {
             right: Box::new(Expr::Literal(LiteralValue::Int(0))),
         };
         assert_eq!(eval_expr(&expr, &row), Value::Null);
+    }
+}
+
+#[cfg(test)]
+mod json_access_raw {
+    use super::*;
+
+    fn raw(bytes: &'static [u8]) -> Value {
+        Value::RawJson(bytes::Bytes::from_static(bytes))
+    }
+
+    #[test]
+    fn raw_json_arrow_text_string_field() {
+        let v = eval_json_access(&raw(br#"{"status":"active"}"#), "status", true);
+        assert_eq!(v, Value::Text("active".into()));
+    }
+
+    #[test]
+    fn raw_json_arrow_json_object_field() {
+        let v = eval_json_access(&raw(br#"{"nested":{"a":1}}"#), "nested", false);
+        assert_eq!(v, Value::Json(serde_json::json!({"a": 1})));
+    }
+
+    #[test]
+    fn raw_json_arrow_text_nonstring_stringifies() {
+        let v = eval_json_access(&raw(br#"{"count":42}"#), "count", true);
+        assert_eq!(v, Value::Text("42".into()));
+    }
+
+    #[test]
+    fn raw_json_missing_field_is_null() {
+        let v = eval_json_access(&raw(br#"{"a":1}"#), "b", true);
+        assert_eq!(v, Value::Null);
+    }
+
+    #[test]
+    fn raw_json_null_field_arrow_text_is_null() {
+        // Postgres ->> on a JSON null returns SQL NULL, not the string "null".
+        let v = eval_json_access(&raw(br#"{"a":null}"#), "a", true);
+        assert_eq!(v, Value::Null);
+    }
+
+    #[test]
+    fn raw_json_non_object_returns_null() {
+        let v = eval_json_access(&raw(br#"[1,2,3]"#), "anything", true);
+        assert_eq!(v, Value::Null);
+    }
+
+    #[test]
+    fn raw_json_malformed_bytes_returns_null() {
+        let v = eval_json_access(&raw(b"not json"), "x", true);
+        assert_eq!(v, Value::Null);
+    }
+
+    #[test]
+    fn raw_json_chained_access() {
+        // payload->'user'->>'name' over the outer Value::RawJson
+        let step1 = eval_json_access(
+            &raw(br#"{"user":{"name":"Ada"}}"#),
+            "user",
+            false, // -> returns Json
+        );
+        // step1 should be Value::Json({"name": "Ada"})
+        let step2 = eval_json_access(&step1, "name", true);
+        assert_eq!(step2, Value::Text("Ada".into()));
     }
 }
