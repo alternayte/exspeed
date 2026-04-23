@@ -31,10 +31,10 @@ pub fn transform_statement(stmt: sp::Statement) -> Result<ExqlStatement, ParseEr
                 })
             }
         }
-        other => Err(ParseError::Unsupported(format!(
-            "statement type: {}",
-            short_stmt_name(&other)
-        ))),
+        other => Err(ParseError::Unsupported {
+            feature: format!("statement type: {}", short_stmt_name(&other)),
+            hint: "ExQL supports SELECT with WHERE, JOIN, GROUP BY, ORDER BY, LIMIT".into(),
+        }),
     }
 }
 
@@ -61,7 +61,10 @@ fn transform_query(query: sp::Query) -> Result<QueryExpr, ParseError> {
                 .map(transform_order_by_expr)
                 .collect::<Result<Vec<_>, _>>()?,
             sp::OrderByKind::All(_) => {
-                return Err(ParseError::Unsupported("ORDER BY ALL".into()));
+                return Err(ParseError::Unsupported {
+                    feature: "ORDER BY ALL".into(),
+                    hint: "ExQL supports SELECT with WHERE, JOIN, GROUP BY, ORDER BY, LIMIT".into(),
+                });
             }
         },
         None => vec![],
@@ -108,7 +111,10 @@ fn transform_query(query: sp::Query) -> Result<QueryExpr, ParseError> {
             }
             Ok(result)
         }
-        other => Err(ParseError::Unsupported(format!("query body type: {other}"))),
+        other => Err(ParseError::Unsupported {
+            feature: format!("query body type: {other}"),
+            hint: "ExQL supports SELECT with WHERE, JOIN, GROUP BY, ORDER BY, LIMIT".into(),
+        }),
     }
 }
 
@@ -146,9 +152,10 @@ fn transform_select(
         // but we can support them later. For simplicity, treat additional FROM items
         // as an error if they have joins, or merge them.
         if let Some(extra) = from_iter.next() {
-            return Err(ParseError::Unsupported(format!(
-                "multiple FROM items (implicit cross join): {extra}"
-            )));
+            return Err(ParseError::Unsupported {
+                feature: format!("multiple FROM items (implicit cross join): {extra}"),
+                hint: "ExQL supports SELECT with WHERE, JOIN, GROUP BY, ORDER BY, LIMIT".into(),
+            });
         }
 
         (from_clause, join_clauses)
@@ -164,7 +171,10 @@ fn transform_select(
             .map(transform_expr)
             .collect::<Result<Vec<_>, _>>()?,
         sp::GroupByExpr::All(_) => {
-            return Err(ParseError::Unsupported("GROUP BY ALL".into()));
+            return Err(ParseError::Unsupported {
+                feature: "GROUP BY ALL".into(),
+                hint: "ExQL supports SELECT with WHERE, JOIN, GROUP BY, ORDER BY, LIMIT".into(),
+            });
         }
     };
 
@@ -224,7 +234,10 @@ fn transform_select_item(item: sp::SelectItem) -> Result<SelectItem, ParseError>
                     Some(object_name_to_string(&name))
                 }
                 sp::SelectItemQualifiedWildcardKind::Expr(_) => {
-                    return Err(ParseError::Unsupported("expression wildcard".into()));
+                    return Err(ParseError::Unsupported {
+                        feature: "expression wildcard".into(),
+                        hint: "ExQL supports SELECT with WHERE, JOIN, GROUP BY, ORDER BY, LIMIT".into(),
+                    });
                 }
             };
             Ok(SelectItem {
@@ -309,14 +322,16 @@ fn transform_table_factor(tf: sp::TableFactor) -> Result<FromClause, ParseError>
                         driver,
                     })
                 }
-                _ => Err(ParseError::Unsupported(format!(
-                    "table function: {fn_name}"
-                ))),
+                _ => Err(ParseError::Unsupported {
+                    feature: format!("table function: {fn_name}"),
+                    hint: "ExQL supports SELECT with WHERE, JOIN, GROUP BY, ORDER BY, LIMIT".into(),
+                }),
             }
         }
-        other => Err(ParseError::Unsupported(format!(
-            "FROM clause type: {other}"
-        ))),
+        other => Err(ParseError::Unsupported {
+            feature: format!("FROM clause type: {other}"),
+            hint: "ExQL supports SELECT with WHERE, JOIN, GROUP BY, ORDER BY, LIMIT".into(),
+        }),
     }
 }
 
@@ -349,9 +364,10 @@ fn transform_table_function(
                 driver,
             })
         }
-        _ => Err(ParseError::Unsupported(format!(
-            "table function: {fn_name}"
-        ))),
+        _ => Err(ParseError::Unsupported {
+            feature: format!("table function: {fn_name}"),
+            hint: "ExQL supports SELECT with WHERE, JOIN, GROUP BY, ORDER BY, LIMIT".into(),
+        }),
     }
 }
 
@@ -385,14 +401,16 @@ fn transform_table_function_expr(
                     driver,
                 })
             }
-            _ => Err(ParseError::Unsupported(format!(
-                "TABLE function: {fn_name}"
-            ))),
+            _ => Err(ParseError::Unsupported {
+                feature: format!("TABLE function: {fn_name}"),
+                hint: "ExQL supports SELECT with WHERE, JOIN, GROUP BY, ORDER BY, LIMIT".into(),
+            }),
         }
     } else {
-        Err(ParseError::Unsupported(
-            "TABLE() with non-function expression".into(),
-        ))
+        Err(ParseError::Unsupported {
+            feature: "TABLE() with non-function expression".into(),
+            hint: "ExQL supports SELECT with WHERE, JOIN, GROUP BY, ORDER BY, LIMIT".into(),
+        })
     }
 }
 
@@ -407,17 +425,26 @@ fn transform_join(join: sp::Join) -> Result<JoinClause, ParseError> {
         sp::JoinOperator::Left(c) => (JoinType::Left, c),
         sp::JoinOperator::LeftOuter(c) => (JoinType::Left, c),
         other => {
-            return Err(ParseError::Unsupported(format!("join type: {other:?}")));
+            return Err(ParseError::Unsupported {
+                feature: format!("join type: {other:?}"),
+                hint: "ExQL supports SELECT with WHERE, JOIN, GROUP BY, ORDER BY, LIMIT".into(),
+            });
         }
     };
 
     let on_expr = match constraint {
         sp::JoinConstraint::On(expr) => transform_expr(expr)?,
         sp::JoinConstraint::Using(_) => {
-            return Err(ParseError::Unsupported("JOIN USING".into()));
+            return Err(ParseError::Unsupported {
+                feature: "JOIN USING".into(),
+                hint: "ExQL supports SELECT with WHERE, JOIN, GROUP BY, ORDER BY, LIMIT".into(),
+            });
         }
         sp::JoinConstraint::Natural => {
-            return Err(ParseError::Unsupported("NATURAL JOIN".into()));
+            return Err(ParseError::Unsupported {
+                feature: "NATURAL JOIN".into(),
+                hint: "ExQL supports SELECT with WHERE, JOIN, GROUP BY, ORDER BY, LIMIT".into(),
+            });
         }
         sp::JoinConstraint::None => {
             return Err(ParseError::Transform("JOIN without ON clause".into()));
@@ -632,9 +659,10 @@ fn transform_expr(expr: sp::Expr) -> Result<Expr, ParseError> {
             ..
         } => {
             if operand.is_some() {
-                return Err(ParseError::Unsupported(
-                    "simple CASE (CASE <operand> WHEN ...)".into(),
-                ));
+                return Err(ParseError::Unsupported {
+                    feature: "simple CASE (CASE <operand> WHEN ...)".into(),
+                    hint: "ExQL supports SELECT with WHERE, JOIN, GROUP BY, ORDER BY, LIMIT".into(),
+                });
             }
             let conds = conditions
                 .into_iter()
@@ -706,7 +734,10 @@ fn transform_expr(expr: sp::Expr) -> Result<Expr, ParseError> {
         }
 
         // Anything else
-        other => Err(ParseError::Unsupported(format!("expression type: {other}"))),
+        other => Err(ParseError::Unsupported {
+            feature: format!("expression type: {other}"),
+            hint: "ExQL supports SELECT with WHERE, JOIN, GROUP BY, ORDER BY, LIMIT".into(),
+        }),
     }
 }
 
@@ -771,7 +802,10 @@ fn transform_binary_op(op: sp::BinaryOperator) -> Result<BinaryOperator, ParseEr
         sp::BinaryOperator::Multiply => Ok(BinaryOperator::Mul),
         sp::BinaryOperator::Divide => Ok(BinaryOperator::Div),
         sp::BinaryOperator::Modulo => Ok(BinaryOperator::Mod),
-        other => Err(ParseError::Unsupported(format!("binary operator: {other}"))),
+        other => Err(ParseError::Unsupported {
+            feature: format!("binary operator: {other}"),
+            hint: "ExQL supports SELECT with WHERE, JOIN, GROUP BY, ORDER BY, LIMIT".into(),
+        }),
     }
 }
 
@@ -779,7 +813,10 @@ fn transform_unary_op(op: sp::UnaryOperator) -> Result<UnaryOperator, ParseError
     match op {
         sp::UnaryOperator::Not => Ok(UnaryOperator::Not),
         sp::UnaryOperator::Minus => Ok(UnaryOperator::Neg),
-        other => Err(ParseError::Unsupported(format!("unary operator: {other}"))),
+        other => Err(ParseError::Unsupported {
+            feature: format!("unary operator: {other}"),
+            hint: "ExQL supports SELECT with WHERE, JOIN, GROUP BY, ORDER BY, LIMIT".into(),
+        }),
     }
 }
 
@@ -806,7 +843,10 @@ fn transform_value(val: sp::Value) -> Result<Expr, ParseError> {
         sp::Value::DoubleQuotedString(s) => Ok(Expr::Literal(LiteralValue::String(s))),
         sp::Value::Boolean(b) => Ok(Expr::Literal(LiteralValue::Bool(b))),
         sp::Value::Null => Ok(Expr::Literal(LiteralValue::Null)),
-        other => Err(ParseError::Unsupported(format!("value type: {other}"))),
+        other => Err(ParseError::Unsupported {
+            feature: format!("value type: {other}"),
+            hint: "ExQL supports SELECT with WHERE, JOIN, GROUP BY, ORDER BY, LIMIT".into(),
+        }),
     }
 }
 

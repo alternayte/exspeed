@@ -24,12 +24,18 @@ pub fn parse(sql: &str) -> Result<ExqlStatement, ParseError> {
 
     let dialect = ExspeedDialect;
     let statements =
-        Parser::parse_sql(&dialect, &clean_sql).map_err(|e| ParseError::Sql(e.to_string()))?;
+        Parser::parse_sql(&dialect, &clean_sql).map_err(|e| {
+            let (message, line, column) = error::extract_position(&e.to_string());
+            ParseError::Sql { message, line, column }
+        })?;
     if statements.is_empty() {
-        return Err(ParseError::Sql("empty SQL".into()));
+        return Err(ParseError::Sql { message: "empty SQL".into(), line: 1, column: 0 });
     }
     if statements.len() > 1 {
-        return Err(ParseError::Unsupported("multiple statements".into()));
+        return Err(ParseError::Unsupported {
+            feature: "multiple statements".into(),
+            hint: "ExQL supports a single SELECT, CREATE VIEW, CREATE MATERIALIZED VIEW, or DROP STREAM per query".into(),
+        });
     }
 
     let mut stmt = transform::transform_statement(statements.into_iter().next().unwrap())?;
