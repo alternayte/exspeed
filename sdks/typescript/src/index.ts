@@ -13,6 +13,7 @@ export {
   QueueOverflowError,
   KeyCollisionError,
   DedupMapFullError,
+  QueryError,
 } from "./errors.js";
 export type {
   BrokerEndpoint,
@@ -26,6 +27,8 @@ export type {
   FetchRecord,
   SeekOptions,
   SeekResult,
+  QueryResult,
+  Value,
 } from "./types.js";
 export { OpCode } from "./protocol/opcodes.js";
 export { newMsgId } from "./msg-id.js";

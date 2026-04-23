@@ -107,3 +107,23 @@ export class QueueOverflowError extends ExspeedError {
     this.droppedCount = droppedCount;
   }
 }
+
+export class QueryError extends ExspeedError {
+  readonly code: string;
+  readonly line?: number;
+  readonly column?: number;
+  readonly hint?: string;
+
+  constructor(
+    message: string,
+    code: string,
+    options?: { line?: number; column?: number; hint?: string },
+  ) {
+    super(message);
+    this.name = "QueryError";
+    this.code = code;
+    this.line = options?.line;
+    this.column = options?.column;
+    this.hint = options?.hint;
+  }
+}

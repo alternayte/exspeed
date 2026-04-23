@@ -104,3 +104,12 @@ export interface SeekOptions {
 export interface SeekResult {
   offset: bigint;
 }
+
+export type Value = string | number | boolean | null | Record<string, unknown>;
+
+export interface QueryResult {
+  columns: string[];
+  rows: Value[][];
+  rowCount: number;
+  executionTimeMs: number;
+}
