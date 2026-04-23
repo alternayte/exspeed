@@ -60,6 +60,7 @@ bincode = { workspace = true }
 # DB-gated integration tests (Postgres + MySQL) use sqlx for fixture
 # setup/teardown. Workspace features already enable postgres + mysql + any.
 sqlx = { workspace = true }
+axum = { workspace = true }
 # MSSQL fixture setup/teardown + E2E assertions.
 tiberius = { workspace = true }
 bb8 = { workspace = true }

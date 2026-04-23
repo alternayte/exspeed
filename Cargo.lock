@@ -1305,6 +1305,7 @@ name = "exspeed"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "axum",
  "bb8",
  "bb8-tiberius",
  "bincode",
