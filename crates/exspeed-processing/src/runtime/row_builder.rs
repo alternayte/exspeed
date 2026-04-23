@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use exspeed_streams::StoredRecord;
 
 use crate::planner::column_set::ColumnSet;
@@ -65,6 +64,7 @@ pub fn stored_record_to_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use exspeed_common::Offset;
     use exspeed_streams::StoredRecord;
 
@@ -103,8 +103,7 @@ mod tests {
 
     #[test]
     fn payload_referenced_without_star_includes_only_payload() {
-        let mut cs = ColumnSet::default();
-        cs.payload_referenced = true;
+        let cs = ColumnSet { payload_referenced: true, ..ColumnSet::default() };
         let r = stored_record_to_row(&rec(br#"{"a":1}"#), None, &cs);
         assert_eq!(r.columns, vec!["payload"]);
         assert!(matches!(r.values[0], Value::RawJson(_)));
@@ -112,8 +111,7 @@ mod tests {
 
     #[test]
     fn non_utf8_payload_falls_back_to_text() {
-        let mut cs = ColumnSet::default();
-        cs.payload_referenced = true;
+        let cs = ColumnSet { payload_referenced: true, ..ColumnSet::default() };
         let r = stored_record_to_row(&rec(&[0xFF, 0xFE]), None, &cs);
         assert!(matches!(r.values[0], Value::Text(_)));
     }
