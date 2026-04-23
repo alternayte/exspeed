@@ -1,3 +1,4 @@
+pub mod column_set;
 pub mod logical;
 pub mod physical;
 
