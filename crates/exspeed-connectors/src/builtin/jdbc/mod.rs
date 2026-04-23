@@ -11,16 +11,59 @@ use async_trait::async_trait;
 use tracing::{error, info, warn};
 
 use crate::config::ConnectorConfig;
-use crate::traits::{ConnectorError, HealthStatus, SinkBatch, SinkConnector, SinkRecord, WriteResult};
+use crate::traits::{
+    ConnectorError, HealthStatus, PoisonReason, SinkBatch, SinkConnector, SinkRecord, WriteResult,
+};
 
 use self::backend::{BackendError, Param, SinkBackend};
 use self::dialect::{dialect_for, ColumnSpec, Dialect, DialectKind};
 use self::schema::{is_valid_ident, parse_schema};
 use self::sqlx_backend::SqlxBackend;
 
-enum WriteStepError {
-    Skip { reason: &'static str },
-    Halt { msg: String },
+/// Outcome of one sink step (one record, DDL, etc.) before it is turned
+/// into a `WriteResult` by the main `write` loop.
+enum StepError {
+    /// Record is fundamentally unfit for this sink — route to DLQ.
+    Poison { reason: PoisonReason },
+    /// Transient failure — whole batch retry is appropriate.
+    Transient { msg: String },
+    /// Duplicate primary key on upsert — treat as success and advance past.
+    DuplicateKeyIgnored,
+}
+
+/// Classification of a backend error for DLQ/retry routing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ErrClass {
+    DuplicateKey,
+    Poison { detail: String },
+    Transient,
+}
+
+fn classify_backend_err(err: &BackendError) -> ErrClass {
+    match err {
+        BackendError::Pool(_) | BackendError::Io(_) => ErrClass::Transient,
+        BackendError::Sql { sqlstate, message } => match sqlstate.as_str() {
+            // PK violation: Postgres 23505, MySQL 1062, MSSQL 2627.
+            "23505" | "1062" | "2627" => ErrClass::DuplicateKey,
+            // NOT NULL violation.
+            "23502" => ErrClass::Poison { detail: format!("not-null violation: {message}") },
+            // Numeric value out of range.
+            "22003" => ErrClass::Poison { detail: format!("numeric overflow: {message}") },
+            // Invalid text representation (e.g. bad timestamp parsed by DB).
+            "22P02" => ErrClass::Poison { detail: format!("invalid text: {message}") },
+            // Anything else — unknown, default to transient.
+            _ => ErrClass::Transient,
+        },
+    }
+}
+
+fn step_error_from_backend(e: &BackendError) -> StepError {
+    match classify_backend_err(e) {
+        ErrClass::DuplicateKey => StepError::DuplicateKeyIgnored,
+        ErrClass::Poison { detail } =>
+            StepError::Poison { reason: PoisonReason::SinkRejected { detail } },
+        ErrClass::Transient => StepError::Transient { msg: format!("execute failed: {e}") },
+    }
 }
 
 pub struct JdbcSinkConnector {
@@ -172,7 +215,7 @@ impl JdbcSinkConnector {
         backend: &dyn SinkBackend,
         record: &SinkRecord,
         json: &serde_json::Value,
-    ) -> Result<(), WriteStepError> {
+    ) -> Result<(), StepError> {
         let cols = ["offset", "subject", "key", "value"];
         let sql = if self.mode == "upsert" {
             self.dialect.upsert_sql(&self.table, &cols, &["offset"])
@@ -200,10 +243,10 @@ impl JdbcSinkConnector {
             value_param,
         ];
 
-        backend
-            .execute_row(&sql, &params)
-            .await
-            .map_err(backend_err_to_halt)
+        match backend.execute_row(&sql, &params).await {
+            Ok(()) => Ok(()),
+            Err(e) => Err(step_error_from_backend(&e)),
+        }
     }
 
     async fn write_typed(
@@ -212,18 +255,20 @@ impl JdbcSinkConnector {
         record: &SinkRecord,
         json: &serde_json::Value,
         cols: &[ColumnSpec],
-    ) -> Result<(), WriteStepError> {
+    ) -> Result<(), StepError> {
         use self::schema::{bind_json_as_type, BindError};
 
         let obj = match json.as_object() {
             Some(o) => o,
-            None => return Err(WriteStepError::Skip { reason: "non_object_json" }),
+            None => return Err(StepError::Poison { reason: PoisonReason::NonJsonRecord }),
         };
 
         for c in cols {
             if !c.nullable && !obj.contains_key(&c.name) {
                 warn!(offset = record.offset, field = %c.name, "jdbc sink: missing required field");
-                return Err(WriteStepError::Skip { reason: "missing_required_field" });
+                return Err(StepError::Poison {
+                    reason: PoisonReason::MissingRequiredField { field: c.name.clone() },
+                });
             }
         }
 
@@ -240,27 +285,36 @@ impl JdbcSinkConnector {
             let value = obj.get(&c.name);
             match bind_json_as_type(c, value) {
                 Ok(p) => params.push(p),
-                Err(e) => match &e {
-                    BindError::TypeMismatch { field, expected, got } => {
-                        warn!(offset = record.offset, %field, %expected, %got, "jdbc sink: type mismatch");
-                        return Err(WriteStepError::Skip { reason: "type_mismatch" });
-                    }
-                    BindError::TimestampParse { field, .. } => {
-                        warn!(offset = record.offset, %field, "jdbc sink: unparseable timestamp");
-                        return Err(WriteStepError::Skip { reason: "timestamp_parse" });
-                    }
-                    BindError::MissingRequired { field } => {
-                        warn!(offset = record.offset, %field, "jdbc sink: missing required");
-                        return Err(WriteStepError::Skip { reason: "missing_required_field" });
-                    }
-                },
+                Err(e) => {
+                    let reason = match e {
+                        BindError::TypeMismatch { field, expected, got } => {
+                            warn!(offset = record.offset, %field, %expected, %got,
+                                  "jdbc sink: type mismatch");
+                            PoisonReason::TypeMismatch {
+                                field,
+                                expected: expected.to_string(),
+                                got: got.to_string(),
+                            }
+                        }
+                        BindError::TimestampParse { field, .. } => {
+                            warn!(offset = record.offset, %field,
+                                  "jdbc sink: unparseable timestamp");
+                            PoisonReason::TimestampParseFailed { field }
+                        }
+                        BindError::MissingRequired { field } => {
+                            warn!(offset = record.offset, %field, "jdbc sink: missing required");
+                            PoisonReason::MissingRequiredField { field }
+                        }
+                    };
+                    return Err(StepError::Poison { reason });
+                }
             }
         }
 
-        backend
-            .execute_row(&sql, &params)
-            .await
-            .map_err(backend_err_to_halt)
+        match backend.execute_row(&sql, &params).await {
+            Ok(()) => Ok(()),
+            Err(e) => Err(step_error_from_backend(&e)),
+        }
     }
 
     async fn build_backend(&self) -> Result<Box<dyn SinkBackend>, ConnectorError> {
@@ -279,10 +333,6 @@ impl JdbcSinkConnector {
             }
         }
     }
-}
-
-fn backend_err_to_halt(e: BackendError) -> WriteStepError {
-    WriteStepError::Halt { msg: format!("execute failed: {e}") }
 }
 
 #[async_trait]
@@ -330,65 +380,60 @@ impl SinkConnector for JdbcSinkConnector {
         let backend = match self.backend.as_deref() {
             Some(b) => b,
             None => {
-                return Ok(WriteResult::AllFailed(
-                    "jdbc sink: backend not initialised — call start() first".into(),
-                ))
+                return Ok(WriteResult::TransientFailure {
+                    last_successful_offset: None,
+                    error: "jdbc sink: backend not initialised — call start() first".into(),
+                });
             }
         };
 
         let mut last_successful: Option<u64> = None;
-        let mut any_success = false;
-        let mut first_fail: Option<String> = None;
 
-        'records: for record in &batch.records {
+        for record in &batch.records {
             let json: serde_json::Value = match serde_json::from_slice(&record.value) {
                 Ok(v) => v,
                 Err(_) => {
-                    warn!(offset = record.offset, reason = "non_json", "jdbc sink: skipping record");
-                    self.record_skip("non_json_object");
-                    last_successful = Some(record.offset);
-                    any_success = true;
-                    continue 'records;
+                    warn!(offset = record.offset, "jdbc sink: non-JSON record");
+                    return Ok(WriteResult::Poison {
+                        last_successful_offset: last_successful,
+                        poison_offset: record.offset,
+                        reason: PoisonReason::NonJsonRecord,
+                        record: record.clone(),
+                    });
                 }
             };
 
-            let result = if let Some(cols) = self.schema_cols.clone() {
+            let step_result = if let Some(cols) = self.schema_cols.clone() {
                 self.write_typed(backend, record, &json, &cols).await
             } else {
                 self.write_blob(backend, record, &json).await
             };
 
-            match result {
-                Ok(()) => {
+            match step_result {
+                Ok(()) | Err(StepError::DuplicateKeyIgnored) => {
                     last_successful = Some(record.offset);
-                    any_success = true;
                 }
-                Err(WriteStepError::Skip { reason }) => {
-                    warn!(offset = record.offset, %reason, "jdbc sink: skipping record");
-                    self.record_skip(reason);
-                    last_successful = Some(record.offset);
-                    any_success = true;
+                Err(StepError::Poison { reason }) => {
+                    self.record_skip(reason.label());
+                    return Ok(WriteResult::Poison {
+                        last_successful_offset: last_successful,
+                        poison_offset: record.offset,
+                        reason,
+                        record: record.clone(),
+                    });
                 }
-                Err(WriteStepError::Halt { msg }) => {
+                Err(StepError::Transient { msg }) => {
                     error!(offset = record.offset, "jdbc sink: {msg}");
                     self.record_write_error("");
-                    first_fail = Some(msg);
-                    break 'records;
+                    return Ok(WriteResult::TransientFailure {
+                        last_successful_offset: last_successful,
+                        error: msg,
+                    });
                 }
             }
         }
 
-        if first_fail.is_some() {
-            if let Some(offset) = last_successful {
-                Ok(WriteResult::PartialSuccess { last_successful_offset: offset })
-            } else {
-                Ok(WriteResult::AllFailed(first_fail.unwrap_or_default()))
-            }
-        } else if any_success || batch.records.is_empty() {
-            Ok(WriteResult::AllSuccess)
-        } else {
-            Ok(WriteResult::AllFailed("no records processed".into()))
-        }
+        Ok(WriteResult::AllSuccess)
     }
 
     async fn flush(&mut self) -> Result<(), ConnectorError> {
@@ -408,6 +453,58 @@ impl SinkConnector for JdbcSinkConnector {
         } else {
             HealthStatus::Unhealthy("jdbc sink: backend not initialised".into())
         }
+    }
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+
+    fn sql(code: &str) -> BackendError {
+        BackendError::Sql { sqlstate: code.into(), message: "msg".into() }
+    }
+
+    #[test]
+    fn pg_pk_violation_is_duplicate() {
+        assert_eq!(classify_backend_err(&sql("23505")), ErrClass::DuplicateKey);
+    }
+    #[test]
+    fn mysql_pk_violation_is_duplicate() {
+        assert_eq!(classify_backend_err(&sql("1062")), ErrClass::DuplicateKey);
+    }
+    #[test]
+    fn mssql_pk_violation_is_duplicate() {
+        assert_eq!(classify_backend_err(&sql("2627")), ErrClass::DuplicateKey);
+    }
+    #[test]
+    fn not_null_is_poison() {
+        assert!(matches!(classify_backend_err(&sql("23502")), ErrClass::Poison { .. }));
+    }
+    #[test]
+    fn numeric_overflow_is_poison() {
+        assert!(matches!(classify_backend_err(&sql("22003")), ErrClass::Poison { .. }));
+    }
+    #[test]
+    fn invalid_text_is_poison() {
+        assert!(matches!(classify_backend_err(&sql("22P02")), ErrClass::Poison { .. }));
+    }
+    #[test]
+    fn unknown_code_is_transient() {
+        assert_eq!(classify_backend_err(&sql("42601")), ErrClass::Transient);
+    }
+    #[test]
+    fn pool_err_is_transient() {
+        assert_eq!(
+            classify_backend_err(&BackendError::Pool("boom".into())),
+            ErrClass::Transient
+        );
+    }
+    #[test]
+    fn io_err_is_transient() {
+        assert_eq!(
+            classify_backend_err(&BackendError::Io("boom".into())),
+            ErrClass::Transient
+        );
     }
 }
 
