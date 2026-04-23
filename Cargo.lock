@@ -1469,6 +1469,7 @@ dependencies = [
  "opentelemetry",
  "percent-encoding",
  "pgwire-replication",
+ "rand 0.8.5",
  "redis",
  "reqwest",
  "rust-s3",
