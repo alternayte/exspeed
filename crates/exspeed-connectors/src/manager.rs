@@ -17,8 +17,10 @@ use exspeed_streams::traits::StorageEngine;
 use exspeed_streams::StorageError;
 
 use crate::builtin;
-use crate::config::ConnectorConfig;
-use crate::traits::{SinkBatch, SinkRecord, WriteResult};
+use crate::config::{ConnectorConfig, OnTransientExhausted};
+use crate::dlq::DlqWriter;
+use crate::retry::RetryPolicy;
+use crate::traits::{PoisonReason, SinkBatch, SinkRecord, WriteResult};
 
 // ---------------------------------------------------------------------------
 // Status types
@@ -690,6 +692,10 @@ impl ConnectorManager {
         let poll_interval = std::time::Duration::from_millis(config.poll_interval_ms);
         let task_name = name.clone();
         let name_for_select = name.clone();
+        let retry_policy: RetryPolicy = config.retry.clone();
+        let on_transient_exhausted: OnTransientExhausted = config.on_transient_exhausted;
+        let broker_append_for_dlq = self.broker_append.clone();
+        let cfg_for_dlq = config.clone();
 
         // Insert into map before spawning
         {
@@ -710,11 +716,32 @@ impl ConnectorManager {
         // Spawn sink task
         tokio::spawn(async move {
             let name = name_for_select;
+            #[allow(deprecated)]
             let work = async move {
             // Start the sink
             if let Err(e) = sink.start().await {
                 error!(connector = task_name.as_str(), error = %e, "sink start failed");
                 return;
+            }
+
+            // Build the DLQ writer (None if dlq_stream unset).
+            let dlq_writer = match DlqWriter::from_config(
+                broker_append_for_dlq.clone(),
+                &cfg_for_dlq,
+            ) {
+                Ok(w) => w,
+                Err(e) => {
+                    error!(connector = task_name.as_str(), error = %e,
+                           "DLQ writer init failed");
+                    return;
+                }
+            };
+            if let Some(w) = &dlq_writer {
+                if let Err(e) = broker_append_for_dlq.ensure_stream(w.stream()).await {
+                    error!(connector = task_name.as_str(), error = %e,
+                           "DLQ stream auto-create failed");
+                    return;
+                }
             }
 
             // Load last sink offset
@@ -765,63 +792,197 @@ impl ConnectorManager {
                     })
                     .collect();
 
-                if !filtered.is_empty() {
-                    // Convert to SinkRecords
-                    let sink_records: Vec<SinkRecord> = filtered
-                        .iter()
-                        .map(|r| SinkRecord {
-                            offset: r.offset.0,
-                            timestamp: r.timestamp,
-                            subject: r.subject.clone(),
-                            key: r.key.clone(),
-                            value: r.value.clone(),
-                            headers: r.headers.clone(),
-                        })
-                        .collect();
+                if filtered.is_empty() {
+                    current_offset = new_offset;
+                    if let Err(e) = offset_store.save_sink_offset(&task_name, current_offset).await {
+                        error!(connector = task_name.as_str(), error = %e, "failed to save sink offset");
+                    }
+                    continue;
+                }
 
-                    let batch = SinkBatch {
-                        records: sink_records,
-                    };
+                // Convert to SinkRecords
+                let sink_records: Vec<SinkRecord> = filtered
+                    .iter()
+                    .map(|r| SinkRecord {
+                        offset: r.offset.0,
+                        timestamp: r.timestamp,
+                        subject: r.subject.clone(),
+                        key: r.key.clone(),
+                        value: r.value.clone(),
+                        headers: r.headers.clone(),
+                    })
+                    .collect();
 
+                // Inner retry loop. Rebuilds the batch each attempt.
+                let mut attempt: u32 = 0;
+                'retry: loop {
+                    let batch = SinkBatch { records: sink_records.clone() };
                     match sink.write(batch).await {
                         Ok(WriteResult::AllSuccess) => {
                             metrics.record_consume(&stream_str, &task_name);
+                            current_offset = new_offset;
+                            break 'retry;
                         }
-                        Ok(WriteResult::PartialSuccess {
-                            last_successful_offset,
-                        }) => {
-                            warn!(
-                                connector = task_name.as_str(),
-                                last_offset = last_successful_offset,
-                                "partial write success"
-                            );
-                            // Only advance to after the last successful record
-                            let partial_offset = last_successful_offset + 1;
-                            if let Err(e) = offset_store.save_sink_offset(&task_name, partial_offset).await {
-                                error!(connector = task_name.as_str(), error = %e, "failed to save sink offset");
+                        Ok(WriteResult::PartialSuccess { last_successful_offset }) => {
+                            warn!(connector = task_name.as_str(),
+                                  last_offset = last_successful_offset,
+                                  "partial write success");
+                            current_offset = last_successful_offset + 1;
+                            break 'retry;
+                        }
+                        Ok(WriteResult::Poison { poison_offset, reason, record, .. }) => {
+                            match &dlq_writer {
+                                Some(dlq) => {
+                                    match dlq.write(&record, &reason).await {
+                                        Ok(()) => {
+                                            metrics.connector_dlq_total.add(1, &[
+                                                opentelemetry::KeyValue::new(
+                                                    "connector", task_name.to_string()),
+                                                opentelemetry::KeyValue::new(
+                                                    "reason", reason.label()),
+                                            ]);
+                                        }
+                                        Err(e) => {
+                                            error!(connector = task_name.as_str(),
+                                                   error = %e,
+                                                   "DLQ write failed; advancing anyway");
+                                            metrics.connector_dlq_failures_total.add(1, &[
+                                                opentelemetry::KeyValue::new(
+                                                    "connector", task_name.to_string()),
+                                            ]);
+                                        }
+                                    }
+                                }
+                                None => {
+                                    metrics.connector_records_skipped_total.add(1, &[
+                                        opentelemetry::KeyValue::new(
+                                            "connector", task_name.to_string()),
+                                        opentelemetry::KeyValue::new(
+                                            "stream", stream_str.clone()),
+                                        opentelemetry::KeyValue::new(
+                                            "reason", reason.label()),
+                                    ]);
+                                }
                             }
-                            current_offset = partial_offset;
-                            continue;
+                            current_offset = poison_offset + 1;
+                            break 'retry;
                         }
-                        Ok(WriteResult::AllFailed(msg)) => {
-                            error!(connector = task_name.as_str(), error = %msg, "all records failed to write");
-                            tokio::time::sleep(poll_interval).await;
-                            continue;
+                        Ok(WriteResult::TransientFailure { error, .. })
+                        | Ok(WriteResult::AllFailed(error)) => {
+                            match retry_policy.delay_for(attempt) {
+                                Some(d) => {
+                                    warn!(connector = task_name.as_str(),
+                                          attempt, backoff_ms = d.as_millis() as u64,
+                                          error = %error,
+                                          "transient failure; retrying");
+                                    tokio::time::sleep(d).await;
+                                    attempt += 1;
+                                    continue 'retry;
+                                }
+                                None => {
+                                    metrics.connector_retry_attempts_total.add(1, &[
+                                        opentelemetry::KeyValue::new(
+                                            "connector", task_name.to_string()),
+                                        opentelemetry::KeyValue::new("outcome", "exhausted"),
+                                    ]);
+                                    match on_transient_exhausted {
+                                        OnTransientExhausted::Halt => {
+                                            error!(connector = task_name.as_str(),
+                                                   error = %error,
+                                                   "transient retries exhausted; halting");
+                                            metrics.connector_transient_exhausted_total.add(1, &[
+                                                opentelemetry::KeyValue::new(
+                                                    "connector", task_name.to_string()),
+                                                opentelemetry::KeyValue::new("action", "halt"),
+                                            ]);
+                                            return;
+                                        }
+                                        OnTransientExhausted::DlqBatch if dlq_writer.is_some() => {
+                                            let dlq = dlq_writer.as_ref().unwrap();
+                                            for rec in &sink_records {
+                                                let reason = PoisonReason::SinkRejected {
+                                                    detail: format!(
+                                                        "transient-retry-exhausted: {error}")
+                                                };
+                                                if let Err(e) = dlq.write(rec, &reason).await {
+                                                    error!(connector = task_name.as_str(),
+                                                           error = %e,
+                                                           "dlq_batch write failed");
+                                                    metrics.connector_dlq_failures_total.add(1, &[
+                                                        opentelemetry::KeyValue::new(
+                                                            "connector", task_name.to_string()),
+                                                    ]);
+                                                } else {
+                                                    metrics.connector_dlq_total.add(1, &[
+                                                        opentelemetry::KeyValue::new(
+                                                            "connector", task_name.to_string()),
+                                                        opentelemetry::KeyValue::new(
+                                                            "reason", "sink_rejected"),
+                                                    ]);
+                                                }
+                                            }
+                                            metrics.connector_transient_exhausted_total.add(1, &[
+                                                opentelemetry::KeyValue::new(
+                                                    "connector", task_name.to_string()),
+                                                opentelemetry::KeyValue::new(
+                                                    "action", "dlq_batch"),
+                                            ]);
+                                            current_offset = new_offset;
+                                            break 'retry;
+                                        }
+                                        OnTransientExhausted::DlqBatch => {
+                                            error!(connector = task_name.as_str(),
+                                                   "dlq_batch requested but dlq_stream unset; halting");
+                                            metrics.connector_transient_exhausted_total.add(1, &[
+                                                opentelemetry::KeyValue::new(
+                                                    "connector", task_name.to_string()),
+                                                opentelemetry::KeyValue::new(
+                                                    "action", "halt_no_dlq"),
+                                            ]);
+                                            return;
+                                        }
+                                        OnTransientExhausted::LoopForever => {
+                                            warn!(connector = task_name.as_str(),
+                                                  error = %error,
+                                                  "transient retries exhausted; looping");
+                                            metrics.connector_transient_exhausted_total.add(1, &[
+                                                opentelemetry::KeyValue::new(
+                                                    "connector", task_name.to_string()),
+                                                opentelemetry::KeyValue::new(
+                                                    "action", "loop_forever"),
+                                            ]);
+                                            tokio::time::sleep(poll_interval).await;
+                                            attempt = 0;
+                                            continue 'retry;
+                                        }
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
-                            error!(connector = task_name.as_str(), error = %e, "sink write error");
-                            tokio::time::sleep(poll_interval).await;
-                            continue;
+                            error!(connector = task_name.as_str(),
+                                   error = %e, "sink write ConnectorError");
+                            match retry_policy.delay_for(attempt) {
+                                Some(d) => {
+                                    tokio::time::sleep(d).await;
+                                    attempt += 1;
+                                    continue 'retry;
+                                }
+                                None => {
+                                    error!(connector = task_name.as_str(),
+                                           error = %e,
+                                           "ConnectorError retries exhausted; halting");
+                                    return;
+                                }
+                            }
                         }
                     }
-                }
+                } // end 'retry
 
-                // Advance past all records we read (including filtered-out ones)
-                current_offset = new_offset;
-
-                // Persist sink offset
+                // Persist sink offset after each successful inner-loop exit.
                 if let Err(e) = offset_store.save_sink_offset(&task_name, current_offset).await {
-                    error!(connector = task_name.as_str(), error = %e, "failed to save sink offset");
+                    error!(connector = task_name.as_str(), error = %e,
+                           "failed to save sink offset");
                 }
             }
             }; // end of `work` async block

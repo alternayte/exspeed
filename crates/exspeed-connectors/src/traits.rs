@@ -73,6 +73,26 @@ pub struct SinkBatch {
 pub enum WriteResult {
     AllSuccess,
     PartialSuccess { last_successful_offset: u64 },
+    /// A single record is unrecoverable. Manager routes to DLQ (if configured)
+    /// and advances past `poison_offset`. Prior records in the same batch were
+    /// already written by the sink (it returns `Poison` after completing
+    /// partial work up to `last_successful_offset`).
+    Poison {
+        last_successful_offset: Option<u64>,
+        poison_offset: u64,
+        reason: PoisonReason,
+        record: SinkRecord,
+    },
+    /// Whole-batch transient failure. Manager applies `RetryPolicy`; exhaustion
+    /// dispatches on `on_transient_exhausted`.
+    TransientFailure {
+        last_successful_offset: Option<u64>,
+        error: String,
+    },
+    /// DEPRECATED: kept for compatibility during sink migration. New sinks
+    /// must return `TransientFailure` or `Poison` instead. Removed once all
+    /// builtin sinks are migrated.
+    #[deprecated(note = "use TransientFailure or Poison")]
     AllFailed(String),
 }
 
