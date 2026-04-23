@@ -5,6 +5,7 @@ pub enum PhysicalPlan {
     SeqScan {
         stream: String,
         alias: Option<String>,
+        required_columns: crate::planner::column_set::ColumnSet,
     },
     ExternalScan {
         connection: String,

@@ -11,7 +11,7 @@ use physical::PhysicalPlan;
 pub fn plan(query: &QueryExpr, emit_mode: EmitMode) -> Result<PhysicalPlan, ParseError> {
     let logical = build_logical(query, emit_mode)?;
     let physical = to_physical(logical);
-    Ok(physical)
+    Ok(annotate_scans(physical))
 }
 
 // ---------------------------------------------------------------------------
@@ -191,7 +191,11 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
 
 fn to_physical(logical: LogicalPlan) -> PhysicalPlan {
     match logical {
-        LogicalPlan::Scan { stream, alias } => PhysicalPlan::SeqScan { stream, alias },
+        LogicalPlan::Scan { stream, alias } => PhysicalPlan::SeqScan {
+            stream,
+            alias,
+            required_columns: crate::planner::column_set::ColumnSet::default(),
+        },
         LogicalPlan::ExternalScan {
             connection,
             table,
@@ -270,6 +274,104 @@ fn to_physical(logical: LogicalPlan) -> PhysicalPlan {
             limit,
             offset,
         },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Annotation pass: populate SeqScan::required_columns
+// ---------------------------------------------------------------------------
+
+use crate::planner::column_set::{collect_columns, collect_from_projection, ColumnSet};
+
+/// Walk the plan tree and populate each `SeqScan`'s `required_columns` with
+/// the columns that the tree above it actually references.
+pub fn annotate_scans(plan: PhysicalPlan) -> PhysicalPlan {
+    annotate_with_seed(plan, ColumnSet::default())
+}
+
+fn annotate_with_seed(plan: PhysicalPlan, seed: ColumnSet) -> PhysicalPlan {
+    match plan {
+        PhysicalPlan::SeqScan { stream, alias, .. } => {
+            PhysicalPlan::SeqScan { stream, alias, required_columns: seed }
+        }
+        PhysicalPlan::ExternalScan { .. } => plan,
+        PhysicalPlan::Filter { input, predicate } => {
+            let mut cs = seed;
+            collect_columns(&predicate, &mut cs);
+            PhysicalPlan::Filter {
+                input: Box::new(annotate_with_seed(*input, cs)),
+                predicate,
+            }
+        }
+        PhysicalPlan::Project { input, items } => {
+            // Above a Project the scan's columns aren't visible. Discard the
+            // seed and start fresh from this projection's references.
+            let mut cs = ColumnSet::default();
+            collect_from_projection(&items, &mut cs);
+            PhysicalPlan::Project {
+                input: Box::new(annotate_with_seed(*input, cs)),
+                items,
+            }
+        }
+        PhysicalPlan::Sort { input, order_by } => {
+            let mut cs = seed;
+            for key in &order_by {
+                collect_columns(&key.expr, &mut cs);
+            }
+            PhysicalPlan::Sort {
+                input: Box::new(annotate_with_seed(*input, cs)),
+                order_by,
+            }
+        }
+        PhysicalPlan::Limit { input, limit, offset } => {
+            PhysicalPlan::Limit {
+                input: Box::new(annotate_with_seed(*input, seed)),
+                limit,
+                offset,
+            }
+        }
+        PhysicalPlan::HashAggregate { input, group_by, select_items } => {
+            // Only the GROUP BY keys are needed from the scan; aggregate function
+            // arguments (e.g. the `*` in count(*)) are evaluated after grouping
+            // and do not imply scan-level column reads.
+            let mut cs = ColumnSet::default();
+            for g in &group_by { collect_columns(g, &mut cs); }
+            PhysicalPlan::HashAggregate {
+                input: Box::new(annotate_with_seed(*input, cs)),
+                group_by,
+                select_items,
+            }
+        }
+        PhysicalPlan::WindowedAggregate {
+            input, window_size, group_by, select_items, emit_mode,
+        } => {
+            // Same logic as HashAggregate: only GROUP BY keys reference scan columns.
+            let mut cs = ColumnSet::default();
+            for g in &group_by { collect_columns(g, &mut cs); }
+            PhysicalPlan::WindowedAggregate {
+                input: Box::new(annotate_with_seed(*input, cs)),
+                window_size, group_by, select_items, emit_mode,
+            }
+        }
+        PhysicalPlan::HashJoin { left, right, on, join_type } => {
+            let mut cs = ColumnSet::default();
+            collect_columns(&on, &mut cs);
+            PhysicalPlan::HashJoin {
+                left: Box::new(annotate_with_seed(*left, cs.clone())),
+                right: Box::new(annotate_with_seed(*right, cs)),
+                on,
+                join_type,
+            }
+        }
+        PhysicalPlan::StreamStreamJoin { left, right, on, within, join_type } => {
+            let mut cs = ColumnSet::default();
+            collect_columns(&on, &mut cs);
+            PhysicalPlan::StreamStreamJoin {
+                left: Box::new(annotate_with_seed(*left, cs.clone())),
+                right: Box::new(annotate_with_seed(*right, cs)),
+                on, within, join_type,
+            }
+        }
     }
 }
 
@@ -658,5 +760,69 @@ mod tests {
             }
             other => panic!("expected Project, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod annotate_tests {
+    use super::*;
+    use crate::parser::parse;
+    use crate::parser::ast::{EmitMode, ExqlStatement};
+    use crate::planner::column_set::ColumnSet;
+    use crate::planner::physical::PhysicalPlan;
+
+    // Note: `plan()` returns `Result<PhysicalPlan, ParseError>` (not ExqlError).
+    fn plan_for(sql: &str) -> PhysicalPlan {
+        let stmt = parse(sql).expect("parse");
+        let q = match stmt {
+            ExqlStatement::Query(q) => q,
+            _ => panic!("expected SELECT"),
+        };
+        plan(&q, EmitMode::Changes).expect("plan")
+    }
+
+    fn find_scan(plan: &PhysicalPlan) -> &ColumnSet {
+        match plan {
+            PhysicalPlan::SeqScan { required_columns, .. } => required_columns,
+            PhysicalPlan::Filter { input, .. }
+            | PhysicalPlan::Project { input, .. }
+            | PhysicalPlan::Sort { input, .. }
+            | PhysicalPlan::Limit { input, .. }
+            | PhysicalPlan::HashAggregate { input, .. }
+            | PhysicalPlan::WindowedAggregate { input, .. } => find_scan(input),
+            _ => panic!("no SeqScan reachable"),
+        }
+    }
+
+    #[test]
+    fn select_star_marks_everything() {
+        let p = plan_for("SELECT * FROM events LIMIT 5");
+        let cs = find_scan(&p);
+        assert!(cs.select_star);
+        assert!(cs.payload_referenced);
+    }
+
+    #[test]
+    fn select_offset_only_skips_payload() {
+        let p = plan_for("SELECT offset FROM events");
+        let cs = find_scan(&p);
+        assert!(!cs.payload_referenced);
+        assert!(cs.virtual_cols.contains("offset"));
+    }
+
+    #[test]
+    fn where_on_payload_marks_payload() {
+        let p = plan_for("SELECT offset FROM events WHERE payload->>'status' = 'ok'");
+        let cs = find_scan(&p);
+        assert!(cs.payload_referenced);
+        assert!(cs.virtual_cols.contains("offset"));
+    }
+
+    #[test]
+    fn group_by_collects_only_group_keys() {
+        let p = plan_for("SELECT key, count(*) FROM events GROUP BY key");
+        let cs = find_scan(&p);
+        assert!(cs.virtual_cols.contains("key"));
+        assert!(!cs.payload_referenced);
     }
 }

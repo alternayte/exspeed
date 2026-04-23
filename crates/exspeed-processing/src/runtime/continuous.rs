@@ -624,7 +624,7 @@ fn decompose_plan(plan: &PhysicalPlan) -> Result<ContinuousPipeline, String> {
                 filter = Some(predicate.clone());
                 current = input;
             }
-            PhysicalPlan::SeqScan { stream, alias } => {
+            PhysicalPlan::SeqScan { stream, alias, .. } => {
                 source_stream = Some((stream.clone(), alias.clone()));
                 break;
             }
@@ -723,7 +723,7 @@ fn decompose_plan(plan: &PhysicalPlan) -> Result<ContinuousPipeline, String> {
 
 fn extract_seq_scan(plan: &PhysicalPlan) -> Result<(String, Option<String>), String> {
     match plan {
-        PhysicalPlan::SeqScan { stream, alias } => Ok((stream.clone(), alias.clone())),
+        PhysicalPlan::SeqScan { stream, alias, .. } => Ok((stream.clone(), alias.clone())),
         _ => Err("continuous query joins only support direct stream scans".into()),
     }
 }
