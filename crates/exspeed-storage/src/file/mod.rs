@@ -509,23 +509,49 @@ impl FileStorage {
                 .ok_or_else(|| StorageError::StreamNotFound(stream.clone()))?
         };
 
-        // We're inside spawn_blocking — use blocking_lock to acquire the tokio Mutex.
-        let part = tokio::task::block_in_place(|| part_arc.blocking_lock());
+        // Brief critical section: validate offsets, sync active writer,
+        // and snapshot the readers we need. The lock is released before
+        // any file I/O so that metadata methods (try_lock) aren't starved.
+        let (sealed_readers, active_path) = {
+            let part = tokio::task::block_in_place(|| part_arc.blocking_lock());
 
-        // Refuse to silently skip over trimmed-away history. `from < earliest`
-        // indicates the consumer is behind the retention window — they must
-        // explicitly re-seek. Tailing past `next` is still legal (empty Ok).
-        let earliest = part.earliest_offset();
-        let next = part.next_offset();
-        if from.0 < earliest && from.0 < next {
-            return Err(StorageError::OffsetOutOfRange {
-                requested: from.0,
-                earliest,
-            });
+            let earliest = part.earliest_offset();
+            let next = part.next_offset();
+            if from.0 < earliest && from.0 < next {
+                return Err(StorageError::OffsetOutOfRange {
+                    requested: from.0,
+                    earliest,
+                });
+            }
+
+            part.sync_active().map_err(StorageError::Io)?;
+            (part.sealed_readers().clone(), part.active_path())
+        };
+
+        // File I/O without holding the partition lock.
+        let mut result = Vec::new();
+        let mut remaining = max_records;
+
+        for reader in &sealed_readers {
+            if remaining == 0 {
+                break;
+            }
+            let records = reader.read_from(from.0, remaining).map_err(StorageError::Io)?;
+            remaining -= records.len();
+            result.extend(records);
         }
 
-        let records = part.read(from, max_records)?;
-        Ok(records)
+        if remaining > 0 {
+            let active_reader =
+                crate::file::segment_reader::SegmentReader::open(&active_path)
+                    .map_err(StorageError::Io)?;
+            let records = active_reader
+                .read_from(from.0, remaining)
+                .map_err(StorageError::Io)?;
+            result.extend(records);
+        }
+
+        Ok(result)
     }
 
     fn seek_by_time_sync(

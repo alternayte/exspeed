@@ -455,6 +455,21 @@ impl Partition {
         self.next_offset
     }
 
+    /// Flush buffered writes in the active segment so readers see them.
+    pub fn sync_active(&self) -> std::io::Result<()> {
+        self.active_writer.sync()
+    }
+
+    /// Snapshot of the sealed segment readers (cheap Clone via derive).
+    pub fn sealed_readers(&self) -> &Vec<SegmentReader> {
+        &self.sealed_readers
+    }
+
+    /// Path to the active segment file.
+    pub fn active_path(&self) -> std::path::PathBuf {
+        self.active_writer.path().to_path_buf()
+    }
+
     /// Return the earliest retained offset across sealed and active segments.
     ///
     /// Returns 0 when no records have ever been written (or `next_offset == 0`).

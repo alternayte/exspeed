@@ -19,7 +19,7 @@ use crate::file::time_index::TimeIndex;
 /// When companion index files (`.idx`, `.tix`) exist alongside the segment,
 /// they are loaded automatically and used to accelerate lookups. Segments
 /// without index files fall back to sequential scanning.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SegmentReader {
     path: PathBuf,
     base_offset: u64,

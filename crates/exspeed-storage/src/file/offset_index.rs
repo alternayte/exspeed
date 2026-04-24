@@ -19,7 +19,7 @@ pub const EMPTY_OFFSET: u64 = u64::MAX;
 /// Maps logical stream offset (`u64`) to the byte position of that record
 /// within a segment file (`u32`). Uses open addressing with linear probing
 /// at a load factor of ~0.77 (slot_count = ceil(entries * 1.3)).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OffsetIndex {
     #[allow(dead_code)]
     path: PathBuf,
