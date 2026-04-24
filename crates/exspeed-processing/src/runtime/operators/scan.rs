@@ -33,6 +33,7 @@ struct StreamingState {
     alias: Option<String>,
     required: ColumnSet,
     predicate: Option<Expr>,
+    key_eq_filter: Option<String>,
     cursor: Offset,
     buf: VecDeque<Row>,
     exhausted: bool,
@@ -75,6 +76,7 @@ impl ScanOperator {
         required: ColumnSet,
         predicate: Option<Expr>,
         start: Offset,
+        key_eq_filter: Option<String>,
     ) -> Self {
         let column_names = {
             use exspeed_streams::StoredRecord;
@@ -95,6 +97,7 @@ impl ScanOperator {
                 alias,
                 required,
                 predicate,
+                key_eq_filter,
                 cursor: start,
                 buf: VecDeque::new(),
                 exhausted: false,
@@ -112,7 +115,7 @@ impl ScanOperator {
         required: ColumnSet,
         predicate: Option<Expr>,
     ) -> Self {
-        Self::streaming_from(storage, stream, alias, required, predicate, Offset(0))
+        Self::streaming_from(storage, stream, alias, required, predicate, Offset(0), None)
     }
 
     /// Construct a streaming scan that pulls batches from storage on demand.
@@ -231,7 +234,11 @@ impl Operator for ScanOperator {
                 }
                 let batch = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current()
-                        .block_on(s.storage.read(&s.stream, s.cursor, BATCH_SIZE))
+                        .block_on(if let Some(ref kf) = s.key_eq_filter {
+                            s.storage.read_with_hints(&s.stream, s.cursor, BATCH_SIZE, Some(kf.as_str()))
+                        } else {
+                            s.storage.read(&s.stream, s.cursor, BATCH_SIZE)
+                        })
                 });
                 let batch = match batch {
                     Ok(b) => b,

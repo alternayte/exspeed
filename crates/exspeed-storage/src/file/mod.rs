@@ -556,6 +556,69 @@ impl FileStorage {
         Ok(result)
     }
 
+    fn read_with_hints_sync(
+        &self,
+        stream: &StreamName,
+        from: Offset,
+        max_records: usize,
+        key_filter: Option<&str>,
+    ) -> Result<Vec<StoredRecord>, StorageError> {
+        let part_arc = {
+            let key = (stream.as_str().to_string(), 0u32);
+            self.inner
+                .partitions
+                .get(&key)
+                .map(|r| r.value().clone())
+                .ok_or_else(|| StorageError::StreamNotFound(stream.clone()))?
+        };
+
+        let (sealed_readers, active_path) = {
+            let part = tokio::task::block_in_place(|| part_arc.blocking_lock());
+
+            let earliest = part.earliest_offset();
+            let next = part.next_offset();
+            if from.0 < earliest && from.0 < next {
+                return Err(StorageError::OffsetOutOfRange {
+                    requested: from.0,
+                    earliest,
+                });
+            }
+
+            part.sync_active().map_err(StorageError::Io)?;
+            (part.sealed_readers().clone(), part.active_path())
+        };
+
+        let mut result = Vec::new();
+        let mut remaining = max_records;
+
+        for reader in &sealed_readers {
+            if remaining == 0 {
+                break;
+            }
+            // Bloom filter check: skip segment if key definitely not present
+            if let Some(key) = key_filter {
+                if !reader.might_contain_key(key.as_bytes()) {
+                    continue;
+                }
+            }
+            let records = reader.read_from(from.0, remaining).map_err(StorageError::Io)?;
+            remaining -= records.len();
+            result.extend(records);
+        }
+
+        if remaining > 0 {
+            let active_reader =
+                crate::file::segment_reader::SegmentReader::open(&active_path)
+                    .map_err(StorageError::Io)?;
+            let records = active_reader
+                .read_from(from.0, remaining)
+                .map_err(StorageError::Io)?;
+            result.extend(records);
+        }
+
+        Ok(result)
+    }
+
     fn seek_by_time_sync(
         &self,
         stream: &StreamName,
@@ -703,6 +766,23 @@ impl StorageEngine for FileStorage {
         tokio::task::spawn_blocking(move || this.read_sync(&stream, from, max_records))
             .await
             .map_err(|e| StorageError::Io(std::io::Error::other(e)))?
+    }
+
+    async fn read_with_hints(
+        &self,
+        stream: &StreamName,
+        from: Offset,
+        max_records: usize,
+        key_filter: Option<&str>,
+    ) -> Result<Vec<StoredRecord>, StorageError> {
+        let this = self.clone();
+        let stream = stream.clone();
+        let key_filter = key_filter.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || {
+            this.read_with_hints_sync(&stream, from, max_records, key_filter.as_deref())
+        })
+        .await
+        .map_err(|e| StorageError::Io(std::io::Error::other(e)))?
     }
 
     async fn seek_by_time(

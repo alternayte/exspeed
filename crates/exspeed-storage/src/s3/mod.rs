@@ -191,6 +191,24 @@ impl StorageEngine for S3TieredStorage {
         }
     }
 
+    async fn read_with_hints(
+        &self,
+        stream: &StreamName,
+        from: Offset,
+        max_records: usize,
+        key_filter: Option<&str>,
+    ) -> Result<Vec<StoredRecord>, StorageError> {
+        // Delegate to local storage which handles bloom filter skipping.
+        // S3 fetch-on-miss is not wired for hinted reads yet — if local
+        // returns empty we fall back to the unhinted S3-aware read path.
+        match self.local.read_with_hints(stream, from, max_records, key_filter).await {
+            Ok(records) if !records.is_empty() => Ok(records),
+            Ok(_empty) => self.read(stream, from, max_records).await,
+            Err(StorageError::StreamNotFound(_)) => self.read(stream, from, max_records).await,
+            other => other,
+        }
+    }
+
     async fn seek_by_time(
         &self,
         stream: &StreamName,

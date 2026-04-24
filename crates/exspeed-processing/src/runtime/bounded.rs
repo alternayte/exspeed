@@ -108,7 +108,7 @@ fn build_operator<'a>(
 ) -> BuildOperatorFuture<'a> {
     Box::pin(async move {
     match plan {
-        PhysicalPlan::SeqScan { stream, alias, required_columns, predicate, reverse_limit, timestamp_lower_bound, key_eq_filter: _ } => {
+        PhysicalPlan::SeqScan { stream, alias, required_columns, predicate, reverse_limit, timestamp_lower_bound, key_eq_filter } => {
             // Check materialized views first
             if let Some(mv_reg) = mv_registry {
                 if let Some((_columns, rows)) = mv_reg.get_rows(stream) {
@@ -144,6 +144,7 @@ fn build_operator<'a>(
                     required_columns.clone(),
                     predicate.clone(),
                     start,
+                    key_eq_filter.clone(),
                 )) as Box<dyn Operator>)
             }
         }

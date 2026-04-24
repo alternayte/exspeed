@@ -106,6 +106,22 @@ pub trait StorageEngine: Send + Sync {
         None
     }
 
+    /// Read records with optional hints that allow storage-level optimisations.
+    ///
+    /// When `key_filter` is `Some`, the engine MAY skip segments whose bloom
+    /// filter proves the key is absent.  The default implementation ignores
+    /// the hint and delegates to [`read`].
+    async fn read_with_hints(
+        &self,
+        stream: &StreamName,
+        from: Offset,
+        max_records: usize,
+        key_filter: Option<&str>,
+    ) -> Result<Vec<StoredRecord>, StorageError> {
+        let _ = key_filter;
+        self.read(stream, from, max_records).await
+    }
+
     /// Append N records. Default implementation serializes via `append`;
     /// FileStorage overrides this to use a single WAL batch.
     async fn append_batch(
