@@ -83,10 +83,11 @@ impl CacheTracker {
 
             let seg_path = &entry.seg_path;
 
-            // Remove .seg / .idx / .tix files (best-effort).
+            // Remove .seg / .idx / .tix / .bloom files (best-effort).
             let _ = std::fs::remove_file(seg_path);
             let _ = std::fs::remove_file(seg_path.with_extension("idx"));
             let _ = std::fs::remove_file(seg_path.with_extension("tix"));
+            let _ = std::fs::remove_file(seg_path.with_extension("bloom"));
 
             info!(
                 stream = %lru_key.0,

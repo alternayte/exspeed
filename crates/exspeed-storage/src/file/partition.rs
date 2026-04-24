@@ -14,6 +14,7 @@ use tracing::{error, info};
 
 use crate::file::io_errors::is_storage_full;
 
+use crate::file::bloom_filter::BloomFilter;
 use crate::file::offset_index::OffsetIndex;
 use crate::file::segment_reader::SegmentReader;
 use crate::file::segment_syncer::SegmentSyncerHandle;
@@ -399,6 +400,7 @@ impl Partition {
         let _ = fs::remove_file(&seg_path);
         let _ = fs::remove_file(seg_path.with_extension("idx"));
         let _ = fs::remove_file(seg_path.with_extension("tix"));
+        let _ = fs::remove_file(seg_path.with_extension("bloom"));
 
         stats.segments_deleted += 1;
         stats.bytes_reclaimed += size;
@@ -664,6 +666,7 @@ impl Partition {
         let _ = fs::remove_file(&active_path);
         let _ = fs::remove_file(active_path.with_extension("idx"));
         let _ = fs::remove_file(active_path.with_extension("tix"));
+        let _ = fs::remove_file(active_path.with_extension("bloom"));
         stats.bytes_reclaimed += old_active_size;
 
         // ── Step 5: Build the new active segment and replay. ──────────────
@@ -673,6 +676,7 @@ impl Partition {
         let _ = fs::remove_file(&placeholder_path);
         let _ = fs::remove_file(placeholder_path.with_extension("idx"));
         let _ = fs::remove_file(placeholder_path.with_extension("tix"));
+        let _ = fs::remove_file(placeholder_path.with_extension("bloom"));
 
         for stored in &replay_records {
             let record = Record {
@@ -809,6 +813,17 @@ impl Partition {
             .collect();
         let tix_path = seg_path.with_extension("tix");
         TimeIndex::build(&tix_path, &time_entries, time_index::DEFAULT_INTERVAL)?;
+
+        // Build bloom filter (.bloom) for record keys.
+        let bloom_path = seg_path.with_extension("bloom");
+        let all_records = reader.read_all()?;
+        let keys: Vec<&[u8]> = all_records
+            .iter()
+            .filter_map(|r| r.key.as_ref().map(|k| k.as_ref()))
+            .collect();
+        if !keys.is_empty() {
+            let _ = BloomFilter::build(&bloom_path, &keys);
+        }
 
         Ok(())
     }

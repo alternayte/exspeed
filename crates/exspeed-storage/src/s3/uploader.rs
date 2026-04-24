@@ -168,7 +168,7 @@ async fn upload_with_retry(
     unreachable!()
 }
 
-/// Upload `.seg`, `.idx`, and `.tix` companion files for the given segment.
+/// Upload `.seg`, `.idx`, `.tix`, and `.bloom` companion files for the given segment.
 async fn upload_segment_files(
     bucket: &Bucket,
     prefix: &str,
@@ -177,6 +177,7 @@ async fn upload_segment_files(
     let seg_path = &info.seg_path;
     let idx_path = seg_path.with_extension("idx");
     let tix_path = seg_path.with_extension("tix");
+    let bloom_path = seg_path.with_extension("bloom");
 
     let stream = &info.stream_name;
     let partition_id = info.partition_id;
@@ -184,9 +185,10 @@ async fn upload_segment_files(
     // .seg is always required.
     upload_file(bucket, prefix, stream, partition_id, seg_path, true).await?;
 
-    // .idx and .tix may not exist yet (e.g. empty segment), treat as optional.
+    // .idx, .tix, and .bloom may not exist yet (e.g. empty segment), treat as optional.
     upload_file(bucket, prefix, stream, partition_id, &idx_path, false).await?;
     upload_file(bucket, prefix, stream, partition_id, &tix_path, false).await?;
+    upload_file(bucket, prefix, stream, partition_id, &bloom_path, false).await?;
 
     Ok(())
 }

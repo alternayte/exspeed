@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use exspeed_streams::record::StoredRecord;
 
 use crate::encoding::{decode_record, unwrap_crc};
+use crate::file::bloom_filter::BloomFilter;
 use crate::file::offset_index::OffsetIndex;
 use crate::file::segment_writer::{SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION};
 use crate::file::time_index::TimeIndex;
@@ -26,6 +27,7 @@ pub struct SegmentReader {
     file_size: u64,
     offset_index: Option<OffsetIndex>,
     time_index: Option<TimeIndex>,
+    bloom_filter: Option<BloomFilter>,
 }
 
 impl SegmentReader {
@@ -78,12 +80,16 @@ impl SegmentReader {
         let tix_path = path.with_extension("tix");
         let time_index = TimeIndex::load(&tix_path).ok();
 
+        let bloom_path = path.with_extension("bloom");
+        let bloom_filter = BloomFilter::load(&bloom_path).ok();
+
         Ok(Self {
             path: path.to_path_buf(),
             base_offset,
             file_size,
             offset_index,
             time_index,
+            bloom_filter,
         })
     }
 
@@ -110,6 +116,15 @@ impl SegmentReader {
     /// Get the last timestamp from the time index.
     pub fn last_timestamp(&self) -> Option<u64> {
         self.time_index.as_ref()?.last_timestamp()
+    }
+
+    /// Check whether a key *might* be present in this segment using the
+    /// bloom filter. Returns `true` when no bloom filter exists (absence
+    /// cannot be confirmed without one, so the segment must not be skipped).
+    pub fn might_contain_key(&self, key: &[u8]) -> bool {
+        self.bloom_filter
+            .as_ref()
+            .map_or(true, |bf| bf.might_contain(key))
     }
 
     /// The filesystem path of this segment file.
