@@ -1,3 +1,4 @@
+pub mod bloom_filter;
 pub mod io_errors;
 pub mod offset_index;
 pub mod partition;
