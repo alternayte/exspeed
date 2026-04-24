@@ -66,18 +66,16 @@ impl ScanOperator {
     }
 
     /// Construct a streaming scan that pulls batches from storage on demand,
-    /// optionally applying a pushed-down predicate during batch conversion.
-    pub fn streaming_with_predicate(
+    /// starting at the given offset and optionally applying a pushed-down
+    /// predicate during batch conversion.
+    pub fn streaming_from(
         storage: Arc<dyn StorageEngine>,
         stream: StreamName,
         alias: Option<String>,
         required: ColumnSet,
         predicate: Option<Expr>,
+        start: Offset,
     ) -> Self {
-        // Compute the column names by building a dummy row from an empty
-        // record — cheap and keeps `.columns()` consistent with what scan
-        // will actually emit. For empty streams this still produces the
-        // expected column schema.
         let column_names = {
             use exspeed_streams::StoredRecord;
             let dummy = StoredRecord {
@@ -97,12 +95,24 @@ impl ScanOperator {
                 alias,
                 required,
                 predicate,
-                cursor: Offset(0),
+                cursor: start,
                 buf: VecDeque::new(),
                 exhausted: false,
             }),
             column_names,
         }
+    }
+
+    /// Construct a streaming scan that pulls batches from storage on demand,
+    /// optionally applying a pushed-down predicate during batch conversion.
+    pub fn streaming_with_predicate(
+        storage: Arc<dyn StorageEngine>,
+        stream: StreamName,
+        alias: Option<String>,
+        required: ColumnSet,
+        predicate: Option<Expr>,
+    ) -> Self {
+        Self::streaming_from(storage, stream, alias, required, predicate, Offset(0))
     }
 
     /// Construct a streaming scan that pulls batches from storage on demand.

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use exspeed_common::StreamName;
+use exspeed_common::{Offset, StreamName};
 use exspeed_streams::StorageEngine;
 
 const MAX_RESULT_ROWS: usize = 10_000;
@@ -108,7 +108,7 @@ fn build_operator<'a>(
 ) -> BuildOperatorFuture<'a> {
     Box::pin(async move {
     match plan {
-        PhysicalPlan::SeqScan { stream, alias, required_columns, predicate, reverse_limit, .. } => {
+        PhysicalPlan::SeqScan { stream, alias, required_columns, predicate, reverse_limit, timestamp_lower_bound } => {
             // Check materialized views first
             if let Some(mv_reg) = mv_registry {
                 if let Some((_columns, rows)) = mv_reg.get_rows(stream) {
@@ -132,12 +132,18 @@ fn build_operator<'a>(
                     required_columns.clone(), predicate.clone(), *limit,
                 )) as Box<dyn Operator>)
             } else {
-                Ok(Box::new(ScanOperator::streaming_with_predicate(
+                let start = if let Some(ts_bound) = timestamp_lower_bound {
+                    storage.seek_by_time(&stream_name, *ts_bound).await.unwrap_or(Offset(0))
+                } else {
+                    Offset(0)
+                };
+                Ok(Box::new(ScanOperator::streaming_from(
                     storage.clone(),
                     stream_name,
                     alias.clone(),
                     required_columns.clone(),
                     predicate.clone(),
+                    start,
                 )) as Box<dyn Operator>)
             }
         }
