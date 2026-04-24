@@ -351,12 +351,18 @@ fn extract_json_access_eq(json_side: &Expr, literal_side: &Expr) -> Option<(Stri
     if let Expr::JsonAccess {
         expr,
         field,
-        as_text: true,
+        as_text: _,
     } = json_side
     {
         if matches!(expr.as_ref(), Expr::Column { name, .. } if name == "payload") {
-            if let Expr::Literal(LiteralValue::String(val)) = literal_side {
-                return Some((field.clone(), val.clone()));
+            let val_str = match literal_side {
+                Expr::Literal(LiteralValue::String(s)) => Some(s.clone()),
+                Expr::Literal(LiteralValue::Int(n)) => Some(n.to_string()),
+                Expr::Literal(LiteralValue::Float(f)) => Some(f.to_string()),
+                _ => None,
+            };
+            if let Some(val) = val_str {
+                return Some((field.clone(), val));
             }
         }
     }
