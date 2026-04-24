@@ -10,6 +10,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ExQL query engine improvements — structured errors, predicate pushdown,
 and SQL queries over the TCP wire protocol.
 
+### Bug fixes
+
+- **Active segment full-scan on read.** `read_from()` on the active
+  (unsealed) segment decoded the entire file then filtered, making
+  every bounded query O(total_records) regardless of LIMIT. Now uses
+  sequential read that stops after the requested batch size.
+
 ### ExQL improvements
 
 - **Structured error messages.** Parse errors now include line/column
