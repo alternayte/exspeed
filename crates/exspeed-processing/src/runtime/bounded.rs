@@ -108,7 +108,7 @@ fn build_operator<'a>(
 ) -> BuildOperatorFuture<'a> {
     Box::pin(async move {
     match plan {
-        PhysicalPlan::SeqScan { stream, alias, required_columns, predicate } => {
+        PhysicalPlan::SeqScan { stream, alias, required_columns, predicate, reverse_limit: _ } => {
             // Check materialized views first
             if let Some(mv_reg) = mv_registry {
                 if let Some((_columns, rows)) = mv_reg.get_rows(stream) {
@@ -206,6 +206,11 @@ fn build_operator<'a>(
                 *limit,
                 offset.unwrap_or(0),
             )) as Box<dyn Operator>)
+        }
+
+        PhysicalPlan::TopN { input, order_by, limit } => {
+            let child = build_operator(input, storage, connections, mv_registry).await?;
+            Ok(Box::new(crate::runtime::operators::topn::TopNOperator::new(child, order_by.clone(), *limit)) as Box<dyn Operator>)
         }
 
         PhysicalPlan::WindowedAggregate { .. } => Err(ExqlError::Execution(

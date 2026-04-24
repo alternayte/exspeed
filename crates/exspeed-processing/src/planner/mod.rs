@@ -197,6 +197,7 @@ fn to_physical(logical: LogicalPlan) -> PhysicalPlan {
             alias,
             required_columns: crate::planner::column_set::ColumnSet::default(),
             predicate: None,
+            reverse_limit: None,
         },
         LogicalPlan::ExternalScan {
             connection,
@@ -293,12 +294,12 @@ pub fn annotate_scans(plan: PhysicalPlan) -> PhysicalPlan {
 
 fn annotate_with_seed(plan: PhysicalPlan, seed: ColumnSet) -> PhysicalPlan {
     match plan {
-        PhysicalPlan::SeqScan { stream, alias, predicate, .. } => {
+        PhysicalPlan::SeqScan { stream, alias, predicate, reverse_limit, .. } => {
             let mut cs = seed;
             if let Some(ref pred) = predicate {
                 collect_columns(pred, &mut cs);
             }
-            PhysicalPlan::SeqScan { stream, alias, required_columns: cs, predicate }
+            PhysicalPlan::SeqScan { stream, alias, required_columns: cs, predicate, reverse_limit }
         }
         PhysicalPlan::ExternalScan { .. } => plan,
         PhysicalPlan::Filter { input, predicate } => {
@@ -376,6 +377,17 @@ fn annotate_with_seed(plan: PhysicalPlan, seed: ColumnSet) -> PhysicalPlan {
                 on, within, join_type,
             }
         }
+        PhysicalPlan::TopN { input, order_by, limit } => {
+            let mut cs = seed;
+            for key in &order_by {
+                collect_columns(&key.expr, &mut cs);
+            }
+            PhysicalPlan::TopN {
+                input: Box::new(annotate_with_seed(*input, cs)),
+                order_by,
+                limit,
+            }
+        }
     }
 }
 
@@ -390,8 +402,8 @@ fn push_down_filters(plan: PhysicalPlan) -> PhysicalPlan {
     match plan {
         PhysicalPlan::Filter { input, predicate } => {
             match *input {
-                PhysicalPlan::SeqScan { stream, alias, required_columns, predicate: None } => {
-                    PhysicalPlan::SeqScan { stream, alias, required_columns, predicate: Some(predicate) }
+                PhysicalPlan::SeqScan { stream, alias, required_columns, predicate: None, reverse_limit } => {
+                    PhysicalPlan::SeqScan { stream, alias, required_columns, predicate: Some(predicate), reverse_limit }
                 }
                 other => PhysicalPlan::Filter {
                     input: Box::new(push_down_filters(other)),
@@ -430,6 +442,10 @@ fn push_down_filters(plan: PhysicalPlan) -> PhysicalPlan {
             left: Box::new(push_down_filters(*left)),
             right: Box::new(push_down_filters(*right)),
             on, within, join_type,
+        },
+        PhysicalPlan::TopN { input, order_by, limit } => PhysicalPlan::TopN {
+            input: Box::new(push_down_filters(*input)),
+            order_by, limit,
         },
         other => other,
     }
@@ -889,7 +905,8 @@ mod annotate_tests {
             | PhysicalPlan::Sort { input, .. }
             | PhysicalPlan::Limit { input, .. }
             | PhysicalPlan::HashAggregate { input, .. }
-            | PhysicalPlan::WindowedAggregate { input, .. } => find_scan(input),
+            | PhysicalPlan::WindowedAggregate { input, .. }
+            | PhysicalPlan::TopN { input, .. } => find_scan(input),
             _ => panic!("no SeqScan reachable"),
         }
     }

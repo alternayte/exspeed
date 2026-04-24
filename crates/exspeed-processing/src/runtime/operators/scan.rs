@@ -24,6 +24,7 @@ pub struct ScanOperator {
 enum Mode {
     Rows { rows: Vec<Row>, position: usize },
     Streaming(StreamingState),
+    ReverseTail(ReverseTailState),
 }
 
 struct StreamingState {
@@ -35,6 +36,18 @@ struct StreamingState {
     cursor: Offset,
     buf: VecDeque<Row>,
     exhausted: bool,
+}
+
+struct ReverseTailState {
+    storage: Arc<dyn StorageEngine>,
+    stream: StreamName,
+    alias: Option<String>,
+    required: ColumnSet,
+    predicate: Option<Expr>,
+    limit: u64,
+    rows: Vec<Row>,
+    position: usize,
+    computed: bool,
 }
 
 impl ScanOperator {
@@ -101,6 +114,44 @@ impl ScanOperator {
     ) -> Self {
         Self::streaming_with_predicate(storage, stream, alias, required, None)
     }
+
+    /// Construct a reverse-tail scan that reads the last `limit` records
+    /// from the stream and yields them in descending offset order.
+    pub fn reverse_tail(
+        storage: Arc<dyn StorageEngine>,
+        stream: StreamName,
+        alias: Option<String>,
+        required: ColumnSet,
+        predicate: Option<Expr>,
+        limit: u64,
+    ) -> Self {
+        let column_names = {
+            use exspeed_streams::StoredRecord;
+            let dummy = StoredRecord {
+                offset: Offset(0),
+                timestamp: 0,
+                key: None,
+                subject: String::new(),
+                value: bytes::Bytes::from_static(b"{}"),
+                headers: vec![],
+            };
+            stored_record_to_row(&dummy, alias.as_deref(), &required).columns
+        };
+        Self {
+            mode: Mode::ReverseTail(ReverseTailState {
+                storage,
+                stream,
+                alias,
+                required,
+                predicate,
+                limit,
+                rows: Vec::new(),
+                position: 0,
+                computed: false,
+            }),
+            column_names,
+        }
+    }
 }
 
 impl Operator for ScanOperator {
@@ -110,6 +161,52 @@ impl Operator for ScanOperator {
                 if *position < rows.len() {
                     let row = rows[*position].clone();
                     *position += 1;
+                    Some(row)
+                } else {
+                    None
+                }
+            }
+            Mode::ReverseTail(s) => {
+                if !s.computed {
+                    let bounds = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current()
+                            .block_on(s.storage.stream_bounds(&s.stream))
+                    });
+                    if let Ok((earliest, next)) = bounds {
+                        if next.0 > earliest.0 {
+                            let overfetch = if s.predicate.is_some() { s.limit * 4 } else { s.limit };
+                            let start = next.0.saturating_sub(overfetch).max(earliest.0);
+                            let count = (next.0 - start) as usize;
+                            let batch = tokio::task::block_in_place(|| {
+                                tokio::runtime::Handle::current()
+                                    .block_on(s.storage.read(&s.stream, Offset(start), count))
+                            })
+                            .unwrap_or_default();
+
+                            let mut rows: Vec<Row> = batch
+                                .iter()
+                                .map(|r| stored_record_to_row(r, s.alias.as_deref(), &s.required))
+                                .filter(|row| {
+                                    s.predicate.as_ref().map_or(true, |pred| {
+                                        eval_expr(pred, row) == crate::types::Value::Bool(true)
+                                    })
+                                })
+                                .collect();
+
+                            let take = s.limit as usize;
+                            if rows.len() > take {
+                                rows = rows.split_off(rows.len() - take);
+                            }
+                            rows.reverse();
+                            s.rows = rows;
+                        }
+                    }
+                    s.computed = true;
+                }
+
+                if s.position < s.rows.len() {
+                    let row = s.rows[s.position].clone();
+                    s.position += 1;
                     Some(row)
                 } else {
                     None
@@ -289,6 +386,27 @@ mod tests {
                 count += 1;
             }
             assert_eq!(count, 5);
+        });
+    }
+
+    #[test]
+    fn reverse_tail_returns_last_n_in_desc_order() {
+        let rt = multi_thread_runtime();
+        rt.block_on(async {
+            let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+            let stream = StreamName::try_from("t_rev").unwrap();
+            seed(&storage, &stream, 100).await;
+
+            let cs = ColumnSet::needs_everything();
+            let mut scan = ScanOperator::reverse_tail(storage, stream, None, cs, None, 5);
+
+            let mut offsets = Vec::new();
+            while let Some(row) = tokio::task::block_in_place(|| scan.next()) {
+                if let Some(Value::Int(o)) = row.get("offset") {
+                    offsets.push(*o);
+                }
+            }
+            assert_eq!(offsets, vec![99, 98, 97, 96, 95]);
         });
     }
 

@@ -7,6 +7,7 @@ pub enum PhysicalPlan {
         alias: Option<String>,
         required_columns: crate::planner::column_set::ColumnSet,
         predicate: Option<crate::parser::ast::Expr>,
+        reverse_limit: Option<u64>,
     },
     ExternalScan {
         connection: String,
@@ -55,5 +56,10 @@ pub enum PhysicalPlan {
         input: Box<PhysicalPlan>,
         limit: Option<u64>,
         offset: Option<u64>,
+    },
+    TopN {
+        input: Box<PhysicalPlan>,
+        order_by: Vec<OrderByItem>,
+        limit: u64,
     },
 }

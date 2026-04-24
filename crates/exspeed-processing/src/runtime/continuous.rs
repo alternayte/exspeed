@@ -125,7 +125,8 @@ fn detect_mode(plan: &PhysicalPlan) -> ContinuousMode {
         | PhysicalPlan::Filter { input, .. }
         | PhysicalPlan::Sort { input, .. }
         | PhysicalPlan::Limit { input, .. }
-        | PhysicalPlan::HashAggregate { input, .. } => detect_mode(input),
+        | PhysicalPlan::HashAggregate { input, .. }
+        | PhysicalPlan::TopN { input, .. } => detect_mode(input),
         // Leaf / hash join / other — Simple
         _ => ContinuousMode::Simple,
     }
@@ -697,6 +698,10 @@ fn decompose_plan(plan: &PhysicalPlan) -> Result<ContinuousPipeline, String> {
             }
             PhysicalPlan::Sort { input, .. } => {
                 // Skip ORDER BY for continuous queries
+                current = input;
+            }
+            PhysicalPlan::TopN { input, .. } => {
+                // Skip TopN for continuous queries (unbounded)
                 current = input;
             }
             _ => {
