@@ -133,6 +133,94 @@ pub async fn get_query(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Index management
+// ---------------------------------------------------------------------------
+
+/// POST /api/v1/indexes
+///
+/// Create a secondary index from a `CREATE INDEX` SQL statement.
+pub async fn create_index(
+    State(state): State<Arc<AppState>>,
+    identity: Option<Extension<Arc<Identity>>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if let Some(Extension(id)) = identity {
+        if let Some(resp) = super::require_global_admin(&id) {
+            return resp;
+        }
+    }
+    let sql = match body.get("sql").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "missing 'sql' field"})),
+            )
+                .into_response()
+        }
+    };
+    match state.exql.create_index(sql).await {
+        Ok(name) => (
+            StatusCode::CREATED,
+            Json(json!({"name": name, "status": "created"})),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(e.to_json())).into_response(),
+    }
+}
+
+/// DELETE /api/v1/indexes/{name}
+///
+/// Drop a secondary index by name.
+pub async fn drop_index(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    identity: Option<Extension<Arc<Identity>>>,
+) -> Response {
+    if let Some(Extension(id)) = identity {
+        if let Some(resp) = super::require_global_admin(&id) {
+            return resp;
+        }
+    }
+    match state.exql.drop_index(&format!("DROP INDEX {name}")).await {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(json!({"status": "dropped", "name": name})),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(e.to_json())).into_response(),
+    }
+}
+
+/// GET /api/v1/indexes
+///
+/// List all secondary indexes by reading their metadata JSON files.
+pub async fn list_indexes(
+    State(state): State<Arc<AppState>>,
+    identity: Option<Extension<Arc<Identity>>>,
+) -> Response {
+    if let Some(Extension(id)) = identity {
+        if let Some(resp) = super::require_global_admin(&id) {
+            return resp;
+        }
+    }
+    let index_dir = state.exql.data_dir().join("indexes");
+    let mut indexes = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&index_dir) {
+        for entry in entries.flatten() {
+            if entry.path().extension().and_then(|e| e.to_str()) == Some("json") {
+                if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                    if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
+                        indexes.push(meta);
+                    }
+                }
+            }
+        }
+    }
+    (StatusCode::OK, Json(json!(indexes))).into_response()
+}
+
 /// DELETE /api/v1/queries/{id}
 ///
 /// Remove a continuous query (stops it if running, deletes from disk).

@@ -72,7 +72,7 @@ impl ExqlEngine {
     }
 
     /// Return the data directory path.
-    fn data_dir(&self) -> &std::path::Path {
+    pub fn data_dir(&self) -> &std::path::Path {
         &self.data_dir
     }
 

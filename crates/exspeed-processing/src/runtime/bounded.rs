@@ -233,6 +233,10 @@ fn build_operator<'a>(
         PhysicalPlan::StreamStreamJoin { .. } => Err(ExqlError::Execution(
             "StreamStreamJoin is not supported in bounded execution".into(),
         )),
+
+        PhysicalPlan::IndexScan { .. } => Err(ExqlError::Execution(
+            "IndexScan is not yet supported in bounded execution".into(),
+        )),
     }
     })
 }

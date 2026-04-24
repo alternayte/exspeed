@@ -393,6 +393,7 @@ fn annotate_with_seed(plan: PhysicalPlan, seed: ColumnSet) -> PhysicalPlan {
                 limit,
             }
         }
+        PhysicalPlan::IndexScan { .. } => plan, // indexes manage their own columns
     }
 }
 
@@ -452,6 +453,7 @@ fn push_down_filters(plan: PhysicalPlan) -> PhysicalPlan {
             input: Box::new(push_down_filters(*input)),
             order_by, limit,
         },
+        PhysicalPlan::IndexScan { .. } => plan,
         other => other,
     }
 }
@@ -556,6 +558,7 @@ fn optimize_sort_limit(plan: PhysicalPlan) -> PhysicalPlan {
             input: Box::new(optimize_sort_limit(*input)),
             window_size, group_by, select_items, emit_mode,
         },
+        PhysicalPlan::IndexScan { .. } => plan,
         other => other,
     }
 }
@@ -643,6 +646,7 @@ fn extract_timestamp_bounds(plan: PhysicalPlan) -> PhysicalPlan {
             input: Box::new(extract_timestamp_bounds(*input)),
             window_size, group_by, select_items, emit_mode,
         },
+        PhysicalPlan::IndexScan { .. } => plan,
         other => other,
     }
 }
@@ -732,6 +736,7 @@ fn extract_key_eq_filter(plan: PhysicalPlan) -> PhysicalPlan {
             input: Box::new(extract_key_eq_filter(*input)),
             window_size, group_by, select_items, emit_mode,
         },
+        PhysicalPlan::IndexScan { .. } => plan,
         other => other,
     }
 }
@@ -1301,7 +1306,8 @@ mod annotate_tests {
 
     fn find_scan(plan: &PhysicalPlan) -> &ColumnSet {
         match plan {
-            PhysicalPlan::SeqScan { required_columns, .. } => required_columns,
+            PhysicalPlan::SeqScan { required_columns, .. }
+            | PhysicalPlan::IndexScan { required_columns, .. } => required_columns,
             PhysicalPlan::Filter { input, .. }
             | PhysicalPlan::Project { input, .. }
             | PhysicalPlan::Sort { input, .. }

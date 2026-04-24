@@ -139,6 +139,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(queries::get_query).delete(queries::delete_query),
         )
         .route(
+            "/api/v1/indexes",
+            get(queries::list_indexes).post(queries::create_index),
+        )
+        .route(
+            "/api/v1/indexes/{name}",
+            delete(queries::drop_index),
+        )
+        .route(
             "/api/v1/connections",
             get(connections::list_connections).post(connections::create_connection),
         )

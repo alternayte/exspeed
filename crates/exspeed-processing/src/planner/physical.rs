@@ -64,4 +64,13 @@ pub enum PhysicalPlan {
         order_by: Vec<OrderByItem>,
         limit: u64,
     },
+    IndexScan {
+        stream: String,
+        alias: Option<String>,
+        required_columns: crate::planner::column_set::ColumnSet,
+        index_name: String,
+        field_path: String,
+        lookup_value: String,
+        predicate: Option<crate::parser::ast::Expr>,
+    },
 }
