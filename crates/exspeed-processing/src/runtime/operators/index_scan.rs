@@ -75,7 +75,7 @@ impl IndexScanOperator {
         all_offsets.sort();
         all_offsets.dedup();
 
-        // Fetch each matching record by offset
+        // Fetch each matching record from indexed (sealed) segments
         for offset in &all_offsets {
             let batch = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
@@ -95,6 +95,58 @@ impl IndexScanOperator {
                         self.rows.push(row);
                     }
                 }
+            }
+        }
+
+        // The active segment has no .sidx file — scan it with predicate
+        // filtering. Determine the active segment's start offset by finding
+        // the highest base_offset among sealed segments (from .seg filenames).
+        let active_start = {
+            let mut max_sealed_offset: Option<u64> = None;
+            if let Ok(entries) = std::fs::read_dir(&self.partition_dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_str().unwrap_or("");
+                    if name_str.ends_with(".seg") {
+                        if let Ok(base) = name_str.trim_end_matches(".seg").parse::<u64>() {
+                            max_sealed_offset = Some(max_sealed_offset.map_or(base, |prev: u64| prev.max(base)));
+                        }
+                    }
+                }
+            }
+            // The active segment is the one with the highest base_offset.
+            // Records in it start at that base_offset. We already got indexed
+            // results from sealed segments, so scan from the active's base.
+            max_sealed_offset.unwrap_or(0)
+        };
+
+        let batch_size = 1024usize;
+        let mut cursor = Offset(active_start);
+        loop {
+            let batch = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(self.storage.read(&self.stream, cursor, batch_size))
+            });
+
+            let records = match batch {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+
+            if records.is_empty() {
+                break;
+            }
+
+            cursor = Offset(records.last().unwrap().offset.0 + 1);
+
+            for record in &records {
+                let row = stored_record_to_row(record, self.alias.as_deref(), &self.required);
+                if let Some(ref pred) = self.predicate {
+                    if eval_expr(pred, &row) != Value::Bool(true) {
+                        continue;
+                    }
+                }
+                self.rows.push(row);
             }
         }
 
