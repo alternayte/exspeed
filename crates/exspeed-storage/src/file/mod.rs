@@ -2,6 +2,7 @@ pub mod bloom_filter;
 pub mod io_errors;
 pub mod offset_index;
 pub mod partition;
+pub mod secondary_index;
 pub mod segment_reader;
 pub mod segment_writer;
 pub mod stream_config;
