@@ -9,6 +9,7 @@ pub enum PhysicalPlan {
         predicate: Option<crate::parser::ast::Expr>,
         reverse_limit: Option<u64>,
         timestamp_lower_bound: Option<u64>,
+        key_eq_filter: Option<String>,
     },
     ExternalScan {
         connection: String,

@@ -14,6 +14,7 @@ pub fn plan(query: &QueryExpr, emit_mode: EmitMode) -> Result<PhysicalPlan, Pars
     let optimized = push_down_filters(physical);
     let optimized = optimize_sort_limit(optimized);
     let optimized = extract_timestamp_bounds(optimized);
+    let optimized = extract_key_eq_filter(optimized);
     Ok(annotate_scans(optimized))
 }
 
@@ -201,6 +202,7 @@ fn to_physical(logical: LogicalPlan) -> PhysicalPlan {
             predicate: None,
             reverse_limit: None,
             timestamp_lower_bound: None,
+            key_eq_filter: None,
         },
         LogicalPlan::ExternalScan {
             connection,
@@ -297,12 +299,12 @@ pub fn annotate_scans(plan: PhysicalPlan) -> PhysicalPlan {
 
 fn annotate_with_seed(plan: PhysicalPlan, seed: ColumnSet) -> PhysicalPlan {
     match plan {
-        PhysicalPlan::SeqScan { stream, alias, predicate, reverse_limit, timestamp_lower_bound, .. } => {
+        PhysicalPlan::SeqScan { stream, alias, predicate, reverse_limit, timestamp_lower_bound, key_eq_filter, .. } => {
             let mut cs = seed;
             if let Some(ref pred) = predicate {
                 collect_columns(pred, &mut cs);
             }
-            PhysicalPlan::SeqScan { stream, alias, required_columns: cs, predicate, reverse_limit, timestamp_lower_bound }
+            PhysicalPlan::SeqScan { stream, alias, required_columns: cs, predicate, reverse_limit, timestamp_lower_bound, key_eq_filter }
         }
         PhysicalPlan::ExternalScan { .. } => plan,
         PhysicalPlan::Filter { input, predicate } => {
@@ -405,8 +407,8 @@ fn push_down_filters(plan: PhysicalPlan) -> PhysicalPlan {
     match plan {
         PhysicalPlan::Filter { input, predicate } => {
             match *input {
-                PhysicalPlan::SeqScan { stream, alias, required_columns, predicate: None, reverse_limit, timestamp_lower_bound } => {
-                    PhysicalPlan::SeqScan { stream, alias, required_columns, predicate: Some(predicate), reverse_limit, timestamp_lower_bound }
+                PhysicalPlan::SeqScan { stream, alias, required_columns, predicate: None, reverse_limit, timestamp_lower_bound, key_eq_filter } => {
+                    PhysicalPlan::SeqScan { stream, alias, required_columns, predicate: Some(predicate), reverse_limit, timestamp_lower_bound, key_eq_filter }
                 }
                 other => PhysicalPlan::Filter {
                     input: Box::new(push_down_filters(other)),
@@ -579,8 +581,8 @@ fn subtree_preserves_offset_order(plan: &PhysicalPlan) -> bool {
 /// Push `reverse_limit` down through order-preserving nodes into the `SeqScan`.
 fn set_reverse_limit(plan: PhysicalPlan, limit: u64) -> PhysicalPlan {
     match plan {
-        PhysicalPlan::SeqScan { stream, alias, required_columns, predicate, timestamp_lower_bound, .. } => {
-            PhysicalPlan::SeqScan { stream, alias, required_columns, predicate, reverse_limit: Some(limit), timestamp_lower_bound }
+        PhysicalPlan::SeqScan { stream, alias, required_columns, predicate, timestamp_lower_bound, key_eq_filter, .. } => {
+            PhysicalPlan::SeqScan { stream, alias, required_columns, predicate, reverse_limit: Some(limit), timestamp_lower_bound, key_eq_filter }
         }
         PhysicalPlan::Project { input, items } => PhysicalPlan::Project {
             input: Box::new(set_reverse_limit(*input, limit)), items,
@@ -602,11 +604,11 @@ fn set_reverse_limit(plan: PhysicalPlan, limit: u64) -> PhysicalPlan {
 /// storage layer can skip segments via the TimeIndex.
 fn extract_timestamp_bounds(plan: PhysicalPlan) -> PhysicalPlan {
     match plan {
-        PhysicalPlan::SeqScan { stream, alias, required_columns, predicate, reverse_limit, .. } => {
+        PhysicalPlan::SeqScan { stream, alias, required_columns, predicate, reverse_limit, key_eq_filter, .. } => {
             let bound = predicate.as_ref().and_then(extract_timestamp_lower_bound);
             PhysicalPlan::SeqScan {
                 stream, alias, required_columns, predicate, reverse_limit,
-                timestamp_lower_bound: bound,
+                timestamp_lower_bound: bound, key_eq_filter,
             }
         }
         PhysicalPlan::Project { input, items } => PhysicalPlan::Project {
@@ -676,6 +678,85 @@ fn extract_timestamp_lower_bound(expr: &Expr) -> Option<u64> {
                 _ => {}
             }
             None
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Optimisation: key equality extraction (bloom filter hint)
+// ---------------------------------------------------------------------------
+
+/// Walk the plan tree and extract `key = '<literal>'` predicates from SeqScan
+/// nodes. When a WHERE clause contains an equality comparison on the `key`
+/// column against a string literal, the value is lifted into the SeqScan's
+/// `key_eq_filter` so the storage layer can skip segments via bloom filters.
+fn extract_key_eq_filter(plan: PhysicalPlan) -> PhysicalPlan {
+    match plan {
+        PhysicalPlan::SeqScan { stream, alias, required_columns, predicate, reverse_limit, timestamp_lower_bound, .. } => {
+            let key_filter = predicate.as_ref().and_then(find_key_equality);
+            PhysicalPlan::SeqScan {
+                stream, alias, required_columns, predicate, reverse_limit,
+                timestamp_lower_bound, key_eq_filter: key_filter,
+            }
+        }
+        PhysicalPlan::Project { input, items } => PhysicalPlan::Project {
+            input: Box::new(extract_key_eq_filter(*input)), items,
+        },
+        PhysicalPlan::Filter { input, predicate } => PhysicalPlan::Filter {
+            input: Box::new(extract_key_eq_filter(*input)), predicate,
+        },
+        PhysicalPlan::Limit { input, limit, offset } => PhysicalPlan::Limit {
+            input: Box::new(extract_key_eq_filter(*input)), limit, offset,
+        },
+        PhysicalPlan::TopN { input, order_by, limit } => PhysicalPlan::TopN {
+            input: Box::new(extract_key_eq_filter(*input)), order_by, limit,
+        },
+        PhysicalPlan::Sort { input, order_by } => PhysicalPlan::Sort {
+            input: Box::new(extract_key_eq_filter(*input)), order_by,
+        },
+        PhysicalPlan::HashAggregate { input, group_by, select_items } => PhysicalPlan::HashAggregate {
+            input: Box::new(extract_key_eq_filter(*input)), group_by, select_items,
+        },
+        PhysicalPlan::HashJoin { left, right, on, join_type } => PhysicalPlan::HashJoin {
+            left: Box::new(extract_key_eq_filter(*left)),
+            right: Box::new(extract_key_eq_filter(*right)),
+            on, join_type,
+        },
+        PhysicalPlan::StreamStreamJoin { left, right, on, within, join_type } => PhysicalPlan::StreamStreamJoin {
+            left: Box::new(extract_key_eq_filter(*left)),
+            right: Box::new(extract_key_eq_filter(*right)),
+            on, within, join_type,
+        },
+        PhysicalPlan::WindowedAggregate { input, window_size, group_by, select_items, emit_mode } => PhysicalPlan::WindowedAggregate {
+            input: Box::new(extract_key_eq_filter(*input)),
+            window_size, group_by, select_items, emit_mode,
+        },
+        other => other,
+    }
+}
+
+/// Extract a key equality value from a predicate expression.
+///
+/// Recognises `key = '<literal>'` and `'<literal>' = key`, including when
+/// nested inside an AND tree (returns the first match).
+fn find_key_equality(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+            if matches!(left.as_ref(), Expr::Column { name, .. } if name == "key") {
+                if let Expr::Literal(LiteralValue::String(s)) = right.as_ref() {
+                    return Some(s.clone());
+                }
+            }
+            if matches!(right.as_ref(), Expr::Column { name, .. } if name == "key") {
+                if let Expr::Literal(LiteralValue::String(s)) = left.as_ref() {
+                    return Some(s.clone());
+                }
+            }
+            None
+        }
+        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+            find_key_equality(left).or_else(|| find_key_equality(right))
         }
         _ => None,
     }
@@ -1175,6 +1256,24 @@ mod tests {
                 assert!(
                     debug.contains("timestamp_lower_bound: Some(1700000000000)"),
                     "should extract timestamp bound, got: {debug}"
+                );
+            }
+            _ => panic!("expected Query"),
+        }
+    }
+
+    #[test]
+    fn plan_key_eq_extracts_filter() {
+        let stmt = crate::parser::parse(
+            r#"SELECT * FROM "orders" WHERE key = 'order-123'"#
+        ).unwrap();
+        match stmt {
+            ExqlStatement::Query(q) => {
+                let p = plan(&q, EmitMode::Changes).unwrap();
+                let debug = format!("{p:?}");
+                assert!(
+                    debug.contains(r#"key_eq_filter: Some("order-123")"#),
+                    "should extract key equality, got: {debug}"
                 );
             }
             _ => panic!("expected Query"),
