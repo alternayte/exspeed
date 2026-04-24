@@ -5,6 +5,8 @@ use crate::parser::ast::{AggregateFunc, Expr, SelectItem};
 use crate::runtime::eval::{compare_values, eval_expr};
 use crate::types::{Row, Value};
 
+const MAX_GROUP_COUNT: usize = 100_000;
+
 /// Reads ALL input rows, groups by `group_by` expressions, accumulates
 /// aggregates, then yields one row per group.
 pub struct AggregateOperator {
@@ -60,6 +62,9 @@ impl AggregateOperator {
 
             let state = groups.entry(key.clone()).or_insert_with(|| {
                 group_keys.push(key.clone());
+                if group_keys.len() > MAX_GROUP_COUNT {
+                    panic!("GROUP BY cardinality exceeds {MAX_GROUP_COUNT}; add a filter or reduce group count");
+                }
                 GroupState {
                     group_values: group_values.clone(),
                     accumulators: agg_descs.iter().map(|_| AggAccum::new()).collect(),

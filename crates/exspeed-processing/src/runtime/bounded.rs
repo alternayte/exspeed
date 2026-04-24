@@ -4,6 +4,8 @@ use std::time::Instant;
 use exspeed_common::StreamName;
 use exspeed_streams::StorageEngine;
 
+const MAX_RESULT_ROWS: usize = 10_000;
+
 /// Boxed future returned by the recursive `build_operator` helper.
 type BuildOperatorFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn Operator>, ExqlError>> + Send + 'a>>;
@@ -79,6 +81,9 @@ pub async fn execute_bounded_with_mv(
         let mut rows = Vec::new();
         while let Some(row) = root.next() {
             rows.push(row);
+            if rows.len() >= MAX_RESULT_ROWS {
+                break;
+            }
         }
         (columns, rows)
     })
@@ -486,6 +491,38 @@ mod tests {
         assert_eq!(
             result.rows[0].get("region"),
             Some(&Value::Text("eu".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn result_capped_at_max_rows() {
+        let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+        storage
+            .create_stream(&StreamName::try_from("big").unwrap(), 0, 0)
+            .await
+            .unwrap();
+
+        for i in 0..15_000u64 {
+            let record = Record {
+                key: None,
+                value: Bytes::from(format!(r#"{{"i":{i}}}"#)),
+                subject: "s".into(),
+                headers: vec![],
+                timestamp_ns: None,
+            };
+            storage
+                .append(&StreamName::try_from("big").unwrap(), &record)
+                .await
+                .unwrap();
+        }
+
+        let result = execute_bounded(r#"SELECT * FROM "big""#, &storage)
+            .await
+            .unwrap();
+        assert!(
+            result.rows.len() <= 10_000,
+            "should be capped at MAX_RESULT_ROWS, got {}",
+            result.rows.len()
         );
     }
 
