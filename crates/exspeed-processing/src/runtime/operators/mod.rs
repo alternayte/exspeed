@@ -6,6 +6,7 @@ pub mod project;
 pub mod scan;
 pub mod sort;
 pub mod stream_join;
+pub mod topn;
 pub mod windowed_aggregate;
 
 use crate::types::Row;
