@@ -52,6 +52,6 @@ console.log("Tip: The HTTP poller connector will fetch live crypto prices every 
 console.log("     Place crypto-prices.toml in your server's connectors.d/ folder");
 
 for await (const msg of sub) {
-  console.log(`[${msg.subject}] timestamp=${msg.timestamp.toLocaleString()} offset=${msg.offset}`, msg.json());
+  console.log(`[${msg.subject}] offset=${msg.offset}`, msg.json());
   await msg.ack();
 }

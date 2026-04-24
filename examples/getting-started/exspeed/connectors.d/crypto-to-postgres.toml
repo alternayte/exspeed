@@ -1,0 +1,12 @@
+[connector]
+name = "crypto-to-postgres"
+type = "sink"
+plugin = "jdbc"
+stream = "crypto_flat_btc"
+
+[settings]
+connection = "postgres://rhythms:rhythms@host.docker.internal:5432/rhythms"
+table = "crypto_flat_btc"
+mode = "upsert"
+upsert_keys = "ts"
+auto_create_table = "true"

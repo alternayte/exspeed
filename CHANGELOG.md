@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-04-24
+
+ExQL query engine improvements — structured errors, predicate pushdown,
+and SQL queries over the TCP wire protocol.
+
+### ExQL improvements
+
+- **Structured error messages.** Parse errors now include line/column
+  position extracted from the SQL parser. Unsupported-feature errors
+  include a hint listing what ExQL does support. All error responses
+  (HTTP and TCP) return a JSON object with `error`, `code`, and
+  context-specific fields (`line`, `column`, `hint`).
+- **Predicate pushdown.** When a `WHERE` clause sits directly above a
+  stream scan, the filter is absorbed into the scan operator. Rows are
+  evaluated during storage batch reads — non-matching rows are never
+  materialized, significantly improving performance on large streams
+  with selective predicates.
+- **TCP query protocol.** Bounded SQL queries can now be executed over
+  the binary TCP protocol via `OpCode::Query` (0x20) /
+  `OpCode::QueryResult` (0x85). JSON-encoded results match the HTTP
+  API format.
+
+### TypeScript SDK
+
+- **`client.query(sql)`** — execute bounded SQL queries over TCP.
+  Returns `QueryResult` with `columns`, `rows`, `rowCount`,
+  `executionTimeMs`. Errors throw `QueryError` with structured `code`,
+  `line`, `column`, `hint` fields.
+
+### Documentation
+
+- Fixed all connector TOML examples in the README to use the correct
+  `[connector]` section format with `type` (not bare `connector_type`).
+- Added documentation for JDBC poll source, SQLite JDBC sink, and
+  SQL Server JDBC sink connectors.
+- Fixed JDBC sink `connection_url` → `connection` in README example.
+
 ## [0.3.0] — 2026-04-23
 
 Connector-framework release. Substantially extends the connector surface

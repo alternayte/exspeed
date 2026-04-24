@@ -25,8 +25,9 @@ A lightweight streaming platform built in Rust. One binary, zero partitions, ord
 - **Ordered streams** — one stream = one ordered log, no partitions
 - **Binary protocol** (TCP port 5933) and **HTTP API** (port 8080)
 - **Push delivery** with ACK/NACK, dead-letter queues, consumer groups
-- **ExQL SQL engine** — bounded queries, continuous queries, materialized views, tumbling windows, stream-stream joins, joins with external databases (Postgres, MySQL)
-- **Connectors** — HTTP webhook, HTTP sink, HTTP poller, Postgres outbox, Postgres CDC, JDBC sink, S3 sink, RabbitMQ source/sink
+- **ExQL SQL engine** — bounded queries (with predicate pushdown), continuous queries, materialized views, tumbling windows, stream-stream joins, joins with external databases (Postgres, MySQL, SQLite, SQL Server), SQL queries over TCP
+- **Connectors** — HTTP webhook/sink/poller, Postgres outbox/CDC, JDBC sink (Postgres, MySQL, SQLite, SQL Server), JDBC poll source, SQL Server CDC, S3 sink, RabbitMQ source/sink
+- **Connector resilience** — retry policies with exponential backoff, dead-letter queues for poison records
 - **Retention policies** — time-based (default 7 days) and size-based (default 10 GB per stream)
 - **Idempotent publish** — retry-safe publishes with a `msg_id` field (xxhash64 collision detection, per-stream window, snapshot-based fast restart). See [Idempotent publish](#idempotent-publish).
 - **Subject filtering** and key-based indexing with SEEK
@@ -173,6 +174,8 @@ exspeed query "SELECT * FROM orders LIMIT 10"
 exspeed query --continuous "SELECT payload->>'region' AS region, COUNT(*) FROM orders GROUP BY payload->>'region'"
 ```
 
+Queries can also be executed over the binary TCP protocol via the TypeScript SDK's `client.query()` method — see the [SDK documentation](sdks/typescript/README.md#sql-queries).
+
 ### Views
 
 ```bash
@@ -203,6 +206,8 @@ ExQL lets you query streams using SQL. Streams are tables where each row has `of
 ### Bounded Queries
 
 Standard SQL executed against the current contents of a stream:
+
+WHERE clauses are pushed down into the scan operator and evaluated during storage reads, so filtered queries on large streams only materialize matching rows.
 
 ```sql
 -- Count records per region
@@ -319,8 +324,9 @@ Receives HTTP POST requests and writes them to a stream:
 
 ```toml
 # connectors.d/stripe-webhook.toml
+[connector]
 name = "stripe-webhook"
-connector_type = "source"
+type = "source"
 plugin = "http_webhook"
 stream = "stripe_events"
 
@@ -337,8 +343,9 @@ Forwards stream records to an HTTP endpoint:
 
 ```toml
 # connectors.d/notify-service.toml
+[connector]
 name = "notify-service"
-connector_type = "sink"
+type = "sink"
 plugin = "http_sink"
 stream = "notifications"
 
@@ -357,8 +364,9 @@ Polls an HTTP endpoint at a regular interval:
 
 ```toml
 # connectors.d/weather-poller.toml
+[connector]
 name = "weather-poller"
-connector_type = "source"
+type = "source"
 plugin = "http_poll"
 stream = "weather_data"
 
@@ -374,8 +382,9 @@ Polls an outbox table and writes new rows to a stream:
 
 ```toml
 # connectors.d/pg-outbox.toml
+[connector]
 name = "pg-outbox"
-connector_type = "source"
+type = "source"
 plugin = "postgres_outbox"
 stream = "domain_events"
 
@@ -391,8 +400,9 @@ Captures changes from Postgres logical replication:
 
 ```toml
 # connectors.d/pg-cdc.toml
+[connector]
 name = "pg-cdc"
-connector_type = "source"
+type = "source"
 plugin = "postgres_cdc"
 stream = "users_cdc"
 
@@ -408,15 +418,53 @@ Writes stream records to a database table:
 
 ```toml
 # connectors.d/jdbc-sink.toml
+[connector]
 name = "analytics-sink"
-connector_type = "sink"
+type = "sink"
 plugin = "jdbc"
 stream = "analytics_events"
 
 [settings]
-connection_url = "postgresql://user:pass@localhost:5432/analytics"
+connection = "postgresql://user:pass@localhost:5432/analytics"
 table = "events"
 ```
+
+### JDBC Sink — SQLite
+
+```toml
+# connectors.d/sqlite-archive.toml
+[connector]
+name = "sqlite-archive"
+type = "sink"
+plugin = "jdbc"
+stream = "events"
+
+[settings]
+connection = "sqlite://./events.db"
+table = "events"
+mode = "insert"
+```
+
+Uses `ON CONFLICT ... DO UPDATE` for upsert mode (SQLite 3.24+).
+
+### JDBC Sink — SQL Server
+
+```toml
+# connectors.d/mssql-sink.toml
+[connector]
+name = "mssql-sink"
+type = "sink"
+plugin = "jdbc"
+stream = "events"
+
+[settings]
+connection = "mssql://user:pass@localhost:1433/mydb"
+table = "events"
+mode = "upsert"
+upsert_keys = "id"
+```
+
+Uses `MERGE` with `HOLDLOCK` for upsert. Backed by the `tiberius` driver (sqlx does not support MSSQL).
 
 ### S3 Sink
 
@@ -424,8 +472,9 @@ Writes stream records to S3 (or MinIO) in batches:
 
 ```toml
 # connectors.d/s3-archive.toml
+[connector]
 name = "s3-archive"
-connector_type = "sink"
+type = "sink"
 plugin = "s3"
 stream = "orders"
 
@@ -444,8 +493,9 @@ Consumes messages from a RabbitMQ queue:
 
 ```toml
 # connectors.d/rabbitmq-source.toml
+[connector]
 name = "rmq-ingest"
-connector_type = "source"
+type = "source"
 plugin = "rabbitmq"
 stream = "incoming_messages"
 
@@ -460,8 +510,9 @@ Publishes stream records to a RabbitMQ exchange:
 
 ```toml
 # connectors.d/rabbitmq-sink.toml
+[connector]
 name = "rmq-publish"
-connector_type = "sink"
+type = "sink"
 plugin = "rabbitmq"
 stream = "outgoing_messages"
 
@@ -470,6 +521,49 @@ url = "amqp://guest:guest@localhost:5672"
 exchange = "my-exchange"
 routing_key = "events"
 ```
+
+### JDBC Poll Source
+
+Periodically polls a SQL table for new rows and emits them as JSON:
+
+```toml
+# connectors.d/orders-poll.toml
+[connector]
+name = "orders-poller"
+type = "source"
+plugin = "jdbc_poll"
+stream = "orders_feed"
+poll_interval_ms = 10000
+
+[settings]
+connection = "postgresql://user:pass@localhost:5432/myapp"
+table = "orders"
+tracking_column = "updated_at"
+```
+
+Supports Postgres, MySQL, SQLite, and SQL Server. Uses dialect-specific SQL (`LIMIT` vs `TOP(N)`). Tracks the last-seen `tracking_column` value and resumes from there on restart.
+
+### SQL Server CDC Source
+
+Streams insert/update/delete events from SQL Server tables with Change Data Capture enabled:
+
+```toml
+# connectors.d/cdc-orders.toml
+[connector]
+name = "cdc-orders"
+type = "source"
+plugin = "mssql_cdc"
+stream = "orders-cdc"
+
+[settings]
+connection = "mssql://sa:Password1@localhost:1433/master?trust_server_certificate=true"
+capture_instance = "dbo_orders"
+schema = "id:bigint, total:bigint, status:text"
+```
+
+Each event becomes a JSON record with a `__op` field (`insert`, `update_before`, `update_after`, `delete`). LSN tracking ensures restart resumes from the last processed position.
+
+Prerequisites: CDC must be enabled on the target table and SQL Server Agent must be running.
 
 ### Validating Connectors
 
@@ -583,6 +677,14 @@ curl -X POST http://localhost:8080/api/v1/queries \
 
 # Response:
 # {"columns": ["region", "count"], "rows": [["eu", 42], ["us", 17]], "row_count": 2, "execution_time_ms": 12}
+
+# Error response (structured):
+# {
+#   "error": "parse error: SQL parse error at line 1, column 25: Expected end of statement, found: UNION",
+#   "code": "PARSE_ERROR",
+#   "line": 1,
+#   "column": 25
+# }
 
 # Create continuous query
 curl -X POST http://localhost:8080/api/v1/queries/continuous \
@@ -1445,41 +1547,7 @@ The binary is at `target/release/exspeed`. Copy it anywhere — it's a single st
 
 ### SQL Server CDC source (`mssql_cdc`)
 
-Streams insert/update/delete events from SQL Server tables with Change
-Data Capture enabled. Each event becomes a JSON record with a `__op`
-field (`insert`, `update_before`, `update_after`, `delete`) and the
-declared business columns.
-
-Prerequisites on the target SQL Server:
-
-```sql
-EXEC sys.sp_cdc_enable_db;
-EXEC sys.sp_cdc_enable_table
-    @source_schema = 'dbo', @source_name = 'orders', @role_name = NULL;
-```
-
-SQL Server Agent must be running — CDC's capture job populates the
-`cdc.dbo_orders_CT` change table asynchronously from the transaction
-log. The default `mcr.microsoft.com/mssql/server:2022-latest` image
-does not start Agent; for local CDC experimentation use a different
-image or enable Agent manually.
-
-```toml
-[connector]
-name = "cdc-orders"
-type = "source"
-plugin = "mssql_cdc"
-stream = "orders-cdc"
-
-[settings]
-connection = "mssql://sa:Exspeed_Test!1@localhost:1433/master?trust_server_certificate=true"
-capture_instance = "dbo_orders"
-schema = "id:bigint, total:bigint, status:text"
-```
-
-LSN (Log Sequence Number) tracking: the connector persists the last-
-processed LSN as a hex string via the standard offset store; restart
-resumes from just past that LSN.
+See [SQL Server CDC Source](#sql-server-cdc-source) in the Connectors section above.
 
 ### Connector resilience: DLQ + retry
 

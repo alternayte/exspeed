@@ -113,6 +113,38 @@ const latencyMs = await client.ping();
 await client.close();
 ```
 
+### SQL Queries
+
+Execute bounded SQL queries over the TCP protocol:
+
+```ts
+const result = await client.query(
+  'SELECT payload->>\'region\' AS region, COUNT(*) AS cnt FROM orders GROUP BY 1'
+);
+
+console.log(result.columns);       // ["region", "cnt"]
+console.log(result.rows);          // [["eu", 42], ["us", 17]]
+console.log(result.rowCount);      // 2
+console.log(result.executionTimeMs); // 12
+```
+
+Query errors include structured diagnostics:
+
+```ts
+import { QueryError } from '@exspeed/sdk';
+
+try {
+  await client.query("SELECT * FROM orders UNION SELECT * FROM events");
+} catch (err) {
+  if (err instanceof QueryError) {
+    console.log(err.code);    // "UNSUPPORTED"
+    console.log(err.hint);    // "ExQL supports SELECT with WHERE, JOIN, GROUP BY, ORDER BY, LIMIT"
+    console.log(err.line);    // 1
+    console.log(err.column);  // 25
+  }
+}
+```
+
 ## Events
 
 ```ts
