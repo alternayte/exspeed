@@ -8,6 +8,7 @@ pub enum PhysicalPlan {
         required_columns: crate::planner::column_set::ColumnSet,
         predicate: Option<crate::parser::ast::Expr>,
         reverse_limit: Option<u64>,
+        timestamp_lower_bound: Option<u64>,
     },
     ExternalScan {
         connection: String,

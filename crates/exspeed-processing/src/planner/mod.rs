@@ -13,6 +13,7 @@ pub fn plan(query: &QueryExpr, emit_mode: EmitMode) -> Result<PhysicalPlan, Pars
     let physical = to_physical(logical);
     let optimized = push_down_filters(physical);
     let optimized = optimize_sort_limit(optimized);
+    let optimized = extract_timestamp_bounds(optimized);
     Ok(annotate_scans(optimized))
 }
 
@@ -199,6 +200,7 @@ fn to_physical(logical: LogicalPlan) -> PhysicalPlan {
             required_columns: crate::planner::column_set::ColumnSet::default(),
             predicate: None,
             reverse_limit: None,
+            timestamp_lower_bound: None,
         },
         LogicalPlan::ExternalScan {
             connection,
@@ -295,12 +297,12 @@ pub fn annotate_scans(plan: PhysicalPlan) -> PhysicalPlan {
 
 fn annotate_with_seed(plan: PhysicalPlan, seed: ColumnSet) -> PhysicalPlan {
     match plan {
-        PhysicalPlan::SeqScan { stream, alias, predicate, reverse_limit, .. } => {
+        PhysicalPlan::SeqScan { stream, alias, predicate, reverse_limit, timestamp_lower_bound, .. } => {
             let mut cs = seed;
             if let Some(ref pred) = predicate {
                 collect_columns(pred, &mut cs);
             }
-            PhysicalPlan::SeqScan { stream, alias, required_columns: cs, predicate, reverse_limit }
+            PhysicalPlan::SeqScan { stream, alias, required_columns: cs, predicate, reverse_limit, timestamp_lower_bound }
         }
         PhysicalPlan::ExternalScan { .. } => plan,
         PhysicalPlan::Filter { input, predicate } => {
@@ -403,8 +405,8 @@ fn push_down_filters(plan: PhysicalPlan) -> PhysicalPlan {
     match plan {
         PhysicalPlan::Filter { input, predicate } => {
             match *input {
-                PhysicalPlan::SeqScan { stream, alias, required_columns, predicate: None, reverse_limit } => {
-                    PhysicalPlan::SeqScan { stream, alias, required_columns, predicate: Some(predicate), reverse_limit }
+                PhysicalPlan::SeqScan { stream, alias, required_columns, predicate: None, reverse_limit, timestamp_lower_bound } => {
+                    PhysicalPlan::SeqScan { stream, alias, required_columns, predicate: Some(predicate), reverse_limit, timestamp_lower_bound }
                 }
                 other => PhysicalPlan::Filter {
                     input: Box::new(push_down_filters(other)),
@@ -577,8 +579,8 @@ fn subtree_preserves_offset_order(plan: &PhysicalPlan) -> bool {
 /// Push `reverse_limit` down through order-preserving nodes into the `SeqScan`.
 fn set_reverse_limit(plan: PhysicalPlan, limit: u64) -> PhysicalPlan {
     match plan {
-        PhysicalPlan::SeqScan { stream, alias, required_columns, predicate, .. } => {
-            PhysicalPlan::SeqScan { stream, alias, required_columns, predicate, reverse_limit: Some(limit) }
+        PhysicalPlan::SeqScan { stream, alias, required_columns, predicate, timestamp_lower_bound, .. } => {
+            PhysicalPlan::SeqScan { stream, alias, required_columns, predicate, reverse_limit: Some(limit), timestamp_lower_bound }
         }
         PhysicalPlan::Project { input, items } => PhysicalPlan::Project {
             input: Box::new(set_reverse_limit(*input, limit)), items,
@@ -587,6 +589,95 @@ fn set_reverse_limit(plan: PhysicalPlan, limit: u64) -> PhysicalPlan {
             input: Box::new(set_reverse_limit(*input, limit)), predicate,
         },
         other => other,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Optimisation: timestamp bound extraction
+// ---------------------------------------------------------------------------
+
+/// Walk the plan tree and extract timestamp lower bounds from SeqScan
+/// predicates. When a WHERE clause contains `timestamp > <literal>` or
+/// `timestamp >= <literal>`, the bound is lifted into the SeqScan so the
+/// storage layer can skip segments via the TimeIndex.
+fn extract_timestamp_bounds(plan: PhysicalPlan) -> PhysicalPlan {
+    match plan {
+        PhysicalPlan::SeqScan { stream, alias, required_columns, predicate, reverse_limit, .. } => {
+            let bound = predicate.as_ref().and_then(extract_timestamp_lower_bound);
+            PhysicalPlan::SeqScan {
+                stream, alias, required_columns, predicate, reverse_limit,
+                timestamp_lower_bound: bound,
+            }
+        }
+        PhysicalPlan::Project { input, items } => PhysicalPlan::Project {
+            input: Box::new(extract_timestamp_bounds(*input)), items,
+        },
+        PhysicalPlan::Filter { input, predicate } => PhysicalPlan::Filter {
+            input: Box::new(extract_timestamp_bounds(*input)), predicate,
+        },
+        PhysicalPlan::Limit { input, limit, offset } => PhysicalPlan::Limit {
+            input: Box::new(extract_timestamp_bounds(*input)), limit, offset,
+        },
+        PhysicalPlan::TopN { input, order_by, limit } => PhysicalPlan::TopN {
+            input: Box::new(extract_timestamp_bounds(*input)), order_by, limit,
+        },
+        PhysicalPlan::Sort { input, order_by } => PhysicalPlan::Sort {
+            input: Box::new(extract_timestamp_bounds(*input)), order_by,
+        },
+        PhysicalPlan::HashAggregate { input, group_by, select_items } => PhysicalPlan::HashAggregate {
+            input: Box::new(extract_timestamp_bounds(*input)), group_by, select_items,
+        },
+        PhysicalPlan::HashJoin { left, right, on, join_type } => PhysicalPlan::HashJoin {
+            left: Box::new(extract_timestamp_bounds(*left)),
+            right: Box::new(extract_timestamp_bounds(*right)),
+            on, join_type,
+        },
+        PhysicalPlan::StreamStreamJoin { left, right, on, within, join_type } => PhysicalPlan::StreamStreamJoin {
+            left: Box::new(extract_timestamp_bounds(*left)),
+            right: Box::new(extract_timestamp_bounds(*right)),
+            on, within, join_type,
+        },
+        PhysicalPlan::WindowedAggregate { input, window_size, group_by, select_items, emit_mode } => PhysicalPlan::WindowedAggregate {
+            input: Box::new(extract_timestamp_bounds(*input)),
+            window_size, group_by, select_items, emit_mode,
+        },
+        other => other,
+    }
+}
+
+/// Extract a timestamp lower bound from a predicate expression.
+///
+/// Recognises patterns like `timestamp > N`, `timestamp >= N`, and
+/// `N < timestamp`, `N <= timestamp`. When multiple bounds appear in
+/// an AND tree, the tightest (maximum) bound is returned.
+fn extract_timestamp_lower_bound(expr: &Expr) -> Option<u64> {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            match op {
+                BinaryOperator::Gt | BinaryOperator::Gte => {
+                    if matches!(left.as_ref(), Expr::Column { name, .. } if name == "timestamp") {
+                        if let Expr::Literal(LiteralValue::Int(n)) = right.as_ref() {
+                            return Some(*n as u64);
+                        }
+                    }
+                }
+                BinaryOperator::Lt | BinaryOperator::Lte => {
+                    if matches!(right.as_ref(), Expr::Column { name, .. } if name == "timestamp") {
+                        if let Expr::Literal(LiteralValue::Int(n)) = left.as_ref() {
+                            return Some(*n as u64);
+                        }
+                    }
+                }
+                BinaryOperator::And => {
+                    let l = extract_timestamp_lower_bound(left);
+                    let r = extract_timestamp_lower_bound(right);
+                    return l.into_iter().chain(r).max();
+                }
+                _ => {}
+            }
+            None
+        }
+        _ => None,
     }
 }
 
@@ -1067,6 +1158,24 @@ mod tests {
                 let p = plan(&q, EmitMode::Changes).unwrap();
                 let debug = format!("{p:?}");
                 assert!(debug.contains("Sort"), "unbounded ORDER BY should keep Sort, got: {debug}");
+            }
+            _ => panic!("expected Query"),
+        }
+    }
+
+    #[test]
+    fn plan_timestamp_filter_extracts_bound() {
+        let stmt = crate::parser::parse(
+            r#"SELECT * FROM "orders" WHERE timestamp > 1700000000000"#
+        ).unwrap();
+        match stmt {
+            ExqlStatement::Query(q) => {
+                let p = plan(&q, EmitMode::Changes).unwrap();
+                let debug = format!("{p:?}");
+                assert!(
+                    debug.contains("timestamp_lower_bound: Some(1700000000000)"),
+                    "should extract timestamp bound, got: {debug}"
+                );
             }
             _ => panic!("expected Query"),
         }
