@@ -38,6 +38,8 @@ pub struct ExqlEngine {
     pub leadership: Arc<ClusterLeadership>,
     /// Shared server metrics.
     pub metrics: Arc<Metrics>,
+    /// Root data directory for persisted state.
+    data_dir: PathBuf,
 }
 
 impl ExqlEngine {
@@ -49,7 +51,7 @@ impl ExqlEngine {
         metrics: Arc<Metrics>,
     ) -> Self {
         let connection_registry = Arc::new(ConnectionRegistry::new(data_dir.clone()));
-        let query_registry = Arc::new(QueryRegistry::new(data_dir));
+        let query_registry = Arc::new(QueryRegistry::new(data_dir.clone()));
         let mv_registry = Arc::new(MaterializedViewRegistry::new());
         Self {
             storage,
@@ -58,6 +60,7 @@ impl ExqlEngine {
             mv_registry,
             leadership,
             metrics,
+            data_dir,
         }
     }
 
@@ -66,6 +69,69 @@ impl ExqlEngine {
         self.connection_registry.load_all();
         self.query_registry.load_all()?;
         Ok(())
+    }
+
+    /// Return the data directory path.
+    fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
+    }
+
+    /// Create a secondary index from a `CREATE INDEX` statement.
+    ///
+    /// Parses `sql`, persists index metadata as JSON under
+    /// `{data_dir}/indexes/{name}.json`, and returns the index name.
+    pub async fn create_index(&self, sql: &str) -> Result<String, ExqlError> {
+        let stmt = crate::parser::parse(sql)?;
+        match stmt {
+            crate::parser::ExqlStatement::CreateIndex {
+                name,
+                stream,
+                field_path,
+            } => {
+                let index_dir = self.data_dir().join("indexes");
+                std::fs::create_dir_all(&index_dir)
+                    .map_err(|e| ExqlError::Storage(e.to_string()))?;
+                let meta = serde_json::json!({
+                    "name": name,
+                    "stream": stream,
+                    "field_path": field_path,
+                });
+                let path = index_dir.join(format!("{name}.json"));
+                std::fs::write(
+                    &path,
+                    serde_json::to_string_pretty(&meta).unwrap(),
+                )
+                .map_err(|e| ExqlError::Storage(e.to_string()))?;
+                Ok(name)
+            }
+            _ => Err(ExqlError::Execution(
+                "expected CREATE INDEX statement".into(),
+            )),
+        }
+    }
+
+    /// Drop a secondary index from a `DROP INDEX` statement.
+    ///
+    /// Parses `sql`, removes the index metadata JSON file if it exists, and
+    /// returns the index name.
+    pub async fn drop_index(&self, sql: &str) -> Result<String, ExqlError> {
+        let stmt = crate::parser::parse(sql)?;
+        match stmt {
+            crate::parser::ExqlStatement::DropIndex(name) => {
+                let path = self
+                    .data_dir()
+                    .join("indexes")
+                    .join(format!("{name}.json"));
+                if path.exists() {
+                    std::fs::remove_file(&path)
+                        .map_err(|e| ExqlError::Storage(e.to_string()))?;
+                }
+                Ok(name)
+            }
+            _ => Err(ExqlError::Execution(
+                "expected DROP INDEX statement".into(),
+            )),
+        }
     }
 
     /// Execute a bounded (batch) SQL query.

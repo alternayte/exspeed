@@ -16,6 +16,17 @@ use sqlparser::parser::Parser;
 /// - `EMIT CHANGES` / `EMIT FINAL` suffix on CREATE VIEW statements
 /// - `WITHIN '<duration>'` on JOIN clauses (for stream-stream joins)
 pub fn parse(sql: &str) -> Result<ExqlStatement, ParseError> {
+    let trimmed = sql.trim();
+    let upper = trimmed.to_uppercase();
+
+    // Handle CREATE INDEX before sqlparser (not standard SQL)
+    if upper.starts_with("CREATE INDEX") {
+        return parse_create_index(trimmed);
+    }
+    if upper.starts_with("DROP INDEX") {
+        return parse_drop_index(trimmed);
+    }
+
     // --- Pre-process: extract EMIT mode ---
     let (sql_no_emit, emit_mode) = extract_emit_mode(sql);
 
@@ -121,7 +132,9 @@ fn apply_within_values(stmt: &mut ExqlStatement, within_values: &[String]) {
         ExqlStatement::Query(ref mut q) => q,
         ExqlStatement::CreateStream { ref mut query, .. } => query,
         ExqlStatement::CreateMaterializedView { ref mut query, .. } => query,
-        ExqlStatement::DropStream(_) => return,
+        ExqlStatement::DropStream(_)
+        | ExqlStatement::CreateIndex { .. }
+        | ExqlStatement::DropIndex(_) => return,
     };
 
     for (i, join) in query.joins.iter_mut().enumerate() {
@@ -129,6 +142,73 @@ fn apply_within_values(stmt: &mut ExqlStatement, within_values: &[String]) {
             join.within = Some(val.clone());
         }
     }
+}
+
+fn parse_create_index(sql: &str) -> Result<ExqlStatement, ParseError> {
+    // CREATE INDEX name ON stream(payload->>'field')
+    // CREATE INDEX name ON "stream"(payload->>'field')
+    let tokens: Vec<&str> = sql.split_whitespace().collect();
+    if tokens.len() < 5 {
+        return Err(ParseError::Sql {
+            message: "CREATE INDEX requires: CREATE INDEX <name> ON <stream>(<expr>)".into(),
+            line: 1,
+            column: 0,
+        });
+    }
+    // tokens[0] = CREATE, tokens[1] = INDEX, tokens[2] = name, tokens[3] = ON
+    let name = tokens[2].to_string();
+    if tokens[3].to_uppercase() != "ON" {
+        return Err(ParseError::Sql {
+            message: format!("expected ON after index name, found '{}'", tokens[3]),
+            line: 1,
+            column: 0,
+        });
+    }
+    // Rejoin remaining tokens to handle quoted stream names
+    let rest = tokens[4..].join(" ");
+    let paren_start = rest.find('(').ok_or_else(|| ParseError::Sql {
+        message: "expected (<field_expr>) after stream name".into(),
+        line: 1,
+        column: 0,
+    })?;
+    let paren_end = rest.rfind(')').ok_or_else(|| ParseError::Sql {
+        message: "expected closing ) in field expression".into(),
+        line: 1,
+        column: 0,
+    })?;
+    let stream = rest[..paren_start].trim().trim_matches('"').to_string();
+    let field_expr = rest[paren_start + 1..paren_end].trim();
+
+    // Extract field path from expressions like payload->>'field_name'
+    let field_path = if field_expr.contains("->>") {
+        field_expr
+            .split("->>")
+            .last()
+            .map(|s| s.trim().trim_matches('\'').trim_matches('"').to_string())
+            .unwrap_or_else(|| field_expr.to_string())
+    } else {
+        field_expr.trim_matches('\'').trim_matches('"').to_string()
+    };
+
+    Ok(ExqlStatement::CreateIndex {
+        name,
+        stream,
+        field_path,
+    })
+}
+
+fn parse_drop_index(sql: &str) -> Result<ExqlStatement, ParseError> {
+    let tokens: Vec<&str> = sql.split_whitespace().collect();
+    if tokens.len() < 3 {
+        return Err(ParseError::Sql {
+            message: "DROP INDEX requires: DROP INDEX <name>".into(),
+            line: 1,
+            column: 0,
+        });
+    }
+    Ok(ExqlStatement::DropIndex(
+        tokens[2].trim_matches('"').to_string(),
+    ))
 }
 
 #[cfg(test)]
@@ -518,6 +598,52 @@ mod tests {
                 assert!(q.joins[0].within.is_none());
             }
             other => panic!("expected Query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_create_index() {
+        let stmt = parse(r#"CREATE INDEX idx_article ON orders(payload->>'article_id')"#).unwrap();
+        match stmt {
+            ExqlStatement::CreateIndex {
+                name,
+                stream,
+                field_path,
+            } => {
+                assert_eq!(name, "idx_article");
+                assert_eq!(stream, "orders");
+                assert_eq!(field_path, "article_id");
+            }
+            other => panic!("expected CreateIndex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_create_index_quoted_stream() {
+        let stmt =
+            parse(r#"CREATE INDEX idx_region ON "my-stream"(payload->>'region')"#).unwrap();
+        match stmt {
+            ExqlStatement::CreateIndex {
+                name,
+                stream,
+                field_path,
+            } => {
+                assert_eq!(name, "idx_region");
+                assert_eq!(stream, "my-stream");
+                assert_eq!(field_path, "region");
+            }
+            other => panic!("expected CreateIndex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_drop_index() {
+        let stmt = parse("DROP INDEX idx_article").unwrap();
+        match stmt {
+            ExqlStatement::DropIndex(name) => {
+                assert_eq!(name, "idx_article");
+            }
+            other => panic!("expected DropIndex, got {other:?}"),
         }
     }
 }

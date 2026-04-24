@@ -18,6 +18,12 @@ pub enum ExqlStatement {
         query: QueryExpr,
     },
     DropStream(String),
+    CreateIndex {
+        name: String,
+        stream: String,
+        field_path: String,
+    },
+    DropIndex(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
