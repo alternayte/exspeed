@@ -1,5 +1,6 @@
 pub mod aggregate;
 pub mod filter;
+pub mod index_scan;
 pub mod join;
 pub mod limit;
 pub mod project;
