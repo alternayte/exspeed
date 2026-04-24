@@ -759,12 +759,55 @@ impl Partition {
     }
 
     /// Register a secondary index definition so that `.sidx.{name}` files
-    /// are built when segments are sealed. No-op if an index with the same
-    /// name is already registered.
+    /// are built when segments are sealed. Also backfills existing sealed
+    /// segments that do not yet have a `.sidx.{name}` file.
+    ///
+    /// No-op if an index with the same name is already registered.
     pub fn register_secondary_index(&mut self, name: String, field_path: String) {
         if !self.secondary_indexes.iter().any(|(n, _)| n == &name) {
-            self.secondary_indexes.push((name, field_path));
+            self.secondary_indexes.push((name.clone(), field_path.clone()));
+            if let Err(e) = self.backfill_secondary_index(&name, &field_path) {
+                tracing::warn!(index = %name, error = %e, "failed to backfill secondary index");
+            }
         }
+    }
+
+    /// Build `.sidx.{name}` files for every sealed segment that does not
+    /// already have one. Called from `register_secondary_index` so that
+    /// indexes created after data already exists cover the full history.
+    fn backfill_secondary_index(&self, name: &str, field_path: &str) -> io::Result<()> {
+        for reader in &self.sealed_readers {
+            let sidx_path = reader.path().with_extension(format!("sidx.{name}"));
+            if sidx_path.exists() {
+                continue; // already indexed
+            }
+            let records = reader.read_all()?;
+            let mut entries = Vec::new();
+            for record in &records {
+                if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&record.value) {
+                    if let Some(val) = json.get(field_path) {
+                        let val_str = match val {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        entries.push((
+                            crate::file::secondary_index::SecondaryIndex::hash_value(&val_str),
+                            record.offset.0,
+                        ));
+                    }
+                }
+            }
+            if !entries.is_empty() {
+                crate::file::secondary_index::SecondaryIndex::build(&sidx_path, &mut entries)?;
+                info!(
+                    index = name,
+                    segment = %reader.path().display(),
+                    entries = entries.len(),
+                    "backfilled secondary index for sealed segment"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Roll the active segment: seal it, build indexes, open a reader for it,
