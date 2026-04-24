@@ -162,8 +162,24 @@ impl SegmentReader {
     /// Return the offset of the last record in the segment, or `None` if the
     /// segment contains no records.
     pub fn last_offset(&self) -> io::Result<Option<u64>> {
-        let records = self.read_all()?;
-        Ok(records.last().map(|r| r.offset.0))
+        let mut file = File::open(&self.path)?;
+        file.seek(SeekFrom::Start(SEGMENT_HEADER_SIZE as u64))?;
+
+        let mut last: Option<u64> = None;
+        let mut pos = SEGMENT_HEADER_SIZE as u64;
+
+        loop {
+            match self.read_one_record(&mut file, pos) {
+                Ok((record, consumed)) => {
+                    last = Some(record.offset.0);
+                    pos += consumed as u64;
+                }
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(last)
     }
 
     /// Scan a segment sequentially, collecting data needed for index building.
