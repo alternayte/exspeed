@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::Operator;
 use crate::parser::ast::{AggregateFunc, Expr, SelectItem};
@@ -70,7 +70,7 @@ impl AggregateOperator {
             for (i, desc) in agg_descs.iter().enumerate() {
                 if let Some(d) = desc {
                     let val = eval_expr(&d.expr, &row);
-                    state.accumulators[i].accumulate(&d.func, &val);
+                    state.accumulators[i].accumulate(d, &val);
                 }
             }
         }
@@ -89,7 +89,7 @@ impl AggregateOperator {
                 columns.push(col_name);
 
                 if let Some(desc) = &agg_descs[i] {
-                    values.push(state.accumulators[i].result(&desc.func));
+                    values.push(state.accumulators[i].result(desc));
                 } else {
                     // Non-aggregate expression — evaluate using group values.
                     // Build a temporary row from the group values.
@@ -128,7 +128,7 @@ impl AggregateOperator {
                 columns.push(col_name);
                 if let Some(desc) = &agg_descs[i] {
                     let acc = AggAccum::new();
-                    values.push(acc.result(&desc.func));
+                    values.push(acc.result(desc));
                 } else {
                     values.push(Value::Null);
                 }
@@ -178,6 +178,8 @@ struct GroupState {
 struct AggDesc {
     func: AggregateFunc,
     expr: Expr,
+    is_count_star: bool,
+    distinct: bool,
 }
 
 struct AggAccum {
@@ -185,6 +187,7 @@ struct AggAccum {
     sum: f64,
     min: Option<Value>,
     max: Option<Value>,
+    seen: HashSet<String>,
 }
 
 impl AggAccum {
@@ -194,17 +197,23 @@ impl AggAccum {
             sum: 0.0,
             min: None,
             max: None,
+            seen: HashSet::new(),
         }
     }
 
-    fn accumulate(&mut self, func: &AggregateFunc, val: &Value) {
-        match func {
+    fn accumulate(&mut self, desc: &AggDesc, val: &Value) {
+        // Handle DISTINCT: skip already-seen values (NULLs are never "seen").
+        if desc.distinct && !val.is_null() {
+            let key = val.to_string();
+            if !self.seen.insert(key) {
+                return;
+            }
+        }
+
+        match desc.func {
             AggregateFunc::Count => {
-                // COUNT(*) counts all rows; COUNT(expr) counts non-null.
-                // We always increment — the caller passes Wildcard for COUNT(*).
-                if !val.is_null() || matches!(val, Value::Null) {
-                    // For COUNT(*) the expr evaluates to Null (since Wildcard
-                    // returns Null), but we still count.
+                // COUNT(*) counts all rows; COUNT(column) skips NULLs.
+                if desc.is_count_star || !val.is_null() {
                     self.count += 1;
                 }
             }
@@ -249,8 +258,8 @@ impl AggAccum {
         }
     }
 
-    fn result(&self, func: &AggregateFunc) -> Value {
-        match func {
+    fn result(&self, desc: &AggDesc) -> Value {
+        match desc.func {
             AggregateFunc::Count => Value::Int(self.count),
             AggregateFunc::Sum => {
                 if self.count == 0 {
@@ -282,9 +291,15 @@ impl AggAccum {
 /// Extract an aggregate descriptor from an expression, if it is an aggregate.
 fn extract_agg_desc(expr: &Expr) -> Option<AggDesc> {
     match expr {
-        Expr::Aggregate { func, expr, .. } => Some(AggDesc {
+        Expr::Aggregate {
+            func,
+            expr,
+            distinct,
+        } => Some(AggDesc {
             func: func.clone(),
+            is_count_star: matches!(expr.as_ref(), Expr::Wildcard { .. }),
             expr: *expr.clone(),
+            distinct: *distinct,
         }),
         _ => None,
     }
@@ -485,5 +500,143 @@ mod tests {
         assert_eq!(r1.get("count"), Some(&Value::Int(0)));
 
         assert!(agg.next().is_none());
+    }
+
+    #[test]
+    fn count_column_skips_nulls() {
+        let rows = vec![
+            Row {
+                columns: vec!["x".into()],
+                values: vec![Value::Int(1)],
+            },
+            Row {
+                columns: vec!["x".into()],
+                values: vec![Value::Null],
+            },
+            Row {
+                columns: vec!["x".into()],
+                values: vec![Value::Int(3)],
+            },
+        ];
+        let select_items = vec![
+            SelectItem {
+                expr: Expr::Aggregate {
+                    func: AggregateFunc::Count,
+                    expr: Box::new(Expr::Column {
+                        table: None,
+                        name: "x".into(),
+                    }),
+                    distinct: false,
+                },
+                alias: Some("cnt_col".into()),
+            },
+            SelectItem {
+                expr: Expr::Aggregate {
+                    func: AggregateFunc::Count,
+                    expr: Box::new(Expr::Wildcard { table: None }),
+                    distinct: false,
+                },
+                alias: Some("cnt_star".into()),
+            },
+        ];
+        let scan = Box::new(ScanOperator::new(rows));
+        let mut agg = AggregateOperator::new(scan, vec![], select_items);
+        let r = agg.next().unwrap();
+        assert_eq!(
+            r.get("cnt_col"),
+            Some(&Value::Int(2)),
+            "COUNT(x) should skip NULLs"
+        );
+        assert_eq!(
+            r.get("cnt_star"),
+            Some(&Value::Int(3)),
+            "COUNT(*) should count all"
+        );
+    }
+
+    #[test]
+    fn sum_distinct_deduplicates() {
+        let rows = vec![
+            Row {
+                columns: vec!["x".into()],
+                values: vec![Value::Int(10)],
+            },
+            Row {
+                columns: vec!["x".into()],
+                values: vec![Value::Int(20)],
+            },
+            Row {
+                columns: vec!["x".into()],
+                values: vec![Value::Int(10)],
+            },
+            Row {
+                columns: vec!["x".into()],
+                values: vec![Value::Int(20)],
+            },
+            Row {
+                columns: vec!["x".into()],
+                values: vec![Value::Int(30)],
+            },
+        ];
+        let select_items = vec![SelectItem {
+            expr: Expr::Aggregate {
+                func: AggregateFunc::Sum,
+                expr: Box::new(Expr::Column {
+                    table: None,
+                    name: "x".into(),
+                }),
+                distinct: true,
+            },
+            alias: Some("sum_d".into()),
+        }];
+        let scan = Box::new(ScanOperator::new(rows));
+        let mut agg = AggregateOperator::new(scan, vec![], select_items);
+        let r = agg.next().unwrap();
+        assert_eq!(
+            r.get("sum_d"),
+            Some(&Value::Int(60)),
+            "SUM(DISTINCT x) = 10+20+30"
+        );
+    }
+
+    #[test]
+    fn count_distinct_deduplicates() {
+        let rows = vec![
+            Row {
+                columns: vec!["x".into()],
+                values: vec![Value::Int(1)],
+            },
+            Row {
+                columns: vec!["x".into()],
+                values: vec![Value::Int(2)],
+            },
+            Row {
+                columns: vec!["x".into()],
+                values: vec![Value::Int(1)],
+            },
+            Row {
+                columns: vec!["x".into()],
+                values: vec![Value::Null],
+            },
+        ];
+        let select_items = vec![SelectItem {
+            expr: Expr::Aggregate {
+                func: AggregateFunc::Count,
+                expr: Box::new(Expr::Column {
+                    table: None,
+                    name: "x".into(),
+                }),
+                distinct: true,
+            },
+            alias: Some("cnt_d".into()),
+        }];
+        let scan = Box::new(ScanOperator::new(rows));
+        let mut agg = AggregateOperator::new(scan, vec![], select_items);
+        let r = agg.next().unwrap();
+        assert_eq!(
+            r.get("cnt_d"),
+            Some(&Value::Int(2)),
+            "COUNT(DISTINCT x) = 2 (skip NULL and dedup)"
+        );
     }
 }
