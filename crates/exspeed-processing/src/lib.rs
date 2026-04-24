@@ -64,10 +64,52 @@ impl ExqlEngine {
         }
     }
 
-    /// Load persisted state (connections + queries) from disk.
+    /// Load persisted state (connections + queries + secondary indexes) from disk.
     pub fn load(&self) -> Result<(), String> {
         self.connection_registry.load_all();
         self.query_registry.load_all()?;
+
+        // Load secondary index definitions and register on partitions
+        let index_dir = self.data_dir.join("indexes");
+        if index_dir.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&index_dir) {
+                for entry in entries.flatten() {
+                    if entry.path().extension().and_then(|e| e.to_str()) == Some("json") {
+                        if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
+                                let name = meta["name"].as_str().unwrap_or("").to_string();
+                                let stream = meta["stream"].as_str().unwrap_or("").to_string();
+                                let field_path =
+                                    meta["field_path"].as_str().unwrap_or("").to_string();
+                                if !name.is_empty() && !stream.is_empty() {
+                                    if let Ok(sn) =
+                                        exspeed_common::StreamName::try_from(stream.as_str())
+                                    {
+                                        let storage = self.storage.clone();
+                                        let _ = tokio::task::block_in_place(|| {
+                                            tokio::runtime::Handle::current().block_on(
+                                                storage.register_secondary_index(
+                                                    &sn,
+                                                    name.clone(),
+                                                    field_path.clone(),
+                                                ),
+                                            )
+                                        });
+                                        info!(
+                                            index = %name,
+                                            stream = %stream,
+                                            field = %field_path,
+                                            "loaded secondary index"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -102,6 +144,17 @@ impl ExqlEngine {
                     serde_json::to_string_pretty(&meta).unwrap(),
                 )
                 .map_err(|e| ExqlError::Storage(e.to_string()))?;
+
+                // Register on running partitions immediately
+                if let Ok(sn) = exspeed_common::StreamName::try_from(stream.as_str()) {
+                    self.storage
+                        .register_secondary_index(&sn, name.clone(), field_path.clone())
+                        .await
+                        .map_err(|e| {
+                            ExqlError::Storage(format!("failed to register index: {e}"))
+                        })?;
+                }
+
                 Ok(name)
             }
             _ => Err(ExqlError::Execution(
