@@ -108,7 +108,7 @@ fn build_operator<'a>(
 ) -> BuildOperatorFuture<'a> {
     Box::pin(async move {
     match plan {
-        PhysicalPlan::SeqScan { stream, alias, required_columns, predicate, reverse_limit: _ } => {
+        PhysicalPlan::SeqScan { stream, alias, required_columns, predicate, reverse_limit } => {
             // Check materialized views first
             if let Some(mv_reg) = mv_registry {
                 if let Some((_columns, rows)) = mv_reg.get_rows(stream) {
@@ -126,13 +126,20 @@ fn build_operator<'a>(
                 ExqlError::Storage(format!("invalid stream name '{}': {}", stream, e))
             })?;
 
-            Ok(Box::new(ScanOperator::streaming_with_predicate(
-                storage.clone(),
-                stream_name,
-                alias.clone(),
-                required_columns.clone(),
-                predicate.clone(),
-            )) as Box<dyn Operator>)
+            if let Some(limit) = reverse_limit {
+                Ok(Box::new(ScanOperator::reverse_tail(
+                    storage.clone(), stream_name, alias.clone(),
+                    required_columns.clone(), predicate.clone(), *limit,
+                )) as Box<dyn Operator>)
+            } else {
+                Ok(Box::new(ScanOperator::streaming_with_predicate(
+                    storage.clone(),
+                    stream_name,
+                    alias.clone(),
+                    required_columns.clone(),
+                    predicate.clone(),
+                )) as Box<dyn Operator>)
+            }
         }
 
         PhysicalPlan::ExternalScan {
@@ -567,5 +574,33 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.rows.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn select_offset_desc_limit() {
+        let storage = setup_test_data().await;
+        let result = execute_bounded(
+            r#"SELECT offset FROM "orders" ORDER BY offset DESC LIMIT 3"#,
+            &storage,
+        ).await.unwrap();
+        assert_eq!(result.rows.len(), 3);
+        let offsets: Vec<i64> = result.rows.iter()
+            .filter_map(|r| r.get("offset").and_then(|v| v.to_i64()))
+            .collect();
+        assert_eq!(offsets, vec![4, 3, 2], "should return last 3 offsets in DESC order");
+    }
+
+    #[tokio::test]
+    async fn select_offset_asc_limit_no_sort() {
+        let storage = setup_test_data().await;
+        let result = execute_bounded(
+            r#"SELECT offset FROM "orders" ORDER BY offset ASC LIMIT 3"#,
+            &storage,
+        ).await.unwrap();
+        assert_eq!(result.rows.len(), 3);
+        let offsets: Vec<i64> = result.rows.iter()
+            .filter_map(|r| r.get("offset").and_then(|v| v.to_i64()))
+            .collect();
+        assert_eq!(offsets, vec![0, 1, 2]);
     }
 }
