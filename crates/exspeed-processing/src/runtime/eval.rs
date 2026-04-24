@@ -288,6 +288,12 @@ pub fn compare_values(left: &Value, right: &Value) -> Option<Ordering> {
         (Value::Int(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
         (Value::Float(a), Value::Int(b)) => a.partial_cmp(&(*b as f64)),
 
+        // Timestamp ↔ numeric comparisons (timestamp is epoch-milliseconds)
+        (Value::Timestamp(a), Value::Int(b)) => (*a as i64).partial_cmp(b),
+        (Value::Int(a), Value::Timestamp(b)) => a.partial_cmp(&(*b as i64)),
+        (Value::Timestamp(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
+        (Value::Float(a), Value::Timestamp(b)) => a.partial_cmp(&(*b as f64)),
+
         // Fallback: compare Display representations
         _ => left.to_string().partial_cmp(&right.to_string()),
     }
