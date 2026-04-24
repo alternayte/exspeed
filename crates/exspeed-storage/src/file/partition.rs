@@ -766,6 +766,16 @@ impl Partition {
     pub fn register_secondary_index(&mut self, name: String, field_path: String) {
         if !self.secondary_indexes.iter().any(|(n, _)| n == &name) {
             self.secondary_indexes.push((name.clone(), field_path.clone()));
+
+            // Force-roll the active segment so it becomes sealed and gets
+            // indexed. Without this, streams under 256MB would never have
+            // .sidx files because the segment never rolls naturally.
+            if self.next_offset > 0 {
+                if let Err(e) = self.roll_segment() {
+                    tracing::warn!(index = %name, error = %e, "failed to roll segment for index backfill");
+                }
+            }
+
             if let Err(e) = self.backfill_secondary_index(&name, &field_path) {
                 tracing::warn!(index = %name, error = %e, "failed to backfill secondary index");
             }
