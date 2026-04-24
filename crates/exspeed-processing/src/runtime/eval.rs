@@ -389,30 +389,33 @@ fn like_match(text: &str, pattern: &str) -> bool {
 }
 
 fn like_match_recursive(text: &[u8], pattern: &[u8]) -> bool {
-    if pattern.is_empty() {
-        return text.is_empty();
-    }
-    match pattern[0] {
-        b'%' => {
-            // '%' matches zero or more characters.
-            // Try matching the rest of the pattern at every position.
-            for i in 0..=text.len() {
-                if like_match_recursive(&text[i..], &pattern[1..]) {
-                    return true;
-                }
-            }
-            false
-        }
-        b'_' => {
-            // '_' matches exactly one character.
-            !text.is_empty() && like_match_recursive(&text[1..], &pattern[1..])
-        }
-        c => {
-            !text.is_empty()
-                && text[0].eq_ignore_ascii_case(&c)
-                && like_match_recursive(&text[1..], &pattern[1..])
+    let (mut ti, mut pi) = (0usize, 0usize);
+    let (mut star_pi, mut star_ti) = (usize::MAX, 0usize);
+
+    while ti < text.len() {
+        if pi < pattern.len()
+            && (pattern[pi] == b'_' || text[ti].eq_ignore_ascii_case(&pattern[pi]))
+        {
+            ti += 1;
+            pi += 1;
+        } else if pi < pattern.len() && pattern[pi] == b'%' {
+            star_pi = pi;
+            star_ti = ti;
+            pi += 1;
+        } else if star_pi != usize::MAX {
+            pi = star_pi + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
         }
     }
+
+    while pi < pattern.len() && pattern[pi] == b'%' {
+        pi += 1;
+    }
+
+    pi == pattern.len()
 }
 
 /// Parse an interval string like "1 hour", "30 minutes", "7 days" into
@@ -456,6 +459,45 @@ fn is_truthy(v: &Value) -> bool {
         Value::Int(i) => *i != 0,
         Value::Null => false,
         _ => true,
+    }
+}
+
+#[cfg(test)]
+mod like_tests {
+    use super::like_match;
+
+    #[test]
+    fn like_basic_patterns() {
+        assert!(like_match("hello", "hello"));
+        assert!(like_match("hello", "%llo"));
+        assert!(like_match("hello", "h%o"));
+        assert!(like_match("hello", "%"));
+        assert!(like_match("hello", "h_llo"));
+        assert!(!like_match("hello", "world"));
+        assert!(!like_match("hello", "h_lo"));
+        assert!(like_match("", ""));
+        assert!(like_match("", "%"));
+        assert!(!like_match("", "_"));
+        assert!(like_match("abc", "a%c"));
+        assert!(like_match("abc", "%b%"));
+    }
+
+    #[test]
+    fn like_pathological_pattern_completes_fast() {
+        let text = "a".repeat(100);
+        let pattern = "%a%b%c%d%e%f%g%h%i%j%";
+        let start = std::time::Instant::now();
+        let _ = like_match(&text, pattern);
+        assert!(
+            start.elapsed().as_millis() < 100,
+            "LIKE should not take exponential time"
+        );
+    }
+
+    #[test]
+    fn like_case_insensitive() {
+        assert!(like_match("Hello", "hello"));
+        assert!(like_match("WORLD", "w%d"));
     }
 }
 
