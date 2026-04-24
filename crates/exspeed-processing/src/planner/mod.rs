@@ -12,6 +12,7 @@ pub fn plan(query: &QueryExpr, emit_mode: EmitMode) -> Result<PhysicalPlan, Pars
     let logical = build_logical(query, emit_mode)?;
     let physical = to_physical(logical);
     let optimized = push_down_filters(physical);
+    let optimized = optimize_sort_limit(optimized);
     Ok(annotate_scans(optimized))
 }
 
@@ -452,6 +453,144 @@ fn push_down_filters(plan: PhysicalPlan) -> PhysicalPlan {
 }
 
 // ---------------------------------------------------------------------------
+// Optimisation: sort/limit fusion
+// ---------------------------------------------------------------------------
+
+/// Detect `Limit(Sort(…))` patterns and replace with either:
+/// - Eliminated sort (ORDER BY offset ASC on a scan that's already ordered)
+/// - Reverse-tail scan (ORDER BY offset DESC LIMIT N)
+/// - TopN heap (any other ORDER BY + LIMIT)
+fn optimize_sort_limit(plan: PhysicalPlan) -> PhysicalPlan {
+    match plan {
+        PhysicalPlan::Limit { input, limit, offset } => {
+            match *input {
+                PhysicalPlan::Sort { input: sort_input, order_by } => {
+                    if let Some(lim) = limit {
+                        // ORDER BY offset DESC LIMIT N → reverse-tail scan
+                        if is_single_offset_order(&order_by) {
+                            if order_by[0].descending {
+                                return PhysicalPlan::Limit {
+                                    input: Box::new(set_reverse_limit(
+                                        optimize_sort_limit(*sort_input), lim,
+                                    )),
+                                    limit: Some(lim),
+                                    offset,
+                                };
+                            } else if subtree_preserves_offset_order(&sort_input) {
+                                // ORDER BY offset ASC on a naturally-ordered subtree → drop sort
+                                return PhysicalPlan::Limit {
+                                    input: Box::new(optimize_sort_limit(*sort_input)),
+                                    limit: Some(lim),
+                                    offset,
+                                };
+                            }
+                        }
+                        // Generic ORDER BY + LIMIT → TopN heap
+                        let effective_limit = lim + offset.unwrap_or(0);
+                        return PhysicalPlan::Limit {
+                            input: Box::new(PhysicalPlan::TopN {
+                                input: Box::new(optimize_sort_limit(*sort_input)),
+                                order_by,
+                                limit: effective_limit,
+                            }),
+                            limit: Some(lim),
+                            offset,
+                        };
+                    }
+                    // No limit → keep Sort intact, recurse into child
+                    PhysicalPlan::Limit {
+                        input: Box::new(PhysicalPlan::Sort {
+                            input: Box::new(optimize_sort_limit(*sort_input)),
+                            order_by,
+                        }),
+                        limit,
+                        offset,
+                    }
+                }
+                other => PhysicalPlan::Limit {
+                    input: Box::new(optimize_sort_limit(other)),
+                    limit,
+                    offset,
+                },
+            }
+        }
+        PhysicalPlan::Sort { input, order_by } => {
+            // Standalone ORDER BY offset ASC on a naturally-ordered tree → no-op
+            if is_single_offset_order(&order_by) && !order_by[0].descending
+                && subtree_preserves_offset_order(&input)
+            {
+                return optimize_sort_limit(*input);
+            }
+            PhysicalPlan::Sort {
+                input: Box::new(optimize_sort_limit(*input)),
+                order_by,
+            }
+        }
+        PhysicalPlan::Project { input, items } => PhysicalPlan::Project {
+            input: Box::new(optimize_sort_limit(*input)), items,
+        },
+        PhysicalPlan::Filter { input, predicate } => PhysicalPlan::Filter {
+            input: Box::new(optimize_sort_limit(*input)), predicate,
+        },
+        PhysicalPlan::TopN { input, order_by, limit } => PhysicalPlan::TopN {
+            input: Box::new(optimize_sort_limit(*input)), order_by, limit,
+        },
+        PhysicalPlan::HashAggregate { input, group_by, select_items } => PhysicalPlan::HashAggregate {
+            input: Box::new(optimize_sort_limit(*input)), group_by, select_items,
+        },
+        PhysicalPlan::HashJoin { left, right, on, join_type } => PhysicalPlan::HashJoin {
+            left: Box::new(optimize_sort_limit(*left)),
+            right: Box::new(optimize_sort_limit(*right)),
+            on, join_type,
+        },
+        PhysicalPlan::StreamStreamJoin { left, right, on, within, join_type } => PhysicalPlan::StreamStreamJoin {
+            left: Box::new(optimize_sort_limit(*left)),
+            right: Box::new(optimize_sort_limit(*right)),
+            on, within, join_type,
+        },
+        PhysicalPlan::WindowedAggregate { input, window_size, group_by, select_items, emit_mode } => PhysicalPlan::WindowedAggregate {
+            input: Box::new(optimize_sort_limit(*input)),
+            window_size, group_by, select_items, emit_mode,
+        },
+        other => other,
+    }
+}
+
+/// True when `order_by` is a single `ORDER BY offset` clause.
+fn is_single_offset_order(order_by: &[OrderByItem]) -> bool {
+    order_by.len() == 1
+        && matches!(&order_by[0].expr, Expr::Column { name, .. } if name == "offset")
+}
+
+/// True when the subtree is guaranteed to emit rows in ascending offset order
+/// (i.e. a `SeqScan` with only order-preserving nodes above it).
+fn subtree_preserves_offset_order(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::SeqScan { .. } => true,
+        PhysicalPlan::Project { input, .. } | PhysicalPlan::Filter { input, .. } => {
+            subtree_preserves_offset_order(input)
+        }
+        _ => false,
+    }
+}
+
+/// Push `reverse_limit` down through order-preserving nodes into the `SeqScan`.
+fn set_reverse_limit(plan: PhysicalPlan, limit: u64) -> PhysicalPlan {
+    match plan {
+        PhysicalPlan::SeqScan { stream, alias, required_columns, predicate, .. } => {
+            PhysicalPlan::SeqScan { stream, alias, required_columns, predicate, reverse_limit: Some(limit) }
+        }
+        PhysicalPlan::Project { input, items } => PhysicalPlan::Project {
+            input: Box::new(set_reverse_limit(*input, limit)), items,
+        },
+        PhysicalPlan::Filter { input, predicate } => PhysicalPlan::Filter {
+            input: Box::new(set_reverse_limit(*input, limit)), predicate,
+        },
+        other => other,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -571,7 +710,7 @@ mod tests {
         match stmt {
             ExqlStatement::Query(q) => {
                 let p = plan(&q, EmitMode::Changes).unwrap();
-                // Limit → Sort → Project → SeqScan
+                // After optimize_sort_limit: Limit → TopN → Project → SeqScan
                 match p {
                     PhysicalPlan::Limit {
                         input,
@@ -581,15 +720,17 @@ mod tests {
                         assert_eq!(limit, Some(10));
                         assert!(offset.is_none());
                         match *input {
-                            PhysicalPlan::Sort {
+                            PhysicalPlan::TopN {
                                 input: inner,
                                 ref order_by,
+                                limit: topn_limit,
                             } => {
                                 assert_eq!(order_by.len(), 1);
                                 assert!(order_by[0].descending);
+                                assert_eq!(topn_limit, 10);
                                 assert!(matches!(*inner, PhysicalPlan::Project { .. }));
                             }
-                            other => panic!("expected Sort, got {other:?}"),
+                            other => panic!("expected TopN, got {other:?}"),
                         }
                     }
                     other => panic!("expected Limit, got {other:?}"),
@@ -873,6 +1014,59 @@ mod tests {
                     }
                     other => panic!("expected Project, got {other:?}"),
                 }
+            }
+            _ => panic!("expected Query"),
+        }
+    }
+
+    #[test]
+    fn plan_offset_asc_eliminates_sort() {
+        let stmt = crate::parser::parse(r#"SELECT * FROM "orders" ORDER BY offset ASC LIMIT 10"#).unwrap();
+        match stmt {
+            ExqlStatement::Query(q) => {
+                let p = plan(&q, EmitMode::Changes).unwrap();
+                let debug = format!("{p:?}");
+                assert!(!debug.contains("Sort"), "Sort should be eliminated for ORDER BY offset ASC, got: {debug}");
+            }
+            _ => panic!("expected Query"),
+        }
+    }
+
+    #[test]
+    fn plan_offset_desc_limit_uses_reverse_scan() {
+        let stmt = crate::parser::parse(r#"SELECT * FROM "orders" ORDER BY offset DESC LIMIT 5"#).unwrap();
+        match stmt {
+            ExqlStatement::Query(q) => {
+                let p = plan(&q, EmitMode::Changes).unwrap();
+                let debug = format!("{p:?}");
+                assert!(!debug.contains("Sort"), "Sort should be eliminated, got: {debug}");
+                assert!(debug.contains("reverse_limit: Some(5)"), "should set reverse_limit, got: {debug}");
+            }
+            _ => panic!("expected Query"),
+        }
+    }
+
+    #[test]
+    fn plan_timestamp_desc_limit_uses_topn() {
+        let stmt = crate::parser::parse(r#"SELECT * FROM "orders" ORDER BY timestamp DESC LIMIT 10"#).unwrap();
+        match stmt {
+            ExqlStatement::Query(q) => {
+                let p = plan(&q, EmitMode::Changes).unwrap();
+                let debug = format!("{p:?}");
+                assert!(debug.contains("TopN"), "should use TopN for non-offset ORDER BY + LIMIT, got: {debug}");
+            }
+            _ => panic!("expected Query"),
+        }
+    }
+
+    #[test]
+    fn plan_unbounded_sort_preserved() {
+        let stmt = crate::parser::parse(r#"SELECT * FROM "orders" ORDER BY key ASC"#).unwrap();
+        match stmt {
+            ExqlStatement::Query(q) => {
+                let p = plan(&q, EmitMode::Changes).unwrap();
+                let debug = format!("{p:?}");
+                assert!(debug.contains("Sort"), "unbounded ORDER BY should keep Sort, got: {debug}");
             }
             _ => panic!("expected Query"),
         }
