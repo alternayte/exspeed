@@ -32,6 +32,8 @@ pub struct ConnectorConfig {
     pub dedup_window_secs: u64,
     #[serde(default)]
     pub transform_sql: String,
+    #[serde(default)]
+    pub key_field: String,
 
     // ---- DLQ + retry (all optional with backwards-compatible defaults) ----
     /// Behavior when `RetryPolicy` exhausts on a `TransientFailure`. Default
@@ -166,6 +168,8 @@ struct TomlConnectorSection {
     #[serde(default = "default_dedup_window")]
     dedup_window_secs: u64,
     #[serde(default)]
+    key_field: String,
+    #[serde(default)]
     on_transient_exhausted: OnTransientExhausted,
 }
 
@@ -185,6 +189,7 @@ impl TomlConnector {
             dedup_key: self.connector.dedup_key,
             dedup_window_secs: self.connector.dedup_window_secs,
             transform_sql: self.transform.map(|t| t.sql).unwrap_or_default(),
+            key_field: self.connector.key_field,
             on_transient_exhausted: self.connector.on_transient_exhausted,
             retry: self.retry,
         }
@@ -254,6 +259,7 @@ mod tests {
             dedup_key: String::new(),
             dedup_window_secs: 86400,
             transform_sql: String::new(),
+            key_field: String::new(),
             on_transient_exhausted: OnTransientExhausted::default(),
             retry: RetryPolicy::default_transient(),
         };
@@ -312,6 +318,7 @@ outbox_table = "outbox_events"
             dedup_key: String::new(),
             dedup_window_secs: 86400,
             transform_sql: String::new(),
+            key_field: String::new(),
             on_transient_exhausted: OnTransientExhausted::default(),
             retry: RetryPolicy::default_transient(),
         };
@@ -336,6 +343,7 @@ outbox_table = "outbox_events"
             dedup_key: String::new(),
             dedup_window_secs: 86400,
             transform_sql: String::new(),
+            key_field: String::new(),
             on_transient_exhausted: OnTransientExhausted::default(),
             retry: RetryPolicy::default_transient(),
         };
@@ -355,7 +363,7 @@ outbox_table = "outbox_events"
             settings: HashMap::from([("val".into(), "${EXSPEED_TEST_UNSET_VAR:-fallback_value}".into())]),
             batch_size: 100, poll_interval_ms: 50, dedup_enabled: true,
             dedup_key: String::new(), dedup_window_secs: 86400, transform_sql: String::new(),
-            on_transient_exhausted: OnTransientExhausted::default(), retry: RetryPolicy::default_transient(),
+            key_field: String::new(), on_transient_exhausted: OnTransientExhausted::default(), retry: RetryPolicy::default_transient(),
         };
         config.resolve_env_vars();
         assert_eq!(config.settings.get("val").unwrap(), "fallback_value");
@@ -370,7 +378,7 @@ outbox_table = "outbox_events"
             settings: HashMap::from([("val".into(), "${EXSPEED_TEST_SET_VAR:-ignored}".into())]),
             batch_size: 100, poll_interval_ms: 50, dedup_enabled: true,
             dedup_key: String::new(), dedup_window_secs: 86400, transform_sql: String::new(),
-            on_transient_exhausted: OnTransientExhausted::default(), retry: RetryPolicy::default_transient(),
+            key_field: String::new(), on_transient_exhausted: OnTransientExhausted::default(), retry: RetryPolicy::default_transient(),
         };
         config.resolve_env_vars();
         assert_eq!(config.settings.get("val").unwrap(), "from_env");
@@ -386,7 +394,7 @@ outbox_table = "outbox_events"
             settings: HashMap::from([("val".into(), "${EXSPEED_TEST_EMPTY_DEFAULT:-}".into())]),
             batch_size: 100, poll_interval_ms: 50, dedup_enabled: true,
             dedup_key: String::new(), dedup_window_secs: 86400, transform_sql: String::new(),
-            on_transient_exhausted: OnTransientExhausted::default(), retry: RetryPolicy::default_transient(),
+            key_field: String::new(), on_transient_exhausted: OnTransientExhausted::default(), retry: RetryPolicy::default_transient(),
         };
         config.resolve_env_vars();
         assert_eq!(config.settings.get("val").unwrap(), "");
@@ -408,6 +416,7 @@ outbox_table = "outbox_events"
             dedup_key: String::new(),
             dedup_window_secs: 86400,
             transform_sql: String::new(),
+            key_field: String::new(),
             on_transient_exhausted: OnTransientExhausted::default(),
             retry: RetryPolicy::default_transient(),
         };
@@ -469,5 +478,26 @@ url = "https://example.com/hook"
         assert_eq!(config.on_transient_exhausted, OnTransientExhausted::LoopForever);
         assert_eq!(config.retry.max_retries, 5);
         assert!(config.retry.jitter);
+    }
+
+    #[test]
+    fn key_field_parsed_from_toml() {
+        let toml = r#"
+[connector]
+name = "test"
+type = "source"
+plugin = "test"
+stream = "s"
+key_field = "order_id"
+
+[settings]
+url = "http://example.com"
+"#;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.toml");
+        std::fs::write(&path, toml).unwrap();
+
+        let config = ConnectorConfig::load_toml(&path).unwrap();
+        assert_eq!(config.key_field, "order_id");
     }
 }

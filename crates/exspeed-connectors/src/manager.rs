@@ -480,6 +480,7 @@ impl ConnectorManager {
         let dedup_window_secs = config.dedup_window_secs;
         let dedup_key_header = config.dedup_key.clone();
         let transform_sql = config.transform_sql.clone();
+        let key_field = config.key_field.clone();
         let task_name = name.clone();
         let name_for_select = name.clone();
         let source_retry_policy: RetryPolicy = config.retry.clone();
@@ -649,8 +650,22 @@ impl ConnectorManager {
                         record.clone()
                     };
 
+                    let extracted_key = if !key_field.is_empty() && record.key.is_none() {
+                        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&record.value) {
+                            json.get(&key_field)
+                                .and_then(|v| match v {
+                                    serde_json::Value::String(s) => Some(bytes::Bytes::from(s.clone().into_bytes())),
+                                    other => Some(bytes::Bytes::from(other.to_string().into_bytes())),
+                                })
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
                     let storage_record = Record {
-                        key: record.key.clone(),
+                        key: record.key.clone().or(extracted_key),
                         value: record.value.clone(),
                         subject: record.subject.clone(),
                         headers: record.headers.clone(),

@@ -233,6 +233,7 @@ mod tests {
             dedup_key: String::new(),
             dedup_window_secs: 86400,
             transform_sql: String::new(),
+            key_field: String::new(),
             on_transient_exhausted: crate::config::OnTransientExhausted::default(),
             retry: crate::retry::RetryPolicy::default_transient(),
         }
