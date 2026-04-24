@@ -189,13 +189,40 @@ impl ExqlEngine {
 
     /// Execute a bounded (batch) SQL query.
     pub async fn execute_bounded(&self, sql: &str) -> Result<ResultSet, ExqlError> {
+        let indexes = self.load_index_defs();
         runtime::bounded::execute_bounded_with_mv(
             sql,
             &self.storage,
             Some(&self.connection_registry),
             Some(&self.mv_registry),
+            &indexes,
         )
         .await
+    }
+
+    /// Load secondary index definitions from `{data_dir}/indexes/*.json`.
+    fn load_index_defs(&self) -> Vec<runtime::bounded::IndexDef> {
+        let mut defs = Vec::new();
+        let index_dir = self.data_dir.join("indexes");
+        if let Ok(entries) = std::fs::read_dir(&index_dir) {
+            for entry in entries.flatten() {
+                if entry.path().extension().and_then(|e| e.to_str()) == Some("json") {
+                    if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
+                            defs.push(runtime::bounded::IndexDef {
+                                name: meta["name"].as_str().unwrap_or("").to_string(),
+                                stream: meta["stream"].as_str().unwrap_or("").to_string(),
+                                field_path: meta["field_path"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        defs
     }
 
     /// Resume every persisted continuous query under `token`. Called once

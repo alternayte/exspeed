@@ -13,10 +13,11 @@ type BuildOperatorFuture<'a> =
 use crate::error::ExqlError;
 use crate::external::connections::ConnectionRegistry;
 use crate::materialized_view::MaterializedViewRegistry;
-use crate::parser::ast::ExqlStatement;
+use crate::parser::ast::{BinaryOperator, Expr, ExqlStatement, LiteralValue};
 use crate::planner::physical::PhysicalPlan;
 use crate::runtime::operators::aggregate::AggregateOperator;
 use crate::runtime::operators::filter::FilterOperator;
+use crate::runtime::operators::index_scan::IndexScanOperator;
 use crate::runtime::operators::join::HashJoinOperator;
 use crate::runtime::operators::limit::LimitOperator;
 use crate::runtime::operators::project::ProjectOperator;
@@ -25,12 +26,20 @@ use crate::runtime::operators::sort::SortOperator;
 use crate::runtime::operators::Operator;
 use crate::types::{ResultSet, Row};
 
+/// Metadata for a secondary index loaded from `{data_dir}/indexes/{name}.json`.
+#[derive(Debug, Clone)]
+pub struct IndexDef {
+    pub name: String,
+    pub stream: String,
+    pub field_path: String,
+}
+
 /// Execute a bounded (batch) SQL query against storage, returning a ResultSet.
 pub async fn execute_bounded(
     sql: &str,
     storage: &Arc<dyn StorageEngine>,
 ) -> Result<ResultSet, ExqlError> {
-    execute_bounded_with_mv(sql, storage, None, None).await
+    execute_bounded_with_mv(sql, storage, None, None, &[]).await
 }
 
 /// Execute a bounded (batch) SQL query with optional external connection support.
@@ -39,7 +48,7 @@ pub async fn execute_bounded_with_connections(
     storage: &Arc<dyn StorageEngine>,
     connections: Option<&ConnectionRegistry>,
 ) -> Result<ResultSet, ExqlError> {
-    execute_bounded_with_mv(sql, storage, connections, None).await
+    execute_bounded_with_mv(sql, storage, connections, None, &[]).await
 }
 
 /// Execute a bounded (batch) SQL query with optional connection and MV registry support.
@@ -48,6 +57,7 @@ pub async fn execute_bounded_with_mv(
     storage: &Arc<dyn StorageEngine>,
     connections: Option<&ConnectionRegistry>,
     mv_registry: Option<&MaterializedViewRegistry>,
+    indexes: &[IndexDef],
 ) -> Result<ResultSet, ExqlError> {
     let start = Instant::now();
 
@@ -68,7 +78,7 @@ pub async fn execute_bounded_with_mv(
     let plan = crate::planner::plan(&query, crate::parser::ast::EmitMode::Changes)?;
 
     // 4. Build operator tree
-    let mut root = build_operator(&plan, storage, connections, mv_registry).await?;
+    let mut root = build_operator(&plan, storage, connections, mv_registry, indexes).await?;
 
     // 5. Pull all rows from the root operator.
     //
@@ -105,6 +115,7 @@ fn build_operator<'a>(
     storage: &'a Arc<dyn StorageEngine>,
     connections: Option<&'a ConnectionRegistry>,
     mv_registry: Option<&'a MaterializedViewRegistry>,
+    indexes: &'a [IndexDef],
 ) -> BuildOperatorFuture<'a> {
     Box::pin(async move {
     match plan {
@@ -125,6 +136,29 @@ fn build_operator<'a>(
             let stream_name = StreamName::try_from(stream.as_str()).map_err(|e| {
                 ExqlError::Storage(format!("invalid stream name '{}': {}", stream, e))
             })?;
+
+            // Check if an index can serve this query (only for forward scans
+            // without reverse_limit or timestamp bounds).
+            if reverse_limit.is_none() && timestamp_lower_bound.is_none() {
+                if let Some(ref pred) = predicate {
+                    if let Some((idx_name, _field, lookup_val)) =
+                        find_indexed_payload_eq(pred, indexes, stream)
+                    {
+                        if let Some(partition_dir) = storage.partition_dir_path(stream, 0) {
+                            return Ok(Box::new(IndexScanOperator::new(
+                                storage.clone(),
+                                stream_name,
+                                alias.clone(),
+                                required_columns.clone(),
+                                partition_dir,
+                                idx_name,
+                                lookup_val,
+                                predicate.clone(),
+                            )) as Box<dyn Operator>);
+                        }
+                    }
+                }
+            }
 
             if let Some(limit) = reverse_limit {
                 Ok(Box::new(ScanOperator::reverse_tail(
@@ -166,12 +200,12 @@ fn build_operator<'a>(
         }
 
         PhysicalPlan::Filter { input, predicate } => {
-            let child = build_operator(input, storage, connections, mv_registry).await?;
+            let child = build_operator(input, storage, connections, mv_registry, indexes).await?;
             Ok(Box::new(FilterOperator::new(child, predicate.clone())) as Box<dyn Operator>)
         }
 
         PhysicalPlan::Project { input, items } => {
-            let child = build_operator(input, storage, connections, mv_registry).await?;
+            let child = build_operator(input, storage, connections, mv_registry, indexes).await?;
             Ok(Box::new(ProjectOperator::new(child, items.clone())) as Box<dyn Operator>)
         }
 
@@ -181,8 +215,8 @@ fn build_operator<'a>(
             on,
             join_type,
         } => {
-            let left_op = build_operator(left, storage, connections, mv_registry).await?;
-            let right_op = build_operator(right, storage, connections, mv_registry).await?;
+            let left_op = build_operator(left, storage, connections, mv_registry, indexes).await?;
+            let right_op = build_operator(right, storage, connections, mv_registry, indexes).await?;
             Ok(Box::new(HashJoinOperator::new(
                 left_op,
                 right_op,
@@ -196,7 +230,7 @@ fn build_operator<'a>(
             group_by,
             select_items,
         } => {
-            let child = build_operator(input, storage, connections, mv_registry).await?;
+            let child = build_operator(input, storage, connections, mv_registry, indexes).await?;
             Ok(Box::new(AggregateOperator::new(
                 child,
                 group_by.clone(),
@@ -205,7 +239,7 @@ fn build_operator<'a>(
         }
 
         PhysicalPlan::Sort { input, order_by } => {
-            let child = build_operator(input, storage, connections, mv_registry).await?;
+            let child = build_operator(input, storage, connections, mv_registry, indexes).await?;
             Ok(Box::new(SortOperator::new(child, order_by.clone())) as Box<dyn Operator>)
         }
 
@@ -214,7 +248,7 @@ fn build_operator<'a>(
             limit,
             offset,
         } => {
-            let child = build_operator(input, storage, connections, mv_registry).await?;
+            let child = build_operator(input, storage, connections, mv_registry, indexes).await?;
             Ok(Box::new(LimitOperator::new(
                 child,
                 *limit,
@@ -223,7 +257,7 @@ fn build_operator<'a>(
         }
 
         PhysicalPlan::TopN { input, order_by, limit } => {
-            let child = build_operator(input, storage, connections, mv_registry).await?;
+            let child = build_operator(input, storage, connections, mv_registry, indexes).await?;
             Ok(Box::new(crate::runtime::operators::topn::TopNOperator::new(child, order_by.clone(), *limit)) as Box<dyn Operator>)
         }
 
@@ -235,11 +269,98 @@ fn build_operator<'a>(
             "StreamStreamJoin is not supported in bounded execution".into(),
         )),
 
-        PhysicalPlan::IndexScan { .. } => Err(ExqlError::Execution(
-            "IndexScan is not yet supported in bounded execution".into(),
-        )),
+        PhysicalPlan::IndexScan { stream, alias, required_columns, index_name, field_path: _, lookup_value, predicate } => {
+            let stream_name = StreamName::try_from(stream.as_str()).map_err(|e| {
+                ExqlError::Storage(format!("invalid stream name '{}': {}", stream, e))
+            })?;
+            let partition_dir = storage.partition_dir_path(stream, 0)
+                .ok_or_else(|| ExqlError::Storage("no partition directory available".into()))?;
+            Ok(Box::new(IndexScanOperator::new(
+                storage.clone(),
+                stream_name,
+                alias.clone(),
+                required_columns.clone(),
+                partition_dir,
+                index_name.clone(),
+                lookup_value.clone(),
+                predicate.clone(),
+            )) as Box<dyn Operator>)
+        }
     }
     })
+}
+
+// ---------------------------------------------------------------------------
+// Index-aware predicate detection
+// ---------------------------------------------------------------------------
+
+/// Walk a predicate expression looking for `payload->>'field_path' = 'value'`
+/// patterns that match a secondary index. Returns `(index_name, field_path,
+/// lookup_value)` on the first match found.
+///
+/// For AND-combined predicates we recurse into both sides so a compound filter
+/// like `payload->>'region' = 'eu' AND payload->>'total' > 100` can still use
+/// the index on `region`.
+fn find_indexed_payload_eq(
+    expr: &Expr,
+    indexes: &[IndexDef],
+    stream: &str,
+) -> Option<(String, String, String)> {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
+            // Check left = payload->>'field', right = literal
+            if let Some((field, value)) = extract_json_access_eq(left, right) {
+                if let Some(idx) = indexes
+                    .iter()
+                    .find(|i| i.stream == stream && i.field_path == field)
+                {
+                    return Some((idx.name.clone(), field, value));
+                }
+            }
+            // Check reversed: right = payload->>'field', left = literal
+            if let Some((field, value)) = extract_json_access_eq(right, left) {
+                if let Some(idx) = indexes
+                    .iter()
+                    .find(|i| i.stream == stream && i.field_path == field)
+                {
+                    return Some((idx.name.clone(), field, value));
+                }
+            }
+            None
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => find_indexed_payload_eq(left, indexes, stream)
+            .or_else(|| find_indexed_payload_eq(right, indexes, stream)),
+        _ => None,
+    }
+}
+
+/// Match a pair of expressions against the pattern:
+///   `json_side` = `payload->>'field'`  (JsonAccess with as_text=true on Column "payload")
+///   `literal_side` = string literal
+///
+/// Returns `(field_name, literal_value)` if the pattern matches.
+fn extract_json_access_eq(json_side: &Expr, literal_side: &Expr) -> Option<(String, String)> {
+    if let Expr::JsonAccess {
+        expr,
+        field,
+        as_text: true,
+    } = json_side
+    {
+        if matches!(expr.as_ref(), Expr::Column { name, .. } if name == "payload") {
+            if let Expr::Literal(LiteralValue::String(val)) = literal_side {
+                return Some((field.clone(), val.clone()));
+            }
+        }
+    }
+    None
 }
 
 /// Resolve the driver and URL for an external scan.
@@ -443,6 +564,7 @@ mod tests {
             &storage,
             None,
             Some(&mv_registry),
+            &[],
         )
         .await
         .unwrap();
@@ -506,6 +628,7 @@ mod tests {
             &storage,
             None,
             Some(&mv_registry),
+            &[],
         )
         .await
         .unwrap();
@@ -580,6 +703,7 @@ mod tests {
             &storage,
             None,
             Some(&mv_registry),
+            &[],
         )
         .await
         .unwrap();
