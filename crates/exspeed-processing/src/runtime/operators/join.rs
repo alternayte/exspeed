@@ -5,6 +5,8 @@ use crate::parser::ast::{Expr, JoinType};
 use crate::runtime::eval::eval_expr;
 use crate::types::{Row, Value};
 
+const MAX_JOIN_RIGHT_ROWS: usize = 100_000;
+
 /// Hash-join operator.
 ///
 /// Build phase: reads ALL rows from the right input and builds a
@@ -47,9 +49,20 @@ impl HashJoinOperator {
 
         // Build phase: consume entire right side into a hash map.
         let mut right_lookup: HashMap<String, Vec<Row>> = HashMap::new();
+        let mut right_count = 0usize;
         while let Some(row) = right.next() {
-            let key = eval_expr(&right_key_expr, &row).to_string();
-            right_lookup.entry(key).or_default().push(row);
+            right_count += 1;
+            if right_count > MAX_JOIN_RIGHT_ROWS {
+                panic!(
+                    "hash join right side exceeds {MAX_JOIN_RIGHT_ROWS} rows; \
+                     add a filter or LIMIT to the right side"
+                );
+            }
+            let key_val = eval_expr(&right_key_expr, &row);
+            if !key_val.is_null() {
+                let key = key_val.to_string();
+                right_lookup.entry(key).or_default().push(row);
+            }
         }
 
         Self {
@@ -102,8 +115,14 @@ impl Operator for HashJoinOperator {
             // Advance to the next left row.
             match self.left.next() {
                 Some(left_row) => {
-                    let key = eval_expr(&self.left_key_expr, &left_row).to_string();
-                    self.current_matches = self.right_lookup.get(&key).cloned().unwrap_or_default();
+                    let key_val = eval_expr(&self.left_key_expr, &left_row);
+                    if key_val.is_null() {
+                        self.current_matches = Vec::new();
+                    } else {
+                        let key = key_val.to_string();
+                        self.current_matches =
+                            self.right_lookup.get(&key).cloned().unwrap_or_default();
+                    }
                     self.match_idx = 0;
                     self.current_left = Some(left_row);
                     self.left_had_match = false;
@@ -234,6 +253,84 @@ mod tests {
         assert_eq!(r3.get("user_id"), Some(&Value::Int(3)));
         assert_eq!(r3.get("name"), Some(&Value::Null));
 
+        assert!(join.next().is_none());
+    }
+
+    #[test]
+    fn inner_join_null_keys_dont_match() {
+        let left = vec![
+            Row {
+                columns: vec!["k".into(), "v".into()],
+                values: vec![Value::Null, Value::Text("a".into())],
+            },
+            Row {
+                columns: vec!["k".into(), "v".into()],
+                values: vec![Value::Int(1), Value::Text("b".into())],
+            },
+        ];
+        let right = vec![
+            Row {
+                columns: vec!["k".into(), "n".into()],
+                values: vec![Value::Null, Value::Text("x".into())],
+            },
+            Row {
+                columns: vec!["k".into(), "n".into()],
+                values: vec![Value::Int(1), Value::Text("y".into())],
+            },
+        ];
+        let on = Expr::BinaryOp {
+            left: Box::new(Expr::Column {
+                table: None,
+                name: "k".into(),
+            }),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expr::Column {
+                table: None,
+                name: "k".into(),
+            }),
+        };
+        let l = Box::new(ScanOperator::new(left));
+        let r = Box::new(ScanOperator::new(right));
+        let mut join = HashJoinOperator::new(l, r, JoinType::Inner, on);
+
+        let r1 = join.next().unwrap();
+        assert_eq!(r1.get("v"), Some(&Value::Text("b".into())));
+        assert_eq!(r1.get("n"), Some(&Value::Text("y".into())));
+        assert!(join.next().is_none(), "NULL keys should not match");
+    }
+
+    #[test]
+    fn left_join_null_key_emits_nulls() {
+        let left = vec![Row {
+            columns: vec!["k".into(), "v".into()],
+            values: vec![Value::Null, Value::Text("a".into())],
+        }];
+        let right = vec![Row {
+            columns: vec!["k".into(), "n".into()],
+            values: vec![Value::Int(1), Value::Text("y".into())],
+        }];
+        let on = Expr::BinaryOp {
+            left: Box::new(Expr::Column {
+                table: None,
+                name: "k".into(),
+            }),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expr::Column {
+                table: None,
+                name: "k".into(),
+            }),
+        };
+        let l = Box::new(ScanOperator::new(left));
+        let r = Box::new(ScanOperator::new(right));
+        let mut join = HashJoinOperator::new(l, r, JoinType::Left, on);
+
+        let r1 = join.next().unwrap();
+        assert_eq!(r1.get("v"), Some(&Value::Text("a".into())));
+        assert_eq!(
+            r1.get("n"),
+            Some(&Value::Null),
+            "NULL left key should emit NULL right side"
+        );
         assert!(join.next().is_none());
     }
 }
