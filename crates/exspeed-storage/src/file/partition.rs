@@ -124,6 +124,10 @@ pub struct Partition {
     /// segment so periodic fsync follows the active segment instead of
     /// fsyncing a sealed (unchanging) file.
     syncer_handle: Option<Arc<SegmentSyncerHandle>>,
+    /// Secondary index definitions: (index_name, field_path).
+    /// Populated via `register_secondary_index()` when the ExqlEngine loads
+    /// index metadata. Built into `.sidx.{name}` files at segment seal time.
+    pub(crate) secondary_indexes: Vec<(String, String)>,
 }
 
 impl Partition {
@@ -146,6 +150,7 @@ impl Partition {
             segment_max_bytes: DEFAULT_SEGMENT_MAX_BYTES,
             seal_tx: None,
             syncer_handle: None,
+            secondary_indexes: Vec::new(),
         })
     }
 
@@ -241,6 +246,7 @@ impl Partition {
             segment_max_bytes: DEFAULT_SEGMENT_MAX_BYTES,
             seal_tx: None,
             syncer_handle: None,
+            secondary_indexes: Vec::new(),
         })
     }
 
@@ -401,6 +407,21 @@ impl Partition {
         let _ = fs::remove_file(seg_path.with_extension("idx"));
         let _ = fs::remove_file(seg_path.with_extension("tix"));
         let _ = fs::remove_file(seg_path.with_extension("bloom"));
+
+        // Clean up secondary index files (.sidx.*)
+        if let Some(parent) = seg_path.parent() {
+            if let Some(stem) = seg_path.file_stem().and_then(|s| s.to_str()) {
+                if let Ok(entries) = fs::read_dir(parent) {
+                    for entry in entries.flatten() {
+                        if let Some(name) = entry.file_name().to_str() {
+                            if name.starts_with(stem) && name.contains(".sidx.") {
+                                let _ = fs::remove_file(entry.path());
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         stats.segments_deleted += 1;
         stats.bytes_reclaimed += size;
@@ -737,6 +758,15 @@ impl Partition {
         self.syncer_handle = Some(handle);
     }
 
+    /// Register a secondary index definition so that `.sidx.{name}` files
+    /// are built when segments are sealed. No-op if an index with the same
+    /// name is already registered.
+    pub fn register_secondary_index(&mut self, name: String, field_path: String) {
+        if !self.secondary_indexes.iter().any(|(n, _)| n == &name) {
+            self.secondary_indexes.push((name, field_path));
+        }
+    }
+
     /// Roll the active segment: seal it, build indexes, open a reader for it,
     /// and create a new active segment starting at `next_offset`.
     fn roll_segment(&mut self) -> io::Result<()> {
@@ -823,6 +853,32 @@ impl Partition {
             .collect();
         if !keys.is_empty() {
             let _ = BloomFilter::build(&bloom_path, &keys);
+        }
+
+        // Build secondary indexes (.sidx.{name})
+        for (idx_name, field_path) in &self.secondary_indexes {
+            let sidx_path = seg_path.with_extension(format!("sidx.{idx_name}"));
+            let mut entries = Vec::new();
+            for record in &all_records {
+                if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&record.value) {
+                    if let Some(val) = json.get(field_path.as_str()) {
+                        let val_str = match val {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        entries.push((
+                            crate::file::secondary_index::SecondaryIndex::hash_value(&val_str),
+                            record.offset.0,
+                        ));
+                    }
+                }
+            }
+            if !entries.is_empty() {
+                let _ = crate::file::secondary_index::SecondaryIndex::build(
+                    &sidx_path,
+                    &mut entries,
+                );
+            }
         }
 
         Ok(())
