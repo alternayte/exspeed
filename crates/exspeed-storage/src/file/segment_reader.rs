@@ -155,14 +155,8 @@ impl SegmentReader {
             }
         }
 
-        // Fallback: sequential scan + filter.
-        let all = self.read_all()?;
-        let filtered: Vec<StoredRecord> = all
-            .into_iter()
-            .filter(|r| r.offset.0 >= from_offset)
-            .take(max_records)
-            .collect();
-        Ok(filtered)
+        // Fallback: sequential read from the start, stopping after max_records.
+        self.read_from_file_position(SEGMENT_HEADER_SIZE as u64, from_offset, max_records)
     }
 
     /// Return the offset of the last record in the segment, or `None` if the
