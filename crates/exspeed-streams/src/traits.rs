@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use async_trait::async_trait;
 use crate::error::StorageError;
 use crate::record::{Record, StoredRecord};
@@ -82,6 +84,27 @@ pub trait StorageEngine: Send + Sync {
         stream: &StreamName,
         drop_from: Offset,
     ) -> Result<(), StorageError>;
+
+    /// Register a secondary index on the given stream's partition so that
+    /// `.sidx.{name}` files are built when segments are sealed.
+    ///
+    /// Default is a no-op for non-file-backed implementations.
+    async fn register_secondary_index(
+        &self,
+        _stream: &StreamName,
+        _name: String,
+        _field_path: String,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    /// Return the filesystem path for a given stream + partition, if the
+    /// implementation is backed by local files.
+    ///
+    /// Default returns `None` for non-file-backed implementations.
+    fn partition_dir_path(&self, _stream: &str, _partition: u32) -> Option<PathBuf> {
+        None
+    }
 
     /// Append N records. Default implementation serializes via `append`;
     /// FileStorage overrides this to use a single WAL batch.

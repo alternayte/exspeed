@@ -313,4 +313,17 @@ impl StorageEngine for S3TieredStorage {
         }
         Ok(())
     }
+
+    async fn register_secondary_index(
+        &self,
+        stream: &StreamName,
+        name: String,
+        field_path: String,
+    ) -> Result<(), StorageError> {
+        self.local.register_secondary_index(stream, name, field_path).await
+    }
+
+    fn partition_dir_path(&self, stream: &str, partition: u32) -> Option<std::path::PathBuf> {
+        self.local.partition_dir_path(stream, partition)
+    }
 }

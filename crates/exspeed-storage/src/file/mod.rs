@@ -767,6 +767,28 @@ impl StorageEngine for FileStorage {
             .map_err(|e| StorageError::Io(std::io::Error::other(e)))?
     }
 
+    async fn register_secondary_index(
+        &self,
+        stream: &StreamName,
+        name: String,
+        field_path: String,
+    ) -> Result<(), StorageError> {
+        let key = (stream.as_str().to_string(), 0u32);
+        let part_arc = self
+            .inner
+            .partitions
+            .get(&key)
+            .map(|r| r.value().clone())
+            .ok_or_else(|| StorageError::StreamNotFound(stream.clone()))?;
+        let mut part = part_arc.lock().await;
+        part.register_secondary_index(name, field_path);
+        Ok(())
+    }
+
+    fn partition_dir_path(&self, stream: &str, partition: u32) -> Option<std::path::PathBuf> {
+        Some(self.partition_dir(stream, partition))
+    }
+
     async fn append_batch(
         &self,
         stream: &StreamName,
