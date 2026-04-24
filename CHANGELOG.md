@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-04-24
+
+Indexing release. Queries on timestamp, key, and payload fields are now
+index-aware — orders of magnitude faster on large streams.
+
+### Indexing
+
+- **Timestamp seek.** `WHERE timestamp > X` uses the existing TimeIndex
+  (`.tix`) on sealed segments to jump to the approximate position via
+  `seek_by_time()` instead of scanning from offset 0.
+- **Bloom filters on key.** Per-segment `.bloom` files are built at seal
+  time. `WHERE key = 'x'` skips sealed segments whose bloom filter
+  proves the key is absent.
+- **Secondary indexes on payload fields.**
+  `CREATE INDEX idx ON stream(payload->>'field')` builds sorted
+  `(hash, offset)` index files (`.sidx`) per segment. Existing sealed
+  segments are backfilled on creation. The planner automatically
+  detects indexed payload predicates and uses `IndexScan` for targeted
+  offset lookups instead of sequential scans.
+- **Index management API.** `POST /api/v1/indexes`,
+  `GET /api/v1/indexes`, `DELETE /api/v1/indexes/{name}`.
+- **CLI support.** `exspeed query "CREATE INDEX ..."` and
+  `exspeed query "DROP INDEX ..."` route to the indexes API.
+- **Startup reload.** Saved index definitions are loaded from
+  `{data_dir}/indexes/` at startup and registered on partitions.
+
+### Connectors
+
+- **`key_field` config.** New global connector option in `[connector]`
+  section. Extracts record keys from JSON payloads for any source
+  connector. Plugin-specific key logic takes precedence.
+
+### Bug fixes
+
+- **Timestamp cross-type comparison.** `WHERE timestamp > 1000` now
+  compares numerically instead of falling through to string comparison
+  (`Value::Timestamp` vs `Value::Int`).
+
 ## [0.4.1] — 2026-04-24
 
 ExQL query engine hardening — correctness fixes, safety nets, and
