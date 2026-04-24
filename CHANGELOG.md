@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] — 2026-04-24
+
+ExQL query engine hardening — correctness fixes, safety nets, and
+ORDER BY optimizations.
+
+### Bug fixes
+
+- **COUNT(column) now skips NULLs.** The accumulator had a tautological
+  condition that counted all rows regardless. COUNT(*) still counts
+  all rows; COUNT(column) skips NULLs per SQL semantics.
+- **DISTINCT aggregates now work.** The `distinct` flag on
+  `SUM(DISTINCT x)`, `COUNT(DISTINCT x)`, etc. was silently discarded.
+  Values are now deduplicated per group before accumulation.
+- **NULL join keys no longer match.** Hash join converted NULL to the
+  string "NULL", causing all NULL-keyed rows to match. NULLs are now
+  excluded from the lookup (SQL semantics: NULL ≠ NULL).
+- **ReDoS in LIKE patterns.** Replaced recursive backtracking
+  (`like_match_recursive`) with an iterative O(n×m) two-pointer
+  algorithm. Pathological patterns like `%a%b%c%d%...%` no longer
+  cause exponential CPU usage.
+- **`last_offset()` no longer allocates entire record vec.** Scans
+  sequentially with O(1) memory instead of `read_all()`.
+
+### Safety nets
+
+- **Default result row limit (10,000).** Bounded queries without an
+  explicit LIMIT are capped at 10,000 rows to prevent OOM. Users
+  override with an explicit `LIMIT` clause.
+- **GROUP BY cardinality limit (100,000).** Queries exceeding 100,000
+  distinct groups return an error instead of consuming unbounded memory.
+- **Hash join right-side limit (100,000).** Joins against streams
+  exceeding 100,000 rows on the right side return an error.
+
+### Performance
+
+- **ORDER BY offset ASC sort elimination.** Since offsets are
+  monotonically increasing in storage, `ORDER BY offset ASC` removes
+  the Sort operator entirely.
+- **ORDER BY offset DESC LIMIT N reverse scan.** Reads the last N
+  records directly from the tail of the stream — no full scan or sort.
+- **TopN operator.** For all other `ORDER BY ... LIMIT N` queries
+  (timestamp, key, subject), replaces the full Sort with a bounded
+  binary heap using O(N) memory.
+
 ## [0.4.0] — 2026-04-24
 
 ExQL query engine improvements — structured errors, predicate pushdown,
