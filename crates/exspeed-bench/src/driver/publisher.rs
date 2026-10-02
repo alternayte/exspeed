@@ -499,7 +499,7 @@ fn spawn_reader(mut reader: FramedRead<OwnedReadHalf, ExspeedCodec>, inner: Arc<
                 };
                 let mut map = inner.pending.lock().await;
                 if let Some(batch) = map.remove(&frame.correlation_id) {
-                    for (tx, result) in batch.responders.into_iter().zip(resp.results.into_iter()) {
+                    for (tx, result) in batch.responders.into_iter().zip(resp.results) {
                         let _ = tx.send(match result {
                             BatchResult::Written { offset } => Ok(Offset(offset)),
                             BatchResult::Duplicate { offset, .. } => Ok(Offset(offset)),

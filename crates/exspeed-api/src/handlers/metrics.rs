@@ -22,7 +22,7 @@ pub async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl Into
     // 3. Update consumer lag per stream/consumer.
     {
         let consumers = state.broker.consumers.read().unwrap();
-        for (_, consumer_state) in consumers.iter() {
+        for consumer_state in consumers.values() {
             let stream = &consumer_state.config.stream;
             let consumer = &consumer_state.config.name;
             let consumer_offset = consumer_state.config.offset;

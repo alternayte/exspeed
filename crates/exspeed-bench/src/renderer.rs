@@ -67,7 +67,7 @@ pub fn readme_snippet(r: &BenchResult) -> String {
         s,
         "\nFull methodology, per-scenario tables, and reproduction steps in [BENCHMARKS.md](BENCHMARKS.md).\nResults refreshed {date} (git `{sha}`).",
         date = r.run_timestamp.format("%Y-%m-%d"),
-        sha = &r.git_sha,
+        sha = r.git_sha,
     );
 
     s

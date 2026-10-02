@@ -11,7 +11,7 @@ use crate::types::{Row, Value};
 ///
 /// # Example (manual test)
 ///
-/// ```ignore
+/// ```text
 /// // Requires a running Postgres instance:
 /// //   docker run --rm -e POSTGRES_PASSWORD=pw -p 5432:5432 postgres:16
 /// //   psql postgresql://postgres:pw@localhost/postgres -c \

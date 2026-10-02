@@ -1,4 +1,6 @@
 #![cfg(test)]
+// Tests serialise on a std Mutex across awaits on purpose (env-var setup).
+#![allow(clippy::await_holding_lock)]
 //! Integration tests for RedisLeaseBackend. Requires a running Redis;
 //! point `EXSPEED_OFFSET_STORE_REDIS_URL` at it.
 //!

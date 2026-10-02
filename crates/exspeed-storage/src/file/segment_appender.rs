@@ -199,7 +199,7 @@ async fn flush_singles(
 
     match result {
         Ok(assignments) => {
-            for (tx, (offset, ts)) in responders.into_iter().zip(assignments.into_iter()) {
+            for (tx, (offset, ts)) in responders.into_iter().zip(assignments) {
                 let _ = tx.send(Ok((offset, ts)));
             }
         }

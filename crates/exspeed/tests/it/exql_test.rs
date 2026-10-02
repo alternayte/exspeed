@@ -368,8 +368,7 @@ async fn setup_stream_bulk(
     );
 
     const CHUNK: usize = 1_000;
-    let mut corr: u32 = 10;
-    for chunk in records.chunks(CHUNK) {
+    for (corr, chunk) in (10u32..).zip(records.chunks(CHUNK)) {
         let batch = PublishBatchRequest {
             stream: stream_name.into(),
             records: chunk
@@ -397,7 +396,6 @@ async fn setup_stream_bulk(
             "PublishBatch (corr={}) should return PublishBatchOk",
             corr
         );
-        corr += 1;
     }
 }
 

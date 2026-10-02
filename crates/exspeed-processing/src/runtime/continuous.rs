@@ -694,7 +694,7 @@ fn decompose_plan(plan: &PhysicalPlan) -> Result<ContinuousPipeline, String> {
                 // Descend into the input to find the source stream.
                 current = input;
             }
-            PhysicalPlan::StreamStreamJoin { left, right: _, .. } => {
+            PhysicalPlan::StreamStreamJoin { left, .. } => {
                 // The left child gives us the source stream.
                 // The right stream was already extracted in detect_mode().
                 current = left;

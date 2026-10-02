@@ -662,13 +662,11 @@ impl ConnectorManager {
                             if let Ok(json) =
                                 serde_json::from_slice::<serde_json::Value>(&record.value)
                             {
-                                json.get(&key_field).and_then(|v| match v {
+                                json.get(&key_field).map(|v| match v {
                                     serde_json::Value::String(s) => {
-                                        Some(bytes::Bytes::from(s.clone().into_bytes()))
+                                        bytes::Bytes::from(s.clone().into_bytes())
                                     }
-                                    other => {
-                                        Some(bytes::Bytes::from(other.to_string().into_bytes()))
-                                    }
+                                    other => bytes::Bytes::from(other.to_string().into_bytes()),
                                 })
                             } else {
                                 None

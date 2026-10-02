@@ -48,6 +48,7 @@ pub struct ConnectorConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum OnTransientExhausted {
     /// Put the connector into `Failed` status; offset does not advance.
     /// Requires manual restart to resume.
@@ -57,13 +58,8 @@ pub enum OnTransientExhausted {
     DlqBatch,
     /// Keep retrying forever (today's behavior). Ignores `max_retries`
     /// post-exhaustion — loops with `poll_interval_ms` between attempts.
+    #[default]
     LoopForever,
-}
-
-impl Default for OnTransientExhausted {
-    fn default() -> Self {
-        Self::LoopForever
-    }
 }
 
 fn default_batch_size() -> u32 {

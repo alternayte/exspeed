@@ -124,7 +124,7 @@ impl SegmentReader {
     pub fn might_contain_key(&self, key: &[u8]) -> bool {
         self.bloom_filter
             .as_ref()
-            .map_or(true, |bf| bf.might_contain(key))
+            .is_none_or(|bf| bf.might_contain(key))
     }
 
     /// The filesystem path of this segment file.

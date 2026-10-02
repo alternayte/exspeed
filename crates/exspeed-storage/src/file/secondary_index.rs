@@ -11,10 +11,10 @@ pub struct SecondaryIndex {
 }
 
 impl SecondaryIndex {
-    pub fn build(path: &Path, entries: &mut Vec<(u64, u64)>) -> io::Result<Self> {
+    pub fn build(path: &Path, entries: &mut [(u64, u64)]) -> io::Result<Self> {
         entries.sort_by_key(|&(hash, _)| hash);
         let idx = Self {
-            entries: entries.clone(),
+            entries: entries.to_vec(),
         };
         idx.save(path)?;
         Ok(idx)

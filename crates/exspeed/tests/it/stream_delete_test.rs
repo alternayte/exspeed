@@ -338,7 +338,7 @@ async fn delete_during_inflight_publish_is_safe() {
                 .send()
                 .await;
             published += 1;
-            if published % 50 == 0 {
+            if published.is_multiple_of(50) {
                 tokio::task::yield_now().await;
             }
         }

@@ -183,7 +183,7 @@ async fn typed_schema_binds_correct_types() {
     let pool = sqlx::postgres::PgPool::connect(&pg_url).await.unwrap();
     wait_for_rows(&pool, &table, 2, 10).await;
 
-    let (sum,): (i64,) = sqlx::query_as(&format!("SELECT SUM(total_cents) FROM \"{}\"", table))
+    let (sum,): (i64,) = sqlx::query_as(&format!("SELECT SUM(total_cents)::bigint FROM \"{}\"", table))
         .fetch_one(&pool)
         .await
         .unwrap();

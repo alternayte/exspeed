@@ -207,7 +207,7 @@ impl Operator for ScanOperator {
                                 .iter()
                                 .map(|r| stored_record_to_row(r, s.alias.as_deref(), &s.required))
                                 .filter(|row| {
-                                    s.predicate.as_ref().map_or(true, |pred| {
+                                    s.predicate.as_ref().is_none_or(|pred| {
                                         eval_expr(pred, row) == crate::types::Value::Bool(true)
                                     })
                                 })

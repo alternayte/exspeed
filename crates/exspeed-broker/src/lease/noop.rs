@@ -98,7 +98,7 @@ mod tests {
             .unwrap();
         // Spin briefly — on_lost should remain false.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(*guard.on_lost.borrow(), false);
+        assert!(!(*guard.on_lost.borrow()));
     }
 
     #[tokio::test]

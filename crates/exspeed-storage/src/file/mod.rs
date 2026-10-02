@@ -37,8 +37,9 @@ use crate::file::stream_config::StreamConfig;
 /// future use (trigger a mid-interval fsync when unflushed bytes exceed this
 /// value). In the current implementation only the timer fires — byte-threshold
 /// triggering is a planned follow-up.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum StorageSyncMode {
+    #[default]
     Sync,
     Async {
         interval: std::time::Duration,
@@ -46,12 +47,6 @@ pub enum StorageSyncMode {
         /// Currently unused — timer-only. TODO: wire up byte-threshold trigger.
         threshold_bytes: usize,
     },
-}
-
-impl Default for StorageSyncMode {
-    fn default() -> Self {
-        StorageSyncMode::Sync
-    }
 }
 
 struct FileStorageInner {

@@ -2,6 +2,9 @@
 //! cases that don't need multi-pod coordination; Postgres/Redis integration
 //! tests require a running backend (skipped gracefully when unavailable).
 
+// Tests serialise on a std Mutex across awaits on purpose (env-var setup).
+#![allow(clippy::await_holding_lock)]
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 

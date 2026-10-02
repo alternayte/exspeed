@@ -120,7 +120,7 @@ fn extract_within_clauses(sql: &str) -> (String, Vec<String>) {
                     let value_end = after_within_start + trimmed_offset + 1 + end_quote + 1;
                     result = format!(
                         "{}{}",
-                        &result[..within_pos].trim_end(),
+                        result[..within_pos].trim_end(),
                         &result[value_end..]
                     );
                     continue;

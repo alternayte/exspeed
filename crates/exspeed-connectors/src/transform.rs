@@ -159,14 +159,12 @@ fn find_top_level_where(upper: &str) -> Option<usize> {
         match bytes[i] {
             b'(' => depth += 1,
             b')' => depth = depth.saturating_sub(1),
-            b'W' if depth == 0 => {
-                if upper[i..].starts_with("WHERE") {
-                    // Make sure it's a word boundary (not part of ELSEWHERE etc.)
-                    let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
-                    let after_ok = i + 5 >= bytes.len() || !bytes[i + 5].is_ascii_alphanumeric();
-                    if before_ok && after_ok {
-                        return Some(i);
-                    }
+            b'W' if depth == 0 && upper[i..].starts_with("WHERE") => {
+                // Make sure it's a word boundary (not part of ELSEWHERE etc.)
+                let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+                let after_ok = i + 5 >= bytes.len() || !bytes[i + 5].is_ascii_alphanumeric();
+                if before_ok && after_ok {
+                    return Some(i);
                 }
             }
             _ => {}

@@ -17,7 +17,7 @@ use crate::traits::{
 };
 
 use self::backend::{BackendError, Param, SinkBackend};
-use self::dialect::{dialect_for, ColumnSpec, Dialect, DialectKind};
+use self::dialect::{dialect_for, ColumnSpec, Dialect, DialectKind, JsonType};
 use self::schema::{is_valid_ident, parse_schema};
 use self::sqlx_backend::SqlxBackend;
 
@@ -233,6 +233,15 @@ impl JdbcSinkConnector {
         } else {
             self.dialect.insert_sql(&self.table, &cols)
         };
+        let sql = self.dialect.cast_placeholders(
+            sql,
+            &[
+                JsonType::Bigint,
+                JsonType::Text,
+                JsonType::Text,
+                JsonType::Jsonb,
+            ],
+        );
 
         let subject_param = if record.subject.is_empty() {
             Param::Null
@@ -295,6 +304,8 @@ impl JdbcSinkConnector {
         } else {
             self.dialect.insert_sql(&self.table, &col_names)
         };
+        let col_types: Vec<JsonType> = cols.iter().map(|c| c.json_type).collect();
+        let sql = self.dialect.cast_placeholders(sql, &col_types);
 
         let mut params: Vec<Param> = Vec::with_capacity(cols.len());
         for c in cols {

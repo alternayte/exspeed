@@ -44,11 +44,9 @@ pub fn call_function(name: &str, args: &[Value]) -> Value {
             match (ts, interval) {
                 (Some(ts), Some(interval)) => {
                     let window_nanos = parse_interval_nanos(interval);
-                    if window_nanos == 0 {
-                        Value::Null
-                    } else {
-                        let window_start = (ts / window_nanos) * window_nanos;
-                        Value::Timestamp(window_start)
+                    match ts.checked_div(window_nanos) {
+                        Some(n) => Value::Timestamp(n * window_nanos),
+                        None => Value::Null,
                     }
                 }
                 _ => Value::Null,
@@ -341,8 +339,8 @@ mod tests {
     fn test_abs() {
         assert_eq!(call_function("ABS", &[Value::Int(-5)]), Value::Int(5));
         assert_eq!(
-            call_function("ABS", &[Value::Float(-3.14)]),
-            Value::Float(3.14)
+            call_function("ABS", &[Value::Float(-2.75)]),
+            Value::Float(2.75)
         );
     }
 

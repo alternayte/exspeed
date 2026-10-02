@@ -1,4 +1,4 @@
-use super::dialect::{ColumnSpec, Dialect};
+use super::dialect::{ColumnSpec, Dialect, JsonType};
 
 pub struct PostgresDialect;
 
@@ -32,8 +32,24 @@ impl Dialect for PostgresDialect {
         )
     }
 
+    fn cast_placeholders(&self, mut sql: String, types: &[JsonType]) -> String {
+        // Highest index first so `$1` never matches the prefix of `$10`.
+        for (i, t) in types.iter().enumerate().rev() {
+            let cast = match t {
+                JsonType::Text => continue,
+                JsonType::Bigint => "bigint",
+                JsonType::Double => "double precision",
+                JsonType::Boolean => "boolean",
+                JsonType::Timestamptz => "timestamptz",
+                JsonType::Jsonb => "jsonb",
+            };
+            let ph = self.placeholder(i + 1);
+            sql = replace_placeholder(&sql, &ph, &format!("{ph}::{cast}"));
+        }
+        sql
+    }
+
     fn create_table_typed_sql(&self, table: &str, cols: &[ColumnSpec], pk_cols: &[&str]) -> String {
-        use crate::builtin::jdbc::dialect::JsonType;
         let t = self.quote_ident(table);
         let col_lines: Vec<String> = cols
             .iter()
@@ -97,10 +113,40 @@ impl Dialect for PostgresDialect {
     }
 }
 
+/// Replace `ph` (e.g. `$1`) only where it is not followed by another digit.
+fn replace_placeholder(sql: &str, ph: &str, with: &str) -> String {
+    let mut out = String::with_capacity(sql.len() + 16);
+    let mut rest = sql;
+    while let Some(pos) = rest.find(ph) {
+        let after = &rest[pos + ph.len()..];
+        out.push_str(&rest[..pos]);
+        if after.starts_with(|c: char| c.is_ascii_digit()) {
+            out.push_str(ph);
+        } else {
+            out.push_str(with);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builtin::jdbc::dialect::JsonType;
+
+    #[test]
+    fn casts_typed_placeholders_without_touching_longer_indexes() {
+        let sql =
+            PostgresDialect.insert_sql("t", &["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]);
+        let mut types = vec![JsonType::Text; 10];
+        types[0] = JsonType::Jsonb;
+        types[9] = JsonType::Timestamptz;
+        let out = PostgresDialect.cast_placeholders(sql, &types);
+        assert!(out.contains("$1::jsonb"), "{out}");
+        assert!(out.contains("$10::timestamptz"), "{out}");
+        assert!(!out.contains("$10::jsonb"), "{out}");
+    }
 
     fn spec(name: &str, t: JsonType, nullable: bool) -> ColumnSpec {
         ColumnSpec {

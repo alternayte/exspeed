@@ -80,7 +80,7 @@ mod tests {
         let q = bind_param(q, &Param::Null);
         let q = bind_param(q, &Param::Bool(true));
         let q = bind_param(q, &Param::I64(42));
-        let q = bind_param(q, &Param::F64(3.14));
+        let q = bind_param(q, &Param::F64(2.75));
         let q = bind_param(q, &Param::Text("hello".into()));
         let q = bind_param(q, &Param::Timestamptz(chrono::Utc::now()));
         let q = bind_param(q, &Param::JsonText(r#"{"a":1}"#.into()));

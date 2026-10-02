@@ -1,4 +1,6 @@
 #![cfg(test)]
+// Tests serialise on a std Mutex across awaits on purpose (env-var setup).
+#![allow(clippy::await_holding_lock)]
 //! Integration tests for PostgresLeaseBackend. Requires a running Postgres;
 //! point `EXSPEED_OFFSET_STORE_POSTGRES_URL` at it (docker-compose up -d postgres).
 //! Tests skip gracefully when the URL is unset.

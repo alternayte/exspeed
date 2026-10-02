@@ -89,6 +89,13 @@ pub trait Dialect: Send + Sync {
     fn create_table_typed_sql(&self, table: &str, cols: &[ColumnSpec], pk_cols: &[&str]) -> String;
     fn insert_sql(&self, table: &str, cols: &[&str]) -> String;
     fn upsert_sql(&self, table: &str, cols: &[&str], keys: &[&str]) -> String;
+    /// Add explicit casts to placeholders where the driver binds parameters
+    /// with a type the database won't implicitly convert (Postgres types every
+    /// sqlx `Any` text parameter as TEXT, which it refuses to put into JSONB,
+    /// TIMESTAMPTZ, …). `types[i]` is the column type for placeholder `i+1`.
+    fn cast_placeholders(&self, sql: String, _types: &[JsonType]) -> String {
+        sql
+    }
 }
 
 #[cfg(test)]

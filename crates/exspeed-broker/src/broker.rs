@@ -42,6 +42,7 @@ pub struct Broker {
 }
 
 impl Broker {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         storage: Arc<dyn StorageEngine>,
         broker_append: Arc<BrokerAppend>,
@@ -748,8 +749,10 @@ mod tests {
         assert!(matches!(resp, ServerMessage::Ok));
 
         // Verify attempts incremented
-        let nack_attempts = broker.nack_attempts.read().unwrap();
-        assert_eq!(*nack_attempts.get(&("nacker".into(), 0u64)).unwrap(), 1);
+        {
+            let nack_attempts = broker.nack_attempts.read().unwrap();
+            assert_eq!(*nack_attempts.get(&("nacker".into(), 0u64)).unwrap(), 1);
+        }
 
         // DLQ stream should NOT exist yet (only 1 attempt < max_delivery_attempts=5)
         let dlq_resp = fetch(&broker, "events-dlq", 0, 10, "").await;
