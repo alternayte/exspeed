@@ -7,6 +7,7 @@ import {
 import { decodePublish } from "../src/protocol/publish.js";
 import { decodeCreateStream } from "../src/protocol/stream.js";
 import { encodeRecord } from "../src/protocol/record.js";
+import { encodeRecordsBatch } from "../src/protocol/records-batch.js";
 import { Connection } from "../src/connection.js";
 import { encodeErrorFrame } from "../src/protocol/error-frame.js";
 import { KeyCollisionError, DedupMapFullError, QueryError } from "../src/errors.js";
@@ -136,6 +137,50 @@ describe("ExspeedClient", () => {
     expect(captured.maxAgeSecs).toBe(86400n);
     expect(captured.maxBytes).toBe(0n);
 
+    await client.close();
+  });
+
+  it("subscribe() delivers every record of a pushed RecordsBatch frame", async () => {
+    testServer = createTestServer((frame, socket) => {
+      if (frame.opcode === OpCode.Connect) {
+        replyOk(socket, frame.correlationId);
+      } else if (frame.opcode === OpCode.Subscribe) {
+        replyOk(socket, frame.correlationId);
+        setTimeout(() => {
+          const payload = encodeRecordsBatch([0n, 1n, 2n].map((offset) => ({
+            offset,
+            timestamp: 1000n + offset,
+            subject: "orders.created",
+            key: Buffer.from(`k${offset}`),
+            value: Buffer.from(JSON.stringify({ n: Number(offset) })),
+            headers: [],
+          })));
+          socket.write(encodeFrame({
+            version: PROTOCOL_VERSION,
+            opcode: OpCode.RecordsBatch,
+            correlationId: 0,
+            payload,
+          }));
+        }, 50);
+      } else {
+        replyOk(socket, frame.correlationId);
+      }
+    });
+    const port = await testServer.start();
+
+    const client = new ExspeedClient({ host: "127.0.0.1", port, clientId: "test", reconnect: false });
+    await client.connect();
+    const sub = await client.subscribe("my-consumer");
+
+    const seen: number[] = [];
+    for await (const msg of sub) {
+      seen.push(msg.json<{ n: number }>().n);
+      expect(msg.key?.toString()).toBe(`k${msg.offset}`);
+      if (seen.length === 3) break;
+    }
+    expect(seen).toEqual([0, 1, 2]);
+
+    await sub.unsubscribe();
     await client.close();
   });
 
