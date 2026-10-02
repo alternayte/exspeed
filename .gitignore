@@ -8,8 +8,9 @@
 **/node_modules/
 **/dist/
 
-# Local planning / design docs
-/docs/
+# Local planning / design docs live in docs/ subdirectories (e.g. docs/plans/).
+# Top-level docs/*.md are the published user documentation and are tracked.
+/docs/*/
 
 # Git worktrees used during subagent-driven development
 /.worktrees/

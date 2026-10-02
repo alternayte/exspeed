@@ -97,12 +97,12 @@ exspeed                 Binary: CLI + server orchestration (TCP accept loop + HT
 
 ### Key Architectural Patterns
 
-- **StorageEngine trait** (`exspeed-streams`): Sync trait with `append`, `read`, `seek_by_time`, `create_stream`. FileStorage is the real impl; MemoryStorage exists for tests. Async callers use `spawn_blocking`.
+- **StorageEngine trait** (`exspeed-streams`): async trait with `append`, `read`, `seek_by_time`, `create_stream`, etc. FileStorage is the real impl; MemoryStorage exists for tests.
 - **Wire protocol**: 10-byte frame header `[Version(1)][OpCode(1)][CorrelID(4)][PayloadLen(4)]`. Correlation IDs match request/response; push-delivered records use CorrelID 0. CRC32C framing on stored records.
 - **Segment-based storage**: Log-structured append-only. Directory layout: `{data_dir}/streams/{stream}/partitions/0/`. Segments roll at 256MB. Offset and time indexes for random access.
 - **Single partition per stream**: Simplifies broker logic. Single-writer semantics.
 - **Delivery pipeline**: One `tokio::spawn`'d task per active subscription. Polls storage in batches, applies NATS-style subject filtering (`*` = one token, `>` = one or more), sends records via `mpsc` channel to connection handler.
-- **Consumer groups**: Round-robin across group members. State is in-memory (single-instance for now).
+- **Consumer groups**: work sharing only happens with a Postgres/Redis `WorkCoordinator` (`EXSPEED_CONSUMER_STORE`); with the default noop coordinator every member receives every record. See `docs/REVIEW.md` §3.3.
 - **ExQL execution**: Two paths — bounded (one-shot SELECT, reads entire stream) and continuous (long-lived task, outputs to target stream or materialized view). Supports EMIT CHANGES/FINAL, tumbling windows, stream-stream joins with WITHIN.
 - **Connector lifecycle**: `SourceConnector`/`SinkConnector` traits with start/poll/commit/stop. ConnectorManager loads from TOML configs in `{data_dir}/connectors.d/`, supports hot-reload via filesystem watcher.
 
@@ -122,6 +122,10 @@ The SDK (`@exspeed/sdk`) implements the binary wire protocol over TCP. Key class
 - **Subscription**: AsyncIterable with Message objects providing `json<T>()`, `ack()`, `nack()`
 
 Each subscription gets its own TCP connection. Protocol layer is in `src/protocol/` with per-operation modules.
+
+## Documentation
+
+User docs live in `docs/` (index: `docs/README.md`); the root README is a short landing page. `docs/REVIEW.md` holds the October 2026 deep review, the target architecture and the phased plan — read it before making structural changes, and keep the per-feature status notes in `docs/` honest when fixing or adding features.
 
 ## Integration Tests
 
