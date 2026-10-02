@@ -116,9 +116,9 @@ fn clear_shared_env() {
 }
 
 async fn spawn_pod() -> PodHandle {
-    let api_port = portpicker::pick_unused_port().unwrap();
-    let tcp_port = portpicker::pick_unused_port().unwrap();
-    let cluster_port = portpicker::pick_unused_port().unwrap();
+    let api_port = exspeed_testkit::pick_unused_port().unwrap();
+    let tcp_port = exspeed_testkit::pick_unused_port().unwrap();
+    let cluster_port = exspeed_testkit::pick_unused_port().unwrap();
     let tmp = tempfile::tempdir().unwrap();
 
     let cred_path = write_credentials_toml(tmp.path());
@@ -132,13 +132,13 @@ async fn spawn_pod() -> PodHandle {
         credentials_file: Some(cred_path),
         tls_cert: None,
         tls_key: None,
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
+        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+        storage_flush_window_us: 500,
+        storage_flush_threshold_records: 256,
+        storage_flush_threshold_bytes: 1_048_576,
+        storage_sync_interval_ms: 10,
+        storage_sync_bytes: 4 * 1024 * 1024,
+        delivery_buffer: 8192,
     };
 
     let task = tokio::spawn(async move {
@@ -279,9 +279,7 @@ async fn slow_follower_triggers_leader_queue_drop() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         if tokio::time::Instant::now() > deadline {
-            panic!(
-                "follower_queue_drops_total_total did not increment within 30s (was {before})"
-            );
+            panic!("follower_queue_drops_total_total did not increment within 30s (was {before})");
         }
         let now = queue_drops_total(leader_api).await;
         if now > before {

@@ -74,12 +74,12 @@ impl MssqlCdcSource {
         let schema_raw = config.setting_or("schema", "");
         if schema_raw.trim().is_empty() {
             return Err(ConnectorError::Config(
-                "mssql_cdc: 'schema' setting required — declares business columns to extract".into(),
+                "mssql_cdc: 'schema' setting required — declares business columns to extract"
+                    .into(),
             ));
         }
-        let schema_cols = parse_schema(&schema_raw).map_err(|e| {
-            ConnectorError::Config(format!("mssql_cdc: schema DSL error: {e}"))
-        })?;
+        let schema_cols = parse_schema(&schema_raw)
+            .map_err(|e| ConnectorError::Config(format!("mssql_cdc: schema DSL error: {e}")))?;
 
         Ok(Self {
             connection_string,
@@ -102,7 +102,9 @@ fn parse_url_to_config(raw: &str) -> Result<tiberius::Config, ConnectorError> {
         .map_err(|e| ConnectorError::Config(format!("mssql_cdc url parse: {e}")))?;
 
     let mut cfg = tiberius::Config::new();
-    if let Some(h) = u.host_str() { cfg.host(h); }
+    if let Some(h) = u.host_str() {
+        cfg.host(h);
+    }
     cfg.port(u.port().unwrap_or(1433));
     if !u.username().is_empty() {
         let user = percent_encoding::percent_decode_str(u.username())
@@ -119,7 +121,9 @@ fn parse_url_to_config(raw: &str) -> Result<tiberius::Config, ConnectorError> {
         cfg.authentication(tiberius::AuthMethod::sql_server(&user, &pass));
     }
     let db = u.path().trim_start_matches('/');
-    if !db.is_empty() { cfg.database(db); }
+    if !db.is_empty() {
+        cfg.database(db);
+    }
     for (k, v) in u.query_pairs() {
         if k.eq_ignore_ascii_case("trust_server_certificate") && v.eq_ignore_ascii_case("true") {
             cfg.trust_cert();
@@ -133,7 +137,7 @@ fn lsn_to_hex(lsn: &[u8]) -> String {
 }
 
 fn hex_to_lsn(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(s.len() / 2);
@@ -165,9 +169,11 @@ fn column_data_to_json(cd: &ColumnData, ty: JsonType) -> serde_json::Value {
         ColumnData::I64(Some(v)) => Value::Number((*v).into()),
         ColumnData::U8(Some(v)) => Value::Number((*v as u64).into()),
         ColumnData::F32(Some(v)) => serde_json::Number::from_f64(*v as f64)
-            .map(Value::Number).unwrap_or(Value::Null),
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
         ColumnData::F64(Some(v)) => serde_json::Number::from_f64(*v)
-            .map(Value::Number).unwrap_or(Value::Null),
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
         ColumnData::String(Some(s)) => Value::String(s.to_string()),
         _ => match ty {
             JsonType::Text | JsonType::Jsonb | JsonType::Timestamptz => {
@@ -194,7 +200,9 @@ impl SourceConnector for MssqlCdcSource {
         if let Some(s) = last_position {
             match hex_to_lsn(&s) {
                 Some(lsn) => self.last_lsn = Some(lsn),
-                None => warn!(last_position = %s, "mssql_cdc: invalid LSN hex; starting from beginning"),
+                None => {
+                    warn!(last_position = %s, "mssql_cdc: invalid LSN hex; starting from beginning")
+                }
             }
         }
 
@@ -227,21 +235,36 @@ impl SourceConnector for MssqlCdcSource {
                 sys.fn_cdc_get_min_lsn(N'{}') AS min_lsn",
             self.capture_instance.replace('\'', "''")
         );
-        let stream = conn.simple_query(bounds_sql).await
+        let stream = conn
+            .simple_query(bounds_sql)
+            .await
             .map_err(|e| ConnectorError::Connection(format!("mssql_cdc bounds query: {e}")))?;
-        let rows = stream.into_first_result().await
+        let rows = stream
+            .into_first_result()
+            .await
             .map_err(|e| ConnectorError::Connection(format!("mssql_cdc bounds result: {e}")))?;
         let bounds = match rows.first() {
             Some(r) => r,
-            None => return Ok(SourceBatch { records: Vec::new(), position: None }),
+            None => {
+                return Ok(SourceBatch {
+                    records: Vec::new(),
+                    position: None,
+                })
+            }
         };
         let max_lsn: Option<&[u8]> = bounds.get::<&[u8], _>(0);
         let min_lsn: Option<&[u8]> = bounds.get::<&[u8], _>(1);
         let Some(max_lsn) = max_lsn else {
-            return Ok(SourceBatch { records: Vec::new(), position: None });
+            return Ok(SourceBatch {
+                records: Vec::new(),
+                position: None,
+            });
         };
         let Some(min_lsn) = min_lsn else {
-            return Ok(SourceBatch { records: Vec::new(), position: None });
+            return Ok(SourceBatch {
+                records: Vec::new(),
+                position: None,
+            });
         };
         let max_lsn_vec = max_lsn.to_vec();
         let min_lsn_vec = min_lsn.to_vec();
@@ -253,7 +276,10 @@ impl SourceConnector for MssqlCdcSource {
 
         // If from_lsn > max_lsn nothing new.
         if from_lsn > max_lsn_vec {
-            return Ok(SourceBatch { records: Vec::new(), position: None });
+            return Ok(SourceBatch {
+                records: Vec::new(),
+                position: None,
+            });
         }
 
         let fetch_sql = format!(
@@ -265,9 +291,13 @@ impl SourceConnector for MssqlCdcSource {
         let mut q = Query::new(fetch_sql);
         q.bind(from_lsn.clone());
         q.bind(max_lsn_vec.clone());
-        let stream = q.query(&mut *conn).await
+        let stream = q
+            .query(&mut *conn)
+            .await
             .map_err(|e| ConnectorError::Connection(format!("mssql_cdc change fetch: {e}")))?;
-        let rows = stream.into_first_result().await
+        let rows = stream
+            .into_first_result()
+            .await
             .map_err(|e| ConnectorError::Connection(format!("mssql_cdc change result: {e}")))?;
 
         let mut out: Vec<SourceRecord> = Vec::with_capacity(rows.len());
@@ -301,9 +331,7 @@ impl SourceConnector for MssqlCdcSource {
                 }
             }
 
-            let value = Bytes::from(
-                serde_json::to_vec(&obj).unwrap_or_else(|_| b"null".to_vec()),
-            );
+            let value = Bytes::from(serde_json::to_vec(&obj).unwrap_or_else(|_| b"null".to_vec()));
             let subject = if self.subject_template.is_empty() {
                 format!("mssql_cdc.{}.{}", self.capture_instance, op)
             } else {
@@ -315,7 +343,10 @@ impl SourceConnector for MssqlCdcSource {
                 subject,
                 headers: vec![
                     ("exspeed-mssql-op".into(), op.to_string()),
-                    ("exspeed-mssql-capture".into(), self.capture_instance.clone()),
+                    (
+                        "exspeed-mssql-capture".into(),
+                        self.capture_instance.clone(),
+                    ),
                 ],
             });
         }
@@ -327,7 +358,10 @@ impl SourceConnector for MssqlCdcSource {
             None
         };
 
-        Ok(SourceBatch { records: out, position })
+        Ok(SourceBatch {
+            records: out,
+            position,
+        })
     }
 
     async fn commit(&mut self, _position: String) -> Result<(), ConnectorError> {
@@ -341,8 +375,11 @@ impl SourceConnector for MssqlCdcSource {
     }
 
     async fn health(&self) -> HealthStatus {
-        if self.pool.is_some() { HealthStatus::Healthy }
-        else { HealthStatus::Unhealthy("mssql_cdc: not started".into()) }
+        if self.pool.is_some() {
+            HealthStatus::Healthy
+        } else {
+            HealthStatus::Unhealthy("mssql_cdc: not started".into())
+        }
     }
 }
 
@@ -352,19 +389,26 @@ fn row_get_column_data(row: &tiberius::Row, col: &str) -> Option<ColumnData<'sta
     // Note: tiberius::Row doesn't expose ColumnData directly. We re-materialize
     // the value into an owned ColumnData by probing the typed accessors in
     // the same order used by column_data_to_json.
-    if let Ok(Some(v)) = std::panic::catch_unwind(|| row.try_get::<&str, _>(col)).unwrap_or(Ok(None)) {
+    if let Ok(Some(v)) =
+        std::panic::catch_unwind(|| row.try_get::<&str, _>(col)).unwrap_or(Ok(None))
+    {
         return Some(ColumnData::String(Some(v.to_string().into())));
     }
-    if let Ok(Some(v)) = std::panic::catch_unwind(|| row.try_get::<i64, _>(col)).unwrap_or(Ok(None)) {
+    if let Ok(Some(v)) = std::panic::catch_unwind(|| row.try_get::<i64, _>(col)).unwrap_or(Ok(None))
+    {
         return Some(ColumnData::I64(Some(v)));
     }
-    if let Ok(Some(v)) = std::panic::catch_unwind(|| row.try_get::<i32, _>(col)).unwrap_or(Ok(None)) {
+    if let Ok(Some(v)) = std::panic::catch_unwind(|| row.try_get::<i32, _>(col)).unwrap_or(Ok(None))
+    {
         return Some(ColumnData::I32(Some(v)));
     }
-    if let Ok(Some(v)) = std::panic::catch_unwind(|| row.try_get::<bool, _>(col)).unwrap_or(Ok(None)) {
+    if let Ok(Some(v)) =
+        std::panic::catch_unwind(|| row.try_get::<bool, _>(col)).unwrap_or(Ok(None))
+    {
         return Some(ColumnData::Bit(Some(v)));
     }
-    if let Ok(Some(v)) = std::panic::catch_unwind(|| row.try_get::<f64, _>(col)).unwrap_or(Ok(None)) {
+    if let Ok(Some(v)) = std::panic::catch_unwind(|| row.try_get::<f64, _>(col)).unwrap_or(Ok(None))
+    {
         return Some(ColumnData::F64(Some(v)));
     }
     None
@@ -408,9 +452,10 @@ mod tests {
 
     #[test]
     fn new_requires_capture_instance_and_schema() {
-        let cfg = make_config(HashMap::from([
-            ("connection".into(), "mssql://sa:pw@h/db".into()),
-        ]));
+        let cfg = make_config(HashMap::from([(
+            "connection".into(),
+            "mssql://sa:pw@h/db".into(),
+        )]));
         assert!(MssqlCdcSource::new(&cfg).is_err());
 
         let cfg = make_config(HashMap::from([
@@ -451,7 +496,7 @@ mod tests {
     #[test]
     fn hex_to_lsn_rejects_bad_input() {
         assert!(hex_to_lsn("ABC").is_none()); // odd length
-        assert!(hex_to_lsn("GG").is_none());  // non-hex
+        assert!(hex_to_lsn("GG").is_none()); // non-hex
     }
 
     #[test]

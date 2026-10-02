@@ -92,8 +92,7 @@ pub async fn run(
         // "Sustained" heuristic: the producer completed all interval-driven
         // publishes without dropping any. If the broker accepted >= 95% of the
         // expected message count the rate is considered sustained.
-        let expected =
-            (candidate as f64 * profile.exql_duration.as_secs_f64()) as u64;
+        let expected = (candidate as f64 * profile.exql_duration.as_secs_f64()) as u64;
         let tolerance = (expected as f64 * 0.05) as u64;
         let passed = expected.saturating_sub(stats.messages) < tolerance;
 

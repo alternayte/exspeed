@@ -100,9 +100,16 @@ impl S3TieredStorage {
 
         let local_dir = self.local.partition_dir(stream.as_str(), 0);
 
-        uploader::download_segment(&self.bucket, &self.prefix, stream.as_str(), 0, base_offset, &local_dir)
-            .await
-            .map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
+        uploader::download_segment(
+            &self.bucket,
+            &self.prefix,
+            stream.as_str(),
+            0,
+            base_offset,
+            &local_dir,
+        )
+        .await
+        .map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
 
         let local = self.local.clone();
         let stream_name = stream.as_str().to_string();
@@ -123,7 +130,9 @@ impl StorageEngine for S3TieredStorage {
         max_age_secs: u64,
         max_bytes: u64,
     ) -> Result<(), StorageError> {
-        self.local.create_stream(stream, max_age_secs, max_bytes).await
+        self.local
+            .create_stream(stream, max_age_secs, max_bytes)
+            .await
     }
 
     async fn append(
@@ -201,7 +210,11 @@ impl StorageEngine for S3TieredStorage {
         // Delegate to local storage which handles bloom filter skipping.
         // S3 fetch-on-miss is not wired for hinted reads yet — if local
         // returns empty we fall back to the unhinted S3-aware read path.
-        match self.local.read_with_hints(stream, from, max_records, key_filter).await {
+        match self
+            .local
+            .read_with_hints(stream, from, max_records, key_filter)
+            .await
+        {
             Ok(records) if !records.is_empty() => Ok(records),
             Ok(_empty) => self.read(stream, from, max_records).await,
             Err(StorageError::StreamNotFound(_)) => self.read(stream, from, max_records).await,
@@ -219,8 +232,7 @@ impl StorageEngine for S3TieredStorage {
     }
 
     async fn list_streams(&self) -> Result<Vec<StreamName>, StorageError> {
-        let mut streams: Vec<StreamName> =
-            StorageEngine::list_streams(&self.local).await?;
+        let mut streams: Vec<StreamName> = StorageEngine::list_streams(&self.local).await?;
 
         let manifests = self.manifests.read().await;
         for stream_name in manifests.keys() {
@@ -241,11 +253,7 @@ impl StorageEngine for S3TieredStorage {
         Ok(streams)
     }
 
-    async fn trim_up_to(
-        &self,
-        stream: &StreamName,
-        keep_from: Offset,
-    ) -> Result<(), StorageError> {
+    async fn trim_up_to(&self, stream: &StreamName, keep_from: Offset) -> Result<(), StorageError> {
         // Drop local segments below `keep_from`.
         self.local.trim_up_to(stream, keep_from).await?;
         // Drop manifest entries whose last offset is strictly below the
@@ -268,10 +276,7 @@ impl StorageEngine for S3TieredStorage {
         Ok(())
     }
 
-    async fn stream_bounds(
-        &self,
-        stream: &StreamName,
-    ) -> Result<(Offset, Offset), StorageError> {
+    async fn stream_bounds(&self, stream: &StreamName) -> Result<(Offset, Offset), StorageError> {
         // Tightest available view: prefer the live local partition, fall
         // back to the manifest when the stream doesn't exist locally or
         // records have been rotated out to S3 only.
@@ -338,7 +343,9 @@ impl StorageEngine for S3TieredStorage {
         name: String,
         field_path: String,
     ) -> Result<(), StorageError> {
-        self.local.register_secondary_index(stream, name, field_path).await
+        self.local
+            .register_secondary_index(stream, name, field_path)
+            .await
     }
 
     fn partition_dir_path(&self, stream: &str, partition: u32) -> Option<std::path::PathBuf> {

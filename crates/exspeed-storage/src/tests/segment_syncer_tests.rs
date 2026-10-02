@@ -1,11 +1,11 @@
+use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Duration;
-use bytes::Bytes;
 use tempfile::tempdir;
 
+use crate::file::{FileStorage, StorageSyncMode};
 use exspeed_common::StreamName;
 use exspeed_streams::{record::Record, StorageEngine};
-use crate::file::{FileStorage, StorageSyncMode};
 
 fn mk(body: &'static [u8]) -> Record {
     Record {
@@ -28,7 +28,8 @@ async fn async_mode_acks_immediately_then_syncs_on_timer() {
                 threshold_bytes: 4 * 1024 * 1024,
             },
             crate::file::segment_appender::AppenderConfig::default(),
-        ).unwrap()
+        )
+        .unwrap(),
     );
     let stream: StreamName = "s".try_into().unwrap();
     storage.create_stream(&stream, 0, 0).await.unwrap();
@@ -76,12 +77,8 @@ async fn set_active_file_swaps_sync_target() {
         .unwrap();
 
     // Spawn syncer pointing at A.
-    let handle = crate::file::segment_syncer::spawn(
-        file_a,
-        "s".into(),
-        0,
-        Duration::from_millis(50),
-    );
+    let handle =
+        crate::file::segment_syncer::spawn(file_a, "s".into(), 0, Duration::from_millis(50));
 
     // Let it tick once, verify no crash.
     tokio::time::sleep(Duration::from_millis(80)).await;

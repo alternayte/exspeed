@@ -49,7 +49,7 @@ sha2 = "0.10"
 rand = "0.8"
 
 [dev-dependencies]
-portpicker = "0.1"
+exspeed-testkit = { path = "../exspeed-testkit" }
 tempfile = "3"
 rcgen = { workspace = true }
 tokio-postgres = { workspace = true }

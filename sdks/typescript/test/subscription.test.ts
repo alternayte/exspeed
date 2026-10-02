@@ -80,8 +80,25 @@ describe("Subscription", () => {
     expect(slowHandler).toHaveBeenCalled();
   });
 
-  it("emits typed overflow event and drops oldest when queue overflows", () => {
+  it("default 'buffer' policy never drops; emits slow instead", () => {
     const sub = new Subscription("c", "test-sub-id", { maxQueueSize: 2 });
+    const overflow = vi.fn();
+    const slow = vi.fn();
+    sub.on("overflow", overflow);
+    sub.on("slow", slow);
+
+    for (let i = 0; i < 3; i++) {
+      sub.push(
+        { consumerName: "c", offset: BigInt(i), timestamp: 0n, subject: "s", deliveryAttempt: 1, value: Buffer.from(`v${i}`), headers: [] },
+        vi.fn(), vi.fn(),
+      );
+    }
+    expect(overflow).not.toHaveBeenCalled();
+    expect(slow).toHaveBeenCalled();
+  });
+
+  it("emits typed overflow event and drops oldest when queue overflows", () => {
+    const sub = new Subscription("c", "test-sub-id", { maxQueueSize: 2, overflowPolicy: "drop-oldest" });
     const handler = vi.fn();
     sub.on("overflow", handler);
 

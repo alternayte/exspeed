@@ -1,9 +1,9 @@
 // Built in Task 4
 
 mod file_tests;
+mod segment_appender_tests;
 mod segment_recovery_tests;
 mod trait_tests;
-mod segment_appender_tests;
 
 #[cfg(test)]
 mod segment_syncer_tests;
@@ -82,11 +82,8 @@ mod memory_tests {
 
     #[tokio::test]
     async fn trim_up_to_drops_earlier_records() {
-        trait_tests::test_trim_up_to_drops_earlier_records(
-            &MemoryStorage::new(),
-            EXACT_RETENTION,
-        )
-        .await;
+        trait_tests::test_trim_up_to_drops_earlier_records(&MemoryStorage::new(), EXACT_RETENTION)
+            .await;
     }
 
     #[tokio::test]

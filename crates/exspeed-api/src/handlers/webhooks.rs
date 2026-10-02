@@ -52,14 +52,38 @@ pub async fn handle_webhook(
     drop(connectors);
 
     let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .or_else(|| headers.get("x-idempotency-key"))
+        .and_then(|v| v.to_str().ok());
 
-    let storage = state.connector_manager.storage.clone();
-
-    match handle_webhook_post(&storage, &config, body, auth_header).await {
+    use exspeed_broker::log::LogError;
+    use exspeed_connectors::builtin::http_webhook::WebhookError;
+    match handle_webhook_post(
+        &state.broker.log,
+        &config,
+        body,
+        auth_header,
+        idempotency_key,
+    )
+    .await
+    {
         Ok(offset) => (StatusCode::OK, Json(json!({"offset": offset}))),
-        Err(e) if e.contains("unauthorized") => {
-            (StatusCode::UNAUTHORIZED, Json(json!({"error": e})))
-        }
-        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))),
+        Err(WebhookError::Unauthorized) => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized"})),
+        ),
+        Err(WebhookError::Log(e @ (LogError::NotLeader | LogError::DedupNotReady))) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": e.to_string()})),
+        ),
+        Err(WebhookError::Log(e @ LogError::Storage(_))) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        ),
     }
 }

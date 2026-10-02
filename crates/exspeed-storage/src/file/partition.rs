@@ -67,9 +67,8 @@ fn pick_placeholder_base(
     loop {
         let filename = format!("{:020}.seg", candidate);
         let path = dir.join(&filename);
-        let collides = path == active_path
-            || doomed_sealed.iter().any(|p| p == &path)
-            || path.exists();
+        let collides =
+            path == active_path || doomed_sealed.iter().any(|p| p == &path) || path.exists();
         if !collides {
             return Ok(candidate);
         }
@@ -220,6 +219,11 @@ impl Partition {
         if let Some(m) = max_offset_in_active {
             next_offset = next_offset.max(m + 1);
         }
+        // An empty active segment (e.g. after a roll followed by retention
+        // deleting every sealed segment) still pins the next offset to its
+        // base offset; without this, offsets would restart at 0.
+        let active_base = SegmentReader::open(last_seg_path)?.base_offset();
+        next_offset = next_offset.max(active_base);
 
         info!(
             stream = stream_name,
@@ -233,8 +237,7 @@ impl Partition {
         // Open the active segment for append at the post-recovery length.
         let last_reader = SegmentReader::open(last_seg_path)?;
         let base_offset = last_reader.base_offset();
-        let active_writer =
-            SegmentWriter::open_append(last_seg_path, base_offset, current_size)?;
+        let active_writer = SegmentWriter::open_append(last_seg_path, base_offset, current_size)?;
 
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -299,7 +302,11 @@ impl Partition {
     /// the write reached the page cache partially before failing, the next
     /// `Partition::open` will detect the torn tail via `recover_tail` and
     /// truncate to the last durable frame.
-    pub fn append_batch(&mut self, records: &[Record], sync_now: bool) -> io::Result<Vec<(Offset, u64)>> {
+    pub fn append_batch(
+        &mut self,
+        records: &[Record],
+        sync_now: bool,
+    ) -> io::Result<Vec<(Offset, u64)>> {
         if records.is_empty() {
             return Ok(Vec::new());
         }
@@ -586,8 +593,8 @@ impl Partition {
 
         enum StraddleSegment {
             Sealed(usize, PathBuf, u64), // (index in sealed_readers, path, base_offset)
-            Active(PathBuf, u64),         // (path, base_offset)
-            None,                          // no straddle (e.g. drop_from == 0)
+            Active(PathBuf, u64),        // (path, base_offset)
+            None,                        // no straddle (e.g. drop_from == 0)
         }
 
         let active_base = self.active_writer.base_offset();
@@ -765,7 +772,8 @@ impl Partition {
     /// No-op if an index with the same name is already registered.
     pub fn register_secondary_index(&mut self, name: String, field_path: String) {
         if !self.secondary_indexes.iter().any(|(n, _)| n == &name) {
-            self.secondary_indexes.push((name.clone(), field_path.clone()));
+            self.secondary_indexes
+                .push((name.clone(), field_path.clone()));
 
             // Force-roll the active segment so it becomes sealed and gets
             // indexed. Without this, streams under 256MB would never have
@@ -823,6 +831,13 @@ impl Partition {
     /// Roll the active segment: seal it, build indexes, open a reader for it,
     /// and create a new active segment starting at `next_offset`.
     fn roll_segment(&mut self) -> io::Result<()> {
+        // Never seal an empty segment: the new segment would get the same
+        // base offset (and file name) as the old one, and the old path would
+        // end up registered as both sealed and active.
+        if self.active_writer.base_offset() >= self.next_offset {
+            return Ok(());
+        }
+
         // Sync the current active writer.
         self.active_writer.sync()?;
 
@@ -846,10 +861,11 @@ impl Partition {
             last_timestamp: sealed.last_timestamp().unwrap_or(0),
         };
 
+        // Create the new segment before mutating any state, so a failure
+        // leaves the partition exactly as it was.
+        let new_writer = SegmentWriter::create(&self.dir, self.next_offset)?;
         self.sealed_readers.push(sealed);
-
-        // Create a new segment.
-        self.active_writer = SegmentWriter::create(&self.dir, self.next_offset)?;
+        self.active_writer = new_writer;
 
         // If an async-mode syncer is attached, hand it a clone of the new
         // active segment's file handle. Without this the syncer would keep
@@ -927,10 +943,8 @@ impl Partition {
                 }
             }
             if !entries.is_empty() {
-                let _ = crate::file::secondary_index::SecondaryIndex::build(
-                    &sidx_path,
-                    &mut entries,
-                );
+                let _ =
+                    crate::file::secondary_index::SecondaryIndex::build(&sidx_path, &mut entries);
             }
         }
 

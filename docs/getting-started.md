@@ -89,9 +89,8 @@ for await (const msg of await client.subscribe("order-processor")) {
 }
 ```
 
-> ⚠️ Known issue: the current SDK drops batched deliveries (`RecordsBatch`
-> frames), so a consumer that starts with a backlog will miss records. See
-> [REVIEW.md §3.8](REVIEW.md#38-typescript-sdk).
+> Acks are cumulative and there is no automatic redelivery yet; see
+> [concepts.md](concepts.md#current-delivery-semantics).
 
 ## Next steps
 

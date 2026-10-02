@@ -53,9 +53,7 @@ fn bind_param<'q>(
         Param::I64(i) => q.bind(*i),
         Param::F64(f) => q.bind(*f),
         Param::Text(s) => q.bind(s.clone()),
-        Param::Timestamptz(dt) => {
-            q.bind(dt.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
-        }
+        Param::Timestamptz(dt) => q.bind(dt.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)),
         Param::JsonText(s) => q.bind(s.clone()),
     }
 }
@@ -82,7 +80,7 @@ mod tests {
         let q = bind_param(q, &Param::Null);
         let q = bind_param(q, &Param::Bool(true));
         let q = bind_param(q, &Param::I64(42));
-        let q = bind_param(q, &Param::F64(3.14));
+        let q = bind_param(q, &Param::F64(2.75));
         let q = bind_param(q, &Param::Text("hello".into()));
         let q = bind_param(q, &Param::Timestamptz(chrono::Utc::now()));
         let q = bind_param(q, &Param::JsonText(r#"{"a":1}"#.into()));

@@ -40,11 +40,7 @@ pub trait WorkCoordinator: Send + Sync {
 
     /// Add newly-read offsets from storage to the pending queue.
     /// Also advances `delivery_head` to `max(offsets)` if higher.
-    async fn enqueue(
-        &self,
-        group: &str,
-        offsets: &[u64],
-    ) -> Result<(), WorkCoordinatorError>;
+    async fn enqueue(&self, group: &str, offsets: &[u64]) -> Result<(), WorkCoordinatorError>;
 
     /// Current delivery_head (highest offset loaded into pending).
     async fn delivery_head(&self, group: &str) -> Result<u64, WorkCoordinatorError>;

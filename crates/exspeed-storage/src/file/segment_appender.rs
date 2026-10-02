@@ -65,7 +65,10 @@ impl AppenderHandle {
     pub async fn append(&self, record: Record) -> Result<(Offset, u64), StorageError> {
         let (tx, rx) = oneshot::channel();
         self.tx
-            .send(AppendRequest::Single { record, respond_to: tx })
+            .send(AppendRequest::Single {
+                record,
+                respond_to: tx,
+            })
             .await
             .map_err(|_| StorageError::ChannelClosed)?;
         rx.await.map_err(|_| StorageError::ChannelClosed)?
@@ -77,7 +80,10 @@ impl AppenderHandle {
     ) -> Result<Vec<(Offset, u64)>, StorageError> {
         let (tx, rx) = oneshot::channel();
         self.tx
-            .send(AppendRequest::Batch { records, respond_to: tx })
+            .send(AppendRequest::Batch {
+                records,
+                respond_to: tx,
+            })
             .await
             .map_err(|_| StorageError::ChannelClosed)?;
         rx.await.map_err(|_| StorageError::ChannelClosed)?
@@ -99,7 +105,8 @@ pub fn spawn(
     let (tx, mut rx) = mpsc::channel::<AppendRequest>(1024);
 
     tokio::spawn(async move {
-        let mut pending_singles: Vec<PendingSingle> = Vec::with_capacity(config.flush_threshold_records);
+        let mut pending_singles: Vec<PendingSingle> =
+            Vec::with_capacity(config.flush_threshold_records);
         let mut batch_bytes: usize = 0;
         let mut batch_started: Option<Instant> = None;
 
@@ -192,14 +199,16 @@ async fn flush_singles(
 
     match result {
         Ok(assignments) => {
-            for (tx, (offset, ts)) in responders.into_iter().zip(assignments.into_iter()) {
+            for (tx, (offset, ts)) in responders.into_iter().zip(assignments) {
                 let _ = tx.send(Ok((offset, ts)));
             }
         }
         Err(e) => {
             let err_msg = e.to_string();
             for tx in responders {
-                let _ = tx.send(Err(StorageError::Io(std::io::Error::other(err_msg.clone()))));
+                let _ = tx.send(Err(StorageError::Io(std::io::Error::other(
+                    err_msg.clone(),
+                ))));
             }
         }
     }
@@ -218,7 +227,6 @@ async fn flush_explicit_batch(
         let mut p = partition.lock().await;
         p.append_batch(&records, sync_now)
     };
-    let _ = respond_to.send(
-        result.map_err(|e| StorageError::Io(std::io::Error::other(format!("{e}")))),
-    );
+    let _ = respond_to
+        .send(result.map_err(|e| StorageError::Io(std::io::Error::other(format!("{e}")))));
 }

@@ -104,7 +104,10 @@ pub async fn delete(client: &CliClient, name: &str, force: bool) -> Result<()> {
     };
     let (status, body) = client.delete_parsed(&path).await?;
     if !(200..300).contains(&status) {
-        let msg = body["error"].as_str().unwrap_or("unknown error").to_string();
+        let msg = body["error"]
+            .as_str()
+            .unwrap_or("unknown error")
+            .to_string();
         return Err(anyhow!("failed to delete stream: {msg}"));
     }
     println!("Stream '{}' deleted", name);

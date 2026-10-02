@@ -20,8 +20,7 @@ impl LogFormat {
 
 /// Initialize the global tracing subscriber. Call once at process start.
 pub fn init_logging() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("warn"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
 
     let format = LogFormat::from_env();
     match format {
@@ -31,9 +30,7 @@ pub fn init_logging() {
             .with_current_span(false)
             .with_span_list(false)
             .init(),
-        LogFormat::Text => tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .init(),
+        LogFormat::Text => tracing_subscriber::fmt().with_env_filter(filter).init(),
     }
 }
 

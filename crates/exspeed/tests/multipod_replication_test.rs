@@ -127,9 +127,9 @@ fn clear_shared_env() {
 }
 
 async fn spawn_pod() -> PodHandle {
-    let api_port = portpicker::pick_unused_port().unwrap();
-    let tcp_port = portpicker::pick_unused_port().unwrap();
-    let cluster_port = portpicker::pick_unused_port().unwrap();
+    let api_port = exspeed_testkit::pick_unused_port().unwrap();
+    let tcp_port = exspeed_testkit::pick_unused_port().unwrap();
+    let cluster_port = exspeed_testkit::pick_unused_port().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().to_path_buf();
     let cred_path = write_credentials_toml(tmp.path());
@@ -147,13 +147,13 @@ async fn spawn_pod() -> PodHandle {
         credentials_file: Some(cred_path.clone()),
         tls_cert: None,
         tls_key: None,
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
+        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+        storage_flush_window_us: 500,
+        storage_flush_threshold_records: 256,
+        storage_flush_threshold_bytes: 1_048_576,
+        storage_sync_interval_ms: 10,
+        storage_sync_bytes: 4 * 1024 * 1024,
+        delivery_buffer: 8192,
     };
     let task = tokio::spawn(async move {
         let _ = exspeed::cli::server::run(args).await;
@@ -184,7 +184,10 @@ async fn wait_for_leader_split(a: &PodHandle, b: &PodHandle, deadline_secs: u64)
         if tokio::time::Instant::now() > deadline {
             panic!("no leader emerged within {deadline_secs}s");
         }
-        match (healthz_code(a.api_port).await, healthz_code(b.api_port).await) {
+        match (
+            healthz_code(a.api_port).await,
+            healthz_code(b.api_port).await,
+        ) {
             (Some(200), Some(503)) => return (a.api_port, b.api_port),
             (Some(503), Some(200)) => return (b.api_port, a.api_port),
             _ => tokio::time::sleep(Duration::from_millis(300)).await,
@@ -214,9 +217,7 @@ async fn create_stream(api_port: u16, name: &str, max_bytes: u64) {
 
 async fn patch_retention(api_port: u16, name: &str, max_bytes: u64) {
     let resp = reqwest::Client::new()
-        .patch(format!(
-            "http://127.0.0.1:{api_port}/api/v1/streams/{name}"
-        ))
+        .patch(format!("http://127.0.0.1:{api_port}/api/v1/streams/{name}"))
         .header("Authorization", format!("Bearer {ADMIN_TOKEN}"))
         .json(&serde_json::json!({ "max_bytes": max_bytes }))
         .send()
@@ -266,12 +267,7 @@ async fn head_offset(api_port: u16, stream: &str) -> Option<u64> {
     v["head_offset"].as_u64()
 }
 
-async fn wait_all_streams_reach(
-    api_port: u16,
-    streams: &[&str],
-    target: u64,
-    deadline_secs: u64,
-) {
+async fn wait_all_streams_reach(api_port: u16, streams: &[&str], target: u64, deadline_secs: u64) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(deadline_secs);
     loop {
         if tokio::time::Instant::now() > deadline {
@@ -414,20 +410,15 @@ async fn multipod_e2e_bootstrap_failover_rejoin() {
         credentials_file: Some(dying_cred_path),
         tls_cert: None,
         tls_key: None,
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
+        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+        storage_flush_window_us: 500,
+        storage_flush_threshold_records: 256,
+        storage_flush_threshold_bytes: 1_048_576,
+        storage_sync_interval_ms: 10,
+        storage_sync_bytes: 4 * 1024 * 1024,
+        delivery_buffer: 8192,
     };
-    let rejoined_api_port: u16 = dying_api_bind
-        .rsplit(':')
-        .next()
-        .unwrap()
-        .parse()
-        .unwrap();
+    let rejoined_api_port: u16 = dying_api_bind.rsplit(':').next().unwrap().parse().unwrap();
     let _rejoined_task = tokio::spawn(async move {
         let _ = exspeed::cli::server::run(args).await;
     });
@@ -435,13 +426,7 @@ async fn multipod_e2e_bootstrap_failover_rejoin() {
 
     // It should now be a follower (the survivor owns the lease).
     // Catches up to the extra 200 records per stream.
-    wait_all_streams_reach(
-        rejoined_api_port,
-        &streams,
-        per_stream + extra,
-        60,
-    )
-    .await;
+    wait_all_streams_reach(rejoined_api_port, &streams, per_stream + extra, 60).await;
 
     // ---- Final assertion: leader holds total count on every stream -----
     for s in &streams {

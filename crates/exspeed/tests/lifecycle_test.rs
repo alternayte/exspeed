@@ -24,8 +24,8 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
 async fn start_test_server(max_conns: u32) -> (String, tempfile::TempDir) {
-    let port = portpicker::pick_unused_port().unwrap();
-    let api_port = portpicker::pick_unused_port().unwrap();
+    let port = exspeed_testkit::pick_unused_port().unwrap();
+    let api_port = exspeed_testkit::pick_unused_port().unwrap();
     let bind = format!("127.0.0.1:{port}");
     let api_bind = format!("127.0.0.1:{api_port}");
     let tmp = tempfile::tempdir().unwrap();
@@ -97,8 +97,8 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 
 #[tokio::test]
 async fn sigterm_signal_token_stops_accept_loop() {
-    let port = portpicker::pick_unused_port().unwrap();
-    let api_port = portpicker::pick_unused_port().unwrap();
+    let port = exspeed_testkit::pick_unused_port().unwrap();
+    let api_port = exspeed_testkit::pick_unused_port().unwrap();
     let bind = format!("127.0.0.1:{port}");
     let api_bind = format!("127.0.0.1:{api_port}");
     let tmp = tempfile::tempdir().unwrap();
@@ -115,13 +115,13 @@ async fn sigterm_signal_token_stops_accept_loop() {
                 credentials_file: None,
                 tls_cert: None,
                 tls_key: None,
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
+                storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+                storage_flush_window_us: 500,
+                storage_flush_threshold_records: 256,
+                storage_flush_threshold_bytes: 1_048_576,
+                storage_sync_interval_ms: 10,
+                storage_sync_bytes: 4 * 1024 * 1024,
+                delivery_buffer: 8192,
             },
             async {
                 let _ = rx.await;
@@ -134,7 +134,9 @@ async fn sigterm_signal_token_stops_accept_loop() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Open a connection, send CONNECT, then trigger shutdown.
-    let stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
+    let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
     let (reader, writer) = stream.into_split();
     let mut framed_read = FramedRead::new(reader, ExspeedCodec::new());
     let mut framed_write = FramedWrite::new(writer, ExspeedCodec::new());
@@ -161,8 +163,8 @@ async fn sigterm_signal_token_stops_accept_loop() {
 
 #[tokio::test]
 async fn readyz_returns_503_when_data_dir_unwritable() {
-    let port = portpicker::pick_unused_port().unwrap();
-    let api_port = portpicker::pick_unused_port().unwrap();
+    let port = exspeed_testkit::pick_unused_port().unwrap();
+    let api_port = exspeed_testkit::pick_unused_port().unwrap();
     let bind = format!("127.0.0.1:{port}");
     let api_bind = format!("127.0.0.1:{api_port}");
     let tmp = tempfile::tempdir().unwrap();
@@ -200,10 +202,19 @@ async fn readyz_returns_503_when_data_dir_unwritable() {
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&data_for_chmod, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root ignores directory permissions; the probe can't be made to fail.
+        if std::fs::write(data_for_chmod.join(".probe-as-root"), b"x").is_ok() {
+            eprintln!("skipping: running as root, chmod does not block writes");
+            return;
+        }
     }
 
     let bad = reqwest::get(&url).await.unwrap();
-    assert_eq!(bad.status(), 503, "should be unready when data_dir is unwritable");
+    assert_eq!(
+        bad.status(),
+        503,
+        "should be unready when data_dir is unwritable"
+    );
 
     #[cfg(unix)]
     {

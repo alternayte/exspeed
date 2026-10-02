@@ -9,9 +9,15 @@ impl Dialect for SqliteDialect {
     fn placeholder(&self, _n: usize) -> String {
         "?".to_string()
     }
-    fn json_blob_type(&self) -> &'static str { "TEXT" }
-    fn timestamptz_type(&self) -> &'static str { "TEXT" }
-    fn double_type(&self) -> &'static str { "REAL" }
+    fn json_blob_type(&self) -> &'static str {
+        "TEXT"
+    }
+    fn timestamptz_type(&self) -> &'static str {
+        "TEXT"
+    }
+    fn double_type(&self) -> &'static str {
+        "REAL"
+    }
 
     fn create_table_blob_sql(&self, table: &str) -> String {
         let t = self.quote_ident(table);
@@ -26,12 +32,7 @@ impl Dialect for SqliteDialect {
         )
     }
 
-    fn create_table_typed_sql(
-        &self,
-        table: &str,
-        cols: &[ColumnSpec],
-        pk_cols: &[&str],
-    ) -> String {
+    fn create_table_typed_sql(&self, table: &str, cols: &[ColumnSpec], pk_cols: &[&str]) -> String {
         use crate::builtin::jdbc::dialect::JsonType;
         let t = self.quote_ident(table);
         let col_lines: Vec<String> = cols
@@ -43,12 +44,17 @@ impl Dialect for SqliteDialect {
                     JsonType::Text => "TEXT",
                     JsonType::Bigint => "INTEGER",
                     JsonType::Double => self.double_type(),
-                    JsonType::Boolean => "INTEGER",  // 0/1
+                    JsonType::Boolean => "INTEGER", // 0/1
                     JsonType::Timestamptz => self.timestamptz_type(),
                     JsonType::Jsonb => self.json_blob_type(),
                 };
                 let nullability = if c.nullable { "" } else { " NOT NULL" };
-                format!("    {} {}{}", self.quote_ident(&c.name), sql_type, nullability)
+                format!(
+                    "    {} {}{}",
+                    self.quote_ident(&c.name),
+                    sql_type,
+                    nullability
+                )
             })
             .collect();
         let mut body = col_lines.join(",\n");
@@ -101,7 +107,11 @@ mod tests {
     use crate::builtin::jdbc::dialect::JsonType;
 
     fn spec(name: &str, t: JsonType, nullable: bool) -> ColumnSpec {
-        ColumnSpec { name: name.to_string(), json_type: t, nullable }
+        ColumnSpec {
+            name: name.to_string(),
+            json_type: t,
+            nullable,
+        }
     }
 
     #[test]
@@ -136,7 +146,10 @@ mod tests {
     #[test]
     fn insert_sql_uses_question_mark_placeholders() {
         let sql = SqliteDialect.insert_sql("t", &["a", "b", "c"]);
-        assert_eq!(sql, "INSERT INTO \"t\" (\"a\", \"b\", \"c\") VALUES (?, ?, ?)");
+        assert_eq!(
+            sql,
+            "INSERT INTO \"t\" (\"a\", \"b\", \"c\") VALUES (?, ?, ?)"
+        );
     }
 
     #[test]

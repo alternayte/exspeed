@@ -5,9 +5,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
+use super::{ConsumerStore, ConsumerStoreError};
 use crate::consumer_state::ConsumerConfig;
 use crate::persistence;
-use super::{ConsumerStore, ConsumerStoreError};
 
 /// Default interval at which the background flusher drains pending
 /// debounced saves. Acks received within this window for the same consumer
@@ -31,14 +31,20 @@ pub struct FileConsumerStore {
 
 impl FileConsumerStore {
     pub fn new(data_dir: PathBuf) -> Self {
-        Self::with_debounce(data_dir, Duration::from_millis(DEFAULT_DEBOUNCE_INTERVAL_MS))
+        Self::with_debounce(
+            data_dir,
+            Duration::from_millis(DEFAULT_DEBOUNCE_INTERVAL_MS),
+        )
     }
 
     /// Constructor for tests that need a deterministic debounce window.
     pub fn with_debounce(data_dir: PathBuf, interval: Duration) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(flusher(data_dir.clone(), rx, interval));
-        Self { data_dir, debouncer_tx: tx }
+        Self {
+            data_dir,
+            debouncer_tx: tx,
+        }
     }
 }
 
@@ -105,9 +111,12 @@ impl ConsumerStore for FileConsumerStore {
     async fn save(&self, config: &ConsumerConfig) -> Result<(), ConsumerStoreError> {
         let data_dir = self.data_dir.clone();
         let config = config.clone();
-        let result = tokio::task::spawn_blocking(move || persistence::save_consumer(&data_dir, &config))
-            .await
-            .map_err(|e| ConsumerStoreError::Connection(format!("spawn_blocking join failed: {e}")))?;
+        let result =
+            tokio::task::spawn_blocking(move || persistence::save_consumer(&data_dir, &config))
+                .await
+                .map_err(|e| {
+                    ConsumerStoreError::Connection(format!("spawn_blocking join failed: {e}"))
+                })?;
         result?;
         Ok(())
     }
@@ -125,9 +134,12 @@ impl ConsumerStore for FileConsumerStore {
     async fn load(&self, name: &str) -> Result<Option<ConsumerConfig>, ConsumerStoreError> {
         let data_dir = self.data_dir.clone();
         let name = name.to_string();
-        let result = tokio::task::spawn_blocking(move || persistence::load_consumer(&data_dir, &name))
-            .await
-            .map_err(|e| ConsumerStoreError::Connection(format!("spawn_blocking join failed: {e}")))?;
+        let result =
+            tokio::task::spawn_blocking(move || persistence::load_consumer(&data_dir, &name))
+                .await
+                .map_err(|e| {
+                    ConsumerStoreError::Connection(format!("spawn_blocking join failed: {e}"))
+                })?;
         match result {
             Ok(cfg) => Ok(Some(cfg)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -137,18 +149,24 @@ impl ConsumerStore for FileConsumerStore {
 
     async fn load_all(&self) -> Result<Vec<ConsumerConfig>, ConsumerStoreError> {
         let data_dir = self.data_dir.clone();
-        let result = tokio::task::spawn_blocking(move || persistence::load_all_consumers(&data_dir))
-            .await
-            .map_err(|e| ConsumerStoreError::Connection(format!("spawn_blocking join failed: {e}")))?;
+        let result =
+            tokio::task::spawn_blocking(move || persistence::load_all_consumers(&data_dir))
+                .await
+                .map_err(|e| {
+                    ConsumerStoreError::Connection(format!("spawn_blocking join failed: {e}"))
+                })?;
         Ok(result?)
     }
 
     async fn delete(&self, name: &str) -> Result<(), ConsumerStoreError> {
         let data_dir = self.data_dir.clone();
         let name = name.to_string();
-        let result = tokio::task::spawn_blocking(move || persistence::delete_consumer(&data_dir, &name))
-            .await
-            .map_err(|e| ConsumerStoreError::Connection(format!("spawn_blocking join failed: {e}")))?;
+        let result =
+            tokio::task::spawn_blocking(move || persistence::delete_consumer(&data_dir, &name))
+                .await
+                .map_err(|e| {
+                    ConsumerStoreError::Connection(format!("spawn_blocking join failed: {e}"))
+                })?;
         match result {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -250,10 +268,8 @@ mod tests {
     async fn save_debounced_eventually_persists() {
         let dir = TempDir::new().unwrap();
         // Short debounce window so the test finishes quickly.
-        let store = FileConsumerStore::with_debounce(
-            dir.path().to_path_buf(),
-            Duration::from_millis(20),
-        );
+        let store =
+            FileConsumerStore::with_debounce(dir.path().to_path_buf(), Duration::from_millis(20));
         let mut cfg = sample_config("debounced");
 
         // Fire many debounced saves for the same consumer in rapid succession.

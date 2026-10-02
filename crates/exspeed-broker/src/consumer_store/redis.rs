@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use redis::AsyncCommands;
 use tokio::sync::Mutex;
 
-use crate::consumer_state::ConsumerConfig;
 use super::{ConsumerStore, ConsumerStoreError};
+use crate::consumer_state::ConsumerConfig;
 
 pub struct RedisConsumerStore {
     conn: Mutex<redis::aio::MultiplexedConnection>,

@@ -59,9 +59,9 @@ impl Value {
     pub fn as_json(&self) -> Option<std::borrow::Cow<'_, serde_json::Value>> {
         match self {
             Value::Json(v) => Some(std::borrow::Cow::Borrowed(v)),
-            Value::RawJson(b) => {
-                serde_json::from_slice::<serde_json::Value>(b).ok().map(std::borrow::Cow::Owned)
-            }
+            Value::RawJson(b) => serde_json::from_slice::<serde_json::Value>(b)
+                .ok()
+                .map(std::borrow::Cow::Owned),
             _ => None,
         }
     }
@@ -281,10 +281,10 @@ mod tests {
         assert_eq!(v.as_int(), Some(42));
 
         // Float → f64 / i64
-        let v = Value::Float(3.14);
-        assert_eq!(v.to_f64(), Some(3.14));
-        assert_eq!(v.to_i64(), Some(3)); // truncation
-        assert_eq!(v.as_float(), Some(3.14));
+        let v = Value::Float(2.75);
+        assert_eq!(v.to_f64(), Some(2.75));
+        assert_eq!(v.to_i64(), Some(2)); // truncation
+        assert_eq!(v.as_float(), Some(2.75));
 
         // Text → f64 / i64
         let v = Value::Text("100".into());

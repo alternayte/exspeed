@@ -3,12 +3,12 @@ pub mod io_errors;
 pub mod offset_index;
 pub mod partition;
 pub mod secondary_index;
+pub mod segment_appender;
 pub mod segment_reader;
+pub mod segment_syncer;
 pub mod segment_writer;
 pub mod stream_config;
 pub mod time_index;
-pub mod segment_appender;
-pub mod segment_syncer;
 
 use std::collections::HashMap;
 use std::fs;
@@ -24,9 +24,9 @@ use exspeed_common::{Offset, StreamName};
 use exspeed_streams::{Record, StorageEngine, StorageError, StoredRecord};
 
 use crate::file::partition::Partition;
-use crate::file::stream_config::StreamConfig;
 use crate::file::segment_appender::{AppenderConfig, AppenderHandle, AppenderMode};
 use crate::file::segment_syncer::SegmentSyncerHandle;
+use crate::file::stream_config::{StreamConfig, StreamConfigFile};
 
 /// Storage durability mode. `Sync` = group commit + fsync per batch (default,
 /// strongest durability). `Async` = batch writes immediately, fsync on a timer
@@ -37,8 +37,9 @@ use crate::file::segment_syncer::SegmentSyncerHandle;
 /// future use (trigger a mid-interval fsync when unflushed bytes exceed this
 /// value). In the current implementation only the timer fires — byte-threshold
 /// triggering is a planned follow-up.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum StorageSyncMode {
+    #[default]
     Sync,
     Async {
         interval: std::time::Duration,
@@ -46,12 +47,6 @@ pub enum StorageSyncMode {
         /// Currently unused — timer-only. TODO: wire up byte-threshold trigger.
         threshold_bytes: usize,
     },
-}
-
-impl Default for StorageSyncMode {
-    fn default() -> Self {
-        StorageSyncMode::Sync
-    }
 }
 
 struct FileStorageInner {
@@ -115,7 +110,11 @@ impl FileStorage {
     /// Uses the default `StorageSyncMode::Sync` durability mode. To opt into
     /// async-sync mode use [`FileStorage::open_with_mode`].
     pub fn open(data_dir: &Path) -> io::Result<Self> {
-        Self::open_with_mode(data_dir, StorageSyncMode::default(), AppenderConfig::default())
+        Self::open_with_mode(
+            data_dir,
+            StorageSyncMode::default(),
+            AppenderConfig::default(),
+        )
     }
 
     /// Open an existing `FileStorage` with an explicit durability mode and appender config.
@@ -192,8 +191,11 @@ impl FileStorage {
                     };
                     let key = (stream_name.clone(), part_id);
                     let partition_arc = Arc::new(Mutex::new(partition));
-                    let appender =
-                        segment_appender::spawn(partition_arc.clone(), appender_config, appender_mode);
+                    let appender = segment_appender::spawn(
+                        partition_arc.clone(),
+                        appender_config,
+                        appender_mode,
+                    );
                     if let Some(handle) = syncer_handle {
                         syncers.insert(key.clone(), handle);
                     }
@@ -274,7 +276,10 @@ impl FileStorage {
     ///
     /// Called once at startup before any appenders begin producing, so
     /// `try_lock` is expected to succeed immediately for all partitions.
-    pub(crate) fn set_seal_notifier(&self, tx: mpsc::UnboundedSender<partition::SealedSegmentInfo>) {
+    pub(crate) fn set_seal_notifier(
+        &self,
+        tx: mpsc::UnboundedSender<partition::SealedSegmentInfo>,
+    ) {
         // Set on all existing partitions.
         for entry in self.inner.partitions.iter() {
             entry
@@ -322,21 +327,20 @@ impl FileStorage {
         // wrapping in Arc<Mutex>, spawn the syncer, and register the
         // syncer handle on the Partition so roll_segment can swap the
         // syncer's fsync target on segment roll.
-        let syncer_handle = if let StorageSyncMode::Async { interval, .. } =
-            self.inner.storage_sync_mode
-        {
-            let file = new_partition.try_clone_active_segment_file()?;
-            let handle = Arc::new(segment_syncer::spawn(
-                file,
-                stream.to_string(),
-                partition_id,
-                interval,
-            ));
-            new_partition.set_syncer_handle(handle.clone());
-            Some(handle)
-        } else {
-            None
-        };
+        let syncer_handle =
+            if let StorageSyncMode::Async { interval, .. } = self.inner.storage_sync_mode {
+                let file = new_partition.try_clone_active_segment_file()?;
+                let handle = Arc::new(segment_syncer::spawn(
+                    file,
+                    stream.to_string(),
+                    partition_id,
+                    interval,
+                ));
+                new_partition.set_syncer_handle(handle.clone());
+                Some(handle)
+            } else {
+                None
+            };
 
         let key = (stream.to_string(), partition_id);
         let partition_arc = Arc::new(Mutex::new(new_partition));
@@ -344,8 +348,11 @@ impl FileStorage {
             StorageSyncMode::Sync => AppenderMode::Sync,
             StorageSyncMode::Async { .. } => AppenderMode::Async,
         };
-        let appender =
-            segment_appender::spawn(partition_arc.clone(), self.inner.appender_config, appender_mode);
+        let appender = segment_appender::spawn(
+            partition_arc.clone(),
+            self.inner.appender_config,
+            appender_mode,
+        );
 
         self.inner.partitions.insert(key.clone(), partition_arc);
         self.inner.appenders.insert(key.clone(), appender);
@@ -445,29 +452,31 @@ impl FileStorage {
         // wrapping in Arc<Mutex>, spawn the syncer, and register the
         // syncer handle on the Partition so roll_segment can swap the
         // syncer's fsync target on segment roll.
-        let syncer_handle = if let StorageSyncMode::Async { interval, .. } =
-            self.inner.storage_sync_mode
-        {
-            let file = partition.try_clone_active_segment_file()?;
-            let handle = Arc::new(segment_syncer::spawn(
-                file,
-                stream.as_str().to_string(),
-                0,
-                interval,
-            ));
-            partition.set_syncer_handle(handle.clone());
-            Some(handle)
-        } else {
-            None
-        };
+        let syncer_handle =
+            if let StorageSyncMode::Async { interval, .. } = self.inner.storage_sync_mode {
+                let file = partition.try_clone_active_segment_file()?;
+                let handle = Arc::new(segment_syncer::spawn(
+                    file,
+                    stream.as_str().to_string(),
+                    0,
+                    interval,
+                ));
+                partition.set_syncer_handle(handle.clone());
+                Some(handle)
+            } else {
+                None
+            };
 
         let partition_arc = Arc::new(Mutex::new(partition));
         let appender_mode = match self.inner.storage_sync_mode {
             StorageSyncMode::Sync => AppenderMode::Sync,
             StorageSyncMode::Async { .. } => AppenderMode::Async,
         };
-        let appender =
-            segment_appender::spawn(partition_arc.clone(), self.inner.appender_config, appender_mode);
+        let appender = segment_appender::spawn(
+            partition_arc.clone(),
+            self.inner.appender_config,
+            appender_mode,
+        );
 
         // Atomic check-and-insert: use entry() API to guard against a race where
         // two callers pass the fast-path check simultaneously.
@@ -538,15 +547,16 @@ impl FileStorage {
             if remaining == 0 {
                 break;
             }
-            let records = reader.read_from(from.0, remaining).map_err(StorageError::Io)?;
+            let records = reader
+                .read_from(from.0, remaining)
+                .map_err(StorageError::Io)?;
             remaining -= records.len();
             result.extend(records);
         }
 
         if remaining > 0 {
-            let active_reader =
-                crate::file::segment_reader::SegmentReader::open(&active_path)
-                    .map_err(StorageError::Io)?;
+            let active_reader = crate::file::segment_reader::SegmentReader::open(&active_path)
+                .map_err(StorageError::Io)?;
             let records = active_reader
                 .read_from(from.0, remaining)
                 .map_err(StorageError::Io)?;
@@ -601,15 +611,16 @@ impl FileStorage {
                     continue;
                 }
             }
-            let records = reader.read_from(from.0, remaining).map_err(StorageError::Io)?;
+            let records = reader
+                .read_from(from.0, remaining)
+                .map_err(StorageError::Io)?;
             remaining -= records.len();
             result.extend(records);
         }
 
         if remaining > 0 {
-            let active_reader =
-                crate::file::segment_reader::SegmentReader::open(&active_path)
-                    .map_err(StorageError::Io)?;
+            let active_reader = crate::file::segment_reader::SegmentReader::open(&active_path)
+                .map_err(StorageError::Io)?;
             let records = active_reader
                 .read_from(from.0, remaining)
                 .map_err(StorageError::Io)?;
@@ -652,11 +663,7 @@ impl FileStorage {
         Ok(streams)
     }
 
-    fn trim_up_to_sync(
-        &self,
-        stream: &StreamName,
-        keep_from: Offset,
-    ) -> Result<(), StorageError> {
+    fn trim_up_to_sync(&self, stream: &StreamName, keep_from: Offset) -> Result<(), StorageError> {
         let part_arc = {
             let key = (stream.as_str().to_string(), 0u32);
             self.inner
@@ -676,9 +683,15 @@ impl FileStorage {
         // Drop appenders first (writer tasks drain and exit), then syncers
         // (shutdown signal fires, final fsync, tasks exit), then partitions.
         let key_prefix = stream.as_str().to_string();
-        self.inner.appenders.retain(|(name, _), _| name != &key_prefix);
-        self.inner.syncers.retain(|(name, _), _| name != &key_prefix);
-        self.inner.partitions.retain(|(name, _), _| name != &key_prefix);
+        self.inner
+            .appenders
+            .retain(|(name, _), _| name != &key_prefix);
+        self.inner
+            .syncers
+            .retain(|(name, _), _| name != &key_prefix);
+        self.inner
+            .partitions
+            .retain(|(name, _), _| name != &key_prefix);
 
         let stream_dir = self.inner.data_dir.join("streams").join(stream.as_str());
         if stream_dir.exists() {
@@ -687,10 +700,7 @@ impl FileStorage {
         Ok(())
     }
 
-    fn stream_bounds_sync(
-        &self,
-        stream: &StreamName,
-    ) -> Result<(Offset, Offset), StorageError> {
+    fn stream_bounds_sync(&self, stream: &StreamName) -> Result<(Offset, Offset), StorageError> {
         let part_arc = {
             let key = (stream.as_str().to_string(), 0u32);
             self.inner
@@ -726,6 +736,51 @@ impl FileStorage {
 
 #[async_trait]
 impl StorageEngine for FileStorage {
+    async fn create_stream_with(
+        &self,
+        stream: &StreamName,
+        config: &StreamConfig,
+    ) -> Result<(), StorageError> {
+        config.check().map_err(|m| {
+            StorageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, m))
+        })?;
+        let this = self.clone();
+        let stream = stream.clone();
+        let config = config.clone();
+        tokio::task::spawn_blocking(move || {
+            this.create_stream_sync(&stream, config.max_age_secs, config.max_bytes)?;
+            let dir = this.inner.data_dir.join("streams").join(stream.as_str());
+            config.save(&dir).map_err(StorageError::Io)
+        })
+        .await
+        .map_err(|e| StorageError::Io(std::io::Error::other(e)))?
+    }
+
+    async fn stream_config(&self, stream: &StreamName) -> Result<StreamConfig, StorageError> {
+        let key = (stream.as_str().to_string(), 0u32);
+        if !self.inner.partitions.contains_key(&key) {
+            return Err(StorageError::StreamNotFound(stream.clone()));
+        }
+        let dir = self.inner.data_dir.join("streams").join(stream.as_str());
+        StreamConfig::load(&dir).map_err(StorageError::Io)
+    }
+
+    async fn update_stream_config(
+        &self,
+        stream: &StreamName,
+        config: &StreamConfig,
+    ) -> Result<(), StorageError> {
+        let key = (stream.as_str().to_string(), 0u32);
+        if !self.inner.partitions.contains_key(&key) {
+            return Err(StorageError::StreamNotFound(stream.clone()));
+        }
+        config.check().map_err(|m| {
+            StorageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, m))
+        })?;
+        let dir = self.inner.data_dir.join("streams").join(stream.as_str());
+        config.save(&dir).map_err(StorageError::Io)
+    }
+
     async fn create_stream(
         &self,
         stream: &StreamName,
@@ -734,9 +789,11 @@ impl StorageEngine for FileStorage {
     ) -> Result<(), StorageError> {
         let this = self.clone();
         let stream = stream.clone();
-        tokio::task::spawn_blocking(move || this.create_stream_sync(&stream, max_age_secs, max_bytes))
-            .await
-            .map_err(|e| StorageError::Io(std::io::Error::other(e)))?
+        tokio::task::spawn_blocking(move || {
+            this.create_stream_sync(&stream, max_age_secs, max_bytes)
+        })
+        .await
+        .map_err(|e| StorageError::Io(std::io::Error::other(e)))?
     }
 
     async fn append(
@@ -804,11 +861,7 @@ impl StorageEngine for FileStorage {
             .map_err(|e| StorageError::Io(std::io::Error::other(e)))?
     }
 
-    async fn trim_up_to(
-        &self,
-        stream: &StreamName,
-        keep_from: Offset,
-    ) -> Result<(), StorageError> {
+    async fn trim_up_to(&self, stream: &StreamName, keep_from: Offset) -> Result<(), StorageError> {
         let this = self.clone();
         let stream = stream.clone();
         tokio::task::spawn_blocking(move || this.trim_up_to_sync(&stream, keep_from))
@@ -824,10 +877,7 @@ impl StorageEngine for FileStorage {
             .map_err(|e| StorageError::Io(std::io::Error::other(e)))?
     }
 
-    async fn stream_bounds(
-        &self,
-        stream: &StreamName,
-    ) -> Result<(Offset, Offset), StorageError> {
+    async fn stream_bounds(&self, stream: &StreamName) -> Result<(Offset, Offset), StorageError> {
         let this = self.clone();
         let stream = stream.clone();
         tokio::task::spawn_blocking(move || this.stream_bounds_sync(&stream))

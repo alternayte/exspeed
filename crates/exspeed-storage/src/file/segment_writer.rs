@@ -404,9 +404,8 @@ mod tests {
             headers: vec![],
             timestamp_ns: None,
         };
-        let entries: Vec<(Offset, u64, Record)> = (0..5)
-            .map(|i| (Offset(i), 1000 + i, rec.clone()))
-            .collect();
+        let entries: Vec<(Offset, u64, Record)> =
+            (0..5).map(|i| (Offset(i), 1000 + i, rec.clone())).collect();
 
         writer.append_batch(&entries, /*sync_now=*/ true).unwrap();
         assert!(writer.bytes_written() > 5 * 8); // at least 5 framed records
@@ -444,8 +443,11 @@ mod tests {
         // Both handles refer to the same kernel fd. Writing through the writer
         // and sync'ing through the clone should flush the write.
         let rec = Record {
-            subject: "s".into(), key: None, value: Bytes::from_static(b"v"),
-            headers: vec![], timestamp_ns: None,
+            subject: "s".into(),
+            key: None,
+            value: Bytes::from_static(b"v"),
+            headers: vec![],
+            timestamp_ns: None,
         };
         writer.append(Offset(0), 1, &rec).unwrap();
         cloned.sync_data().unwrap();
@@ -470,8 +472,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut writer = SegmentWriter::create(tmp.path(), 0).unwrap();
         let rec = Record {
-            subject: "s".into(), key: None, value: Bytes::from_static(b"hello"),
-            headers: vec![], timestamp_ns: None,
+            subject: "s".into(),
+            key: None,
+            value: Bytes::from_static(b"hello"),
+            headers: vec![],
+            timestamp_ns: None,
         };
         writer.append(Offset(0), 100, &rec).unwrap();
         writer.sync_data().unwrap();
@@ -504,8 +509,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut writer = SegmentWriter::create(tmp.path(), 0).unwrap();
         let rec = Record {
-            subject: "s".into(), key: None, value: Bytes::from_static(b"v"),
-            headers: vec![], timestamp_ns: None,
+            subject: "s".into(),
+            key: None,
+            value: Bytes::from_static(b"v"),
+            headers: vec![],
+            timestamp_ns: None,
         };
         for i in 0..10 {
             writer.append(Offset(i), 2000 + i, &rec).unwrap();
@@ -528,8 +536,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut writer = SegmentWriter::create(tmp.path(), 0).unwrap();
         let rec = Record {
-            subject: "s".into(), key: None, value: Bytes::from_static(b"v"),
-            headers: vec![], timestamp_ns: None,
+            subject: "s".into(),
+            key: None,
+            value: Bytes::from_static(b"v"),
+            headers: vec![],
+            timestamp_ns: None,
         };
         for i in 0..5 {
             writer.append(Offset(i), 3000 + i, &rec).unwrap();
@@ -546,7 +557,10 @@ mod tests {
 
         let (max_offset, _ts, size_after) = SegmentWriter::recover_tail(&seg_path).unwrap();
         assert_eq!(max_offset, Some(4));
-        assert_eq!(size_after, size_before, "file truncated back to last valid record");
+        assert_eq!(
+            size_after, size_before,
+            "file truncated back to last valid record"
+        );
         assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), size_before);
     }
 
@@ -555,12 +569,15 @@ mod tests {
         use bytes::Bytes;
         use exspeed_streams::record::Record;
         use std::fs::OpenOptions;
-        use std::io::{Seek, SeekFrom, Write, Read};
+        use std::io::{Read, Seek, SeekFrom, Write};
         let tmp = tempfile::tempdir().unwrap();
         let mut writer = SegmentWriter::create(tmp.path(), 0).unwrap();
         let rec = Record {
-            subject: "s".into(), key: None, value: Bytes::from_static(b"v"),
-            headers: vec![], timestamp_ns: None,
+            subject: "s".into(),
+            key: None,
+            value: Bytes::from_static(b"v"),
+            headers: vec![],
+            timestamp_ns: None,
         };
         for i in 0..3 {
             writer.append(Offset(i), 4000 + i, &rec).unwrap();
@@ -570,11 +587,9 @@ mod tests {
         drop(writer);
 
         // Append a record whose body we then corrupt.
-        let mut writer = SegmentWriter::open_append(
-            &tmp.path().join("00000000000000000000.seg"),
-            0,
-            good_size,
-        ).unwrap();
+        let mut writer =
+            SegmentWriter::open_append(&tmp.path().join("00000000000000000000.seg"), 0, good_size)
+                .unwrap();
         writer.append(Offset(3), 4003, &rec).unwrap();
         writer.sync_data().unwrap();
         drop(writer);
@@ -582,7 +597,11 @@ mod tests {
         // Flip the last payload byte to break the CRC.
         let seg_path = tmp.path().join("00000000000000000000.seg");
         {
-            let mut f = OpenOptions::new().read(true).write(true).open(&seg_path).unwrap();
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&seg_path)
+                .unwrap();
             f.seek(SeekFrom::End(-1)).unwrap();
             let mut byte = [0u8; 1];
             f.read_exact(&mut byte).unwrap();
@@ -591,8 +610,15 @@ mod tests {
         }
 
         let (max_offset, _ts, size_after) = SegmentWriter::recover_tail(&seg_path).unwrap();
-        assert_eq!(max_offset, Some(2), "CRC-failed record discarded, only 0..3 valid");
-        assert_eq!(size_after, good_size as u64, "file truncated to pre-corruption length");
+        assert_eq!(
+            max_offset,
+            Some(2),
+            "CRC-failed record discarded, only 0..3 valid"
+        );
+        assert_eq!(
+            size_after, good_size as u64,
+            "file truncated to pre-corruption length"
+        );
     }
 
     #[test]
@@ -604,8 +630,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut writer = SegmentWriter::create(tmp.path(), 0).unwrap();
         let rec = Record {
-            subject: "s".into(), key: None, value: Bytes::from_static(b"v"),
-            headers: vec![], timestamp_ns: None,
+            subject: "s".into(),
+            key: None,
+            value: Bytes::from_static(b"v"),
+            headers: vec![],
+            timestamp_ns: None,
         };
         for i in 0..3 {
             writer.append(Offset(i), 5000 + i, &rec).unwrap();
@@ -635,8 +664,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut writer = SegmentWriter::create(tmp.path(), 0).unwrap();
         let rec = Record {
-            subject: "s".into(), key: None, value: Bytes::from_static(b"v"),
-            headers: vec![], timestamp_ns: None,
+            subject: "s".into(),
+            key: None,
+            value: Bytes::from_static(b"v"),
+            headers: vec![],
+            timestamp_ns: None,
         };
         for i in 0..2 {
             writer.append(Offset(i), 6000 + i, &rec).unwrap();
@@ -672,12 +704,14 @@ mod tests {
         f.write_all(&[0xFF; 20]).unwrap();
         drop(f);
 
-        let (max_offset, max_ts, size_after) =
-            SegmentWriter::recover_tail(&seg_path).unwrap();
+        let (max_offset, max_ts, size_after) = SegmentWriter::recover_tail(&seg_path).unwrap();
         assert_eq!(max_offset, None);
         assert_eq!(max_ts, None);
         assert_eq!(size_after, SEGMENT_HEADER_SIZE as u64);
-        assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), SEGMENT_HEADER_SIZE as u64);
+        assert_eq!(
+            std::fs::metadata(&seg_path).unwrap().len(),
+            SEGMENT_HEADER_SIZE as u64
+        );
     }
 
     #[test]
@@ -695,9 +729,8 @@ mod tests {
             headers: vec![],
             timestamp_ns: None,
         };
-        let entries: Vec<(Offset, u64, Record)> = (0..5)
-            .map(|i| (Offset(i), 1000 + i, rec.clone()))
-            .collect();
+        let entries: Vec<(Offset, u64, Record)> =
+            (0..5).map(|i| (Offset(i), 1000 + i, rec.clone())).collect();
 
         // sync_now = false: async-syncer path. Durability should come from the
         // Drop impl's best-effort sync_all.
@@ -708,7 +741,11 @@ mod tests {
         let seg_path = tmp.path().join("00000000000000000000.seg");
         let reader = SegmentReader::open(&seg_path).unwrap();
         let records = reader.read_from(0, 100).unwrap();
-        assert_eq!(records.len(), 5, "all 5 records should be durable after drop");
+        assert_eq!(
+            records.len(),
+            5,
+            "all 5 records should be durable after drop"
+        );
         for (i, r) in records.iter().enumerate() {
             assert_eq!(r.offset.0, i as u64);
             assert_eq!(r.timestamp, 1000 + i as u64);

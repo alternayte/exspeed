@@ -95,7 +95,10 @@ async fn run_ungrouped(
             .await
         {
             Ok(recs) => recs,
-            Err(StorageError::OffsetOutOfRange { requested, earliest }) => {
+            Err(StorageError::OffsetOutOfRange {
+                requested,
+                earliest,
+            }) => {
                 tracing::warn!(
                     stream = %stream_name,
                     consumer = %config.consumer_name,
@@ -132,7 +135,10 @@ async fn run_ungrouped(
                 consume_latency_secs(timestamp),
             );
 
-            batch.push(DeliveryRecord { record, delivery_attempt: 1 });
+            batch.push(DeliveryRecord {
+                record,
+                delivery_attempt: 1,
+            });
             current_offset = next_offset;
         }
 
@@ -175,7 +181,10 @@ async fn run_grouped(
                 .await
             {
                 Ok(recs) => recs,
-                Err(StorageError::OffsetOutOfRange { requested, earliest }) => {
+                Err(StorageError::OffsetOutOfRange {
+                    requested,
+                    earliest,
+                }) => {
                     tracing::warn!(
                         stream = %stream_name,
                         group = %group,

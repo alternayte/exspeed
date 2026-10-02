@@ -4,9 +4,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use tempfile::tempdir;
 
+use crate::file::FileStorage;
 use exspeed_common::StreamName;
 use exspeed_streams::{record::Record, StorageEngine};
-use crate::file::FileStorage;
 
 fn mk_record(body: &[u8]) -> Record {
     Record {

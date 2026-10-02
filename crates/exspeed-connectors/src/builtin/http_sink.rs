@@ -121,9 +121,7 @@ impl SinkConnector for HttpSinkConnector {
                     });
                 }
                 Err((status, body)) => {
-                    let error = format!(
-                        "HTTP sink transient error (status {status}): {body}"
-                    );
+                    let error = format!("HTTP sink transient error (status {status}): {body}");
                     warn!(offset = record.offset, "{}", error);
                     return Ok(WriteResult::TransientFailure {
                         last_successful_offset: last_successful,

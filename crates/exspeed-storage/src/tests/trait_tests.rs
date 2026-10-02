@@ -35,7 +35,10 @@ fn record_with_key(subject: &str, key: &[u8], value: &[u8]) -> Record {
 pub async fn test_create_and_append(engine: &impl StorageEngine) {
     let s = stream("test-create");
     engine.create_stream(&s, 0, 0).await.unwrap();
-    let (offset, _ts) = engine.append(&s, &record("events", b"hello")).await.unwrap();
+    let (offset, _ts) = engine
+        .append(&s, &record("events", b"hello"))
+        .await
+        .unwrap();
     assert_eq!(offset, Offset(0));
 }
 
@@ -126,7 +129,10 @@ pub async fn test_read_past_end(engine: &impl StorageEngine) {
 /// Append to a nonexistent stream, get StreamNotFound error.
 pub async fn test_stream_not_found(engine: &impl StorageEngine) {
     let s = stream("nonexistent");
-    let err = engine.append(&s, &record("events", b"data")).await.unwrap_err();
+    let err = engine
+        .append(&s, &record("events", b"data"))
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, StorageError::StreamNotFound(_)),
         "expected StreamNotFound, got {err:?}"
@@ -152,8 +158,14 @@ pub async fn test_seek_by_time(engine: &impl StorageEngine) {
 
     // Publish records -- we can't control timestamps in MemoryStorage (they use now()),
     // so just verify seek returns a valid offset
-    engine.append(&s, &record("events", b"first")).await.unwrap();
-    engine.append(&s, &record("events", b"second")).await.unwrap();
+    engine
+        .append(&s, &record("events", b"first"))
+        .await
+        .unwrap();
+    engine
+        .append(&s, &record("events", b"second"))
+        .await
+        .unwrap();
 
     // Seek to timestamp 0 (before all records) should return offset 0
     let offset = engine.seek_by_time(&s, 0).await.unwrap();
@@ -277,9 +289,7 @@ pub async fn test_trim_up_to_past_latest_still_advances(
 /// `trim_up_to(5)` may still have earliest == 0 and the test would be
 /// ambiguous. The FileStorage equivalent lives alongside the retention tests
 /// where we can force multiple sealed segments.
-pub async fn test_read_below_earliest_returns_out_of_range(
-    engine: &impl StorageEngine,
-) {
+pub async fn test_read_below_earliest_returns_out_of_range(engine: &impl StorageEngine) {
     let s = stream("test-read-below-earliest");
     engine.create_stream(&s, 0, 0).await.unwrap();
     for i in 0u8..10 {
@@ -294,7 +304,10 @@ pub async fn test_read_below_earliest_returns_out_of_range(
     // Reading below the new earliest must error, not silently skip.
     let err = engine.read(&s, Offset(2), 100).await.unwrap_err();
     match err {
-        StorageError::OffsetOutOfRange { requested, earliest } => {
+        StorageError::OffsetOutOfRange {
+            requested,
+            earliest,
+        } => {
             assert_eq!(requested, 2);
             assert_eq!(earliest, 5);
         }
@@ -331,11 +344,17 @@ pub async fn test_truncate_from_drops_later_records(engine: &impl StorageEngine)
     assert_eq!(next, Offset(7));
 
     // The next append must assign exactly `drop_from = 7`.
-    let (next_off, _) = engine.append(&s, &record("events", b"new-7")).await.unwrap();
+    let (next_off, _) = engine
+        .append(&s, &record("events", b"new-7"))
+        .await
+        .unwrap();
     assert_eq!(next_off, Offset(7));
 
     // And we can keep going.
-    let (next_off, _) = engine.append(&s, &record("events", b"new-8")).await.unwrap();
+    let (next_off, _) = engine
+        .append(&s, &record("events", b"new-8"))
+        .await
+        .unwrap();
     assert_eq!(next_off, Offset(8));
 }
 
@@ -356,7 +375,10 @@ pub async fn test_truncate_from_zero_empties(engine: &impl StorageEngine) {
     assert_eq!(earliest, next, "fully-truncated stream should look empty");
     assert_eq!(next, Offset(0));
 
-    let (next_off, _) = engine.append(&s, &record("events", b"fresh")).await.unwrap();
+    let (next_off, _) = engine
+        .append(&s, &record("events", b"fresh"))
+        .await
+        .unwrap();
     assert_eq!(next_off, Offset(0));
 }
 
@@ -424,7 +446,10 @@ pub async fn test_delete_then_recreate_resets_bounds(engine: &impl StorageEngine
     assert_eq!(earliest, Offset(0));
     assert_eq!(next, Offset(0));
 
-    let (next_off, _) = engine.append(&s, &record("events", b"fresh")).await.unwrap();
+    let (next_off, _) = engine
+        .append(&s, &record("events", b"fresh"))
+        .await
+        .unwrap();
     assert_eq!(next_off, Offset(0));
 }
 
@@ -455,8 +480,14 @@ pub async fn test_timestamps_increasing(engine: &impl StorageEngine) {
     let s = stream("test-timestamps");
     engine.create_stream(&s, 0, 0).await.unwrap();
 
-    engine.append(&s, &record("events", b"first")).await.unwrap();
-    engine.append(&s, &record("events", b"second")).await.unwrap();
+    engine
+        .append(&s, &record("events", b"first"))
+        .await
+        .unwrap();
+    engine
+        .append(&s, &record("events", b"second"))
+        .await
+        .unwrap();
 
     let results = engine.read(&s, Offset(0), 10).await.unwrap();
     assert_eq!(results.len(), 2);
@@ -484,7 +515,10 @@ pub async fn test_append_honors_timestamp_override(engine: &impl StorageEngine) 
     engine.append(&s, &pinned).await.unwrap();
 
     // No override → engine mints a fresh timestamp.
-    engine.append(&s, &record("events", b"minted")).await.unwrap();
+    engine
+        .append(&s, &record("events", b"minted"))
+        .await
+        .unwrap();
 
     let results = engine.read(&s, Offset(0), 10).await.unwrap();
     assert_eq!(results.len(), 2);

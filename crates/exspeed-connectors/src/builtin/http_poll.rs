@@ -58,21 +58,17 @@ impl HttpPollSource {
         let auth_type = config.setting_or("auth_type", "none");
         let auth_token = config.settings.get("auth_token").cloned();
 
-        let items_path = config.settings.get("items_path").cloned().and_then(|s| {
-            if s.is_empty() {
-                None
-            } else {
-                Some(s)
-            }
-        });
+        let items_path = config
+            .settings
+            .get("items_path")
+            .cloned()
+            .filter(|s| !s.is_empty());
 
-        let item_key = config.settings.get("item_key").cloned().and_then(|s| {
-            if s.is_empty() {
-                None
-            } else {
-                Some(s)
-            }
-        });
+        let item_key = config
+            .settings
+            .get("item_key")
+            .cloned()
+            .filter(|s| !s.is_empty());
 
         let subject_template = config.subject_template.clone();
 

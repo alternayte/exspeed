@@ -34,13 +34,20 @@ pub fn parse(sql: &str) -> Result<ExqlStatement, ParseError> {
     let (clean_sql, within_values) = extract_within_clauses(&sql_no_emit);
 
     let dialect = ExspeedDialect;
-    let statements =
-        Parser::parse_sql(&dialect, &clean_sql).map_err(|e| {
-            let (message, line, column) = error::extract_position(&e.to_string());
-            ParseError::Sql { message, line, column }
-        })?;
+    let statements = Parser::parse_sql(&dialect, &clean_sql).map_err(|e| {
+        let (message, line, column) = error::extract_position(&e.to_string());
+        ParseError::Sql {
+            message,
+            line,
+            column,
+        }
+    })?;
     if statements.is_empty() {
-        return Err(ParseError::Sql { message: "empty SQL".into(), line: 1, column: 0 });
+        return Err(ParseError::Sql {
+            message: "empty SQL".into(),
+            line: 1,
+            column: 0,
+        });
     }
     if statements.len() > 1 {
         return Err(ParseError::Unsupported {
@@ -113,7 +120,7 @@ fn extract_within_clauses(sql: &str) -> (String, Vec<String>) {
                     let value_end = after_within_start + trimmed_offset + 1 + end_quote + 1;
                     result = format!(
                         "{}{}",
-                        &result[..within_pos].trim_end(),
+                        result[..within_pos].trim_end(),
                         &result[value_end..]
                     );
                     continue;
@@ -620,8 +627,7 @@ mod tests {
 
     #[test]
     fn parse_create_index_quoted_stream() {
-        let stmt =
-            parse(r#"CREATE INDEX idx_region ON "my-stream"(payload->>'region')"#).unwrap();
+        let stmt = parse(r#"CREATE INDEX idx_region ON "my-stream"(payload->>'region')"#).unwrap();
         match stmt {
             ExqlStatement::CreateIndex {
                 name,

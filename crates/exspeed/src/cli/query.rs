@@ -25,10 +25,7 @@ pub async fn run(client: &CliClient, sql: &str, continuous: bool, json_output: b
         if json_output {
             println!("{}", serde_json::to_string_pretty(&resp)?);
         } else {
-            println!(
-                "Index created: {}",
-                resp["name"].as_str().unwrap_or("?")
-            );
+            println!("Index created: {}", resp["name"].as_str().unwrap_or("?"));
         }
         return Ok(());
     }
@@ -36,7 +33,6 @@ pub async fn run(client: &CliClient, sql: &str, continuous: bool, json_output: b
     // Route DROP INDEX to the indexes API.
     if upper.starts_with("DROP INDEX") {
         let name = sql
-            .trim()
             .split_whitespace()
             .nth(2)
             .unwrap_or("")

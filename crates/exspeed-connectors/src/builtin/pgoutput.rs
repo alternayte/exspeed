@@ -247,9 +247,7 @@ pub async fn ensure_publication(
     tables: &[String],
 ) -> Result<(), ConnectorError> {
     let tables_clause = tables.join(", ");
-    let create_sql = format!(
-        "CREATE PUBLICATION {publication_name} FOR TABLE {tables_clause}"
-    );
+    let create_sql = format!("CREATE PUBLICATION {publication_name} FOR TABLE {tables_clause}");
 
     match client.simple_query(&create_sql).await {
         Ok(_) => {
@@ -284,9 +282,8 @@ pub async fn ensure_replication_slot(
     client: &Client,
     slot_name: &str,
 ) -> Result<(), ConnectorError> {
-    let create_sql = format!(
-        "SELECT pg_create_logical_replication_slot('{slot_name}', 'pgoutput')"
-    );
+    let create_sql =
+        format!("SELECT pg_create_logical_replication_slot('{slot_name}', 'pgoutput')");
 
     match client.simple_query(&create_sql).await {
         Ok(_) => {
@@ -326,10 +323,7 @@ pub async fn ensure_replication_slot(
 // ---------------------------------------------------------------------------
 
 /// Convert a decoded tuple + relation schema to a HashMap of column name -> string value.
-pub fn tuple_to_map(
-    relation: &Relation,
-    tuple: &[ColValue],
-) -> HashMap<String, Option<String>> {
+pub fn tuple_to_map(relation: &Relation, tuple: &[ColValue]) -> HashMap<String, Option<String>> {
     let mut map = HashMap::new();
     for (i, col) in relation.columns.iter().enumerate() {
         let value = tuple.get(i).and_then(|v| match v {
@@ -471,9 +465,21 @@ mod tests {
             schema: "public".into(),
             table: "orders".into(),
             columns: vec![
-                ColumnDef { name: "id".into(), type_oid: 23, type_modifier: -1 },
-                ColumnDef { name: "name".into(), type_oid: 25, type_modifier: -1 },
-                ColumnDef { name: "email".into(), type_oid: 25, type_modifier: -1 },
+                ColumnDef {
+                    name: "id".into(),
+                    type_oid: 23,
+                    type_modifier: -1,
+                },
+                ColumnDef {
+                    name: "name".into(),
+                    type_oid: 25,
+                    type_modifier: -1,
+                },
+                ColumnDef {
+                    name: "email".into(),
+                    type_oid: 25,
+                    type_modifier: -1,
+                },
             ],
         };
         let tuple = vec![

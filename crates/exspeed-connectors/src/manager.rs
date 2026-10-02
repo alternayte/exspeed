@@ -2,16 +2,16 @@ use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{oneshot, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+use exspeed_broker::leadership::ClusterLeadership;
+use exspeed_broker::log::{Log, LogError};
 use exspeed_common::metrics::Metrics;
 use exspeed_common::{Offset, StreamName};
-use exspeed_broker::broker_append::BrokerAppend;
-use exspeed_broker::leadership::ClusterLeadership;
 use exspeed_streams::record::Record;
 use exspeed_streams::traits::StorageEngine;
 use exspeed_streams::StorageError;
@@ -57,6 +57,15 @@ pub struct ConnectorInfo {
 // RunningConnector
 // ---------------------------------------------------------------------------
 
+/// A connector config file in `connectors.d/` and what it currently defines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TomlFile {
+    /// `[connector].name` from the file (need not match the file name).
+    pub connector_name: String,
+    /// Content hash used for change detection.
+    pub hash: u64,
+}
+
 pub struct RunningConnector {
     pub config: ConnectorConfig,
     pub status: ConnectorStatus,
@@ -70,13 +79,16 @@ pub struct RunningConnector {
 
 pub struct ConnectorManager {
     pub storage: Arc<dyn StorageEngine>,
-    pub broker_append: Arc<BrokerAppend>,
+    /// The broker write path; every source record and DLQ write goes here.
+    pub log: Arc<Log>,
     pub connectors: RwLock<HashMap<String, RunningConnector>>,
     pub data_dir: PathBuf,
     pub metrics: Arc<Metrics>,
     pub offset_store: Arc<dyn crate::offset_store::OffsetStore>,
-    /// Tracks content hashes of TOML connector files for change detection.
-    pub toml_hashes: RwLock<HashMap<String, u64>>,
+    /// Connectors that came from `connectors.d/*.toml`, keyed by file name.
+    /// The file watcher only ever reconciles these; connectors created via
+    /// the HTTP API are never touched by it.
+    pub toml_files: RwLock<HashMap<String, TomlFile>>,
     /// Cluster-leader lease wrapper. Used to check whether this pod is
     /// currently the leader before starting connector tasks, and to obtain
     /// the current leader `CancellationToken` for the spawned tasks.
@@ -86,7 +98,7 @@ pub struct ConnectorManager {
 impl ConnectorManager {
     pub fn new(
         storage: Arc<dyn StorageEngine>,
-        broker_append: Arc<BrokerAppend>,
+        log: Arc<Log>,
         data_dir: PathBuf,
         metrics: Arc<Metrics>,
         offset_store: Arc<dyn crate::offset_store::OffsetStore>,
@@ -94,12 +106,12 @@ impl ConnectorManager {
     ) -> Self {
         Self {
             storage,
-            broker_append,
+            log,
             connectors: RwLock::new(HashMap::new()),
             data_dir,
             metrics,
             offset_store,
-            toml_hashes: RwLock::new(HashMap::new()),
+            toml_files: RwLock::new(HashMap::new()),
             leadership,
         }
     }
@@ -130,6 +142,55 @@ impl ConnectorManager {
 
     /// Create and start a new connector. Persists config to disk.
     pub async fn create(&self, config: ConnectorConfig) -> Result<(), String> {
+        self.create_inner(config, true).await
+    }
+
+    /// Create a connector defined by a `connectors.d/` file. The file stays
+    /// the source of truth, so nothing is persisted (in particular, secrets
+    /// resolved from `${VAR}` are never written to disk).
+    pub async fn create_from_file(&self, config: ConnectorConfig) -> Result<(), String> {
+        self.create_inner(config, false).await
+    }
+
+    /// Replace a connector's config and restart it, keeping its offsets.
+    pub async fn update_config(&self, config: ConnectorConfig) -> Result<(), String> {
+        let name = config.name.clone();
+        let exists = self.connectors.read().await.contains_key(&name);
+        if !exists {
+            return self.create_from_file(config).await;
+        }
+        self.stop_connector(&name).await?;
+        self.connectors.write().await.remove(&name);
+        // Keep a REST-persisted copy in sync if one exists.
+        let json = self.config_path(&name);
+        if json.exists() {
+            config
+                .save_json(&json)
+                .map_err(|e| format!("failed to save config: {e}"))?;
+        }
+        if self.leadership.is_currently_leader() {
+            self.start_connector(config).await
+        } else {
+            self.register_stopped(config).await;
+            Ok(())
+        }
+    }
+
+    /// Record a config without starting it (followers, or before leadership).
+    async fn register_stopped(&self, config: ConnectorConfig) {
+        let mut map = self.connectors.write().await;
+        map.insert(
+            config.name.clone(),
+            RunningConnector {
+                config,
+                status: ConnectorStatus::Stopped,
+                cancel_tx: None,
+                started_at: Instant::now(),
+            },
+        );
+    }
+
+    async fn create_inner(&self, config: ConnectorConfig, persist: bool) -> Result<(), String> {
         // Validate name
         if config.name.is_empty() {
             return Err("connector name cannot be empty".into());
@@ -159,14 +220,23 @@ impl ConnectorManager {
         self.ensure_stream_exists(&stream_name).await?;
 
         // Persist config
-        let dir = self.configs_dir();
-        std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create configs dir: {e}"))?;
-        config
-            .save_json(&self.config_path(&config.name))
-            .map_err(|e| format!("failed to save config: {e}"))?;
+        if persist {
+            let dir = self.configs_dir();
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| format!("failed to create configs dir: {e}"))?;
+            config
+                .save_json(&self.config_path(&config.name))
+                .map_err(|e| format!("failed to save config: {e}"))?;
+        }
 
-        // Start the connector
-        self.start_connector(config).await
+        // Start the connector (followers only register it; the leader
+        // supervisor starts everything on promotion).
+        if self.leadership.is_currently_leader() {
+            self.start_connector(config).await
+        } else {
+            self.register_stopped(config).await;
+            Ok(())
+        }
     }
 
     /// Stop and delete a connector, removing config and offset files.
@@ -278,18 +348,27 @@ impl ConnectorManager {
                         file = ?path,
                         "loaded TOML connector config"
                     );
+                    // The file is the source of truth: it replaces any
+                    // stale REST/JSON copy (older versions persisted TOML
+                    // configs, secrets included, to connectors/*.json).
+                    let stale_json = self.config_path(&connector_name);
+                    if stale_json.exists() {
+                        let _ = std::fs::remove_file(&stale_json);
+                    }
                     // Register config without starting (leader supervisor handles startup).
-                    let mut map = self.connectors.write().await;
-                    map.entry(connector_name.clone()).or_insert_with(|| RunningConnector {
-                        config,
-                        status: ConnectorStatus::Stopped,
-                        cancel_tx: None,
-                        started_at: Instant::now(),
-                    });
-                    drop(map);
+                    self.register_stopped(config).await;
                     // Record file hash for change detection.
-                    if let Some(hash) = Self::hash_file(&path) {
-                        self.toml_hashes.write().await.insert(connector_name, hash);
+                    if let (Some(hash), Some(file_name)) = (
+                        Self::hash_file(&path),
+                        path.file_name().and_then(|n| n.to_str()),
+                    ) {
+                        self.toml_files.write().await.insert(
+                            file_name.to_string(),
+                            TomlFile {
+                                connector_name,
+                                hash,
+                            },
+                        );
                     }
                 }
                 Err(e) => {
@@ -358,18 +437,16 @@ impl ConnectorManager {
         Ok(())
     }
 
-    /// Ensure a stream exists, creating it if necessary.
+    /// Ensure a stream exists, creating it if necessary. Followers skip this:
+    /// only the leader writes, and the stream reaches followers by replication.
     async fn ensure_stream_exists(&self, stream: &StreamName) -> Result<(), String> {
-        // Try reading from the stream. If it fails with StreamNotFound, create it.
-        match self.storage.read(stream, Offset(0), 0).await {
-            Ok(_) => Ok(()),
-            Err(StorageError::StreamNotFound(_)) => self
-                .storage
-                .create_stream(stream, 0, 0)
-                .await
-                .map_err(|e| format!("failed to create stream: {e}")),
-            Err(e) => Err(format!("failed to check stream: {e}")),
+        if !self.log.can_write() {
+            return Ok(());
         }
+        self.log
+            .ensure_stream(stream)
+            .await
+            .map_err(|e| format!("failed to create stream: {e}"))
     }
 
     /// Start a connector based on its type (source or sink). Called from REST
@@ -470,7 +547,7 @@ impl ConnectorManager {
         // parent token.
         let child_token = token.child_token();
 
-        let broker_append = self.broker_append.clone();
+        let log = self.log.clone();
         let metrics = self.metrics.clone();
         let offset_store = self.offset_store.clone();
         let stream_str = config.stream.clone();
@@ -485,7 +562,7 @@ impl ConnectorManager {
         let name_for_select = name.clone();
         let source_retry_policy: RetryPolicy = config.retry.clone();
         let source_cfg_for_dlq = config.clone();
-        let broker_append_for_source_dlq = self.broker_append.clone();
+        let log_for_source_dlq = self.log.clone();
 
         // Insert into map before spawning
         {
@@ -507,79 +584,76 @@ impl ConnectorManager {
         tokio::spawn(async move {
             let name = name_for_select;
             let work = async move {
-            // Load last position
-            let last_pos = match offset_store.load_source_offset(&task_name).await {
-                Ok(pos) => pos,
-                Err(e) => {
-                    error!(connector = task_name.as_str(), error = %e, "failed to load offset");
-                    None
-                }
-            };
+                // Load last position
+                let last_pos = match offset_store.load_source_offset(&task_name).await {
+                    Ok(pos) => pos,
+                    Err(e) => {
+                        error!(connector = task_name.as_str(), error = %e, "failed to load offset");
+                        None
+                    }
+                };
 
-            // Start the source
-            if let Err(e) = source.start(last_pos).await {
-                error!(connector = task_name.as_str(), error = %e, "source start failed");
-                return;
-            }
-
-            // Build the DLQ writer (None if dlq_stream unset).
-            let source_dlq = match DlqWriter::from_config(
-                broker_append_for_source_dlq.clone(),
-                &source_cfg_for_dlq,
-            ) {
-                Ok(w) => w,
-                Err(e) => {
-                    error!(connector = task_name.as_str(), error = %e,
-                           "source DLQ writer init failed");
-                    None
-                }
-            };
-            if let Some(w) = &source_dlq {
-                if let Err(e) = broker_append_for_source_dlq.ensure_stream(w.stream()).await {
-                    error!(connector = task_name.as_str(), error = %e,
-                           "source DLQ stream auto-create failed");
-                }
-            }
-
-            let stream_name = match StreamName::try_from(stream_str.as_str()) {
-                Ok(s) => s,
-                Err(e) => {
-                    error!(connector = task_name.as_str(), error = %e, "invalid stream name");
+                // Start the source
+                if let Err(e) = source.start(last_pos).await {
+                    error!(connector = task_name.as_str(), error = %e, "source start failed");
                     return;
                 }
-            };
 
-            let mut dedup_cache = if dedup_enabled {
-                Some(crate::dedup::DedupCache::new(dedup_window_secs))
-            } else {
-                None
-            };
-            let mut dedup_counter = 0u64;
-
-            // Compile transform once before the loop
-            let transform = if !transform_sql.is_empty() {
-                match crate::transform::Transform::compile(&transform_sql) {
-                    Ok(t) => Some(t),
-                    Err(e) => {
-                        error!(
-                            connector = task_name.as_str(),
-                            "transform compile failed: {e}"
-                        );
-                        return;
+                // Build the DLQ writer (None if dlq_stream unset).
+                let source_dlq =
+                    match DlqWriter::from_config(log_for_source_dlq.clone(), &source_cfg_for_dlq) {
+                        Ok(w) => w,
+                        Err(e) => {
+                            error!(connector = task_name.as_str(), error = %e,
+                           "source DLQ writer init failed");
+                            None
+                        }
+                    };
+                if let Some(w) = &source_dlq {
+                    if let Err(e) = log_for_source_dlq.ensure_stream(w.stream()).await {
+                        error!(connector = task_name.as_str(), error = %e,
+                           "source DLQ stream auto-create failed");
                     }
                 }
-            } else {
-                None
-            };
 
-            loop {
-                // Poll for records with RetryPolicy for transient errors.
-                let mut poll_attempt: u32 = 0;
-                let batch = loop {
-                    match source.poll(batch_size).await {
-                        Ok(b) => break b,
+                let stream_name = match StreamName::try_from(stream_str.as_str()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!(connector = task_name.as_str(), error = %e, "invalid stream name");
+                        return;
+                    }
+                };
+
+                let mut dedup_cache = if dedup_enabled {
+                    Some(crate::dedup::DedupCache::new(dedup_window_secs))
+                } else {
+                    None
+                };
+                let mut dedup_counter = 0u64;
+
+                // Compile transform once before the loop
+                let transform = if !transform_sql.is_empty() {
+                    match crate::transform::Transform::compile(&transform_sql) {
+                        Ok(t) => Some(t),
                         Err(e) => {
-                            match source_retry_policy.delay_for(poll_attempt) {
+                            error!(
+                                connector = task_name.as_str(),
+                                "transform compile failed: {e}"
+                            );
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                loop {
+                    // Poll for records with RetryPolicy for transient errors.
+                    let mut poll_attempt: u32 = 0;
+                    let batch = loop {
+                        match source.poll(batch_size).await {
+                            Ok(b) => break b,
+                            Err(e) => match source_retry_policy.delay_for(poll_attempt) {
                                 Some(d) => {
                                     warn!(connector = task_name.as_str(),
                                           attempt = poll_attempt, error = %e,
@@ -590,146 +664,192 @@ impl ConnectorManager {
                                 None => {
                                     error!(connector = task_name.as_str(), error = %e,
                                            "source poll retries exhausted; looping with poll_interval");
-                                    metrics.connector_transient_exhausted_total.add(1, &[
-                                        opentelemetry::KeyValue::new(
-                                            "connector", task_name.to_string()),
-                                        opentelemetry::KeyValue::new(
-                                            "action", "source_loop_forever"),
-                                    ]);
+                                    metrics.connector_transient_exhausted_total.add(
+                                        1,
+                                        &[
+                                            opentelemetry::KeyValue::new(
+                                                "connector",
+                                                task_name.to_string(),
+                                            ),
+                                            opentelemetry::KeyValue::new(
+                                                "action",
+                                                "source_loop_forever",
+                                            ),
+                                        ],
+                                    );
                                     tokio::time::sleep(poll_interval).await;
                                     poll_attempt = 0;
                                 }
+                            },
+                        }
+                    };
+
+                    if batch.records.is_empty() {
+                        tokio::time::sleep(poll_interval).await;
+                        continue;
+                    }
+
+                    // Append each record to storage
+                    for record in &batch.records {
+                        // Dedup check
+                        if let Some(ref mut cache) = dedup_cache {
+                            let key = if !dedup_key_header.is_empty() {
+                                // Look up named header
+                                record
+                                    .headers
+                                    .iter()
+                                    .find(|(k, _)| k == &dedup_key_header)
+                                    .map(|(_, v)| v.clone())
+                            } else {
+                                // Use record key, or content hash fallback
+                                record
+                                    .key
+                                    .as_ref()
+                                    .map(|k| String::from_utf8_lossy(k).to_string())
+                            }
+                            .unwrap_or_else(|| {
+                                crate::dedup::DedupCache::content_hash(&record.value)
+                            });
+
+                            if !cache.check_and_insert(&key) {
+                                continue; // skip duplicate
+                            }
+
+                            // Periodic cleanup
+                            dedup_counter += 1;
+                            if dedup_counter.is_multiple_of(1000) {
+                                cache.cleanup();
                             }
                         }
-                    }
-                };
 
-                if batch.records.is_empty() {
-                    tokio::time::sleep(poll_interval).await;
-                    continue;
-                }
-
-                // Append each record to storage
-                for record in &batch.records {
-                    // Dedup check
-                    if let Some(ref mut cache) = dedup_cache {
-                        let key = if !dedup_key_header.is_empty() {
-                            // Look up named header
-                            record
-                                .headers
-                                .iter()
-                                .find(|(k, _)| k == &dedup_key_header)
-                                .map(|(_, v)| v.clone())
+                        // Apply transform (filter + projection)
+                        let record = if let Some(ref t) = transform {
+                            match t.apply(record) {
+                                Some(r) => r,
+                                None => continue, // filtered out
+                            }
                         } else {
-                            // Use record key, or content hash fallback
-                            record
-                                .key
-                                .as_ref()
-                                .map(|k| String::from_utf8_lossy(k).to_string())
-                        }
-                        .unwrap_or_else(|| crate::dedup::DedupCache::content_hash(&record.value));
+                            record.clone()
+                        };
 
-                        if !cache.check_and_insert(&key) {
-                            continue; // skip duplicate
-                        }
-
-                        // Periodic cleanup
-                        dedup_counter += 1;
-                        if dedup_counter.is_multiple_of(1000) {
-                            cache.cleanup();
-                        }
-                    }
-
-                    // Apply transform (filter + projection)
-                    let record = if let Some(ref t) = transform {
-                        match t.apply(record) {
-                            Some(r) => r,
-                            None => continue, // filtered out
-                        }
-                    } else {
-                        record.clone()
-                    };
-
-                    let extracted_key = if !key_field.is_empty() && record.key.is_none() {
-                        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&record.value) {
-                            json.get(&key_field)
-                                .and_then(|v| match v {
-                                    serde_json::Value::String(s) => Some(bytes::Bytes::from(s.clone().into_bytes())),
-                                    other => Some(bytes::Bytes::from(other.to_string().into_bytes())),
+                        let extracted_key = if !key_field.is_empty() && record.key.is_none() {
+                            if let Ok(json) =
+                                serde_json::from_slice::<serde_json::Value>(&record.value)
+                            {
+                                json.get(&key_field).map(|v| match v {
+                                    serde_json::Value::String(s) => {
+                                        bytes::Bytes::from(s.clone().into_bytes())
+                                    }
+                                    other => bytes::Bytes::from(other.to_string().into_bytes()),
                                 })
+                            } else {
+                                None
+                            }
                         } else {
                             None
-                        }
-                    } else {
-                        None
-                    };
+                        };
 
-                    let storage_record = Record {
-                        key: record.key.clone().or(extracted_key),
-                        value: record.value.clone(),
-                        subject: record.subject.clone(),
-                        headers: record.headers.clone(),
-                        timestamp_ns: None,
-                    };
+                        let storage_record = Record {
+                            key: record.key.clone().or(extracted_key),
+                            value: record.value.clone(),
+                            subject: record.subject.clone(),
+                            headers: record.headers.clone(),
+                            timestamp_ns: None,
+                        };
 
-                    let result = broker_append.append(&stream_name, &storage_record).await;
+                        // Transient append failures (disk full, dedup map full,
+                        // stream briefly missing) are retried: committing the
+                        // source position past a record that was never stored
+                        // would lose it. Only a key collision (same idempotency
+                        // key, different body) is treated as poison.
+                        let mut append_attempt: u32 = 0;
+                        let result = loop {
+                            match log.append(&stream_name, storage_record.clone()).await {
+                                Err(e)
+                                    if !matches!(
+                                        e,
+                                        LogError::InvalidRecord(_)
+                                            | LogError::Storage(StorageError::KeyCollision { .. })
+                                    ) =>
+                                {
+                                    let delay = source_retry_policy
+                                        .delay_for(append_attempt)
+                                        .unwrap_or(poll_interval.max(Duration::from_secs(1)));
+                                    warn!(connector = task_name.as_str(), attempt = append_attempt,
+                                          error = %e, "source append failed; retrying");
+                                    tokio::time::sleep(delay).await;
+                                    append_attempt = append_attempt.saturating_add(1);
+                                }
+                                other => break other,
+                            }
+                        };
 
-                    match result {
-                        Ok(exspeed_broker::broker_append::AppendResult::Written(..)) => {
-                            metrics.record_publish(stream_str.as_str());
-                        }
-                        Ok(exspeed_broker::broker_append::AppendResult::Duplicate(_)) => {
-                            // Silently skip — broker dedup caught it
-                        }
-                        Err(e) => {
-                            error!(
-                                connector = task_name.as_str(),
-                                error = %e,
-                                "failed to append source record"
-                            );
-                            if let Some(dlq) = &source_dlq {
-                                let reason = PoisonReason::SinkRejected {
-                                    detail: format!("source broker append failed: {e}"),
-                                };
-                                let sink_rec = SinkRecord {
-                                    offset: 0,
-                                    timestamp: 0,
-                                    subject: record.subject.clone(),
-                                    key: record.key.clone(),
-                                    value: record.value.clone(),
-                                    headers: record.headers.clone(),
-                                };
-                                if let Err(dlqerr) = dlq.write(&sink_rec, &reason).await {
-                                    error!(connector = task_name.as_str(),
+                        match result {
+                            Ok(exspeed_broker::broker_append::AppendResult::Written(..)) => {
+                                metrics.record_publish(stream_str.as_str());
+                            }
+                            Ok(exspeed_broker::broker_append::AppendResult::Duplicate(_)) => {
+                                // Silently skip — broker dedup caught it
+                            }
+                            Err(e) => {
+                                error!(
+                                    connector = task_name.as_str(),
+                                    error = %e,
+                                    "failed to append source record"
+                                );
+                                if let Some(dlq) = &source_dlq {
+                                    let reason = PoisonReason::SinkRejected {
+                                        detail: format!("source broker append failed: {e}"),
+                                    };
+                                    let sink_rec = SinkRecord {
+                                        offset: 0,
+                                        timestamp: 0,
+                                        subject: record.subject.clone(),
+                                        key: record.key.clone(),
+                                        value: record.value.clone(),
+                                        headers: record.headers.clone(),
+                                    };
+                                    if let Err(dlqerr) = dlq.write(&sink_rec, &reason).await {
+                                        error!(connector = task_name.as_str(),
                                            error = %dlqerr,
                                            "source DLQ write failed");
-                                    metrics.connector_dlq_failures_total.add(1, &[
-                                        opentelemetry::KeyValue::new(
-                                            "connector", task_name.to_string()),
-                                    ]);
-                                } else {
-                                    metrics.connector_dlq_total.add(1, &[
-                                        opentelemetry::KeyValue::new(
-                                            "connector", task_name.to_string()),
-                                        opentelemetry::KeyValue::new(
-                                            "reason", reason.label()),
-                                    ]);
+                                        metrics.connector_dlq_failures_total.add(
+                                            1,
+                                            &[opentelemetry::KeyValue::new(
+                                                "connector",
+                                                task_name.to_string(),
+                                            )],
+                                        );
+                                    } else {
+                                        metrics.connector_dlq_total.add(
+                                            1,
+                                            &[
+                                                opentelemetry::KeyValue::new(
+                                                    "connector",
+                                                    task_name.to_string(),
+                                                ),
+                                                opentelemetry::KeyValue::new(
+                                                    "reason",
+                                                    reason.label(),
+                                                ),
+                                            ],
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                // Save offset and commit
-                if let Some(ref pos) = batch.position {
-                    if let Err(e) = offset_store.save_source_offset(&task_name, pos).await {
-                        error!(connector = task_name.as_str(), error = %e, "failed to save offset");
-                    }
-                    if let Err(e) = source.commit(pos.clone()).await {
-                        error!(connector = task_name.as_str(), error = %e, "source commit failed");
+                    // Save offset and commit
+                    if let Some(ref pos) = batch.position {
+                        if let Err(e) = offset_store.save_source_offset(&task_name, pos).await {
+                            error!(connector = task_name.as_str(), error = %e, "failed to save offset");
+                        }
+                        if let Err(e) = source.commit(pos.clone()).await {
+                            error!(connector = task_name.as_str(), error = %e, "source commit failed");
+                        }
                     }
                 }
-            }
             }; // end of `work` async block
 
             tokio::select! {
@@ -781,7 +901,7 @@ impl ConnectorManager {
         let name_for_select = name.clone();
         let retry_policy: RetryPolicy = config.retry.clone();
         let on_transient_exhausted: OnTransientExhausted = config.on_transient_exhausted;
-        let broker_append_for_dlq = self.broker_append.clone();
+        let log_for_dlq = self.log.clone();
         let cfg_for_dlq = config.clone();
 
         // Insert into map before spawning
@@ -804,272 +924,355 @@ impl ConnectorManager {
         tokio::spawn(async move {
             let name = name_for_select;
             let work = async move {
-            // Start the sink
-            if let Err(e) = sink.start().await {
-                error!(connector = task_name.as_str(), error = %e, "sink start failed");
-                return;
-            }
-
-            // Build the DLQ writer (None if dlq_stream unset).
-            let dlq_writer = match DlqWriter::from_config(
-                broker_append_for_dlq.clone(),
-                &cfg_for_dlq,
-            ) {
-                Ok(w) => w,
-                Err(e) => {
-                    error!(connector = task_name.as_str(), error = %e,
-                           "DLQ writer init failed");
+                // Start the sink
+                if let Err(e) = sink.start().await {
+                    error!(connector = task_name.as_str(), error = %e, "sink start failed");
                     return;
                 }
-            };
-            if let Some(w) = &dlq_writer {
-                if let Err(e) = broker_append_for_dlq.ensure_stream(w.stream()).await {
-                    error!(connector = task_name.as_str(), error = %e,
-                           "DLQ stream auto-create failed");
-                    return;
-                }
-            }
 
-            // Load last sink offset
-            let mut current_offset = match offset_store.load_sink_offset(&task_name).await {
-                Ok(o) => o,
-                Err(e) => {
-                    error!(connector = task_name.as_str(), error = %e, "failed to load sink offset");
-                    0
-                }
-            };
-
-            let stream_name = match StreamName::try_from(stream_str.as_str()) {
-                Ok(s) => s,
-                Err(e) => {
-                    error!(connector = task_name.as_str(), error = %e, "invalid stream name");
-                    return;
-                }
-            };
-
-            loop {
-                // Read records from storage
-                let stored_records = match storage.read(&stream_name, Offset(current_offset), batch_size).await {
-                    Ok(recs) => recs,
+                // Build the DLQ writer (None if dlq_stream unset).
+                let dlq_writer = match DlqWriter::from_config(log_for_dlq.clone(), &cfg_for_dlq) {
+                    Ok(w) => w,
                     Err(e) => {
-                        error!(connector = task_name.as_str(), error = %e, "failed to read from storage");
-                        tokio::time::sleep(poll_interval).await;
-                        continue;
+                        error!(connector = task_name.as_str(), error = %e,
+                           "DLQ writer init failed");
+                        return;
+                    }
+                };
+                if let Some(w) = &dlq_writer {
+                    if let Err(e) = log_for_dlq.ensure_stream(w.stream()).await {
+                        error!(connector = task_name.as_str(), error = %e,
+                           "DLQ stream auto-create failed");
+                        return;
+                    }
+                }
+
+                // Load last sink offset
+                let mut current_offset = match offset_store.load_sink_offset(&task_name).await {
+                    Ok(o) => o,
+                    Err(e) => {
+                        error!(connector = task_name.as_str(), error = %e, "failed to load sink offset");
+                        0
                     }
                 };
 
-                if stored_records.is_empty() {
-                    tokio::time::sleep(poll_interval).await;
-                    continue;
-                }
-
-                // Compute the offset to advance to: past all records we read,
-                // regardless of subject filtering.
-                let new_offset = stored_records
-                    .last()
-                    .map(|r| r.offset.0 + 1)
-                    .unwrap_or(current_offset);
-
-                // Filter by subject if pattern is set
-                let filtered: Vec<_> = stored_records
-                    .into_iter()
-                    .filter(|r| {
-                        exspeed_common::subject::subject_matches(&r.subject, &subject_filter)
-                    })
-                    .collect();
-
-                if filtered.is_empty() {
-                    current_offset = new_offset;
-                    if let Err(e) = offset_store.save_sink_offset(&task_name, current_offset).await {
-                        error!(connector = task_name.as_str(), error = %e, "failed to save sink offset");
+                let stream_name = match StreamName::try_from(stream_str.as_str()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!(connector = task_name.as_str(), error = %e, "invalid stream name");
+                        return;
                     }
-                    continue;
-                }
+                };
 
-                // Convert to SinkRecords
-                let sink_records: Vec<SinkRecord> = filtered
-                    .iter()
-                    .map(|r| SinkRecord {
-                        offset: r.offset.0,
-                        timestamp: r.timestamp,
-                        subject: r.subject.clone(),
-                        key: r.key.clone(),
-                        value: r.value.clone(),
-                        headers: r.headers.clone(),
-                    })
-                    .collect();
+                loop {
+                    // Read records from storage
+                    let stored_records = match storage
+                        .read(&stream_name, Offset(current_offset), batch_size)
+                        .await
+                    {
+                        Ok(recs) => recs,
+                        Err(e) => {
+                            error!(connector = task_name.as_str(), error = %e, "failed to read from storage");
+                            tokio::time::sleep(poll_interval).await;
+                            continue;
+                        }
+                    };
 
-                // Inner retry loop. Rebuilds the batch each attempt.
-                let mut attempt: u32 = 0;
-                'retry: loop {
-                    let batch = SinkBatch { records: sink_records.clone() };
-                    match sink.write(batch).await {
-                        Ok(WriteResult::AllSuccess) => {
-                            metrics.record_consume(&stream_str, &task_name);
-                            current_offset = new_offset;
-                            break 'retry;
+                    if stored_records.is_empty() {
+                        tokio::time::sleep(poll_interval).await;
+                        continue;
+                    }
+
+                    // Compute the offset to advance to: past all records we read,
+                    // regardless of subject filtering.
+                    let new_offset = stored_records
+                        .last()
+                        .map(|r| r.offset.0 + 1)
+                        .unwrap_or(current_offset);
+
+                    // Filter by subject if pattern is set
+                    let filtered: Vec<_> = stored_records
+                        .into_iter()
+                        .filter(|r| {
+                            exspeed_common::subject::subject_matches(&r.subject, &subject_filter)
+                        })
+                        .collect();
+
+                    if filtered.is_empty() {
+                        current_offset = new_offset;
+                        if let Err(e) = offset_store
+                            .save_sink_offset(&task_name, current_offset)
+                            .await
+                        {
+                            error!(connector = task_name.as_str(), error = %e, "failed to save sink offset");
                         }
-                        Ok(WriteResult::PartialSuccess { last_successful_offset }) => {
-                            warn!(connector = task_name.as_str(),
-                                  last_offset = last_successful_offset,
-                                  "partial write success");
-                            current_offset = last_successful_offset + 1;
-                            break 'retry;
-                        }
-                        Ok(WriteResult::Poison { poison_offset, reason, record, .. }) => {
-                            match &dlq_writer {
-                                Some(dlq) => {
-                                    match dlq.write(&record, &reason).await {
+                        continue;
+                    }
+
+                    // Convert to SinkRecords
+                    let sink_records: Vec<SinkRecord> = filtered
+                        .iter()
+                        .map(|r| SinkRecord {
+                            offset: r.offset.0,
+                            timestamp: r.timestamp,
+                            subject: r.subject.clone(),
+                            key: r.key.clone(),
+                            value: r.value.clone(),
+                            headers: r.headers.clone(),
+                        })
+                        .collect();
+
+                    // Inner retry loop. Rebuilds the batch each attempt.
+                    let mut attempt: u32 = 0;
+                    'retry: loop {
+                        let batch = SinkBatch {
+                            records: sink_records.clone(),
+                        };
+                        match sink.write(batch).await {
+                            Ok(WriteResult::AllSuccess) => {
+                                metrics.record_consume(&stream_str, &task_name);
+                                current_offset = new_offset;
+                                break 'retry;
+                            }
+                            Ok(WriteResult::PartialSuccess {
+                                last_successful_offset,
+                            }) => {
+                                warn!(
+                                    connector = task_name.as_str(),
+                                    last_offset = last_successful_offset,
+                                    "partial write success"
+                                );
+                                current_offset = last_successful_offset + 1;
+                                break 'retry;
+                            }
+                            Ok(WriteResult::Poison {
+                                poison_offset,
+                                reason,
+                                record,
+                                ..
+                            }) => {
+                                match &dlq_writer {
+                                    Some(dlq) => match dlq.write(&record, &reason).await {
                                         Ok(()) => {
-                                            metrics.connector_dlq_total.add(1, &[
-                                                opentelemetry::KeyValue::new(
-                                                    "connector", task_name.to_string()),
-                                                opentelemetry::KeyValue::new(
-                                                    "reason", reason.label()),
-                                            ]);
+                                            metrics.connector_dlq_total.add(
+                                                1,
+                                                &[
+                                                    opentelemetry::KeyValue::new(
+                                                        "connector",
+                                                        task_name.to_string(),
+                                                    ),
+                                                    opentelemetry::KeyValue::new(
+                                                        "reason",
+                                                        reason.label(),
+                                                    ),
+                                                ],
+                                            );
                                         }
                                         Err(e) => {
                                             error!(connector = task_name.as_str(),
                                                    error = %e,
                                                    "DLQ write failed; advancing anyway");
-                                            metrics.connector_dlq_failures_total.add(1, &[
-                                                opentelemetry::KeyValue::new(
-                                                    "connector", task_name.to_string()),
-                                            ]);
+                                            metrics.connector_dlq_failures_total.add(
+                                                1,
+                                                &[opentelemetry::KeyValue::new(
+                                                    "connector",
+                                                    task_name.to_string(),
+                                                )],
+                                            );
                                         }
+                                    },
+                                    None => {
+                                        metrics.connector_records_skipped_total.add(
+                                            1,
+                                            &[
+                                                opentelemetry::KeyValue::new(
+                                                    "connector",
+                                                    task_name.to_string(),
+                                                ),
+                                                opentelemetry::KeyValue::new(
+                                                    "stream",
+                                                    stream_str.clone(),
+                                                ),
+                                                opentelemetry::KeyValue::new(
+                                                    "reason",
+                                                    reason.label(),
+                                                ),
+                                            ],
+                                        );
                                     }
                                 }
-                                None => {
-                                    metrics.connector_records_skipped_total.add(1, &[
-                                        opentelemetry::KeyValue::new(
-                                            "connector", task_name.to_string()),
-                                        opentelemetry::KeyValue::new(
-                                            "stream", stream_str.clone()),
-                                        opentelemetry::KeyValue::new(
-                                            "reason", reason.label()),
-                                    ]);
-                                }
+                                current_offset = poison_offset + 1;
+                                break 'retry;
                             }
-                            current_offset = poison_offset + 1;
-                            break 'retry;
-                        }
-                        Ok(WriteResult::TransientFailure { error, .. }) => {
-                            match retry_policy.delay_for(attempt) {
-                                Some(d) => {
-                                    warn!(connector = task_name.as_str(),
+                            Ok(WriteResult::TransientFailure { error, .. }) => {
+                                match retry_policy.delay_for(attempt) {
+                                    Some(d) => {
+                                        warn!(connector = task_name.as_str(),
                                           attempt, backoff_ms = d.as_millis() as u64,
                                           error = %error,
                                           "transient failure; retrying");
-                                    tokio::time::sleep(d).await;
-                                    attempt += 1;
-                                    continue 'retry;
-                                }
-                                None => {
-                                    metrics.connector_retry_attempts_total.add(1, &[
-                                        opentelemetry::KeyValue::new(
-                                            "connector", task_name.to_string()),
-                                        opentelemetry::KeyValue::new("outcome", "exhausted"),
-                                    ]);
-                                    match on_transient_exhausted {
-                                        OnTransientExhausted::Halt => {
-                                            error!(connector = task_name.as_str(),
+                                        tokio::time::sleep(d).await;
+                                        attempt += 1;
+                                        continue 'retry;
+                                    }
+                                    None => {
+                                        metrics.connector_retry_attempts_total.add(
+                                            1,
+                                            &[
+                                                opentelemetry::KeyValue::new(
+                                                    "connector",
+                                                    task_name.to_string(),
+                                                ),
+                                                opentelemetry::KeyValue::new(
+                                                    "outcome",
+                                                    "exhausted",
+                                                ),
+                                            ],
+                                        );
+                                        match on_transient_exhausted {
+                                            OnTransientExhausted::Halt => {
+                                                error!(connector = task_name.as_str(),
                                                    error = %error,
                                                    "transient retries exhausted; halting");
-                                            metrics.connector_transient_exhausted_total.add(1, &[
-                                                opentelemetry::KeyValue::new(
-                                                    "connector", task_name.to_string()),
-                                                opentelemetry::KeyValue::new("action", "halt"),
-                                            ]);
-                                            return;
-                                        }
-                                        OnTransientExhausted::DlqBatch if dlq_writer.is_some() => {
-                                            let dlq = dlq_writer.as_ref().unwrap();
-                                            for rec in &sink_records {
-                                                let reason = PoisonReason::SinkRejected {
-                                                    detail: format!(
-                                                        "transient-retry-exhausted: {error}")
-                                                };
-                                                if let Err(e) = dlq.write(rec, &reason).await {
-                                                    error!(connector = task_name.as_str(),
+                                                metrics.connector_transient_exhausted_total.add(
+                                                    1,
+                                                    &[
+                                                        opentelemetry::KeyValue::new(
+                                                            "connector",
+                                                            task_name.to_string(),
+                                                        ),
+                                                        opentelemetry::KeyValue::new(
+                                                            "action", "halt",
+                                                        ),
+                                                    ],
+                                                );
+                                                return;
+                                            }
+                                            OnTransientExhausted::DlqBatch
+                                                if dlq_writer.is_some() =>
+                                            {
+                                                let dlq = dlq_writer.as_ref().unwrap();
+                                                for rec in &sink_records {
+                                                    let reason = PoisonReason::SinkRejected {
+                                                        detail: format!(
+                                                            "transient-retry-exhausted: {error}"
+                                                        ),
+                                                    };
+                                                    if let Err(e) = dlq.write(rec, &reason).await {
+                                                        error!(connector = task_name.as_str(),
                                                            error = %e,
                                                            "dlq_batch write failed");
-                                                    metrics.connector_dlq_failures_total.add(1, &[
-                                                        opentelemetry::KeyValue::new(
-                                                            "connector", task_name.to_string()),
-                                                    ]);
-                                                } else {
-                                                    metrics.connector_dlq_total.add(1, &[
-                                                        opentelemetry::KeyValue::new(
-                                                            "connector", task_name.to_string()),
-                                                        opentelemetry::KeyValue::new(
-                                                            "reason", "sink_rejected"),
-                                                    ]);
+                                                        metrics.connector_dlq_failures_total.add(
+                                                            1,
+                                                            &[opentelemetry::KeyValue::new(
+                                                                "connector",
+                                                                task_name.to_string(),
+                                                            )],
+                                                        );
+                                                    } else {
+                                                        metrics.connector_dlq_total.add(
+                                                            1,
+                                                            &[
+                                                                opentelemetry::KeyValue::new(
+                                                                    "connector",
+                                                                    task_name.to_string(),
+                                                                ),
+                                                                opentelemetry::KeyValue::new(
+                                                                    "reason",
+                                                                    "sink_rejected",
+                                                                ),
+                                                            ],
+                                                        );
+                                                    }
                                                 }
+                                                metrics.connector_transient_exhausted_total.add(
+                                                    1,
+                                                    &[
+                                                        opentelemetry::KeyValue::new(
+                                                            "connector",
+                                                            task_name.to_string(),
+                                                        ),
+                                                        opentelemetry::KeyValue::new(
+                                                            "action",
+                                                            "dlq_batch",
+                                                        ),
+                                                    ],
+                                                );
+                                                current_offset = new_offset;
+                                                break 'retry;
                                             }
-                                            metrics.connector_transient_exhausted_total.add(1, &[
-                                                opentelemetry::KeyValue::new(
-                                                    "connector", task_name.to_string()),
-                                                opentelemetry::KeyValue::new(
-                                                    "action", "dlq_batch"),
-                                            ]);
-                                            current_offset = new_offset;
-                                            break 'retry;
-                                        }
-                                        OnTransientExhausted::DlqBatch => {
-                                            error!(connector = task_name.as_str(),
+                                            OnTransientExhausted::DlqBatch => {
+                                                error!(connector = task_name.as_str(),
                                                    "dlq_batch requested but dlq_stream unset; halting");
-                                            metrics.connector_transient_exhausted_total.add(1, &[
-                                                opentelemetry::KeyValue::new(
-                                                    "connector", task_name.to_string()),
-                                                opentelemetry::KeyValue::new(
-                                                    "action", "halt_no_dlq"),
-                                            ]);
-                                            return;
-                                        }
-                                        OnTransientExhausted::LoopForever => {
-                                            warn!(connector = task_name.as_str(),
+                                                metrics.connector_transient_exhausted_total.add(
+                                                    1,
+                                                    &[
+                                                        opentelemetry::KeyValue::new(
+                                                            "connector",
+                                                            task_name.to_string(),
+                                                        ),
+                                                        opentelemetry::KeyValue::new(
+                                                            "action",
+                                                            "halt_no_dlq",
+                                                        ),
+                                                    ],
+                                                );
+                                                return;
+                                            }
+                                            OnTransientExhausted::LoopForever => {
+                                                warn!(connector = task_name.as_str(),
                                                   error = %error,
                                                   "transient retries exhausted; looping");
-                                            metrics.connector_transient_exhausted_total.add(1, &[
-                                                opentelemetry::KeyValue::new(
-                                                    "connector", task_name.to_string()),
-                                                opentelemetry::KeyValue::new(
-                                                    "action", "loop_forever"),
-                                            ]);
-                                            tokio::time::sleep(poll_interval).await;
-                                            attempt = 0;
-                                            continue 'retry;
+                                                metrics.connector_transient_exhausted_total.add(
+                                                    1,
+                                                    &[
+                                                        opentelemetry::KeyValue::new(
+                                                            "connector",
+                                                            task_name.to_string(),
+                                                        ),
+                                                        opentelemetry::KeyValue::new(
+                                                            "action",
+                                                            "loop_forever",
+                                                        ),
+                                                    ],
+                                                );
+                                                tokio::time::sleep(poll_interval).await;
+                                                attempt = 0;
+                                                continue 'retry;
+                                            }
                                         }
                                     }
                                 }
                             }
-                        }
-                        Err(e) => {
-                            error!(connector = task_name.as_str(),
+                            Err(e) => {
+                                error!(connector = task_name.as_str(),
                                    error = %e, "sink write ConnectorError");
-                            match retry_policy.delay_for(attempt) {
-                                Some(d) => {
-                                    tokio::time::sleep(d).await;
-                                    attempt += 1;
-                                    continue 'retry;
-                                }
-                                None => {
-                                    error!(connector = task_name.as_str(),
+                                match retry_policy.delay_for(attempt) {
+                                    Some(d) => {
+                                        tokio::time::sleep(d).await;
+                                        attempt += 1;
+                                        continue 'retry;
+                                    }
+                                    None => {
+                                        error!(connector = task_name.as_str(),
                                            error = %e,
                                            "ConnectorError retries exhausted; halting");
-                                    return;
+                                        return;
+                                    }
                                 }
                             }
                         }
-                    }
-                } // end 'retry
+                    } // end 'retry
 
-                // Persist sink offset after each successful inner-loop exit.
-                if let Err(e) = offset_store.save_sink_offset(&task_name, current_offset).await {
-                    error!(connector = task_name.as_str(), error = %e,
+                    // Persist sink offset after each successful inner-loop exit.
+                    if let Err(e) = offset_store
+                        .save_sink_offset(&task_name, current_offset)
+                        .await
+                    {
+                        error!(connector = task_name.as_str(), error = %e,
                            "failed to save sink offset");
+                    }
                 }
-            }
             }; // end of `work` async block
 
             tokio::select! {

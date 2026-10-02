@@ -144,7 +144,9 @@ mod tests {
         let mut buf = BytesMut::new();
         resp.encode(&mut buf);
         assert_eq!(
-            ConnectResponse::decode(buf.freeze()).unwrap().server_version,
+            ConnectResponse::decode(buf.freeze())
+                .unwrap()
+                .server_version,
             2
         );
     }

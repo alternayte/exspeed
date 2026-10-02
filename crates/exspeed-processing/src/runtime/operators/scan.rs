@@ -7,8 +7,8 @@ use exspeed_streams::StorageEngine;
 use crate::parser::ast::Expr;
 use crate::planner::column_set::ColumnSet;
 use crate::runtime::eval::eval_expr;
-use crate::runtime::row_builder::stored_record_to_row;
 use crate::runtime::operators::Operator;
+use crate::runtime::row_builder::stored_record_to_row;
 use crate::types::Row;
 
 const BATCH_SIZE: usize = 1024;
@@ -187,12 +187,19 @@ impl Operator for ScanOperator {
                     });
                     if let Ok((earliest, next)) = bounds {
                         if next.0 > earliest.0 {
-                            let overfetch = if s.predicate.is_some() { s.limit * 4 } else { s.limit };
+                            let overfetch = if s.predicate.is_some() {
+                                s.limit * 4
+                            } else {
+                                s.limit
+                            };
                             let start = next.0.saturating_sub(overfetch).max(earliest.0);
                             let count = (next.0 - start) as usize;
                             let batch = tokio::task::block_in_place(|| {
-                                tokio::runtime::Handle::current()
-                                    .block_on(s.storage.read(&s.stream, Offset(start), count))
+                                tokio::runtime::Handle::current().block_on(s.storage.read(
+                                    &s.stream,
+                                    Offset(start),
+                                    count,
+                                ))
                             })
                             .unwrap_or_default();
 
@@ -200,7 +207,7 @@ impl Operator for ScanOperator {
                                 .iter()
                                 .map(|r| stored_record_to_row(r, s.alias.as_deref(), &s.required))
                                 .filter(|row| {
-                                    s.predicate.as_ref().map_or(true, |pred| {
+                                    s.predicate.as_ref().is_none_or(|pred| {
                                         eval_expr(pred, row) == crate::types::Value::Bool(true)
                                     })
                                 })
@@ -233,12 +240,18 @@ impl Operator for ScanOperator {
                     return None;
                 }
                 let batch = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(if let Some(ref kf) = s.key_eq_filter {
-                            s.storage.read_with_hints(&s.stream, s.cursor, BATCH_SIZE, Some(kf.as_str()))
+                    tokio::runtime::Handle::current().block_on(
+                        if let Some(ref kf) = s.key_eq_filter {
+                            s.storage.read_with_hints(
+                                &s.stream,
+                                s.cursor,
+                                BATCH_SIZE,
+                                Some(kf.as_str()),
+                            )
                         } else {
                             s.storage.read(&s.stream, s.cursor, BATCH_SIZE)
-                        })
+                        },
+                    )
                 });
                 let batch = match batch {
                     Ok(b) => b,
@@ -388,15 +401,17 @@ mod tests {
             seed(&storage, &stream, 100).await;
 
             let predicate = Expr::BinaryOp {
-                left: Box::new(Expr::Column { table: None, name: "offset".into() }),
+                left: Box::new(Expr::Column {
+                    table: None,
+                    name: "offset".into(),
+                }),
                 op: BinaryOperator::Lt,
                 right: Box::new(Expr::Literal(LiteralValue::Int(5))),
             };
 
             let cs = ColumnSet::needs_everything();
-            let mut scan = ScanOperator::streaming_with_predicate(
-                storage, stream, None, cs, Some(predicate),
-            );
+            let mut scan =
+                ScanOperator::streaming_with_predicate(storage, stream, None, cs, Some(predicate));
 
             let mut count = 0;
             while tokio::task::block_in_place(|| scan.next()).is_some() {

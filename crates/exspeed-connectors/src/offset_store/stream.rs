@@ -135,11 +135,7 @@ impl OffsetStore for StreamOffsetStore {
         Ok(self.find_latest(connector).await.and_then(|r| r.position))
     }
 
-    async fn save_sink_offset(
-        &self,
-        connector: &str,
-        offset: u64,
-    ) -> Result<(), OffsetStoreError> {
+    async fn save_sink_offset(&self, connector: &str, offset: u64) -> Result<(), OffsetStoreError> {
         let record = OffsetRecord {
             offset_type: "sink".to_string(),
             position: None,

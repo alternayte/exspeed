@@ -1,4 +1,6 @@
 #![cfg(test)]
+// Tests serialise on a std Mutex across awaits on purpose (env-var setup).
+#![allow(clippy::await_holding_lock)]
 //! Integration tests for PostgresLeaseBackend. Requires a running Postgres;
 //! point `EXSPEED_OFFSET_STORE_POSTGRES_URL` at it (docker-compose up -d postgres).
 //! Tests skip gracefully when the URL is unset.
@@ -121,11 +123,7 @@ async fn postgres_endpoint_is_stored_and_preserved_across_heartbeats() {
     // that must preserve the endpoint (refresh UPDATEs expires_at only;
     // the endpoint column should be untouched).
     let _g = b
-        .try_acquire(
-            "endpoint-1",
-            Duration::from_secs(5),
-            Some("10.0.0.1:5934"),
-        )
+        .try_acquire("endpoint-1", Duration::from_secs(5), Some("10.0.0.1:5934"))
         .await
         .unwrap()
         .expect("first acquire wins");

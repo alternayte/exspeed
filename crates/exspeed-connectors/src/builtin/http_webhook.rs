@@ -2,41 +2,60 @@
 // See exspeed-api/src/handlers/webhooks.rs for the handler.
 // This module provides the handle_webhook_post() function.
 
-use std::sync::Arc;
-
 use bytes::Bytes;
 
 use crate::config::ConnectorConfig;
+use exspeed_broker::broker_append::{AppendResult, IDEMPOTENCY_HEADER};
+use exspeed_broker::log::{Log, LogError};
 use exspeed_common::StreamName;
 use exspeed_streams::record::Record;
-use exspeed_streams::traits::StorageEngine;
+
+/// Why a webhook POST was rejected.
+#[derive(Debug, thiserror::Error)]
+pub enum WebhookError {
+    #[error("unauthorized: invalid or missing bearer token")]
+    Unauthorized,
+    #[error("webhook misconfigured: {0}")]
+    Config(String),
+    #[error(transparent)]
+    Log(#[from] LogError),
+}
 
 /// Handle an incoming HTTP webhook POST request.
 ///
-/// Validates auth, extracts the subject from the request body using the connector's
-/// subject template, builds a [`Record`], and appends it to the configured stream.
+/// Validates auth, extracts the subject from the request body using the
+/// connector's subject template, and appends the body through the broker
+/// write path. `idempotency_key` (from the sender's `Idempotency-Key`
+/// header) makes sender retries safe.
 ///
-/// Returns the resulting [`Offset`](exspeed_common::Offset) as a `u64`.
+/// Returns the record's offset (the original offset for a duplicate).
 pub async fn handle_webhook_post(
-    storage: &Arc<dyn StorageEngine>,
+    log: &Log,
     config: &ConnectorConfig,
     body: Bytes,
     auth_header: Option<&str>,
-) -> Result<u64, String> {
+    idempotency_key: Option<&str>,
+) -> Result<u64, WebhookError> {
     // 1. Validate auth
     let auth_type = config.setting_or("auth_type", "none");
     match auth_type.as_str() {
         "none" => {}
         "bearer" => {
-            let secret = config.setting("auth_secret")?;
-            let expected = format!("Bearer {}", secret);
-            match auth_header {
-                Some(value) if value == expected => {}
-                _ => return Err("unauthorized: invalid or missing bearer token".to_string()),
+            let secret = config
+                .setting("auth_secret")
+                .map_err(WebhookError::Config)?;
+            let expected = format!("Bearer {secret}");
+            let ok = auth_header.is_some_and(|v| {
+                constant_time_eq::constant_time_eq(v.as_bytes(), expected.as_bytes())
+            });
+            if !ok {
+                return Err(WebhookError::Unauthorized);
             }
         }
         other => {
-            return Err(format!("unsupported auth_type: {other}"));
+            return Err(WebhookError::Config(format!(
+                "unsupported auth_type: {other}"
+            )));
         }
     }
 
@@ -44,27 +63,28 @@ pub async fn handle_webhook_post(
     let subject = extract_subject(&config.subject_template, &body);
 
     // 3. Build the record
+    let mut headers = vec![
+        ("x-exspeed-source".to_string(), "http_webhook".to_string()),
+        ("x-exspeed-connector".to_string(), config.name.clone()),
+    ];
+    if let Some(key) = idempotency_key.filter(|k| !k.is_empty()) {
+        headers.push((IDEMPOTENCY_HEADER.to_string(), key.to_string()));
+    }
     let record = Record {
         key: None,
         value: body,
         subject,
-        headers: vec![
-            ("x-exspeed-source".to_string(), "http_webhook".to_string()),
-            ("x-exspeed-connector".to_string(), config.name.clone()),
-        ],
+        headers,
         timestamp_ns: None,
     };
 
     // 4. Resolve stream name and append
     let stream = StreamName::try_from(config.stream.as_str())
-        .map_err(|e| format!("invalid stream name: {e}"))?;
+        .map_err(|e| WebhookError::Config(format!("invalid stream name: {e}")))?;
 
-    let (offset, _timestamp) = storage
-        .append(&stream, &record)
-        .await
-        .map_err(|e| format!("storage error: {e}"))?;
-
-    Ok(offset.0)
+    Ok(match log.append(&stream, record).await? {
+        AppendResult::Written(offset, _) | AppendResult::Duplicate(offset) => offset.0,
+    })
 }
 
 /// Interpolate `{$.field}` references in `template` from the top-level fields of a JSON object.

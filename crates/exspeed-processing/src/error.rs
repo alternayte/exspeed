@@ -21,7 +21,11 @@ impl ExqlError {
     pub fn to_json(&self) -> JsonValue {
         match self {
             ExqlError::Parse(pe) => match pe {
-                ParseError::Sql { message: _, line, column } => json!({
+                ParseError::Sql {
+                    message: _,
+                    line,
+                    column,
+                } => json!({
                     "error": self.to_string(),
                     "code": "PARSE_ERROR",
                     "line": *line,

@@ -10,10 +10,7 @@ pub enum ParseError {
     },
 
     #[error("unsupported: {feature}")]
-    Unsupported {
-        feature: String,
-        hint: String,
-    },
+    Unsupported { feature: String, hint: String },
 
     #[error("transform error: {0}")]
     Transform(String),

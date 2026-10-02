@@ -4,8 +4,8 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 async fn start_server(auth_token: Option<String>) -> (u16, TempDir) {
-    let api_port = portpicker::pick_unused_port().unwrap();
-    let tcp_port = portpicker::pick_unused_port().unwrap();
+    let api_port = exspeed_testkit::pick_unused_port().unwrap();
+    let tcp_port = exspeed_testkit::pick_unused_port().unwrap();
     let tmp = tempfile::tempdir().unwrap();
 
     let args = exspeed::cli::server::ServerArgs {
@@ -16,13 +16,13 @@ async fn start_server(auth_token: Option<String>) -> (u16, TempDir) {
         credentials_file: None,
         tls_cert: None,
         tls_key: None,
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
+        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+        storage_flush_window_us: 500,
+        storage_flush_threshold_records: 256,
+        storage_flush_threshold_bytes: 1_048_576,
+        storage_sync_interval_ms: 10,
+        storage_sync_bytes: 4 * 1024 * 1024,
+        delivery_buffer: 8192,
     };
 
     tokio::spawn(async move {
@@ -42,7 +42,10 @@ async fn leases_endpoint_noop_backend_returns_empty_list() {
     assert_eq!(resp.status(), 200);
 
     let body: Vec<serde_json::Value> = resp.json().await.unwrap();
-    assert!(body.is_empty(), "noop backend should return empty lease list");
+    assert!(
+        body.is_empty(),
+        "noop backend should return empty lease list"
+    );
 }
 
 #[tokio::test]
@@ -95,7 +98,9 @@ async fn ensure_schema(schema: &str) {
     let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
         .await
         .expect("connect to postgres");
-    tokio::spawn(async move { let _ = connection.await; });
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
     let sql = format!("CREATE SCHEMA IF NOT EXISTS {schema}");
     client.execute(&sql, &[]).await.expect("create schema");
 }
@@ -131,8 +136,14 @@ async fn leases_endpoint_postgres_backend_returns_single_cluster_leader_row() {
         "expected exactly one lease (cluster:leader); got {body:?}"
     );
     assert_eq!(body[0]["name"], "cluster:leader");
-    assert!(body[0]["holder"].is_string(), "holder should be a UUID string");
-    assert!(body[0]["expires_at"].is_string(), "expires_at should be a timestamp string");
+    assert!(
+        body[0]["holder"].is_string(),
+        "holder should be a UUID string"
+    );
+    assert!(
+        body[0]["expires_at"].is_string(),
+        "expires_at should be a timestamp string"
+    );
     // `replication_endpoint` is serialized unconditionally. The test
     // server is started without a cluster-bind listener, so this row
     // carries `null`. A real leader with a bound cluster listener would

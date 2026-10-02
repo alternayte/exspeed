@@ -1,11 +1,11 @@
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use crate::driver::Target;
 use crate::driver::exspeed::{ConsumerStats, ProducerStats};
+use crate::driver::Target;
 
 pub async fn ensure_stream(target: Target, addr: &str, stream: &str) -> Result<()> {
     match target {
@@ -34,14 +34,26 @@ pub async fn run_producer(
     match target {
         Target::Exspeed => {
             crate::driver::exspeed::run_producer(
-                addr, stream, payload_bytes, duration, tasks, origin, shared,
+                addr,
+                stream,
+                payload_bytes,
+                duration,
+                tasks,
+                origin,
+                shared,
             )
             .await
         }
         #[cfg(feature = "comparison")]
         Target::Kafka => {
             crate::driver::kafka::run_producer(
-                addr, stream, payload_bytes, duration, tasks, origin, shared,
+                addr,
+                stream,
+                payload_bytes,
+                duration,
+                tasks,
+                origin,
+                shared,
             )
             .await
         }
@@ -60,7 +72,12 @@ pub async fn run_producer_at_rate(
     match target {
         Target::Exspeed => {
             crate::driver::exspeed::run_producer_at_rate(
-                addr, stream, payload_bytes, duration, rate, origin,
+                addr,
+                stream,
+                payload_bytes,
+                duration,
+                rate,
+                origin,
             )
             .await
         }
@@ -68,7 +85,13 @@ pub async fn run_producer_at_rate(
         Target::Kafka => {
             let shared = Arc::new(AtomicU64::new(0));
             crate::driver::kafka::run_producer(
-                addr, stream, payload_bytes, duration, 1, origin, shared,
+                addr,
+                stream,
+                payload_bytes,
+                duration,
+                1,
+                origin,
+                shared,
             )
             .await
         }

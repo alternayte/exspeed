@@ -88,10 +88,8 @@ where
 
     match tls {
         Some(paths) => {
-            let cfg = axum_server::tls_rustls::RustlsConfig::from_pem_file(
-                &paths.cert, &paths.key,
-            )
-            .await?;
+            let cfg = axum_server::tls_rustls::RustlsConfig::from_pem_file(&paths.cert, &paths.key)
+                .await?;
             info!("HTTP API listening on {} (TLS)", addr);
             axum_server::bind_rustls(addr, cfg)
                 .handle(handle)

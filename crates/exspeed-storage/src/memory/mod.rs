@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use exspeed_common::{Offset, StreamName};
-use exspeed_streams::{Record, StorageEngine, StorageError, StoredRecord};
+use exspeed_streams::{Record, StorageEngine, StorageError, StoredRecord, StreamConfig};
 
 /// Per-stream state: the retained records and the next offset to assign.
 ///
@@ -15,6 +15,7 @@ use exspeed_streams::{Record, StorageEngine, StorageError, StoredRecord};
 struct StreamState {
     records: Vec<StoredRecord>,
     next_offset: u64,
+    config: StreamConfig,
 }
 
 impl StreamState {
@@ -22,6 +23,7 @@ impl StreamState {
         Self {
             records: Vec::new(),
             next_offset: 0,
+            config: StreamConfig::default(),
         }
     }
 }
@@ -53,6 +55,37 @@ fn now_nanos() -> u64 {
 
 #[async_trait]
 impl StorageEngine for MemoryStorage {
+    async fn create_stream_with(
+        &self,
+        stream: &StreamName,
+        config: &StreamConfig,
+    ) -> Result<(), StorageError> {
+        self.create_stream(stream, config.max_age_secs, config.max_bytes)
+            .await?;
+        self.update_stream_config(stream, config).await
+    }
+
+    async fn stream_config(&self, stream: &StreamName) -> Result<StreamConfig, StorageError> {
+        let streams = self.streams.read().unwrap();
+        streams
+            .get(stream.as_str())
+            .map(|s| s.config.clone())
+            .ok_or_else(|| StorageError::StreamNotFound(stream.clone()))
+    }
+
+    async fn update_stream_config(
+        &self,
+        stream: &StreamName,
+        config: &StreamConfig,
+    ) -> Result<(), StorageError> {
+        let mut streams = self.streams.write().unwrap();
+        let state = streams
+            .get_mut(stream.as_str())
+            .ok_or_else(|| StorageError::StreamNotFound(stream.clone()))?;
+        state.config = config.clone();
+        Ok(())
+    }
+
     async fn create_stream(
         &self,
         stream: &StreamName,
@@ -127,9 +160,7 @@ impl StorageEngine for MemoryStorage {
 
         // Records are stored in offset order; find the first record whose
         // offset >= `from` and take up to `max_records` from there.
-        let first_idx = state
-            .records
-            .partition_point(|r| r.offset.0 < from.0);
+        let first_idx = state.records.partition_point(|r| r.offset.0 < from.0);
         if first_idx >= state.records.len() {
             return Ok(Vec::new());
         }
@@ -137,7 +168,11 @@ impl StorageEngine for MemoryStorage {
         Ok(state.records[first_idx..end].to_vec())
     }
 
-    async fn seek_by_time(&self, stream: &StreamName, timestamp: u64) -> Result<Offset, StorageError> {
+    async fn seek_by_time(
+        &self,
+        stream: &StreamName,
+        timestamp: u64,
+    ) -> Result<Offset, StorageError> {
         let map = self.streams.read().unwrap();
         let name = stream.as_str().to_string();
         let state = map
@@ -161,11 +196,7 @@ impl StorageEngine for MemoryStorage {
         Ok(streams)
     }
 
-    async fn trim_up_to(
-        &self,
-        stream: &StreamName,
-        keep_from: Offset,
-    ) -> Result<(), StorageError> {
+    async fn trim_up_to(&self, stream: &StreamName, keep_from: Offset) -> Result<(), StorageError> {
         let mut map = self.streams.write().unwrap();
         let state = map
             .get_mut(stream.as_str())
@@ -182,10 +213,7 @@ impl StorageEngine for MemoryStorage {
         Ok(())
     }
 
-    async fn stream_bounds(
-        &self,
-        stream: &StreamName,
-    ) -> Result<(Offset, Offset), StorageError> {
+    async fn stream_bounds(&self, stream: &StreamName) -> Result<(Offset, Offset), StorageError> {
         let map = self.streams.read().unwrap();
         let state = map
             .get(stream.as_str())

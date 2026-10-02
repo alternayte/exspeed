@@ -299,12 +299,28 @@ pub fn annotate_scans(plan: PhysicalPlan) -> PhysicalPlan {
 
 fn annotate_with_seed(plan: PhysicalPlan, seed: ColumnSet) -> PhysicalPlan {
     match plan {
-        PhysicalPlan::SeqScan { stream, alias, predicate, reverse_limit, timestamp_lower_bound, key_eq_filter, .. } => {
+        PhysicalPlan::SeqScan {
+            stream,
+            alias,
+            predicate,
+            reverse_limit,
+            timestamp_lower_bound,
+            key_eq_filter,
+            ..
+        } => {
             let mut cs = seed;
             if let Some(ref pred) = predicate {
                 collect_columns(pred, &mut cs);
             }
-            PhysicalPlan::SeqScan { stream, alias, required_columns: cs, predicate, reverse_limit, timestamp_lower_bound, key_eq_filter }
+            PhysicalPlan::SeqScan {
+                stream,
+                alias,
+                required_columns: cs,
+                predicate,
+                reverse_limit,
+                timestamp_lower_bound,
+                key_eq_filter,
+            }
         }
         PhysicalPlan::ExternalScan { .. } => plan,
         PhysicalPlan::Filter { input, predicate } => {
@@ -335,16 +351,24 @@ fn annotate_with_seed(plan: PhysicalPlan, seed: ColumnSet) -> PhysicalPlan {
                 order_by,
             }
         }
-        PhysicalPlan::Limit { input, limit, offset } => {
-            PhysicalPlan::Limit {
-                input: Box::new(annotate_with_seed(*input, seed)),
-                limit,
-                offset,
-            }
-        }
-        PhysicalPlan::HashAggregate { input, group_by, select_items } => {
+        PhysicalPlan::Limit {
+            input,
+            limit,
+            offset,
+        } => PhysicalPlan::Limit {
+            input: Box::new(annotate_with_seed(*input, seed)),
+            limit,
+            offset,
+        },
+        PhysicalPlan::HashAggregate {
+            input,
+            group_by,
+            select_items,
+        } => {
             let mut cs = ColumnSet::default();
-            for g in &group_by { collect_columns(g, &mut cs); }
+            for g in &group_by {
+                collect_columns(g, &mut cs);
+            }
             collect_from_projection(&select_items, &mut cs);
             PhysicalPlan::HashAggregate {
                 input: Box::new(annotate_with_seed(*input, cs)),
@@ -353,17 +377,31 @@ fn annotate_with_seed(plan: PhysicalPlan, seed: ColumnSet) -> PhysicalPlan {
             }
         }
         PhysicalPlan::WindowedAggregate {
-            input, window_size, group_by, select_items, emit_mode,
+            input,
+            window_size,
+            group_by,
+            select_items,
+            emit_mode,
         } => {
             let mut cs = ColumnSet::default();
-            for g in &group_by { collect_columns(g, &mut cs); }
+            for g in &group_by {
+                collect_columns(g, &mut cs);
+            }
             collect_from_projection(&select_items, &mut cs);
             PhysicalPlan::WindowedAggregate {
                 input: Box::new(annotate_with_seed(*input, cs)),
-                window_size, group_by, select_items, emit_mode,
+                window_size,
+                group_by,
+                select_items,
+                emit_mode,
             }
         }
-        PhysicalPlan::HashJoin { left, right, on, join_type } => {
+        PhysicalPlan::HashJoin {
+            left,
+            right,
+            on,
+            join_type,
+        } => {
             let mut cs = ColumnSet::default();
             collect_columns(&on, &mut cs);
             PhysicalPlan::HashJoin {
@@ -373,16 +411,28 @@ fn annotate_with_seed(plan: PhysicalPlan, seed: ColumnSet) -> PhysicalPlan {
                 join_type,
             }
         }
-        PhysicalPlan::StreamStreamJoin { left, right, on, within, join_type } => {
+        PhysicalPlan::StreamStreamJoin {
+            left,
+            right,
+            on,
+            within,
+            join_type,
+        } => {
             let mut cs = ColumnSet::default();
             collect_columns(&on, &mut cs);
             PhysicalPlan::StreamStreamJoin {
                 left: Box::new(annotate_with_seed(*left, cs.clone())),
                 right: Box::new(annotate_with_seed(*right, cs)),
-                on, within, join_type,
+                on,
+                within,
+                join_type,
             }
         }
-        PhysicalPlan::TopN { input, order_by, limit } => {
+        PhysicalPlan::TopN {
+            input,
+            order_by,
+            limit,
+        } => {
             let mut cs = seed;
             for key in &order_by {
                 collect_columns(&key.expr, &mut cs);
@@ -406,17 +456,29 @@ fn annotate_with_seed(plan: PhysicalPlan, seed: ColumnSet) -> PhysicalPlan {
 /// after materialisation.
 fn push_down_filters(plan: PhysicalPlan) -> PhysicalPlan {
     match plan {
-        PhysicalPlan::Filter { input, predicate } => {
-            match *input {
-                PhysicalPlan::SeqScan { stream, alias, required_columns, predicate: None, reverse_limit, timestamp_lower_bound, key_eq_filter } => {
-                    PhysicalPlan::SeqScan { stream, alias, required_columns, predicate: Some(predicate), reverse_limit, timestamp_lower_bound, key_eq_filter }
-                }
-                other => PhysicalPlan::Filter {
-                    input: Box::new(push_down_filters(other)),
-                    predicate,
-                },
-            }
-        }
+        PhysicalPlan::Filter { input, predicate } => match *input {
+            PhysicalPlan::SeqScan {
+                stream,
+                alias,
+                required_columns,
+                predicate: None,
+                reverse_limit,
+                timestamp_lower_bound,
+                key_eq_filter,
+            } => PhysicalPlan::SeqScan {
+                stream,
+                alias,
+                required_columns,
+                predicate: Some(predicate),
+                reverse_limit,
+                timestamp_lower_bound,
+                key_eq_filter,
+            },
+            other => PhysicalPlan::Filter {
+                input: Box::new(push_down_filters(other)),
+                predicate,
+            },
+        },
         PhysicalPlan::Project { input, items } => PhysicalPlan::Project {
             input: Box::new(push_down_filters(*input)),
             items,
@@ -425,33 +487,69 @@ fn push_down_filters(plan: PhysicalPlan) -> PhysicalPlan {
             input: Box::new(push_down_filters(*input)),
             order_by,
         },
-        PhysicalPlan::Limit { input, limit, offset } => PhysicalPlan::Limit {
+        PhysicalPlan::Limit {
+            input,
+            limit,
+            offset,
+        } => PhysicalPlan::Limit {
             input: Box::new(push_down_filters(*input)),
             limit,
             offset,
         },
-        PhysicalPlan::HashAggregate { input, group_by, select_items } => PhysicalPlan::HashAggregate {
+        PhysicalPlan::HashAggregate {
+            input,
+            group_by,
+            select_items,
+        } => PhysicalPlan::HashAggregate {
             input: Box::new(push_down_filters(*input)),
             group_by,
             select_items,
         },
-        PhysicalPlan::WindowedAggregate { input, window_size, group_by, select_items, emit_mode } => PhysicalPlan::WindowedAggregate {
+        PhysicalPlan::WindowedAggregate {
+            input,
+            window_size,
+            group_by,
+            select_items,
+            emit_mode,
+        } => PhysicalPlan::WindowedAggregate {
             input: Box::new(push_down_filters(*input)),
-            window_size, group_by, select_items, emit_mode,
+            window_size,
+            group_by,
+            select_items,
+            emit_mode,
         },
-        PhysicalPlan::HashJoin { left, right, on, join_type } => PhysicalPlan::HashJoin {
+        PhysicalPlan::HashJoin {
+            left,
+            right,
+            on,
+            join_type,
+        } => PhysicalPlan::HashJoin {
             left: Box::new(push_down_filters(*left)),
             right: Box::new(push_down_filters(*right)),
-            on, join_type,
+            on,
+            join_type,
         },
-        PhysicalPlan::StreamStreamJoin { left, right, on, within, join_type } => PhysicalPlan::StreamStreamJoin {
+        PhysicalPlan::StreamStreamJoin {
+            left,
+            right,
+            on,
+            within,
+            join_type,
+        } => PhysicalPlan::StreamStreamJoin {
             left: Box::new(push_down_filters(*left)),
             right: Box::new(push_down_filters(*right)),
-            on, within, join_type,
+            on,
+            within,
+            join_type,
         },
-        PhysicalPlan::TopN { input, order_by, limit } => PhysicalPlan::TopN {
+        PhysicalPlan::TopN {
+            input,
+            order_by,
+            limit,
+        } => PhysicalPlan::TopN {
             input: Box::new(push_down_filters(*input)),
-            order_by, limit,
+            order_by,
+            limit,
         },
         PhysicalPlan::IndexScan { .. } => plan,
         other => other,
@@ -468,16 +566,24 @@ fn push_down_filters(plan: PhysicalPlan) -> PhysicalPlan {
 /// - TopN heap (any other ORDER BY + LIMIT)
 fn optimize_sort_limit(plan: PhysicalPlan) -> PhysicalPlan {
     match plan {
-        PhysicalPlan::Limit { input, limit, offset } => {
+        PhysicalPlan::Limit {
+            input,
+            limit,
+            offset,
+        } => {
             match *input {
-                PhysicalPlan::Sort { input: sort_input, order_by } => {
+                PhysicalPlan::Sort {
+                    input: sort_input,
+                    order_by,
+                } => {
                     if let Some(lim) = limit {
                         // ORDER BY offset DESC LIMIT N → reverse-tail scan
                         if is_single_offset_order(&order_by) {
                             if order_by[0].descending {
                                 return PhysicalPlan::Limit {
                                     input: Box::new(set_reverse_limit(
-                                        optimize_sort_limit(*sort_input), lim,
+                                        optimize_sort_limit(*sort_input),
+                                        lim,
                                     )),
                                     limit: Some(lim),
                                     offset,
@@ -522,7 +628,8 @@ fn optimize_sort_limit(plan: PhysicalPlan) -> PhysicalPlan {
         }
         PhysicalPlan::Sort { input, order_by } => {
             // Standalone ORDER BY offset ASC on a naturally-ordered tree → no-op
-            if is_single_offset_order(&order_by) && !order_by[0].descending
+            if is_single_offset_order(&order_by)
+                && !order_by[0].descending
                 && subtree_preserves_offset_order(&input)
             {
                 return optimize_sort_limit(*input);
@@ -533,30 +640,67 @@ fn optimize_sort_limit(plan: PhysicalPlan) -> PhysicalPlan {
             }
         }
         PhysicalPlan::Project { input, items } => PhysicalPlan::Project {
-            input: Box::new(optimize_sort_limit(*input)), items,
+            input: Box::new(optimize_sort_limit(*input)),
+            items,
         },
         PhysicalPlan::Filter { input, predicate } => PhysicalPlan::Filter {
-            input: Box::new(optimize_sort_limit(*input)), predicate,
-        },
-        PhysicalPlan::TopN { input, order_by, limit } => PhysicalPlan::TopN {
-            input: Box::new(optimize_sort_limit(*input)), order_by, limit,
-        },
-        PhysicalPlan::HashAggregate { input, group_by, select_items } => PhysicalPlan::HashAggregate {
-            input: Box::new(optimize_sort_limit(*input)), group_by, select_items,
-        },
-        PhysicalPlan::HashJoin { left, right, on, join_type } => PhysicalPlan::HashJoin {
-            left: Box::new(optimize_sort_limit(*left)),
-            right: Box::new(optimize_sort_limit(*right)),
-            on, join_type,
-        },
-        PhysicalPlan::StreamStreamJoin { left, right, on, within, join_type } => PhysicalPlan::StreamStreamJoin {
-            left: Box::new(optimize_sort_limit(*left)),
-            right: Box::new(optimize_sort_limit(*right)),
-            on, within, join_type,
-        },
-        PhysicalPlan::WindowedAggregate { input, window_size, group_by, select_items, emit_mode } => PhysicalPlan::WindowedAggregate {
             input: Box::new(optimize_sort_limit(*input)),
-            window_size, group_by, select_items, emit_mode,
+            predicate,
+        },
+        PhysicalPlan::TopN {
+            input,
+            order_by,
+            limit,
+        } => PhysicalPlan::TopN {
+            input: Box::new(optimize_sort_limit(*input)),
+            order_by,
+            limit,
+        },
+        PhysicalPlan::HashAggregate {
+            input,
+            group_by,
+            select_items,
+        } => PhysicalPlan::HashAggregate {
+            input: Box::new(optimize_sort_limit(*input)),
+            group_by,
+            select_items,
+        },
+        PhysicalPlan::HashJoin {
+            left,
+            right,
+            on,
+            join_type,
+        } => PhysicalPlan::HashJoin {
+            left: Box::new(optimize_sort_limit(*left)),
+            right: Box::new(optimize_sort_limit(*right)),
+            on,
+            join_type,
+        },
+        PhysicalPlan::StreamStreamJoin {
+            left,
+            right,
+            on,
+            within,
+            join_type,
+        } => PhysicalPlan::StreamStreamJoin {
+            left: Box::new(optimize_sort_limit(*left)),
+            right: Box::new(optimize_sort_limit(*right)),
+            on,
+            within,
+            join_type,
+        },
+        PhysicalPlan::WindowedAggregate {
+            input,
+            window_size,
+            group_by,
+            select_items,
+            emit_mode,
+        } => PhysicalPlan::WindowedAggregate {
+            input: Box::new(optimize_sort_limit(*input)),
+            window_size,
+            group_by,
+            select_items,
+            emit_mode,
         },
         PhysicalPlan::IndexScan { .. } => plan,
         other => other,
@@ -584,14 +728,30 @@ fn subtree_preserves_offset_order(plan: &PhysicalPlan) -> bool {
 /// Push `reverse_limit` down through order-preserving nodes into the `SeqScan`.
 fn set_reverse_limit(plan: PhysicalPlan, limit: u64) -> PhysicalPlan {
     match plan {
-        PhysicalPlan::SeqScan { stream, alias, required_columns, predicate, timestamp_lower_bound, key_eq_filter, .. } => {
-            PhysicalPlan::SeqScan { stream, alias, required_columns, predicate, reverse_limit: Some(limit), timestamp_lower_bound, key_eq_filter }
-        }
+        PhysicalPlan::SeqScan {
+            stream,
+            alias,
+            required_columns,
+            predicate,
+            timestamp_lower_bound,
+            key_eq_filter,
+            ..
+        } => PhysicalPlan::SeqScan {
+            stream,
+            alias,
+            required_columns,
+            predicate,
+            reverse_limit: Some(limit),
+            timestamp_lower_bound,
+            key_eq_filter,
+        },
         PhysicalPlan::Project { input, items } => PhysicalPlan::Project {
-            input: Box::new(set_reverse_limit(*input, limit)), items,
+            input: Box::new(set_reverse_limit(*input, limit)),
+            items,
         },
         PhysicalPlan::Filter { input, predicate } => PhysicalPlan::Filter {
-            input: Box::new(set_reverse_limit(*input, limit)), predicate,
+            input: Box::new(set_reverse_limit(*input, limit)),
+            predicate,
         },
         other => other,
     }
@@ -607,44 +767,101 @@ fn set_reverse_limit(plan: PhysicalPlan, limit: u64) -> PhysicalPlan {
 /// storage layer can skip segments via the TimeIndex.
 fn extract_timestamp_bounds(plan: PhysicalPlan) -> PhysicalPlan {
     match plan {
-        PhysicalPlan::SeqScan { stream, alias, required_columns, predicate, reverse_limit, key_eq_filter, .. } => {
+        PhysicalPlan::SeqScan {
+            stream,
+            alias,
+            required_columns,
+            predicate,
+            reverse_limit,
+            key_eq_filter,
+            ..
+        } => {
             let bound = predicate.as_ref().and_then(extract_timestamp_lower_bound);
             PhysicalPlan::SeqScan {
-                stream, alias, required_columns, predicate, reverse_limit,
-                timestamp_lower_bound: bound, key_eq_filter,
+                stream,
+                alias,
+                required_columns,
+                predicate,
+                reverse_limit,
+                timestamp_lower_bound: bound,
+                key_eq_filter,
             }
         }
         PhysicalPlan::Project { input, items } => PhysicalPlan::Project {
-            input: Box::new(extract_timestamp_bounds(*input)), items,
+            input: Box::new(extract_timestamp_bounds(*input)),
+            items,
         },
         PhysicalPlan::Filter { input, predicate } => PhysicalPlan::Filter {
-            input: Box::new(extract_timestamp_bounds(*input)), predicate,
+            input: Box::new(extract_timestamp_bounds(*input)),
+            predicate,
         },
-        PhysicalPlan::Limit { input, limit, offset } => PhysicalPlan::Limit {
-            input: Box::new(extract_timestamp_bounds(*input)), limit, offset,
+        PhysicalPlan::Limit {
+            input,
+            limit,
+            offset,
+        } => PhysicalPlan::Limit {
+            input: Box::new(extract_timestamp_bounds(*input)),
+            limit,
+            offset,
         },
-        PhysicalPlan::TopN { input, order_by, limit } => PhysicalPlan::TopN {
-            input: Box::new(extract_timestamp_bounds(*input)), order_by, limit,
+        PhysicalPlan::TopN {
+            input,
+            order_by,
+            limit,
+        } => PhysicalPlan::TopN {
+            input: Box::new(extract_timestamp_bounds(*input)),
+            order_by,
+            limit,
         },
         PhysicalPlan::Sort { input, order_by } => PhysicalPlan::Sort {
-            input: Box::new(extract_timestamp_bounds(*input)), order_by,
-        },
-        PhysicalPlan::HashAggregate { input, group_by, select_items } => PhysicalPlan::HashAggregate {
-            input: Box::new(extract_timestamp_bounds(*input)), group_by, select_items,
-        },
-        PhysicalPlan::HashJoin { left, right, on, join_type } => PhysicalPlan::HashJoin {
-            left: Box::new(extract_timestamp_bounds(*left)),
-            right: Box::new(extract_timestamp_bounds(*right)),
-            on, join_type,
-        },
-        PhysicalPlan::StreamStreamJoin { left, right, on, within, join_type } => PhysicalPlan::StreamStreamJoin {
-            left: Box::new(extract_timestamp_bounds(*left)),
-            right: Box::new(extract_timestamp_bounds(*right)),
-            on, within, join_type,
-        },
-        PhysicalPlan::WindowedAggregate { input, window_size, group_by, select_items, emit_mode } => PhysicalPlan::WindowedAggregate {
             input: Box::new(extract_timestamp_bounds(*input)),
-            window_size, group_by, select_items, emit_mode,
+            order_by,
+        },
+        PhysicalPlan::HashAggregate {
+            input,
+            group_by,
+            select_items,
+        } => PhysicalPlan::HashAggregate {
+            input: Box::new(extract_timestamp_bounds(*input)),
+            group_by,
+            select_items,
+        },
+        PhysicalPlan::HashJoin {
+            left,
+            right,
+            on,
+            join_type,
+        } => PhysicalPlan::HashJoin {
+            left: Box::new(extract_timestamp_bounds(*left)),
+            right: Box::new(extract_timestamp_bounds(*right)),
+            on,
+            join_type,
+        },
+        PhysicalPlan::StreamStreamJoin {
+            left,
+            right,
+            on,
+            within,
+            join_type,
+        } => PhysicalPlan::StreamStreamJoin {
+            left: Box::new(extract_timestamp_bounds(*left)),
+            right: Box::new(extract_timestamp_bounds(*right)),
+            on,
+            within,
+            join_type,
+        },
+        PhysicalPlan::WindowedAggregate {
+            input,
+            window_size,
+            group_by,
+            select_items,
+            emit_mode,
+        } => PhysicalPlan::WindowedAggregate {
+            input: Box::new(extract_timestamp_bounds(*input)),
+            window_size,
+            group_by,
+            select_items,
+            emit_mode,
         },
         PhysicalPlan::IndexScan { .. } => plan,
         other => other,
@@ -697,44 +914,101 @@ fn extract_timestamp_lower_bound(expr: &Expr) -> Option<u64> {
 /// `key_eq_filter` so the storage layer can skip segments via bloom filters.
 fn extract_key_eq_filter(plan: PhysicalPlan) -> PhysicalPlan {
     match plan {
-        PhysicalPlan::SeqScan { stream, alias, required_columns, predicate, reverse_limit, timestamp_lower_bound, .. } => {
+        PhysicalPlan::SeqScan {
+            stream,
+            alias,
+            required_columns,
+            predicate,
+            reverse_limit,
+            timestamp_lower_bound,
+            ..
+        } => {
             let key_filter = predicate.as_ref().and_then(find_key_equality);
             PhysicalPlan::SeqScan {
-                stream, alias, required_columns, predicate, reverse_limit,
-                timestamp_lower_bound, key_eq_filter: key_filter,
+                stream,
+                alias,
+                required_columns,
+                predicate,
+                reverse_limit,
+                timestamp_lower_bound,
+                key_eq_filter: key_filter,
             }
         }
         PhysicalPlan::Project { input, items } => PhysicalPlan::Project {
-            input: Box::new(extract_key_eq_filter(*input)), items,
+            input: Box::new(extract_key_eq_filter(*input)),
+            items,
         },
         PhysicalPlan::Filter { input, predicate } => PhysicalPlan::Filter {
-            input: Box::new(extract_key_eq_filter(*input)), predicate,
+            input: Box::new(extract_key_eq_filter(*input)),
+            predicate,
         },
-        PhysicalPlan::Limit { input, limit, offset } => PhysicalPlan::Limit {
-            input: Box::new(extract_key_eq_filter(*input)), limit, offset,
+        PhysicalPlan::Limit {
+            input,
+            limit,
+            offset,
+        } => PhysicalPlan::Limit {
+            input: Box::new(extract_key_eq_filter(*input)),
+            limit,
+            offset,
         },
-        PhysicalPlan::TopN { input, order_by, limit } => PhysicalPlan::TopN {
-            input: Box::new(extract_key_eq_filter(*input)), order_by, limit,
+        PhysicalPlan::TopN {
+            input,
+            order_by,
+            limit,
+        } => PhysicalPlan::TopN {
+            input: Box::new(extract_key_eq_filter(*input)),
+            order_by,
+            limit,
         },
         PhysicalPlan::Sort { input, order_by } => PhysicalPlan::Sort {
-            input: Box::new(extract_key_eq_filter(*input)), order_by,
-        },
-        PhysicalPlan::HashAggregate { input, group_by, select_items } => PhysicalPlan::HashAggregate {
-            input: Box::new(extract_key_eq_filter(*input)), group_by, select_items,
-        },
-        PhysicalPlan::HashJoin { left, right, on, join_type } => PhysicalPlan::HashJoin {
-            left: Box::new(extract_key_eq_filter(*left)),
-            right: Box::new(extract_key_eq_filter(*right)),
-            on, join_type,
-        },
-        PhysicalPlan::StreamStreamJoin { left, right, on, within, join_type } => PhysicalPlan::StreamStreamJoin {
-            left: Box::new(extract_key_eq_filter(*left)),
-            right: Box::new(extract_key_eq_filter(*right)),
-            on, within, join_type,
-        },
-        PhysicalPlan::WindowedAggregate { input, window_size, group_by, select_items, emit_mode } => PhysicalPlan::WindowedAggregate {
             input: Box::new(extract_key_eq_filter(*input)),
-            window_size, group_by, select_items, emit_mode,
+            order_by,
+        },
+        PhysicalPlan::HashAggregate {
+            input,
+            group_by,
+            select_items,
+        } => PhysicalPlan::HashAggregate {
+            input: Box::new(extract_key_eq_filter(*input)),
+            group_by,
+            select_items,
+        },
+        PhysicalPlan::HashJoin {
+            left,
+            right,
+            on,
+            join_type,
+        } => PhysicalPlan::HashJoin {
+            left: Box::new(extract_key_eq_filter(*left)),
+            right: Box::new(extract_key_eq_filter(*right)),
+            on,
+            join_type,
+        },
+        PhysicalPlan::StreamStreamJoin {
+            left,
+            right,
+            on,
+            within,
+            join_type,
+        } => PhysicalPlan::StreamStreamJoin {
+            left: Box::new(extract_key_eq_filter(*left)),
+            right: Box::new(extract_key_eq_filter(*right)),
+            on,
+            within,
+            join_type,
+        },
+        PhysicalPlan::WindowedAggregate {
+            input,
+            window_size,
+            group_by,
+            select_items,
+            emit_mode,
+        } => PhysicalPlan::WindowedAggregate {
+            input: Box::new(extract_key_eq_filter(*input)),
+            window_size,
+            group_by,
+            select_items,
+            emit_mode,
         },
         PhysicalPlan::IndexScan { .. } => plan,
         other => other,
@@ -747,7 +1021,11 @@ fn extract_key_eq_filter(plan: PhysicalPlan) -> PhysicalPlan {
 /// nested inside an AND tree (returns the first match).
 fn find_key_equality(expr: &Expr) -> Option<String> {
     match expr {
-        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
             if matches!(left.as_ref(), Expr::Column { name, .. } if name == "key") {
                 if let Expr::Literal(LiteralValue::String(s)) = right.as_ref() {
                     return Some(s.clone());
@@ -760,9 +1038,11 @@ fn find_key_equality(expr: &Expr) -> Option<String> {
             }
             None
         }
-        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
-            find_key_equality(left).or_else(|| find_key_equality(right))
-        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => find_key_equality(left).or_else(|| find_key_equality(right)),
         _ => None,
     }
 }
@@ -806,7 +1086,11 @@ mod tests {
                 // After predicate pushdown: Project → SeqScan { predicate: Some(..) }
                 match p {
                     PhysicalPlan::Project { input, .. } => match *input {
-                        PhysicalPlan::SeqScan { ref predicate, ref stream, .. } => {
+                        PhysicalPlan::SeqScan {
+                            ref predicate,
+                            ref stream,
+                            ..
+                        } => {
                             assert!(predicate.is_some(), "predicate should be pushed into scan");
                             assert_eq!(stream, "orders");
                         }
@@ -1158,15 +1442,17 @@ mod tests {
             ExqlStatement::Query(q) => {
                 let p = plan(&q, EmitMode::Changes).unwrap();
                 match p {
-                    PhysicalPlan::Project { input, .. } => {
-                        match *input {
-                            PhysicalPlan::SeqScan { ref predicate, ref stream, .. } => {
-                                assert!(predicate.is_some(), "predicate should be pushed into scan");
-                                assert_eq!(stream, "orders");
-                            }
-                            other => panic!("expected SeqScan with pushed predicate, got {other:?}"),
+                    PhysicalPlan::Project { input, .. } => match *input {
+                        PhysicalPlan::SeqScan {
+                            ref predicate,
+                            ref stream,
+                            ..
+                        } => {
+                            assert!(predicate.is_some(), "predicate should be pushed into scan");
+                            assert_eq!(stream, "orders");
                         }
-                    }
+                        other => panic!("expected SeqScan with pushed predicate, got {other:?}"),
+                    },
                     other => panic!("expected Project, got {other:?}"),
                 }
             }
@@ -1177,8 +1463,9 @@ mod tests {
     #[test]
     fn no_pushdown_filter_above_join() {
         let stmt = crate::parser::parse(
-            r#"SELECT * FROM "a" JOIN "b" ON a.key = b.key WHERE a.key = 'x'"#
-        ).unwrap();
+            r#"SELECT * FROM "a" JOIN "b" ON a.key = b.key WHERE a.key = 'x'"#,
+        )
+        .unwrap();
         match stmt {
             ExqlStatement::Query(q) => {
                 let p = plan(&q, EmitMode::Changes).unwrap();
@@ -1186,7 +1473,8 @@ mod tests {
                     PhysicalPlan::Project { input, .. } => {
                         assert!(
                             matches!(*input, PhysicalPlan::Filter { .. }),
-                            "filter above join should NOT be pushed down, got {:?}", *input
+                            "filter above join should NOT be pushed down, got {:?}",
+                            *input
                         );
                     }
                     other => panic!("expected Project, got {other:?}"),
@@ -1198,12 +1486,16 @@ mod tests {
 
     #[test]
     fn plan_offset_asc_eliminates_sort() {
-        let stmt = crate::parser::parse(r#"SELECT * FROM "orders" ORDER BY offset ASC LIMIT 10"#).unwrap();
+        let stmt =
+            crate::parser::parse(r#"SELECT * FROM "orders" ORDER BY offset ASC LIMIT 10"#).unwrap();
         match stmt {
             ExqlStatement::Query(q) => {
                 let p = plan(&q, EmitMode::Changes).unwrap();
                 let debug = format!("{p:?}");
-                assert!(!debug.contains("Sort"), "Sort should be eliminated for ORDER BY offset ASC, got: {debug}");
+                assert!(
+                    !debug.contains("Sort"),
+                    "Sort should be eliminated for ORDER BY offset ASC, got: {debug}"
+                );
             }
             _ => panic!("expected Query"),
         }
@@ -1211,13 +1503,20 @@ mod tests {
 
     #[test]
     fn plan_offset_desc_limit_uses_reverse_scan() {
-        let stmt = crate::parser::parse(r#"SELECT * FROM "orders" ORDER BY offset DESC LIMIT 5"#).unwrap();
+        let stmt =
+            crate::parser::parse(r#"SELECT * FROM "orders" ORDER BY offset DESC LIMIT 5"#).unwrap();
         match stmt {
             ExqlStatement::Query(q) => {
                 let p = plan(&q, EmitMode::Changes).unwrap();
                 let debug = format!("{p:?}");
-                assert!(!debug.contains("Sort"), "Sort should be eliminated, got: {debug}");
-                assert!(debug.contains("reverse_limit: Some(5)"), "should set reverse_limit, got: {debug}");
+                assert!(
+                    !debug.contains("Sort"),
+                    "Sort should be eliminated, got: {debug}"
+                );
+                assert!(
+                    debug.contains("reverse_limit: Some(5)"),
+                    "should set reverse_limit, got: {debug}"
+                );
             }
             _ => panic!("expected Query"),
         }
@@ -1225,12 +1524,17 @@ mod tests {
 
     #[test]
     fn plan_timestamp_desc_limit_uses_topn() {
-        let stmt = crate::parser::parse(r#"SELECT * FROM "orders" ORDER BY timestamp DESC LIMIT 10"#).unwrap();
+        let stmt =
+            crate::parser::parse(r#"SELECT * FROM "orders" ORDER BY timestamp DESC LIMIT 10"#)
+                .unwrap();
         match stmt {
             ExqlStatement::Query(q) => {
                 let p = plan(&q, EmitMode::Changes).unwrap();
                 let debug = format!("{p:?}");
-                assert!(debug.contains("TopN"), "should use TopN for non-offset ORDER BY + LIMIT, got: {debug}");
+                assert!(
+                    debug.contains("TopN"),
+                    "should use TopN for non-offset ORDER BY + LIMIT, got: {debug}"
+                );
             }
             _ => panic!("expected Query"),
         }
@@ -1243,7 +1547,10 @@ mod tests {
             ExqlStatement::Query(q) => {
                 let p = plan(&q, EmitMode::Changes).unwrap();
                 let debug = format!("{p:?}");
-                assert!(debug.contains("Sort"), "unbounded ORDER BY should keep Sort, got: {debug}");
+                assert!(
+                    debug.contains("Sort"),
+                    "unbounded ORDER BY should keep Sort, got: {debug}"
+                );
             }
             _ => panic!("expected Query"),
         }
@@ -1251,9 +1558,9 @@ mod tests {
 
     #[test]
     fn plan_timestamp_filter_extracts_bound() {
-        let stmt = crate::parser::parse(
-            r#"SELECT * FROM "orders" WHERE timestamp > 1700000000000"#
-        ).unwrap();
+        let stmt =
+            crate::parser::parse(r#"SELECT * FROM "orders" WHERE timestamp > 1700000000000"#)
+                .unwrap();
         match stmt {
             ExqlStatement::Query(q) => {
                 let p = plan(&q, EmitMode::Changes).unwrap();
@@ -1269,9 +1576,8 @@ mod tests {
 
     #[test]
     fn plan_key_eq_extracts_filter() {
-        let stmt = crate::parser::parse(
-            r#"SELECT * FROM "orders" WHERE key = 'order-123'"#
-        ).unwrap();
+        let stmt =
+            crate::parser::parse(r#"SELECT * FROM "orders" WHERE key = 'order-123'"#).unwrap();
         match stmt {
             ExqlStatement::Query(q) => {
                 let p = plan(&q, EmitMode::Changes).unwrap();
@@ -1289,8 +1595,8 @@ mod tests {
 #[cfg(test)]
 mod annotate_tests {
     use super::*;
-    use crate::parser::parse;
     use crate::parser::ast::{EmitMode, ExqlStatement};
+    use crate::parser::parse;
     use crate::planner::column_set::ColumnSet;
     use crate::planner::physical::PhysicalPlan;
 
@@ -1306,8 +1612,12 @@ mod annotate_tests {
 
     fn find_scan(plan: &PhysicalPlan) -> &ColumnSet {
         match plan {
-            PhysicalPlan::SeqScan { required_columns, .. }
-            | PhysicalPlan::IndexScan { required_columns, .. } => required_columns,
+            PhysicalPlan::SeqScan {
+                required_columns, ..
+            }
+            | PhysicalPlan::IndexScan {
+                required_columns, ..
+            } => required_columns,
             PhysicalPlan::Filter { input, .. }
             | PhysicalPlan::Project { input, .. }
             | PhysicalPlan::Sort { input, .. }
@@ -1357,7 +1667,10 @@ mod annotate_tests {
         // an aggregate. count(*) must stay harmless.
         let p = plan_for("SELECT key, SUM(payload->>'amount') FROM events GROUP BY key");
         let cs = find_scan(&p);
-        assert!(cs.payload_referenced, "SUM(payload->>...) should mark payload");
+        assert!(
+            cs.payload_referenced,
+            "SUM(payload->>...) should mark payload"
+        );
         assert!(cs.virtual_cols.contains("key"));
     }
 }

@@ -91,7 +91,9 @@ mod tests {
         let found_first = manifest.find_segment(0).expect("should find first segment");
         assert_eq!(found_first.base_offset, 0);
 
-        let found_last = manifest.find_segment(299).expect("should find last segment");
+        let found_last = manifest
+            .find_segment(299)
+            .expect("should find last segment");
         assert_eq!(found_last.base_offset, 200);
 
         let not_found = manifest.find_segment(300);

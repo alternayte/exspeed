@@ -30,8 +30,8 @@ impl S3Config {
         let prefix = std::env::var("EXSPEED_STORAGE_S3_PREFIX")
             .unwrap_or_else(|_| "exspeed/streams/".to_string());
 
-        let region_name = std::env::var("EXSPEED_STORAGE_S3_REGION")
-            .unwrap_or_else(|_| "us-east-1".to_string());
+        let region_name =
+            std::env::var("EXSPEED_STORAGE_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
 
         // Build Region: use Custom when an endpoint is provided (e.g. MinIO).
         let region = match std::env::var("EXSPEED_STORAGE_S3_ENDPOINT") {
@@ -39,7 +39,9 @@ impl S3Config {
                 region: region_name,
                 endpoint,
             },
-            _ => region_name.parse().map_err(|e| format!("invalid S3 region: {e}"))?,
+            _ => region_name
+                .parse()
+                .map_err(|e| format!("invalid S3 region: {e}"))?,
         };
 
         // Build Credentials: explicit keys or fall back to the default chain

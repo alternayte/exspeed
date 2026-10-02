@@ -77,7 +77,7 @@ export interface SubscribeOptions {
    *   Callers MUST attach an "error" listener — Node's default behavior on
    *   an un-listened EventEmitter "error" event is to crash the process.
    */
-  overflowPolicy?: "drop-oldest" | "error";
+  overflowPolicy?: "buffer" | "drop-oldest" | "error";
 }
 
 export interface FetchOptions {

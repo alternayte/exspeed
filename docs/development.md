@@ -12,21 +12,31 @@ cargo test -p exspeed --test exql_test   # one integration test file
 cargo clippy --workspace
 ```
 
-**Disk usage.** Each of the ~50 integration test files links the whole
-server into its own binary, which takes about 540 MB with debug info. A full
-`cargo test` can use more than 25 GB. On a constrained machine, build them
-without debug info:
+Integration tests are compiled into **one binary per crate** (`tests/it/`),
+with one module per former test file. Tests that change process-wide
+environment variables still have their own binaries in `tests/*.rs`. Those
+will be merged once configuration moves into a struct; until then, don't
+add `set_var` calls to modules under `tests/it/`.
+
+On a disk-constrained machine, build without debug info, as CI does:
 
 ```bash
 CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cargo test --workspace
 ```
 
-Consolidating the tests into a single binary is part of Phase 0 of the plan
-in [REVIEW.md](REVIEW.md#6-phased-plan).
+Pick test ports with `exspeed_testkit::pick_unused_port()`. It binds
+`127.0.0.1:0`, so it also works on IPv4-only hosts.
 
-**Integration tests and IPv6.** The integration tests pick ports with
-`portpicker`, which needs both IPv4 and IPv6. On hosts or containers
-without IPv6, every server-starting test fails at `pick_unused_port().unwrap()`.
+## CI
+
+`.github/workflows/ci.yml` runs on every PR. It has four jobs:
+
+| Job | What it runs |
+|-----|--------------|
+| `lint` | `cargo fmt --check` and `cargo clippy -D warnings` |
+| `test` | `cargo test --workspace` |
+| `test-services` | Postgres (with `wal_level=logical`), Redis and MySQL in Docker, then the gated tests with `--include-ignored` |
+| `sdk` | SDK typecheck, test and build |
 
 ## TypeScript SDK
 
@@ -67,7 +77,8 @@ EXSPEED_MSSQL_URL="mssql://sa:Exspeed_Test!1@localhost:1433/master?trust_server_
 ```
 
 The replication and multi-pod tests are `#[ignore]` because they need
-Postgres:
+Postgres. They are currently known to fail, and Phase 6 of the plan replaces
+them:
 
 ```bash
 EXSPEED_OFFSET_STORE_POSTGRES_URL=postgres://testuser:testpass@localhost:5432/testdb \

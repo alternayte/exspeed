@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use s3::creds::Credentials;
 use s3::{Bucket, Region};
 
-use crate::consumer_state::ConsumerConfig;
 use super::{ConsumerStore, ConsumerStoreError};
+use crate::consumer_state::ConsumerConfig;
 
 pub struct S3ConsumerStore {
     bucket: Box<Bucket>,
@@ -16,27 +16,23 @@ impl S3ConsumerStore {
     /// Build from environment variables. Reuses the offset store's S3 connection config.
     pub fn from_env() -> Result<Self, ConsumerStoreError> {
         let bucket_name = env::var("EXSPEED_OFFSET_STORE_S3_BUCKET").map_err(|_| {
-            ConsumerStoreError::Connection(
-                "EXSPEED_OFFSET_STORE_S3_BUCKET is required".to_string(),
-            )
+            ConsumerStoreError::Connection("EXSPEED_OFFSET_STORE_S3_BUCKET is required".to_string())
         })?;
 
         let prefix = env::var("EXSPEED_CONSUMER_STORE_S3_PREFIX")
             .unwrap_or_else(|_| "exspeed/consumers/".to_string());
 
-        let region_name = env::var("EXSPEED_OFFSET_STORE_S3_REGION")
-            .unwrap_or_else(|_| "us-east-1".to_string());
+        let region_name =
+            env::var("EXSPEED_OFFSET_STORE_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
 
         let region = match env::var("EXSPEED_OFFSET_STORE_S3_ENDPOINT") {
             Ok(endpoint) => Region::Custom {
                 region: region_name,
                 endpoint,
             },
-            Err(_) => region_name
-                .parse()
-                .map_err(|e: std::str::Utf8Error| {
-                    ConsumerStoreError::Connection(format!("invalid S3 region: {}", e))
-                })?,
+            Err(_) => region_name.parse().map_err(|e: std::str::Utf8Error| {
+                ConsumerStoreError::Connection(format!("invalid S3 region: {}", e))
+            })?,
         };
 
         let credentials = match (
@@ -44,10 +40,9 @@ impl S3ConsumerStore {
             env::var("EXSPEED_OFFSET_STORE_S3_SECRET_KEY"),
         ) {
             (Ok(access_key), Ok(secret_key)) => {
-                Credentials::new(Some(&access_key), Some(&secret_key), None, None, None)
-                    .map_err(|e| {
-                        ConsumerStoreError::Connection(format!("S3 credentials error: {}", e))
-                    })?
+                Credentials::new(Some(&access_key), Some(&secret_key), None, None, None).map_err(
+                    |e| ConsumerStoreError::Connection(format!("S3 credentials error: {}", e)),
+                )?
             }
             _ => Credentials::default().map_err(|e| {
                 ConsumerStoreError::Connection(format!("S3 credentials error: {}", e))
@@ -70,9 +65,8 @@ impl S3ConsumerStore {
 impl ConsumerStore for S3ConsumerStore {
     async fn save(&self, config: &ConsumerConfig) -> Result<(), ConsumerStoreError> {
         let key = self.object_key(&config.name);
-        let json = serde_json::to_vec(config).map_err(|e| {
-            ConsumerStoreError::Serialization(format!("json serialize: {}", e))
-        })?;
+        let json = serde_json::to_vec(config)
+            .map_err(|e| ConsumerStoreError::Serialization(format!("json serialize: {}", e)))?;
         self.bucket
             .put_object(&key, &json)
             .await

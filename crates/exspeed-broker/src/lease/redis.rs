@@ -192,10 +192,7 @@ impl LeaderLease for RedisLeaseBackend {
                 if pttl_ms <= 0 {
                     continue; // expired or no-TTL key
                 }
-                let name = k
-                    .strip_prefix(&self.inner.prefix)
-                    .unwrap_or(&k)
-                    .to_string();
+                let name = k.strip_prefix(&self.inner.prefix).unwrap_or(&k).to_string();
                 // Tolerate pre-Plan-G bare-UUID values by falling back to
                 // parsing the raw string as a UUID. This is observability
                 // only — the refresh/release CAS still fails against the

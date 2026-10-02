@@ -72,7 +72,9 @@ pub struct SinkBatch {
 #[derive(Debug, Clone)]
 pub enum WriteResult {
     AllSuccess,
-    PartialSuccess { last_successful_offset: u64 },
+    PartialSuccess {
+        last_successful_offset: u64,
+    },
     /// A single record is unrecoverable. Manager routes to DLQ (if configured)
     /// and advances past `poison_offset`. Prior records in the same batch were
     /// already written by the sink (it returns `Poison` after completing
@@ -147,11 +149,23 @@ pub trait SinkConnector: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PoisonReason {
     NonJsonRecord,
-    TypeMismatch { field: String, expected: String, got: String },
-    MissingRequiredField { field: String },
-    TimestampParseFailed { field: String },
-    HttpClientError { status: u16 },
-    SinkRejected { detail: String },
+    TypeMismatch {
+        field: String,
+        expected: String,
+        got: String,
+    },
+    MissingRequiredField {
+        field: String,
+    },
+    TimestampParseFailed {
+        field: String,
+    },
+    HttpClientError {
+        status: u16,
+    },
+    SinkRejected {
+        detail: String,
+    },
 }
 
 impl PoisonReason {
@@ -171,14 +185,18 @@ impl PoisonReason {
     pub fn detail(&self) -> String {
         match self {
             Self::NonJsonRecord => "record body is not valid JSON".into(),
-            Self::TypeMismatch { field, expected, got } =>
-                format!("field '{field}': expected {expected}, got {got}"),
-            Self::MissingRequiredField { field } =>
-                format!("field '{field}': missing required value"),
-            Self::TimestampParseFailed { field } =>
-                format!("field '{field}': could not parse as RFC3339 timestamp"),
-            Self::HttpClientError { status } =>
-                format!("HTTP client error (status {status})"),
+            Self::TypeMismatch {
+                field,
+                expected,
+                got,
+            } => format!("field '{field}': expected {expected}, got {got}"),
+            Self::MissingRequiredField { field } => {
+                format!("field '{field}': missing required value")
+            }
+            Self::TimestampParseFailed { field } => {
+                format!("field '{field}': could not parse as RFC3339 timestamp")
+            }
+            Self::HttpClientError { status } => format!("HTTP client error (status {status})"),
             Self::SinkRejected { detail } => detail.clone(),
         }
     }
@@ -193,8 +211,11 @@ mod poison_reason_tests {
         assert_eq!(PoisonReason::NonJsonRecord.label(), "non_json_record");
         assert_eq!(
             PoisonReason::TypeMismatch {
-                field: "x".into(), expected: "int".into(), got: "str".into()
-            }.label(),
+                field: "x".into(),
+                expected: "int".into(),
+                got: "str".into()
+            }
+            .label(),
             "type_mismatch"
         );
         assert_eq!(

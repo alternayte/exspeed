@@ -37,9 +37,8 @@ fn open_recovers_all_appended_records() {
     let tmp = TempDir::new().unwrap();
     let mut p = Partition::create(tmp.path(), "s", 0).unwrap();
     for i in 0..20 {
-        p.append(&mk(
-            Box::leak(format!("v{i}").into_boxed_str()).as_bytes()
-        )).unwrap();
+        p.append(&mk(Box::leak(format!("v{i}").into_boxed_str()).as_bytes()))
+            .unwrap();
     }
     drop(p);
 
@@ -61,14 +60,14 @@ fn open_truncates_partial_tail_length_prefix() {
     let tmp = TempDir::new().unwrap();
     let mut p = Partition::create(tmp.path(), "s", 0).unwrap();
     for i in 0..5 {
-        p.append(&mk(
-            Box::leak(format!("v{i}").into_boxed_str()).as_bytes()
-        )).unwrap();
+        p.append(&mk(Box::leak(format!("v{i}").into_boxed_str()).as_bytes()))
+            .unwrap();
     }
     drop(p);
 
     // Find the single .seg file and append garbage bytes.
-    let entries: Vec<_> = std::fs::read_dir(tmp.path()).unwrap()
+    let entries: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("seg"))
         .collect();

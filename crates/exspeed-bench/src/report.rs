@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
 use crate::host::Host;
 use crate::profile::ProfileKind;
+use serde::{Deserialize, Serialize};
 
 pub const SCHEMA_VERSION: u32 = 1;
 

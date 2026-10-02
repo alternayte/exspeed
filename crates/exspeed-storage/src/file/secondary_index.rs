@@ -11,9 +11,11 @@ pub struct SecondaryIndex {
 }
 
 impl SecondaryIndex {
-    pub fn build(path: &Path, entries: &mut Vec<(u64, u64)>) -> io::Result<Self> {
+    pub fn build(path: &Path, entries: &mut [(u64, u64)]) -> io::Result<Self> {
         entries.sort_by_key(|&(hash, _)| hash);
-        let idx = Self { entries: entries.clone() };
+        let idx = Self {
+            entries: entries.to_vec(),
+        };
         idx.save(path)?;
         Ok(idx)
     }
@@ -23,7 +25,9 @@ impl SecondaryIndex {
         let mut offsets = Vec::new();
         let start = self.entries.partition_point(|&(h, _)| h < hash);
         for &(h, offset) in &self.entries[start..] {
-            if h != hash { break; }
+            if h != hash {
+                break;
+            }
             offsets.push(offset);
         }
         offsets
@@ -61,7 +65,10 @@ impl SecondaryIndex {
         let mut ver = [0u8; 1];
         file.read_exact(&mut ver)?;
         if ver[0] != SIDX_VERSION {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported sidx version"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported sidx version",
+            ));
         }
         let mut buf4 = [0u8; 4];
         file.read_exact(&mut buf4)?;

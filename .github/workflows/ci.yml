@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Debug info makes each test binary ~10x larger and slows linking; line
+  # numbers in panics are enough for CI.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  test-services:
+    name: cargo test (Postgres, Redis, MySQL)
+    runs-on: ubuntu-latest
+    env:
+      EXSPEED_POSTGRES_URL: postgres://testuser:testpass@127.0.0.1:5432/testdb
+      EXSPEED_OFFSET_STORE_POSTGRES_URL: postgres://testuser:testpass@127.0.0.1:5432/testdb
+      EXSPEED_OFFSET_STORE_REDIS_URL: redis://127.0.0.1:6379
+      EXSPEED_MYSQL_URL: mysql://exspeed:exspeed@127.0.0.1:3306/exspeed
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start services
+        # Service containers can't take a command, and CDC needs wal_level=logical.
+        run: |
+          docker run -d --name pg -p 5432:5432 \
+            -e POSTGRES_USER=testuser -e POSTGRES_PASSWORD=testpass -e POSTGRES_DB=testdb \
+            postgres:16 -c wal_level=logical -c max_replication_slots=10 -c max_wal_senders=10
+          docker run -d --name redis -p 6379:6379 redis:7
+          docker run -d --name mysql -p 3306:3306 \
+            -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=exspeed \
+            -e MYSQL_USER=exspeed -e MYSQL_PASSWORD=exspeed mysql:8
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --tests
+      - name: Wait for services
+        run: |
+          for i in $(seq 1 60); do
+            docker exec pg pg_isready -U testuser >/dev/null 2>&1 \
+              && docker exec mysql mysqladmin ping -uroot -proot --silent >/dev/null 2>&1 \
+              && break
+            sleep 2
+          done
+      # The multi-pod replication tests (separate binaries under
+      # crates/exspeed/tests/replication_*, multipod_*, lease_api_test) are
+      # known broken and are being replaced in Phase 6 of docs/REVIEW.md.
+      - name: Run service-backed tests
+        run: >
+          cargo test --workspace --lib --bins
+          --test it --test leadership_test --test postgres_lease_test
+          --test redis_lease_test --test replication_client_test
+          -- --include-ignored
+
+  sdk:
+    name: TypeScript SDK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdks/typescript
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: sdks/typescript/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build

@@ -200,15 +200,12 @@ async fn main() -> Result<()> {
             let profile = a.profile.to_profile();
             let target = a.target.to_target();
             let mut result = new_result(&profile, a.sku, a.storage);
-            result.scenarios.publish =
-                scenarios::publish::run(target, &a.server, &profile).await?;
+            result.scenarios.publish = scenarios::publish::run(target, &a.server, &profile).await?;
             result.scenarios.latency =
                 Some(scenarios::latency::run(target, &a.server, &profile).await?);
-            result.scenarios.fanout =
-                scenarios::fanout::run(target, &a.server, &profile).await?;
-            result.scenarios.exql = Some(
-                scenarios::exql::run(&a.server, &a.api, &profile, 5_000, 500_000, 6).await?,
-            );
+            result.scenarios.fanout = scenarios::fanout::run(target, &a.server, &profile).await?;
+            result.scenarios.exql =
+                Some(scenarios::exql::run(&a.server, &a.api, &profile, 5_000, 500_000, 6).await?);
             write_output(&result, Some(a.output))
         }
         Cmd::Render { input, out } => {

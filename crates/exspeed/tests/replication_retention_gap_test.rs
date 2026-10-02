@@ -116,9 +116,9 @@ fn clear_shared_env() {
 }
 
 async fn spawn_pod() -> PodHandle {
-    let api_port = portpicker::pick_unused_port().unwrap();
-    let tcp_port = portpicker::pick_unused_port().unwrap();
-    let cluster_port = portpicker::pick_unused_port().unwrap();
+    let api_port = exspeed_testkit::pick_unused_port().unwrap();
+    let tcp_port = exspeed_testkit::pick_unused_port().unwrap();
+    let cluster_port = exspeed_testkit::pick_unused_port().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().to_path_buf();
 
@@ -138,13 +138,13 @@ async fn spawn_pod() -> PodHandle {
         credentials_file: Some(cred_path.clone()),
         tls_cert: None,
         tls_key: None,
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
+        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+        storage_flush_window_us: 500,
+        storage_flush_threshold_records: 256,
+        storage_flush_threshold_bytes: 1_048_576,
+        storage_sync_interval_ms: 10,
+        storage_sync_bytes: 4 * 1024 * 1024,
+        delivery_buffer: 8192,
     };
 
     let task = tokio::spawn(async move {
@@ -187,13 +187,13 @@ async fn respawn_pod(prev: PodHandle) -> PodHandle {
         credentials_file: Some(prev.cred_path.clone()),
         tls_cert: None,
         tls_key: None,
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
+        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+        storage_flush_window_us: 500,
+        storage_flush_threshold_records: 256,
+        storage_flush_threshold_bytes: 1_048_576,
+        storage_sync_interval_ms: 10,
+        storage_sync_bytes: 4 * 1024 * 1024,
+        delivery_buffer: 8192,
     };
     let task = tokio::spawn(async move {
         let _ = exspeed::cli::server::run(args).await;
@@ -216,7 +216,10 @@ async fn wait_for_leader_split(a: &PodHandle, b: &PodHandle, deadline_secs: u64)
         if tokio::time::Instant::now() > deadline {
             panic!("no leader emerged within {deadline_secs}s");
         }
-        match (healthz_code(a.api_port).await, healthz_code(b.api_port).await) {
+        match (
+            healthz_code(a.api_port).await,
+            healthz_code(b.api_port).await,
+        ) {
             (Some(200), Some(503)) => return (a.api_port, b.api_port),
             (Some(503), Some(200)) => return (b.api_port, a.api_port),
             _ => tokio::time::sleep(Duration::from_millis(300)).await,

@@ -10,6 +10,7 @@ use crate::consumer_state::{ConsumerGroup, ConsumerState, DeliveryBatch};
 use crate::delivery::{run_delivery, DeliveryConfig};
 use crate::handlers;
 use crate::lease::LeaderLease;
+use crate::log::Log;
 use crate::replication::ReplicationCoordinator;
 use exspeed_common::Metrics;
 use exspeed_protocol::messages::{ClientMessage, ServerMessage};
@@ -23,6 +24,9 @@ pub const DEFAULT_DELIVERY_BUFFER: usize = 8192;
 pub struct Broker {
     pub storage: Arc<dyn StorageEngine>,
     pub broker_append: Arc<BrokerAppend>,
+    /// The single write path. All appends and stream-metadata changes go
+    /// through it.
+    pub log: Arc<Log>,
     pub consumers: RwLock<HashMap<String, ConsumerState>>,
     pub(crate) groups: RwLock<HashMap<String, ConsumerGroup>>,
     pub data_dir: PathBuf,
@@ -42,6 +46,7 @@ pub struct Broker {
 }
 
 impl Broker {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         storage: Arc<dyn StorageEngine>,
         broker_append: Arc<BrokerAppend>,
@@ -52,9 +57,17 @@ impl Broker {
         metrics: Arc<Metrics>,
         delivery_buffer: usize,
     ) -> Self {
+        let dedup_ready = Arc::new(AtomicBool::new(false));
+        let log = Arc::new(Log::new(
+            storage.clone(),
+            broker_append.clone(),
+            metrics.clone(),
+            dedup_ready.clone(),
+        ));
         Self {
             storage,
             broker_append,
+            log,
             consumers: RwLock::new(HashMap::new()),
             groups: RwLock::new(HashMap::new()),
             data_dir,
@@ -65,7 +78,7 @@ impl Broker {
             nack_attempts: RwLock::new(HashMap::new()),
             metrics,
             delivery_buffer,
-            dedup_ready: Arc::new(AtomicBool::new(false)),
+            dedup_ready,
             replication_coordinator: None,
         }
     }
@@ -77,6 +90,7 @@ impl Broker {
         mut self,
         coordinator: Arc<ReplicationCoordinator>,
     ) -> Self {
+        self.log.set_replication(coordinator.clone());
         self.replication_coordinator = Some(coordinator);
         self
     }
@@ -87,40 +101,18 @@ impl Broker {
         self.replication_coordinator.as_ref()
     }
 
-    /// Emit a replication event to any attached coordinator. The event is
-    /// constructed lazily — the `FnOnce` is only invoked when a coordinator
-    /// is present, so single-pod deployments pay no event-construction cost.
-    pub(crate) fn emit_replication_event(
-        &self,
-        make_event: impl FnOnce() -> crate::replication::ReplicationEvent,
-    ) {
-        if let Some(coord) = &self.replication_coordinator {
-            coord.emit(make_event());
-        }
-    }
-
     /// Returns `true` once all startup dedup rebuild tasks have completed.
     pub fn is_dedup_ready(&self) -> bool {
         self.dedup_ready.load(Ordering::Acquire)
     }
 
-    /// Delete a stream and emit a `StreamDeleted` replication event. Thin
-    /// wrapper around the storage trait that exists so multi-pod leaders
-    /// can fan the deletion out to followers. Returns `Err` if storage
-    /// says the stream does not exist (or any other I/O error).
+    /// Delete a stream (through the write path, so it replicates and drops
+    /// the stream's dedup state).
     pub async fn delete_stream(
         &self,
         stream: &exspeed_common::StreamName,
-    ) -> Result<(), exspeed_streams::StorageError> {
-        self.storage.delete_stream(stream).await?;
-        self.emit_replication_event(|| {
-            use crate::replication::ReplicationEvent;
-            use exspeed_protocol::messages::replicate::StreamDeletedEvent;
-            ReplicationEvent::StreamDeleted(StreamDeletedEvent {
-                name: stream.as_str().to_string(),
-            })
-        });
-        Ok(())
+    ) -> Result<(), crate::log::LogError> {
+        self.log.delete_stream(stream).await
     }
 
     /// Load all persisted consumers from the configured ConsumerStore and
@@ -182,7 +174,10 @@ impl Broker {
         let is_grouped = !consumer.config.group.is_empty();
 
         if !is_grouped && !consumer.subscribers.is_empty() {
-            return Err(format!("consumer '{}' is already subscribed", consumer_name));
+            return Err(format!(
+                "consumer '{}' is already subscribed",
+                consumer_name
+            ));
         }
 
         if consumer.subscribers.contains_key(subscriber_id) {
@@ -328,12 +323,7 @@ mod tests {
             .await
     }
 
-    async fn publish(
-        broker: &Broker,
-        stream: &str,
-        subject: &str,
-        value: &[u8],
-    ) -> ServerMessage {
+    async fn publish(broker: &Broker, stream: &str, subject: &str, value: &[u8]) -> ServerMessage {
         broker
             .handle_message(ClientMessage::Publish(PublishRequest {
                 stream: stream.into(),
@@ -435,12 +425,9 @@ mod tests {
     async fn publish_sequential_offsets() {
         let (broker, _dir) = make_broker();
         create_stream(&broker, "orders").await;
-        let o0 =
-            unwrap_publish_offset(publish(&broker, "orders", "orders.created", b"a").await);
-        let o1 =
-            unwrap_publish_offset(publish(&broker, "orders", "orders.created", b"b").await);
-        let o2 =
-            unwrap_publish_offset(publish(&broker, "orders", "orders.created", b"c").await);
+        let o0 = unwrap_publish_offset(publish(&broker, "orders", "orders.created", b"a").await);
+        let o1 = unwrap_publish_offset(publish(&broker, "orders", "orders.created", b"b").await);
+        let o2 = unwrap_publish_offset(publish(&broker, "orders", "orders.created", b"c").await);
         assert_eq!(o0, 0);
         assert_eq!(o1, 1);
         assert_eq!(o2, 2);
@@ -753,8 +740,10 @@ mod tests {
         assert!(matches!(resp, ServerMessage::Ok));
 
         // Verify attempts incremented
-        let nack_attempts = broker.nack_attempts.read().unwrap();
-        assert_eq!(*nack_attempts.get(&("nacker".into(), 0u64)).unwrap(), 1);
+        {
+            let nack_attempts = broker.nack_attempts.read().unwrap();
+            assert_eq!(*nack_attempts.get(&("nacker".into(), 0u64)).unwrap(), 1);
+        }
 
         // DLQ stream should NOT exist yet (only 1 attempt < max_delivery_attempts=5)
         let dlq_resp = fetch(&broker, "events-dlq", 0, 10, "").await;

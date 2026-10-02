@@ -20,11 +20,7 @@ impl WorkCoordinator for NoopWorkCoordinator {
         Ok(Vec::new())
     }
 
-    async fn enqueue(
-        &self,
-        _group: &str,
-        _offsets: &[u64],
-    ) -> Result<(), WorkCoordinatorError> {
+    async fn enqueue(&self, _group: &str, _offsets: &[u64]) -> Result<(), WorkCoordinatorError> {
         Ok(())
     }
 

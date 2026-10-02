@@ -105,20 +105,14 @@ fn parse_connection_string(
 
     let port = pg_config.get_ports().first().copied().unwrap_or(5432);
 
-    let user = pg_config
-        .get_user()
-        .unwrap_or("postgres")
-        .to_string();
+    let user = pg_config.get_user().unwrap_or("postgres").to_string();
 
     let password = pg_config
         .get_password()
         .map(|p| String::from_utf8_lossy(p).into_owned())
         .unwrap_or_default();
 
-    let database = pg_config
-        .get_dbname()
-        .unwrap_or("postgres")
-        .to_string();
+    let database = pg_config.get_dbname().unwrap_or("postgres").to_string();
 
     Ok((host, port, user, password, database))
 }
@@ -220,9 +214,8 @@ impl PostgresSource {
 
         // 3. Parse the last_position as an LSN to resume from
         let start_lsn = match &last_position {
-            Some(pos) => Lsn::parse(pos).map_err(|e| {
-                ConnectorError::Data(format!("invalid LSN position '{pos}': {e}"))
-            })?,
+            Some(pos) => Lsn::parse(pos)
+                .map_err(|e| ConnectorError::Data(format!("invalid LSN position '{pos}': {e}")))?,
             None => Lsn::ZERO,
         };
 
@@ -283,32 +276,28 @@ impl PostgresSource {
                 break;
             }
 
-            let event = match tokio::time::timeout(
-                std::time::Duration::from_secs(1),
-                repl_client.recv(),
-            )
-            .await
-            {
-                Ok(Ok(Some(ev))) => ev,
-                Ok(Ok(None)) => {
-                    debug!("CDC replication stream ended");
-                    break;
-                }
-                Ok(Err(e)) => {
-                    return Err(ConnectorError::Connection(format!(
-                        "replication error: {e}"
-                    )));
-                }
-                Err(_) => {
-                    // Timeout — return what we have so far
-                    break;
-                }
-            };
+            let event =
+                match tokio::time::timeout(std::time::Duration::from_secs(1), repl_client.recv())
+                    .await
+                {
+                    Ok(Ok(Some(ev))) => ev,
+                    Ok(Ok(None)) => {
+                        debug!("CDC replication stream ended");
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        return Err(ConnectorError::Connection(format!(
+                            "replication error: {e}"
+                        )));
+                    }
+                    Err(_) => {
+                        // Timeout — return what we have so far
+                        break;
+                    }
+                };
 
             match event {
-                ReplicationEvent::XLogData {
-                    data, wal_end, ..
-                } => {
+                ReplicationEvent::XLogData { data, wal_end, .. } => {
                     let wal_event = match pgoutput::parse_pgoutput_message(&data) {
                         Ok(ev) => ev,
                         Err(e) => {
@@ -344,11 +333,8 @@ impl PostgresSource {
                                 }
                             };
 
-                            let record = build_cdc_record(
-                                relation, &new_tuple, "insert", wal_end,
-                            )?;
+                            let record = build_cdc_record(relation, &new_tuple, "insert", wal_end)?;
                             records.push(record);
-                            repl_client.update_applied_lsn(wal_end);
                         }
                         pgoutput::WalEvent::Update {
                             relation_id,
@@ -369,11 +355,8 @@ impl PostgresSource {
                                 }
                             };
 
-                            let record = build_cdc_record(
-                                relation, &new_tuple, "update", wal_end,
-                            )?;
+                            let record = build_cdc_record(relation, &new_tuple, "update", wal_end)?;
                             records.push(record);
-                            repl_client.update_applied_lsn(wal_end);
                         }
                         pgoutput::WalEvent::Delete {
                             relation_id,
@@ -393,18 +376,14 @@ impl PostgresSource {
                                 }
                             };
 
-                            let record = build_cdc_record(
-                                relation, &old_tuple, "delete", wal_end,
-                            )?;
+                            let record = build_cdc_record(relation, &old_tuple, "delete", wal_end)?;
                             records.push(record);
-                            repl_client.update_applied_lsn(wal_end);
                         }
                         pgoutput::WalEvent::Begin { .. } => {
                             // Transaction boundary — continue collecting
                         }
                         pgoutput::WalEvent::Commit { end_lsn, .. } => {
                             commit_lsn = Some(Lsn::from_u64(end_lsn));
-                            repl_client.update_applied_lsn(Lsn::from_u64(end_lsn));
                             break;
                         }
                         pgoutput::WalEvent::Unknown(tag) => {
@@ -414,7 +393,6 @@ impl PostgresSource {
                 }
                 ReplicationEvent::Commit { end_lsn, .. } => {
                     commit_lsn = Some(end_lsn);
-                    repl_client.update_applied_lsn(end_lsn);
                     break;
                 }
                 ReplicationEvent::Begin { .. } => {
@@ -447,6 +425,13 @@ impl PostgresSource {
             ConnectorError::Data(format!("invalid LSN in commit position '{position}': {e}"))
         })?;
         self.last_lsn = Some(lsn);
+        // Only now — after the manager has durably appended every record up
+        // to `lsn` — may Postgres advance the slot's confirmed_flush_lsn.
+        // Confirming earlier (inside poll) loses data on a crash because
+        // Postgres refuses to replay WAL older than the confirmed position.
+        if let Some(repl_client) = self.repl_client.as_ref() {
+            repl_client.update_applied_lsn(lsn);
+        }
         Ok(())
     }
 
@@ -566,12 +551,8 @@ impl PostgresSource {
                     Some(Bytes::from(pk_value.clone().into_bytes()))
                 };
 
-                let idemp_key = format!(
-                    "{}:{}:{}",
-                    table,
-                    pk_value,
-                    row_ts.as_deref().unwrap_or("")
-                );
+                let idemp_key =
+                    format!("{}:{}:{}", table, pk_value, row_ts.as_deref().unwrap_or(""));
 
                 let record = SourceRecord {
                     key,
@@ -785,7 +766,10 @@ mod tests {
 
     #[test]
     fn split_table_name_qualified() {
-        assert_eq!(split_table_name("myschema.mytable"), ("myschema", "mytable"));
+        assert_eq!(
+            split_table_name("myschema.mytable"),
+            ("myschema", "mytable")
+        );
     }
 
     #[test]
@@ -878,7 +862,10 @@ mod tests {
         assert_eq!(headers.get("x-table").unwrap(), "orders");
         assert_eq!(headers.get("x-schema").unwrap(), "public");
         assert_eq!(headers.get("x-exspeed-source").unwrap(), "postgres");
-        assert!(headers.get("x-idempotency-key").unwrap().contains("orders:"));
+        assert!(headers
+            .get("x-idempotency-key")
+            .unwrap()
+            .contains("orders:"));
 
         // Check JSON value contains all columns
         let value: serde_json::Value = serde_json::from_slice(&record.value).unwrap();

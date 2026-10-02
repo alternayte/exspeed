@@ -10,24 +10,26 @@ You can define a connector in two ways:
 - **As a TOML file** in `<data-dir>/connectors.d/`. These files are hot-reloaded.
 - **Through the HTTP API** at `POST /api/v1/connectors`.
 
-> ⚠️ **Read this before relying on connectors.** The framework works, but
-> several defaults lose data today:
+> ⚠️ **Known issues (v0.5).** The framework works. These problems remain:
 >
-> - **Dedup is on by default.** It is keyed on the record key, so connectors
->   whose key identifies an entity drop every event after the first one for
->   that entity in a 24-hour window. Set `dedup_enabled = false` unless your
->   key really is a message ID.
-> - **API-created connectors get deleted.** The file watcher removes any
->   running connector that has no matching `<name>.toml` file. Pick one
->   method per deployment, and name each file `<connector name>.toml`.
-> - **Editing a TOML file resets the connector's offsets.**
-> - **Postgres CDC can lose data on a crash**, because it acknowledges WAL
->   before the records are appended.
-> - **The S3 sink can lose data**, because it buffers records in memory and
->   reports them as committed.
+> - **The S3 sink can lose data.** It buffers records in memory and reports
+>   them as committed.
+> - **Connectors don't reconnect or restart.** If an external system is
+>   unavailable, the connector stays down and its status can still read
+>   "running".
+> - **Stopping a connector doesn't flush sinks.**
 >
 > Each plugin's status note below lists its own known problems. The full
 > analysis and the redesign are in [REVIEW.md §3.6](REVIEW.md#36-connectors-exspeed-connectors).
+>
+> **Fixed in v0.6:**
+>
+> - Connector dedup is now off by default.
+> - The file watcher only manages connectors that came from files, so
+>   connectors created through the API are left alone.
+> - Editing a TOML file keeps the connector's offsets.
+> - Postgres CDC confirms WAL only after the records are stored.
+> - A failed append is retried instead of being dropped.
 
 ## Contents
 
@@ -43,7 +45,7 @@ You can define a connector in two ways:
 
 ```toml
 [connector]
-name = "orders-cdc"          # must match the file name: orders-cdc.toml
+name = "orders-cdc"          # any name; the file name does not have to match
 type = "source"              # "source" | "sink"
 plugin = "postgres"          # see the plugin list below
 stream = "orders"            # stream to write to (source) or read from (sink)
@@ -54,8 +56,8 @@ subject_filter = ""          # sinks: only deliver matching subjects (NATS wildc
 key_field = ""               # sources: JSON field to use as the record key
 batch_size = 100
 poll_interval_ms = 50
-dedup_enabled = true         # ⚠️ default true — see the warning above
-dedup_key = ""               # field to dedup on (default: the record key)
+dedup_enabled = false        # keep off unless dedup_key names a real message-id header
+dedup_key = ""               # header to dedup on (default: the record key)
 dedup_window_secs = 86400
 on_transient_exhausted = "loop_forever"  # "loop_forever" | "halt" | "dlq_batch"
 
@@ -89,12 +91,12 @@ from the server's environment. This only applies to files in `connectors.d/`.
 | Plugin | What it does | Status |
 |--------|--------------|--------|
 | [`http_webhook`](#http_webhook) | Accepts `POST /webhooks/<path>` | Works. Auth is optional and **off by default**. |
-| [`postgres` (`mode = "cdc"`)](#postgres) | Logical-replication CDC (pgoutput) | ⚠️ Can lose data on a crash. Picks an arbitrary column as the key. TOASTed columns come through as null. |
+| [`postgres` (`mode = "cdc"`)](#postgres) | Logical-replication CDC (pgoutput) | ⚠️ Picks an arbitrary column as the key. TOASTed columns come through as null. No reconnect. |
 | [`postgres` (`mode = "poll"`)](#postgres) | Polls tables by a timestamp column | ❌ Stops after the first batch, because timestamps aren't decoded. |
-| [`postgres_outbox`](#postgres_outbox) | Transactional outbox, by polling or CDC | ⚠️ Only `text`/`bigint` columns are supported. Turn dedup off. |
+| [`postgres_outbox`](#postgres_outbox) | Transactional outbox, by polling or CDC | ⚠️ Only `text`/`bigint` columns are supported. |
 | [`jdbc_poll`](#jdbc_poll) | Polls any SQL table by an integer cursor | Works with an integer cursor. |
 | [`mssql_cdc`](#mssql_cdc) | SQL Server Change Data Capture | ⚠️ Re-emits the last transaction on every poll. Stalls on transactions larger than `batch_size`. |
-| [`rabbitmq`](#rabbitmq-source) | Consumes from a queue | ⚠️ Doesn't reconnect. Turn dedup off. |
+| [`rabbitmq`](#rabbitmq-source) | Consumes from a queue | ⚠️ Doesn't reconnect. |
 | [`http_poll`](#http_poll) | Polls an HTTP endpoint | ⚠️ Silently truncates responses at `batch_size`. |
 
 ### `http_webhook`

@@ -1,4 +1,4 @@
-use super::dialect::{ColumnSpec, Dialect};
+use super::dialect::{ColumnSpec, Dialect, JsonType};
 
 pub struct PostgresDialect;
 
@@ -9,9 +9,15 @@ impl Dialect for PostgresDialect {
     fn placeholder(&self, n: usize) -> String {
         format!("${}", n)
     }
-    fn json_blob_type(&self) -> &'static str { "JSONB" }
-    fn timestamptz_type(&self) -> &'static str { "TIMESTAMPTZ" }
-    fn double_type(&self) -> &'static str { "DOUBLE PRECISION" }
+    fn json_blob_type(&self) -> &'static str {
+        "JSONB"
+    }
+    fn timestamptz_type(&self) -> &'static str {
+        "TIMESTAMPTZ"
+    }
+    fn double_type(&self) -> &'static str {
+        "DOUBLE PRECISION"
+    }
 
     fn create_table_blob_sql(&self, table: &str) -> String {
         let t = self.quote_ident(table);
@@ -26,13 +32,24 @@ impl Dialect for PostgresDialect {
         )
     }
 
-    fn create_table_typed_sql(
-        &self,
-        table: &str,
-        cols: &[ColumnSpec],
-        pk_cols: &[&str],
-    ) -> String {
-        use crate::builtin::jdbc::dialect::JsonType;
+    fn cast_placeholders(&self, mut sql: String, types: &[JsonType]) -> String {
+        // Highest index first so `$1` never matches the prefix of `$10`.
+        for (i, t) in types.iter().enumerate().rev() {
+            let cast = match t {
+                JsonType::Text => continue,
+                JsonType::Bigint => "bigint",
+                JsonType::Double => "double precision",
+                JsonType::Boolean => "boolean",
+                JsonType::Timestamptz => "timestamptz",
+                JsonType::Jsonb => "jsonb",
+            };
+            let ph = self.placeholder(i + 1);
+            sql = replace_placeholder(&sql, &ph, &format!("{ph}::{cast}"));
+        }
+        sql
+    }
+
+    fn create_table_typed_sql(&self, table: &str, cols: &[ColumnSpec], pk_cols: &[&str]) -> String {
         let t = self.quote_ident(table);
         let col_lines: Vec<String> = cols
             .iter()
@@ -46,7 +63,12 @@ impl Dialect for PostgresDialect {
                     JsonType::Jsonb => self.json_blob_type(),
                 };
                 let nullability = if c.nullable { "" } else { " NOT NULL" };
-                format!("    {} {}{}", self.quote_ident(&c.name), sql_type, nullability)
+                format!(
+                    "    {} {}{}",
+                    self.quote_ident(&c.name),
+                    sql_type,
+                    nullability
+                )
             })
             .collect();
         let mut body = col_lines.join(",\n");
@@ -91,13 +113,47 @@ impl Dialect for PostgresDialect {
     }
 }
 
+/// Replace `ph` (e.g. `$1`) only where it is not followed by another digit.
+fn replace_placeholder(sql: &str, ph: &str, with: &str) -> String {
+    let mut out = String::with_capacity(sql.len() + 16);
+    let mut rest = sql;
+    while let Some(pos) = rest.find(ph) {
+        let after = &rest[pos + ph.len()..];
+        out.push_str(&rest[..pos]);
+        if after.starts_with(|c: char| c.is_ascii_digit()) {
+            out.push_str(ph);
+        } else {
+            out.push_str(with);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builtin::jdbc::dialect::JsonType;
+
+    #[test]
+    fn casts_typed_placeholders_without_touching_longer_indexes() {
+        let sql =
+            PostgresDialect.insert_sql("t", &["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]);
+        let mut types = vec![JsonType::Text; 10];
+        types[0] = JsonType::Jsonb;
+        types[9] = JsonType::Timestamptz;
+        let out = PostgresDialect.cast_placeholders(sql, &types);
+        assert!(out.contains("$1::jsonb"), "{out}");
+        assert!(out.contains("$10::timestamptz"), "{out}");
+        assert!(!out.contains("$10::jsonb"), "{out}");
+    }
 
     fn spec(name: &str, t: JsonType, nullable: bool) -> ColumnSpec {
-        ColumnSpec { name: name.to_string(), json_type: t, nullable }
+        ColumnSpec {
+            name: name.to_string(),
+            json_type: t,
+            nullable,
+        }
     }
 
     #[test]
@@ -151,8 +207,10 @@ mod tests {
         ), "sql was: {sql}");
         assert!(sql.contains("\"email\" = EXCLUDED.\"email\""));
         assert!(sql.contains("\"price\" = EXCLUDED.\"price\""));
-        assert!(!sql.contains("\"id\" = EXCLUDED.\"id\""),
-            "PK column must not appear in DO UPDATE SET");
+        assert!(
+            !sql.contains("\"id\" = EXCLUDED.\"id\""),
+            "PK column must not appear in DO UPDATE SET"
+        );
     }
 
     #[test]

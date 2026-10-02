@@ -64,9 +64,18 @@ export class Message {
   }
 }
 
+/**
+ * What to do when more than `maxQueueSize` records are waiting:
+ * - `buffer` (default): keep buffering and emit `slow`. Nothing is lost.
+ * - `drop-oldest`: discard the oldest queued record (it is NOT acked; with
+ *   cumulative acks a later ack commits past it, so this loses data).
+ * - `error`: reject the incoming record and emit `error`.
+ */
+export type OverflowPolicy = "buffer" | "drop-oldest" | "error";
+
 export interface SubscriptionOptions {
   maxQueueSize: number;
-  overflowPolicy?: "drop-oldest" | "error";
+  overflowPolicy?: OverflowPolicy;
 }
 
 export class Subscription extends EventEmitter implements AsyncIterable<Message> {
@@ -74,7 +83,7 @@ export class Subscription extends EventEmitter implements AsyncIterable<Message>
   readonly subscriberId: string;
   private queue: QueueEntry[] = [];
   private readonly maxQueueSize: number;
-  private readonly overflowPolicy: "drop-oldest" | "error";
+  private readonly overflowPolicy: OverflowPolicy;
   private _closed = false;
   private _paused = false;
   private waiter: ((value: IteratorResult<Message>) => void) | null = null;
@@ -88,7 +97,7 @@ export class Subscription extends EventEmitter implements AsyncIterable<Message>
     this.consumerName = consumerName;
     this.subscriberId = subscriberId;
     this.maxQueueSize = options.maxQueueSize;
-    this.overflowPolicy = options.overflowPolicy ?? "drop-oldest";
+    this.overflowPolicy = options.overflowPolicy ?? "buffer";
   }
 
   push(record: RecordDelivery, ackFn: AckFn, nackFn: NackFn): void {
@@ -103,7 +112,7 @@ export class Subscription extends EventEmitter implements AsyncIterable<Message>
       return;
     }
 
-    if (this.queue.length >= this.maxQueueSize) {
+    if (this.queue.length >= this.maxQueueSize && this.overflowPolicy !== "buffer") {
       if (this.overflowPolicy === "error") {
         // Reject the incoming record; do NOT enqueue.
         this.emit("error", new QueueOverflowError(record.offset, record.subject));

@@ -2,16 +2,19 @@
 //! cases that don't need multi-pod coordination; Postgres/Redis integration
 //! tests require a running backend (skipped gracefully when unavailable).
 
+// Tests serialise on a std Mutex across awaits on purpose (env-var setup).
+#![allow(clippy::await_holding_lock)]
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use exspeed_broker::leadership::ClusterLeadership;
 use exspeed_broker::lease::postgres::PostgresLeaseBackend;
 use exspeed_broker::lease::redis::RedisLeaseBackend;
 use exspeed_broker::lease::LeaderLease;
 use exspeed_broker::lease::NoopLeaderLease;
 use exspeed_broker::lease::{LeaseError, LeaseGuard, LeaseInfo};
-use exspeed_broker::leadership::ClusterLeadership;
 use exspeed_common::Metrics;
 
 /// In-memory fake backend for exercising the endpoint round-trip. Unlike
@@ -193,7 +196,10 @@ async fn postgres_heartbeat_loss_cancels_leader_token() {
     }
 
     let initial_token = leadership.current_child_token().await;
-    assert!(!initial_token.is_cancelled(), "token should be live while leader");
+    assert!(
+        !initial_token.is_cancelled(),
+        "token should be live while leader"
+    );
 
     // Steal the lease row: overwrite the holder UUID so the current holder's
     // next heartbeat UPDATE (which conditions on its own UUID) returns zero
@@ -278,8 +284,7 @@ async fn spawn_with_endpoint_advertises_via_list_all() {
     let metrics = Arc::new(metrics);
     let endpoint = "10.0.0.42:5934";
 
-    let leadership =
-        ClusterLeadership::spawn(lease, metrics, Some(endpoint.to_string())).await;
+    let leadership = ClusterLeadership::spawn(lease, metrics, Some(endpoint.to_string())).await;
 
     // Wait for the retry loop to acquire. Default TTL=30s tick=TTL/3≈10s;
     // the first tick fires immediately, so ~50ms is plenty on RecordingLease.

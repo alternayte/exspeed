@@ -29,9 +29,15 @@ pub async fn run(
         .await?;
     if status == 201 || status == 200 {
         let offset = resp.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
-        let duplicate = resp.get("duplicate").and_then(|v| v.as_bool()).unwrap_or(false);
+        let duplicate = resp
+            .get("duplicate")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         if duplicate {
-            println!("Published to '{}' at offset {} (duplicate=true)", stream, offset);
+            println!(
+                "Published to '{}' at offset {} (duplicate=true)",
+                stream, offset
+            );
         } else {
             println!("Published to '{}' at offset {}", stream, offset);
         }

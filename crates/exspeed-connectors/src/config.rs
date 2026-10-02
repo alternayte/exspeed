@@ -48,6 +48,7 @@ pub struct ConnectorConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum OnTransientExhausted {
     /// Put the connector into `Failed` status; offset does not advance.
     /// Requires manual restart to resume.
@@ -57,11 +58,8 @@ pub enum OnTransientExhausted {
     DlqBatch,
     /// Keep retrying forever (today's behavior). Ignores `max_retries`
     /// post-exhaustion — loops with `poll_interval_ms` between attempts.
+    #[default]
     LoopForever,
-}
-
-impl Default for OnTransientExhausted {
-    fn default() -> Self { Self::LoopForever }
 }
 
 fn default_batch_size() -> u32 {
@@ -70,8 +68,12 @@ fn default_batch_size() -> u32 {
 fn default_poll_interval() -> u64 {
     50
 }
+/// Off by default: with no `dedup_key`, dedup keys on the record key, which
+/// for most sources is an entity id (outbox aggregate_id, AMQP routing key),
+/// so enabling it silently drops every event after the first per entity.
+/// Broker-level idempotency (`x-idempotency-key`) still applies.
 fn default_dedup_enabled() -> bool {
-    true
+    false
 }
 fn default_dedup_window() -> u64 {
     86400
@@ -213,13 +215,23 @@ fn resolve_env(input: &str) -> String {
             };
             match std::env::var(var_name) {
                 Ok(val) => {
-                    result = format!("{}{}{}", &result[..start], val, &result[start + end_rel + 1..]);
+                    result = format!(
+                        "{}{}{}",
+                        &result[..start],
+                        val,
+                        &result[start + end_rel + 1..]
+                    );
                     search_from = start + val.len();
                 }
                 Err(_) => match default_val {
                     Some(default) => {
                         let default_owned = default.to_string();
-                        result = format!("{}{}{}", &result[..start], default_owned, &result[start + end_rel + 1..]);
+                        result = format!(
+                            "{}{}{}",
+                            &result[..start],
+                            default_owned,
+                            &result[start + end_rel + 1..]
+                        );
                         search_from = start + default_owned.len();
                     }
                     None => {
@@ -358,12 +370,25 @@ outbox_table = "outbox_events"
     fn env_var_with_default_uses_default_when_unset() {
         std::env::remove_var("EXSPEED_TEST_UNSET_VAR");
         let mut config = ConnectorConfig {
-            name: "test".into(), connector_type: "source".into(), plugin: "test".into(),
-            stream: "s".into(), subject_template: "".into(), subject_filter: "".into(),
-            settings: HashMap::from([("val".into(), "${EXSPEED_TEST_UNSET_VAR:-fallback_value}".into())]),
-            batch_size: 100, poll_interval_ms: 50, dedup_enabled: true,
-            dedup_key: String::new(), dedup_window_secs: 86400, transform_sql: String::new(),
-            key_field: String::new(), on_transient_exhausted: OnTransientExhausted::default(), retry: RetryPolicy::default_transient(),
+            name: "test".into(),
+            connector_type: "source".into(),
+            plugin: "test".into(),
+            stream: "s".into(),
+            subject_template: "".into(),
+            subject_filter: "".into(),
+            settings: HashMap::from([(
+                "val".into(),
+                "${EXSPEED_TEST_UNSET_VAR:-fallback_value}".into(),
+            )]),
+            batch_size: 100,
+            poll_interval_ms: 50,
+            dedup_enabled: true,
+            dedup_key: String::new(),
+            dedup_window_secs: 86400,
+            transform_sql: String::new(),
+            key_field: String::new(),
+            on_transient_exhausted: OnTransientExhausted::default(),
+            retry: RetryPolicy::default_transient(),
         };
         config.resolve_env_vars();
         assert_eq!(config.settings.get("val").unwrap(), "fallback_value");
@@ -373,12 +398,22 @@ outbox_table = "outbox_events"
     fn env_var_with_default_uses_env_when_set() {
         std::env::set_var("EXSPEED_TEST_SET_VAR", "from_env");
         let mut config = ConnectorConfig {
-            name: "test".into(), connector_type: "source".into(), plugin: "test".into(),
-            stream: "s".into(), subject_template: "".into(), subject_filter: "".into(),
+            name: "test".into(),
+            connector_type: "source".into(),
+            plugin: "test".into(),
+            stream: "s".into(),
+            subject_template: "".into(),
+            subject_filter: "".into(),
             settings: HashMap::from([("val".into(), "${EXSPEED_TEST_SET_VAR:-ignored}".into())]),
-            batch_size: 100, poll_interval_ms: 50, dedup_enabled: true,
-            dedup_key: String::new(), dedup_window_secs: 86400, transform_sql: String::new(),
-            key_field: String::new(), on_transient_exhausted: OnTransientExhausted::default(), retry: RetryPolicy::default_transient(),
+            batch_size: 100,
+            poll_interval_ms: 50,
+            dedup_enabled: true,
+            dedup_key: String::new(),
+            dedup_window_secs: 86400,
+            transform_sql: String::new(),
+            key_field: String::new(),
+            on_transient_exhausted: OnTransientExhausted::default(),
+            retry: RetryPolicy::default_transient(),
         };
         config.resolve_env_vars();
         assert_eq!(config.settings.get("val").unwrap(), "from_env");
@@ -389,12 +424,22 @@ outbox_table = "outbox_events"
     fn env_var_with_empty_default() {
         std::env::remove_var("EXSPEED_TEST_EMPTY_DEFAULT");
         let mut config = ConnectorConfig {
-            name: "test".into(), connector_type: "source".into(), plugin: "test".into(),
-            stream: "s".into(), subject_template: "".into(), subject_filter: "".into(),
+            name: "test".into(),
+            connector_type: "source".into(),
+            plugin: "test".into(),
+            stream: "s".into(),
+            subject_template: "".into(),
+            subject_filter: "".into(),
             settings: HashMap::from([("val".into(), "${EXSPEED_TEST_EMPTY_DEFAULT:-}".into())]),
-            batch_size: 100, poll_interval_ms: 50, dedup_enabled: true,
-            dedup_key: String::new(), dedup_window_secs: 86400, transform_sql: String::new(),
-            key_field: String::new(), on_transient_exhausted: OnTransientExhausted::default(), retry: RetryPolicy::default_transient(),
+            batch_size: 100,
+            poll_interval_ms: 50,
+            dedup_enabled: true,
+            dedup_key: String::new(),
+            dedup_window_secs: 86400,
+            transform_sql: String::new(),
+            key_field: String::new(),
+            on_transient_exhausted: OnTransientExhausted::default(),
+            retry: RetryPolicy::default_transient(),
         };
         config.resolve_env_vars();
         assert_eq!(config.settings.get("val").unwrap(), "");
@@ -451,7 +496,10 @@ jitter = false
         std::fs::write(&path, toml).unwrap();
 
         let config = ConnectorConfig::load_toml(&path).unwrap();
-        assert_eq!(config.on_transient_exhausted, OnTransientExhausted::DlqBatch);
+        assert_eq!(
+            config.on_transient_exhausted,
+            OnTransientExhausted::DlqBatch
+        );
         assert_eq!(config.retry.max_retries, 7);
         assert_eq!(config.retry.initial_backoff_ms, 250);
         assert!(!config.retry.jitter);
@@ -475,7 +523,10 @@ url = "https://example.com/hook"
         std::fs::write(&path, toml).unwrap();
 
         let config = ConnectorConfig::load_toml(&path).unwrap();
-        assert_eq!(config.on_transient_exhausted, OnTransientExhausted::LoopForever);
+        assert_eq!(
+            config.on_transient_exhausted,
+            OnTransientExhausted::LoopForever
+        );
         assert_eq!(config.retry.max_retries, 5);
         assert!(config.retry.jitter);
     }

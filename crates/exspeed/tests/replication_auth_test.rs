@@ -107,9 +107,9 @@ struct LeaderHarness {
 /// a bound cluster listener on 127.0.0.1:<random>. Returns the cluster
 /// port address, both bearer tokens, and the API port.
 async fn start_leader(schema: &str) -> LeaderHarness {
-    let api_port = portpicker::pick_unused_port().unwrap();
-    let tcp_port = portpicker::pick_unused_port().unwrap();
-    let cluster_port = portpicker::pick_unused_port().unwrap();
+    let api_port = exspeed_testkit::pick_unused_port().unwrap();
+    let tcp_port = exspeed_testkit::pick_unused_port().unwrap();
+    let cluster_port = exspeed_testkit::pick_unused_port().unwrap();
     let cluster_addr = format!("127.0.0.1:{cluster_port}");
 
     let tmp = tempfile::tempdir().unwrap();
@@ -135,13 +135,13 @@ async fn start_leader(schema: &str) -> LeaderHarness {
         credentials_file: Some(cred_path),
         tls_cert: None,
         tls_key: None,
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
+        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+        storage_flush_window_us: 500,
+        storage_flush_threshold_records: 256,
+        storage_flush_threshold_bytes: 1_048_576,
+        storage_sync_interval_ms: 10,
+        storage_sync_bytes: 4 * 1024 * 1024,
+        delivery_buffer: 8192,
     };
 
     tokio::spawn(async move {
@@ -293,9 +293,7 @@ async fn cluster_port_rejects_non_replicate_credential_and_accepts_replicate() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         if tokio::time::Instant::now() > deadline {
-            panic!(
-                "replicate-denied counter did not increment within 5s (was {before})"
-            );
+            panic!("replicate-denied counter did not increment within 5s (was {before})");
         }
         let now = auth_denied_replicate_total(leader.api_port).await;
         if now > before {

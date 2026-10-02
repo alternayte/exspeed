@@ -139,7 +139,7 @@ export class ExspeedClient extends EventEmitter {
 
     const sub = new Subscription(consumerName, subscriberId, {
       maxQueueSize: options?.maxQueueSize ?? 1000,
-      overflowPolicy: options?.overflowPolicy ?? "drop-oldest",
+      overflowPolicy: options?.overflowPolicy ?? "buffer",
     });
 
     const ackFn = async (cn: string, offset: bigint) => {
@@ -152,15 +152,22 @@ export class ExspeedClient extends EventEmitter {
     };
 
     conn.on("push", (frame: Frame) => {
-      if (frame.opcode === OpCode.Record) {
-        try {
+      try {
+        if (frame.opcode === OpCode.Record) {
           const record = decodeRecord(frame.payload);
           if (record.consumerName === consumerName) {
             sub.push(record, ackFn, nackFn);
           }
-        } catch (err) {
-          sub.emit("error", err);
+        } else if (frame.opcode === OpCode.RecordsBatch) {
+          // The server batches pushes whenever more than one record is
+          // ready. This connection carries exactly one subscription, so
+          // every record in the batch belongs to `consumerName`.
+          for (const r of decodeRecordsBatch(frame.payload)) {
+            sub.push({ ...r, consumerName, deliveryAttempt: 1 }, ackFn, nackFn);
+          }
         }
+      } catch (err) {
+        sub.emit("error", err);
       }
     });
 
