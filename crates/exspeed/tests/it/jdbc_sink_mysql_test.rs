@@ -150,10 +150,13 @@ async fn mysql_typed_binds_correct_types() {
     let pool = sqlx::mysql::MySqlPool::connect(&url).await.unwrap();
     wait_for_rows(&pool, &table, 2, 10).await;
 
-    let (sum,): (i64,) = sqlx::query_as(&format!("SELECT SUM(amount) FROM `{}`", table))
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let (sum,): (i64,) = sqlx::query_as(&format!(
+        "SELECT CAST(SUM(amount) AS SIGNED) FROM `{}`",
+        table
+    ))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(sum, 300);
 
     common::db::drop_table_mysql(&url, &table).await;
