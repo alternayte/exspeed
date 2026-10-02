@@ -219,6 +219,11 @@ impl Partition {
         if let Some(m) = max_offset_in_active {
             next_offset = next_offset.max(m + 1);
         }
+        // An empty active segment (e.g. after a roll followed by retention
+        // deleting every sealed segment) still pins the next offset to its
+        // base offset; without this, offsets would restart at 0.
+        let active_base = SegmentReader::open(last_seg_path)?.base_offset();
+        next_offset = next_offset.max(active_base);
 
         info!(
             stream = stream_name,
@@ -826,6 +831,13 @@ impl Partition {
     /// Roll the active segment: seal it, build indexes, open a reader for it,
     /// and create a new active segment starting at `next_offset`.
     fn roll_segment(&mut self) -> io::Result<()> {
+        // Never seal an empty segment: the new segment would get the same
+        // base offset (and file name) as the old one, and the old path would
+        // end up registered as both sealed and active.
+        if self.active_writer.base_offset() >= self.next_offset {
+            return Ok(());
+        }
+
         // Sync the current active writer.
         self.active_writer.sync()?;
 
@@ -849,10 +861,11 @@ impl Partition {
             last_timestamp: sealed.last_timestamp().unwrap_or(0),
         };
 
+        // Create the new segment before mutating any state, so a failure
+        // leaves the partition exactly as it was.
+        let new_writer = SegmentWriter::create(&self.dir, self.next_offset)?;
         self.sealed_readers.push(sealed);
-
-        // Create a new segment.
-        self.active_writer = SegmentWriter::create(&self.dir, self.next_offset)?;
+        self.active_writer = new_writer;
 
         // If an async-mode syncer is attached, hand it a clone of the new
         // active segment's file handle. Without this the syncer would keep

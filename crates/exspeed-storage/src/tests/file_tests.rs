@@ -653,3 +653,71 @@ fn append_batch_empty_is_noop() {
     let (offset, _ts) = p.append(&r).unwrap();
     assert_eq!(offset, Offset(0));
 }
+
+fn plain(i: u64) -> Record {
+    Record {
+        key: None,
+        value: Bytes::from(format!("v-{i}")),
+        subject: "test.subject".into(),
+        headers: vec![],
+        timestamp_ns: None,
+    }
+}
+
+/// Regression: an empty active segment left after a roll + retention must
+/// keep pinning the next offset across a restart (offsets used to restart
+/// at 0).
+#[test]
+fn restart_with_empty_active_segment_keeps_offsets_monotonic() {
+    let dir = TempDir::new().unwrap();
+    let part_dir = dir.path().join("part0");
+    {
+        let mut p = Partition::create(&part_dir, "s", 0).unwrap();
+        for i in 0..12 {
+            p.append(&plain(i)).unwrap();
+        }
+        // Rolls the active segment (it is non-empty), leaving an empty one.
+        p.register_secondary_index("idx".into(), "f".into());
+        // Delete every sealed segment.
+        p.trim_up_to(12).unwrap();
+        assert_eq!(p.next_offset(), 12);
+    }
+    let mut p = Partition::open(&part_dir, "s", 0).unwrap();
+    assert_eq!(p.next_offset(), 12, "next offset must survive restart");
+    let (off, _) = p.append(&plain(12)).unwrap();
+    assert_eq!(off, Offset(12));
+}
+
+/// Regression: rolling an already-empty active segment used to register the
+/// same file as both sealed and active, so every record was read twice.
+#[test]
+fn second_index_registration_does_not_duplicate_records() {
+    let dir = TempDir::new().unwrap();
+    let part_dir = dir.path().join("part0");
+    let mut p = Partition::create(&part_dir, "s", 0).unwrap();
+    for i in 0..8 {
+        p.append(&plain(i)).unwrap();
+    }
+    p.register_secondary_index("a".into(), "f".into());
+    p.register_secondary_index("b".into(), "g".into());
+    for i in 8..11 {
+        p.append(&plain(i)).unwrap();
+    }
+    let offsets: Vec<u64> = p
+        .read(Offset(0), 100)
+        .unwrap()
+        .iter()
+        .map(|r| r.offset.0)
+        .collect();
+    assert_eq!(offsets, (0..11).collect::<Vec<_>>());
+
+    drop(p);
+    let p = Partition::open(&part_dir, "s", 0).unwrap();
+    let offsets: Vec<u64> = p
+        .read(Offset(0), 100)
+        .unwrap()
+        .iter()
+        .map(|r| r.offset.0)
+        .collect();
+    assert_eq!(offsets, (0..11).collect::<Vec<_>>());
+}
