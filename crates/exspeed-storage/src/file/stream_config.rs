@@ -1,118 +1,48 @@
+//! On-disk persistence of [`StreamConfig`] as `{stream_dir}/stream.json`.
+
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+pub use exspeed_streams::config::{
+    StreamConfig, DEFAULT_DEDUP_MAX_ENTRIES, DEFAULT_DEDUP_WINDOW_SECS, DEFAULT_MAX_AGE_SECS,
+    DEFAULT_MAX_BYTES,
+};
 
-pub const DEFAULT_MAX_AGE_SECS: u64 = 604_800; // 7 days
-pub const DEFAULT_MAX_BYTES: u64 = 10_737_418_240; // 10 GB
-pub const DEFAULT_DEDUP_WINDOW_SECS: u64 = 300;
-pub const DEFAULT_DEDUP_MAX_ENTRIES: u64 = 500_000;
-
-/// Per-stream retention configuration, persisted as `stream.json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StreamConfig {
-    pub max_age_secs: u64,
-    pub max_bytes: u64,
-    #[serde(default = "default_dedup_window_secs")]
-    pub dedup_window_secs: u64,
-    #[serde(default = "default_dedup_max_entries")]
-    pub dedup_max_entries: u64,
+/// File I/O for [`StreamConfig`]. Import this trait to call
+/// `StreamConfig::load(dir)` / `config.save(dir)`.
+pub trait StreamConfigFile: Sized {
+    /// Persist to `{stream_dir}/stream.json` atomically (tmp + rename + fsync).
+    fn save(&self, stream_dir: &Path) -> io::Result<()>;
+    /// Load from `{stream_dir}/stream.json`; defaults if the file is missing.
+    fn load(stream_dir: &Path) -> io::Result<Self>;
 }
 
-fn default_dedup_window_secs() -> u64 {
-    DEFAULT_DEDUP_WINDOW_SECS
-}
-fn default_dedup_max_entries() -> u64 {
-    DEFAULT_DEDUP_MAX_ENTRIES
-}
-
-impl Default for StreamConfig {
-    fn default() -> Self {
-        Self {
-            max_age_secs: DEFAULT_MAX_AGE_SECS,
-            max_bytes: DEFAULT_MAX_BYTES,
-            dedup_window_secs: DEFAULT_DEDUP_WINDOW_SECS,
-            dedup_max_entries: DEFAULT_DEDUP_MAX_ENTRIES,
-        }
-    }
-}
-
-impl StreamConfig {
-    /// Build a `StreamConfig` from a request, substituting defaults for zero values.
-    pub fn from_request(
-        max_age_secs: u64,
-        max_bytes: u64,
-        dedup_window_secs: u64,
-        dedup_max_entries: u64,
-    ) -> Self {
-        Self {
-            max_age_secs: if max_age_secs == 0 {
-                DEFAULT_MAX_AGE_SECS
-            } else {
-                max_age_secs
-            },
-            max_bytes: if max_bytes == 0 {
-                DEFAULT_MAX_BYTES
-            } else {
-                max_bytes
-            },
-            dedup_window_secs: if dedup_window_secs == 0 {
-                DEFAULT_DEDUP_WINDOW_SECS
-            } else {
-                dedup_window_secs
-            },
-            dedup_max_entries: if dedup_max_entries == 0 {
-                DEFAULT_DEDUP_MAX_ENTRIES
-            } else {
-                dedup_max_entries
-            },
-        }
-    }
-
-    /// Validate stream config parameters.
-    pub fn validate(
-        max_age_secs: u64,
-        _max_bytes: u64,
-        dedup_window_secs: u64,
-        dedup_max_entries: u64,
-    ) -> Result<(), String> {
-        if dedup_window_secs > max_age_secs && max_age_secs > 0 {
-            return Err(format!(
-                "dedup window ({dedup_window_secs}s) exceeds retention ({max_age_secs}s); \
-                 either increase retention (--retention) or shorten dedup window (--dedup-window)"
-            ));
-        }
-        if dedup_max_entries < 1 {
-            return Err("dedup_max_entries must be ≥ 1".to_string());
-        }
-        Ok(())
-    }
-
-    /// Persist this config to `{stream_dir}/stream.json`, fsyncing the file.
-    pub fn save(&self, stream_dir: &Path) -> io::Result<()> {
+impl StreamConfigFile for StreamConfig {
+    fn save(&self, stream_dir: &Path) -> io::Result<()> {
         fs::create_dir_all(stream_dir)?;
         let path = stream_dir.join("stream.json");
+        let tmp = stream_dir.join("stream.json.tmp");
         let json = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
-        let mut file = File::create(&path)?;
-        file.write_all(json.as_bytes())?;
-        file.flush()?;
-        file.sync_all()?;
+        {
+            let mut file = File::create(&tmp)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+        }
+        fs::rename(&tmp, &path)?;
+        if let Ok(dir) = File::open(stream_dir) {
+            let _ = dir.sync_all();
+        }
         Ok(())
     }
 
-    /// Load config from `{stream_dir}/stream.json`.
-    ///
-    /// Returns the default `StreamConfig` if the file does not exist.
-    pub fn load(stream_dir: &Path) -> io::Result<Self> {
+    fn load(stream_dir: &Path) -> io::Result<Self> {
         let path = stream_dir.join("stream.json");
         if !path.exists() {
             return Ok(Self::default());
         }
         let data = fs::read_to_string(&path)?;
-        let config: Self = serde_json::from_str(&data)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        Ok(config)
+        serde_json::from_str(&data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 }
 

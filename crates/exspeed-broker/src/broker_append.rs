@@ -130,7 +130,8 @@ impl DedupMap {
 // BrokerAppend
 // ---------------------------------------------------------------------------
 
-const IDEMPOTENCY_HEADER: &str = "x-idempotency-key";
+/// Header that carries a record's idempotency key (`msg_id`).
+pub const IDEMPOTENCY_HEADER: &str = "x-idempotency-key";
 
 pub struct BrokerAppend {
     storage: Arc<dyn StorageEngine>,
@@ -423,84 +424,130 @@ impl BrokerAppend {
         let mutex = self.per_stream_lock(stream).await;
         let _guard = mutex.lock().await;
 
-        let mut to_append: Vec<(usize, Record)> = Vec::new();
-        let mut results: Vec<Option<AppendResult>> = vec![None; records.len()];
+        enum Slot {
+            Done(AppendResult),
+            /// Index into `to_append`.
+            Write(usize),
+            /// Same msg_id as an earlier record in this batch (same body).
+            SameAs(usize),
+        }
 
-        for (i, record) in records.into_iter().enumerate() {
-            let idemp_key = record
-                .headers
-                .iter()
-                .find(|(k, _)| k == IDEMPOTENCY_HEADER)
-                .map(|(_, v)| v.clone());
+        let mut to_append: Vec<Record> = Vec::new();
+        let mut write_keys: Vec<Option<(String, u64)>> = Vec::new();
+        let mut slots: Vec<Slot> = Vec::with_capacity(records.len());
+        // msg_id -> (input index, body hash) for keys first seen in this batch.
+        let mut batch_keys: HashMap<String, (usize, u64)> = HashMap::new();
 
-            let Some(key) = idemp_key else {
-                // No msg_id on this record — queue it for storage directly.
-                to_append.push((i, record));
-                continue;
-            };
-
-            let body_hash = hash_body(&record.value);
-
+        {
             let mut maps = self.dedup_maps.write().await;
             let map = maps
                 .entry(stream.clone())
                 .or_insert_with(|| DedupMap::new(self.default_window, self.default_max_entries));
 
-            match map.check(&key, body_hash) {
-                DedupCheckResult::HitSameBody { offset } => {
-                    results[i] = Some(AppendResult::Duplicate(Offset(offset)));
+            for (i, record) in records.into_iter().enumerate() {
+                let idemp_key = record
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k == IDEMPOTENCY_HEADER)
+                    .map(|(_, v)| v.clone());
+
+                let Some(key) = idemp_key else {
+                    slots.push(Slot::Write(to_append.len()));
+                    to_append.push(record);
+                    write_keys.push(None);
+                    continue;
+                };
+                let body_hash = hash_body(&record.value);
+
+                if let Some(&(first, first_hash)) = batch_keys.get(&key) {
+                    if first_hash != body_hash {
+                        if let Some(m) = &self.metrics {
+                            m.record_dedup_collision(stream.as_str());
+                        }
+                        // The colliding record is in this same batch and has
+                        // no offset yet.
+                        return Err(StorageError::KeyCollision {
+                            stored_offset: u64::MAX,
+                        });
+                    }
+                    slots.push(Slot::SameAs(first));
+                    continue;
                 }
-                DedupCheckResult::HitDifferentBody { stored_offset } => {
-                    return Err(StorageError::KeyCollision { stored_offset });
+
+                match map.check(&key, body_hash) {
+                    DedupCheckResult::HitSameBody { offset } => {
+                        slots.push(Slot::Done(AppendResult::Duplicate(Offset(offset))));
+                    }
+                    DedupCheckResult::HitDifferentBody { stored_offset } => {
+                        if let Some(m) = &self.metrics {
+                            m.record_dedup_collision(stream.as_str());
+                        }
+                        return Err(StorageError::KeyCollision { stored_offset });
+                    }
+                    DedupCheckResult::Miss => {
+                        batch_keys.insert(key.clone(), (i, body_hash));
+                        slots.push(Slot::Write(to_append.len()));
+                        to_append.push(record);
+                        write_keys.push(Some((key, body_hash)));
+                    }
                 }
-                DedupCheckResult::Miss => {
-                    to_append.push((i, record));
+            }
+
+            // Enforce the entry cap for the keys this batch will add.
+            let new_keys = batch_keys.len() as u64;
+            if map.seen.len() as u64 + new_keys > map.max_entries {
+                map.evict_expired();
+                if map.seen.len() as u64 + new_keys > map.max_entries {
+                    let retry_after_secs = map.time_until_oldest_expires().as_secs() as u32;
+                    if let Some(m) = &self.metrics {
+                        m.record_dedup_map_full(stream.as_str());
+                    }
+                    return Err(StorageError::DedupMapFull { retry_after_secs });
                 }
             }
         }
 
-        if !to_append.is_empty() {
-            let indices: Vec<usize> = to_append.iter().map(|(i, _)| *i).collect();
-            let records_only: Vec<Record> = to_append.into_iter().map(|(_, r)| r).collect();
-
-            let body_hashes: Vec<u64> = records_only.iter().map(|r| hash_body(&r.value)).collect();
-            let msg_ids: Vec<Option<String>> = records_only
-                .iter()
-                .map(|r| {
-                    r.headers
-                        .iter()
-                        .find(|(k, _)| k == IDEMPOTENCY_HEADER)
-                        .map(|(_, v)| v.clone())
-                })
-                .collect();
-
-            let appended = self
-                .storage
-                .append_batch(stream, records_only)
+        let appended = if to_append.is_empty() {
+            Vec::new()
+        } else {
+            self.storage
+                .append_batch(stream, to_append)
                 .await
-                .inspect_err(|e| self.record_write_error(stream, e))?;
+                .inspect_err(|e| self.record_write_error(stream, e))?
+        };
 
+        {
             let mut maps = self.dedup_maps.write().await;
             let map = maps
                 .entry(stream.clone())
                 .or_insert_with(|| DedupMap::new(self.default_window, self.default_max_entries));
-
-            for ((idx, (offset, ts)), (msg_id, body_hash)) in indices
-                .iter()
-                .zip(appended.iter())
-                .zip(msg_ids.iter().zip(body_hashes.iter()))
-            {
-                if let Some(key) = msg_id {
+            for ((offset, _), key) in appended.iter().zip(write_keys.iter()) {
+                if let Some((key, body_hash)) = key {
                     map.insert(key.clone(), offset.0, *body_hash);
                 }
-                results[*idx] = Some(AppendResult::Written(*offset, *ts));
             }
         }
 
-        Ok(results
-            .into_iter()
-            .map(|r| r.expect("all indices populated"))
-            .collect())
+        let mut results: Vec<AppendResult> = Vec::with_capacity(slots.len());
+        for slot in &slots {
+            let r = match slot {
+                Slot::Done(r) => r.clone(),
+                Slot::Write(j) => {
+                    let (o, t) = appended[*j];
+                    AppendResult::Written(o, t)
+                }
+                Slot::SameAs(first) => AppendResult::Duplicate(results[*first].offset()),
+            };
+            results.push(r);
+        }
+        Ok(results)
+    }
+
+    /// Drop all dedup state for `stream` (call when the stream is deleted,
+    /// so a re-created stream doesn't answer "duplicate" for records that no
+    /// longer exist).
+    pub async fn forget_stream(&self, stream: &StreamName) {
+        self.dedup_maps.write().await.remove(stream);
     }
 
     /// Run periodic eviction of expired dedup entries. Call from a background task.
@@ -619,7 +666,9 @@ impl BrokerAppend {
                         if age_ms >= window_secs * 1000 {
                             continue; // already expired
                         }
-                        let inserted_at = Instant::now() - Duration::from_millis(age_ms);
+                        let inserted_at = Instant::now()
+                            .checked_sub(Duration::from_millis(age_ms))
+                            .unwrap_or_else(Instant::now);
                         map.seen.insert(
                             e.msg_id,
                             DedupEntry {
@@ -669,7 +718,9 @@ impl BrokerAppend {
                     let rec_ms = rec.timestamp / 1_000_000;
                     let age_ms = now_ms.saturating_sub(rec_ms);
                     let clamped_age = age_ms.min(window_secs * 1000);
-                    let inserted_at = Instant::now() - Duration::from_millis(clamped_age);
+                    let inserted_at = Instant::now()
+                        .checked_sub(Duration::from_millis(clamped_age))
+                        .unwrap_or_else(Instant::now);
                     let mut maps = self.dedup_maps.write().await;
                     let map = maps.entry(stream.clone()).or_insert_with(|| {
                         DedupMap::new(Duration::from_secs(window_secs), max_entries)

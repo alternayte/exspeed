@@ -8,3 +8,5 @@ exspeed-common = { path = "../exspeed-common" }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }

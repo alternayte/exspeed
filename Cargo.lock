@@ -1556,6 +1556,7 @@ dependencies = [
  "bb8-tiberius",
  "bytes",
  "chrono",
+ "constant_time_eq",
  "exspeed-broker",
  "exspeed-common",
  "exspeed-processing",
@@ -1648,7 +1649,9 @@ dependencies = [
  "async-trait",
  "bytes",
  "exspeed-common",
+ "serde",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

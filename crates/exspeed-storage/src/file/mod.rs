@@ -26,7 +26,7 @@ use exspeed_streams::{Record, StorageEngine, StorageError, StoredRecord};
 use crate::file::partition::Partition;
 use crate::file::segment_appender::{AppenderConfig, AppenderHandle, AppenderMode};
 use crate::file::segment_syncer::SegmentSyncerHandle;
-use crate::file::stream_config::StreamConfig;
+use crate::file::stream_config::{StreamConfig, StreamConfigFile};
 
 /// Storage durability mode. `Sync` = group commit + fsync per batch (default,
 /// strongest durability). `Async` = batch writes immediately, fsync on a timer
@@ -736,6 +736,51 @@ impl FileStorage {
 
 #[async_trait]
 impl StorageEngine for FileStorage {
+    async fn create_stream_with(
+        &self,
+        stream: &StreamName,
+        config: &StreamConfig,
+    ) -> Result<(), StorageError> {
+        config.check().map_err(|m| {
+            StorageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, m))
+        })?;
+        let this = self.clone();
+        let stream = stream.clone();
+        let config = config.clone();
+        tokio::task::spawn_blocking(move || {
+            this.create_stream_sync(&stream, config.max_age_secs, config.max_bytes)?;
+            let dir = this.inner.data_dir.join("streams").join(stream.as_str());
+            config.save(&dir).map_err(StorageError::Io)
+        })
+        .await
+        .map_err(|e| StorageError::Io(std::io::Error::other(e)))?
+    }
+
+    async fn stream_config(&self, stream: &StreamName) -> Result<StreamConfig, StorageError> {
+        let key = (stream.as_str().to_string(), 0u32);
+        if !self.inner.partitions.contains_key(&key) {
+            return Err(StorageError::StreamNotFound(stream.clone()));
+        }
+        let dir = self.inner.data_dir.join("streams").join(stream.as_str());
+        StreamConfig::load(&dir).map_err(StorageError::Io)
+    }
+
+    async fn update_stream_config(
+        &self,
+        stream: &StreamName,
+        config: &StreamConfig,
+    ) -> Result<(), StorageError> {
+        let key = (stream.as_str().to_string(), 0u32);
+        if !self.inner.partitions.contains_key(&key) {
+            return Err(StorageError::StreamNotFound(stream.clone()));
+        }
+        config.check().map_err(|m| {
+            StorageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, m))
+        })?;
+        let dir = self.inner.data_dir.join("streams").join(stream.as_str());
+        config.save(&dir).map_err(StorageError::Io)
+    }
+
     async fn create_stream(
         &self,
         stream: &StreamName,

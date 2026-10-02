@@ -41,6 +41,9 @@ fn make_broker(coord: Arc<ReplicationCoordinator>) -> (Broker, TempDir) {
         exspeed_broker::broker::DEFAULT_DELIVERY_BUFFER,
     )
     .with_replication_coordinator(coord);
+    broker
+        .dedup_ready
+        .store(true, std::sync::atomic::Ordering::Release);
     (broker, dir)
 }
 

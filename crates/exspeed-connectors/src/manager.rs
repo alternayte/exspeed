@@ -8,8 +8,8 @@ use tokio::sync::{oneshot, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use exspeed_broker::broker_append::BrokerAppend;
 use exspeed_broker::leadership::ClusterLeadership;
+use exspeed_broker::log::{Log, LogError};
 use exspeed_common::metrics::Metrics;
 use exspeed_common::{Offset, StreamName};
 use exspeed_streams::record::Record;
@@ -79,7 +79,8 @@ pub struct RunningConnector {
 
 pub struct ConnectorManager {
     pub storage: Arc<dyn StorageEngine>,
-    pub broker_append: Arc<BrokerAppend>,
+    /// The broker write path; every source record and DLQ write goes here.
+    pub log: Arc<Log>,
     pub connectors: RwLock<HashMap<String, RunningConnector>>,
     pub data_dir: PathBuf,
     pub metrics: Arc<Metrics>,
@@ -97,7 +98,7 @@ pub struct ConnectorManager {
 impl ConnectorManager {
     pub fn new(
         storage: Arc<dyn StorageEngine>,
-        broker_append: Arc<BrokerAppend>,
+        log: Arc<Log>,
         data_dir: PathBuf,
         metrics: Arc<Metrics>,
         offset_store: Arc<dyn crate::offset_store::OffsetStore>,
@@ -105,7 +106,7 @@ impl ConnectorManager {
     ) -> Self {
         Self {
             storage,
-            broker_append,
+            log,
             connectors: RwLock::new(HashMap::new()),
             data_dir,
             metrics,
@@ -436,18 +437,16 @@ impl ConnectorManager {
         Ok(())
     }
 
-    /// Ensure a stream exists, creating it if necessary.
+    /// Ensure a stream exists, creating it if necessary. Followers skip this:
+    /// only the leader writes, and the stream reaches followers by replication.
     async fn ensure_stream_exists(&self, stream: &StreamName) -> Result<(), String> {
-        // Try reading from the stream. If it fails with StreamNotFound, create it.
-        match self.storage.read(stream, Offset(0), 0).await {
-            Ok(_) => Ok(()),
-            Err(StorageError::StreamNotFound(_)) => self
-                .storage
-                .create_stream(stream, 0, 0)
-                .await
-                .map_err(|e| format!("failed to create stream: {e}")),
-            Err(e) => Err(format!("failed to check stream: {e}")),
+        if !self.log.can_write() {
+            return Ok(());
         }
+        self.log
+            .ensure_stream(stream)
+            .await
+            .map_err(|e| format!("failed to create stream: {e}"))
     }
 
     /// Start a connector based on its type (source or sink). Called from REST
@@ -548,7 +547,7 @@ impl ConnectorManager {
         // parent token.
         let child_token = token.child_token();
 
-        let broker_append = self.broker_append.clone();
+        let log = self.log.clone();
         let metrics = self.metrics.clone();
         let offset_store = self.offset_store.clone();
         let stream_str = config.stream.clone();
@@ -563,7 +562,7 @@ impl ConnectorManager {
         let name_for_select = name.clone();
         let source_retry_policy: RetryPolicy = config.retry.clone();
         let source_cfg_for_dlq = config.clone();
-        let broker_append_for_source_dlq = self.broker_append.clone();
+        let log_for_source_dlq = self.log.clone();
 
         // Insert into map before spawning
         {
@@ -601,19 +600,17 @@ impl ConnectorManager {
                 }
 
                 // Build the DLQ writer (None if dlq_stream unset).
-                let source_dlq = match DlqWriter::from_config(
-                    broker_append_for_source_dlq.clone(),
-                    &source_cfg_for_dlq,
-                ) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        error!(connector = task_name.as_str(), error = %e,
+                let source_dlq =
+                    match DlqWriter::from_config(log_for_source_dlq.clone(), &source_cfg_for_dlq) {
+                        Ok(w) => w,
+                        Err(e) => {
+                            error!(connector = task_name.as_str(), error = %e,
                            "source DLQ writer init failed");
-                        None
-                    }
-                };
+                            None
+                        }
+                    };
                 if let Some(w) = &source_dlq {
-                    if let Err(e) = broker_append_for_source_dlq.ensure_stream(w.stream()).await {
+                    if let Err(e) = log_for_source_dlq.ensure_stream(w.stream()).await {
                         error!(connector = task_name.as_str(), error = %e,
                            "source DLQ stream auto-create failed");
                     }
@@ -767,8 +764,14 @@ impl ConnectorManager {
                         // key, different body) is treated as poison.
                         let mut append_attempt: u32 = 0;
                         let result = loop {
-                            match broker_append.append(&stream_name, &storage_record).await {
-                                Err(e) if !matches!(e, StorageError::KeyCollision { .. }) => {
+                            match log.append(&stream_name, storage_record.clone()).await {
+                                Err(e)
+                                    if !matches!(
+                                        e,
+                                        LogError::InvalidRecord(_)
+                                            | LogError::Storage(StorageError::KeyCollision { .. })
+                                    ) =>
+                                {
                                     let delay = source_retry_policy
                                         .delay_for(append_attempt)
                                         .unwrap_or(poll_interval.max(Duration::from_secs(1)));
@@ -898,7 +901,7 @@ impl ConnectorManager {
         let name_for_select = name.clone();
         let retry_policy: RetryPolicy = config.retry.clone();
         let on_transient_exhausted: OnTransientExhausted = config.on_transient_exhausted;
-        let broker_append_for_dlq = self.broker_append.clone();
+        let log_for_dlq = self.log.clone();
         let cfg_for_dlq = config.clone();
 
         // Insert into map before spawning
@@ -928,17 +931,16 @@ impl ConnectorManager {
                 }
 
                 // Build the DLQ writer (None if dlq_stream unset).
-                let dlq_writer =
-                    match DlqWriter::from_config(broker_append_for_dlq.clone(), &cfg_for_dlq) {
-                        Ok(w) => w,
-                        Err(e) => {
-                            error!(connector = task_name.as_str(), error = %e,
+                let dlq_writer = match DlqWriter::from_config(log_for_dlq.clone(), &cfg_for_dlq) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        error!(connector = task_name.as_str(), error = %e,
                            "DLQ writer init failed");
-                            return;
-                        }
-                    };
+                        return;
+                    }
+                };
                 if let Some(w) = &dlq_writer {
-                    if let Err(e) = broker_append_for_dlq.ensure_stream(w.stream()).await {
+                    if let Err(e) = log_for_dlq.ensure_stream(w.stream()).await {
                         error!(connector = task_name.as_str(), error = %e,
                            "DLQ stream auto-create failed");
                         return;

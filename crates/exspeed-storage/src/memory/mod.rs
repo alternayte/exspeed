@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use exspeed_common::{Offset, StreamName};
-use exspeed_streams::{Record, StorageEngine, StorageError, StoredRecord};
+use exspeed_streams::{Record, StorageEngine, StorageError, StoredRecord, StreamConfig};
 
 /// Per-stream state: the retained records and the next offset to assign.
 ///
@@ -15,6 +15,7 @@ use exspeed_streams::{Record, StorageEngine, StorageError, StoredRecord};
 struct StreamState {
     records: Vec<StoredRecord>,
     next_offset: u64,
+    config: StreamConfig,
 }
 
 impl StreamState {
@@ -22,6 +23,7 @@ impl StreamState {
         Self {
             records: Vec::new(),
             next_offset: 0,
+            config: StreamConfig::default(),
         }
     }
 }
@@ -53,6 +55,37 @@ fn now_nanos() -> u64 {
 
 #[async_trait]
 impl StorageEngine for MemoryStorage {
+    async fn create_stream_with(
+        &self,
+        stream: &StreamName,
+        config: &StreamConfig,
+    ) -> Result<(), StorageError> {
+        self.create_stream(stream, config.max_age_secs, config.max_bytes)
+            .await?;
+        self.update_stream_config(stream, config).await
+    }
+
+    async fn stream_config(&self, stream: &StreamName) -> Result<StreamConfig, StorageError> {
+        let streams = self.streams.read().unwrap();
+        streams
+            .get(stream.as_str())
+            .map(|s| s.config.clone())
+            .ok_or_else(|| StorageError::StreamNotFound(stream.clone()))
+    }
+
+    async fn update_stream_config(
+        &self,
+        stream: &StreamName,
+        config: &StreamConfig,
+    ) -> Result<(), StorageError> {
+        let mut streams = self.streams.write().unwrap();
+        let state = streams
+            .get_mut(stream.as_str())
+            .ok_or_else(|| StorageError::StreamNotFound(stream.clone()))?;
+        state.config = config.clone();
+        Ok(())
+    }
+
     async fn create_stream(
         &self,
         stream: &StreamName,

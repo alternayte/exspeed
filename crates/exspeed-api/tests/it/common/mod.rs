@@ -101,7 +101,7 @@ pub async fn make_state_with_leader(leader: bool) -> Arc<exspeed_api::AppState> 
         .expect("offset store");
     let cm = Arc::new(ConnectorManager::new(
         storage_dyn.clone(),
-        ba,
+        broker.log.clone(),
         tmp.path().to_path_buf(),
         metrics.clone(),
         oss,

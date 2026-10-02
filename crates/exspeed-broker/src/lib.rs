@@ -7,6 +7,7 @@ pub mod delivery;
 pub mod handlers;
 pub mod leadership;
 pub mod lease;
+pub mod log;
 pub mod persistence;
 pub mod queue_depth_task;
 pub mod replication;

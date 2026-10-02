@@ -12,8 +12,8 @@ use exspeed_broker::broker_append::AppendResult;
 use exspeed_common::auth::Identity;
 use exspeed_common::StreamName;
 use exspeed_protocol::messages::{ClientMessage, DeleteConsumerRequest, ServerMessage};
-use exspeed_storage::file::stream_config::StreamConfig;
-use exspeed_streams::{Record, StorageEngine, StorageError};
+use exspeed_storage::file::stream_config::{StreamConfig, StreamConfigFile};
+use exspeed_streams::{Record, StorageError};
 
 use crate::state::AppState;
 
@@ -105,47 +105,82 @@ pub async fn create_stream(
         return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
     }
 
-    match state
-        .storage
-        .create_stream(&stream_name, body.max_age_secs, body.max_bytes)
-        .await
-    {
-        Ok(()) => {
-            // Overwrite the config written by create_stream_sync with the full
-            // config including dedup fields.
-            let stream_dir = state
-                .storage
-                .data_dir()
-                .join("streams")
-                .join(stream_name.as_str());
-            if let Err(e) = cfg.save(&stream_dir) {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("failed to save stream config: {e}")})),
-                )
-                    .into_response();
-            }
-            state
-                .broker
-                .broker_append
-                .configure_stream(&stream_name, cfg.dedup_window_secs, cfg.dedup_max_entries)
-                .await;
-            (
-                StatusCode::CREATED,
-                Json(json!({"name": body.name, "status": "created"})),
-            )
-                .into_response()
-        }
-        Err(exspeed_streams::StorageError::StreamAlreadyExists(_)) => (
-            StatusCode::CONFLICT,
-            Json(json!({"error": format!("stream '{}' already exists", body.name)})),
+    match state.broker.log.create_stream(&stream_name, &cfg).await {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(json!({"name": body.name, "status": "created"})),
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+        Err(e) => log_error_response(&state, &stream_name, e),
+    }
+}
+
+/// Map a write-path error to an HTTP response.
+pub(crate) fn log_error_response(
+    state: &AppState,
+    stream: &StreamName,
+    e: exspeed_broker::log::LogError,
+) -> Response {
+    use exspeed_broker::log::LogError;
+    match e {
+        LogError::NotLeader | LogError::DedupNotReady => (
+            StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": e.to_string()})),
         )
             .into_response(),
+        LogError::InvalidRecord(_) | LogError::InvalidConfig(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+        LogError::Storage(StorageError::StreamNotFound(_)) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("stream '{stream}' not found")})),
+        )
+            .into_response(),
+        LogError::Storage(StorageError::StreamAlreadyExists(_)) => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": format!("stream '{stream}' already exists")})),
+        )
+            .into_response(),
+        LogError::Storage(StorageError::KeyCollision { stored_offset }) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "msg_id already used for a different message body",
+                "stored_offset": stored_offset,
+            })),
+        )
+            .into_response(),
+        LogError::Storage(StorageError::DedupMapFull { retry_after_secs }) => {
+            let mut resp_headers = HeaderMap::new();
+            if let Ok(val) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+                resp_headers.insert(axum::http::header::RETRY_AFTER, val);
+            }
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                resp_headers,
+                Json(json!({"error": "dedup map full, retry later", "retry_after_secs": retry_after_secs})),
+            )
+                .into_response()
+        }
+        LogError::Storage(e) => {
+            let kind = match &e {
+                StorageError::Io(io_err)
+                    if exspeed_storage::file::io_errors::is_storage_full(io_err) =>
+                {
+                    "storage_full"
+                }
+                _ => "other",
+            };
+            state
+                .metrics
+                .record_storage_write_error(stream.as_str(), kind);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -293,21 +328,14 @@ pub async fn patch_stream(
         }
     }
 
-    // Persist.
-    if let Err(e) = cfg.save(&stream_dir) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("failed to save stream config: {e}")})),
-        )
-            .into_response();
-    }
-
-    // Hot-reconfigure the in-memory dedup map.
-    state
+    if let Err(e) = state
         .broker
-        .broker_append
-        .configure_stream(&stream_name, cfg.dedup_window_secs, cfg.dedup_max_entries)
-        .await;
+        .log
+        .update_stream_config(&stream_name, &cfg)
+        .await
+    {
+        return log_error_response(&state, &stream_name, e);
+    }
 
     let storage_bytes = state.storage.stream_storage_bytes(&name).unwrap_or(0);
     let head_offset = state.storage.stream_head_offset(&name).unwrap_or(0);
@@ -414,79 +442,25 @@ pub async fn publish_to_stream(
     };
 
     let start = std::time::Instant::now();
-    match state
-        .broker
-        .broker_append
-        .append(&stream_name, &record)
-        .await
-    {
-        Ok(AppendResult::Written(offset, _)) => {
-            let elapsed_secs = start.elapsed().as_secs_f64();
+    match state.broker.log.append(&stream_name, record).await {
+        Ok(result) => {
             state
                 .metrics
-                .record_publish_latency(stream_name.as_str(), elapsed_secs);
-            state.metrics.record_publish(stream_name.as_str());
-            (
-                StatusCode::CREATED,
-                Json(json!({"offset": offset.0, "duplicate": false})),
-            )
-                .into_response()
-        }
-        Ok(AppendResult::Duplicate(offset)) => {
-            let elapsed_secs = start.elapsed().as_secs_f64();
-            state
-                .metrics
-                .record_publish_latency(stream_name.as_str(), elapsed_secs);
-            state.metrics.record_publish(stream_name.as_str());
-            (
-                StatusCode::OK,
-                Json(json!({"offset": offset.0, "duplicate": true})),
-            )
-                .into_response()
-        }
-        Err(StorageError::StreamNotFound(_)) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("stream '{}' not found", name)})),
-        )
-            .into_response(),
-        Err(StorageError::KeyCollision { stored_offset }) => (
-            StatusCode::CONFLICT,
-            Json(json!({
-                "error": "msg_id already used for a different message body",
-                "stored_offset": stored_offset,
-            })),
-        )
-            .into_response(),
-        Err(StorageError::DedupMapFull { retry_after_secs }) => {
-            let mut resp_headers = HeaderMap::new();
-            if let Ok(val) = HeaderValue::from_str(&retry_after_secs.to_string()) {
-                resp_headers.insert(axum::http::header::RETRY_AFTER, val);
+                .record_publish_latency(stream_name.as_str(), start.elapsed().as_secs_f64());
+            match result {
+                AppendResult::Written(offset, _) => (
+                    StatusCode::CREATED,
+                    Json(json!({"offset": offset.0, "duplicate": false})),
+                )
+                    .into_response(),
+                AppendResult::Duplicate(offset) => (
+                    StatusCode::OK,
+                    Json(json!({"offset": offset.0, "duplicate": true})),
+                )
+                    .into_response(),
             }
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                resp_headers,
-                Json(json!({"error": "dedup map full, retry later", "retry_after_secs": retry_after_secs})),
-            )
-                .into_response()
         }
-        Err(e) => {
-            let kind = match &e {
-                StorageError::Io(io_err)
-                    if exspeed_storage::file::io_errors::is_storage_full(io_err) =>
-                {
-                    "storage_full"
-                }
-                _ => "other",
-            };
-            state
-                .metrics
-                .record_storage_write_error(stream_name.as_str(), kind);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
-            )
-                .into_response()
-        }
+        Err(e) => log_error_response(&state, &stream_name, e),
     }
 }
 
@@ -603,13 +577,7 @@ pub async fn delete_stream(
                 )
                     .into_response();
             }
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": e.to_string()})),
-                )
-                    .into_response();
-            }
+            Err(e) => return log_error_response(&state, &stream_name, e),
         }
     }
 
@@ -622,11 +590,7 @@ pub async fn delete_stream(
             })),
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => log_error_response(&state, &stream_name, e),
     }
 }
 

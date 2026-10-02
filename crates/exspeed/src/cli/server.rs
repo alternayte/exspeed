@@ -429,7 +429,7 @@ where
                 .data_dir()
                 .join("streams")
                 .join(stream_name_str.as_str());
-            let cfg = exspeed_storage::file::stream_config::StreamConfig::load(&stream_dir)
+            let cfg = <exspeed_storage::file::stream_config::StreamConfig as exspeed_storage::file::stream_config::StreamConfigFile>::load(&stream_dir)
                 .unwrap_or_default();
             broker_append
                 .configure_stream(&stream_name, cfg.dedup_window_secs, cfg.dedup_max_entries)
@@ -598,7 +598,6 @@ where
     // so `Broker::append/create_stream/delete_stream` fan out their
     // `ReplicationEvent`s to every connected follower's mpsc channel
     // before returning to the caller.
-    let broker_append_for_connectors = broker_append.clone();
     let broker_builder = Broker::new(
         storage.clone(),
         broker_append,
@@ -613,6 +612,9 @@ where
         Some(coord) => broker_builder.with_replication_coordinator(coord.clone()),
         None => broker_builder,
     });
+    // Only the leader accepts writes. Every write path (TCP, HTTP, webhooks,
+    // connectors, ExQL) goes through `broker.log`, which enforces this.
+    broker.log.set_write_gate(leadership.clone());
     broker
         .load_consumers()
         .await
@@ -677,7 +679,7 @@ where
     // Create connector manager
     let connector_manager = Arc::new(ConnectorManager::new(
         storage.clone(),
-        broker_append_for_connectors,
+        broker.log.clone(),
         args.data_dir.clone(),
         metrics.clone(),
         offset_store,
@@ -698,8 +700,11 @@ where
         args.data_dir.join("connectors.d"),
     );
 
-    // Create ExQL engine (use file_storage as the StorageEngine trait object)
-    let exql_storage: Arc<dyn StorageEngine> = file_storage.clone();
+    // Create ExQL engine. Reads hit storage directly; query output is written
+    // through the broker's write path.
+    let exql_storage: Arc<dyn StorageEngine> = Arc::new(
+        exspeed_broker::log::LogBackedStorage::new(broker.log.clone()),
+    );
     let exql = Arc::new(ExqlEngine::new(
         exql_storage,
         args.data_dir.clone(),
@@ -1407,46 +1412,31 @@ where
                                     continue;
                                 }
 
-                                // Convert PublishBatchRecord -> Record, injecting msg_id
-                                // into headers as "x-idempotency-key" (mirrors single-publish).
-                                const IDEMPOTENCY_HEADER: &str = "x-idempotency-key";
                                 let records: Vec<Record> = req
                                     .records
                                     .into_iter()
-                                    .map(|br| {
-                                        let mut headers = br.headers;
-                                        if let Some(id) = br.msg_id {
-                                            headers.push((
-                                                IDEMPOTENCY_HEADER.to_owned(),
-                                                id,
-                                            ));
-                                        }
-                                        Record {
-                                            subject: br.subject,
-                                            key: br.key,
-                                            value: br.value,
-                                            headers,
-                                            timestamp_ns: None,
-                                        }
+                                    .map(|br| Record {
+                                        subject: br.subject,
+                                        key: br.key,
+                                        value: br.value,
+                                        headers: exspeed_broker::handlers::with_msg_id(
+                                            br.headers, br.msg_id,
+                                        ),
+                                        timestamp_ns: None,
                                     })
                                     .collect();
 
-                                let results = match broker
-                                    .broker_append
-                                    .append_batch(&stream_name, records)
-                                    .await
-                                {
-                                    Ok(r) => r,
-                                    Err(e) => {
-                                        let response = ServerMessage::Error {
-                                            code: 500,
-                                            message: format!("{e}"),
+                                let results =
+                                    match broker.log.append_batch(&stream_name, records).await {
+                                        Ok(r) => r,
+                                        Err(e) => {
+                                            let response =
+                                                exspeed_broker::handlers::log_error_response(e)
+                                                    .into_frame(correlation_id);
+                                            framed_write.send(response).await?;
+                                            continue;
                                         }
-                                        .into_frame(correlation_id);
-                                        framed_write.send(response).await?;
-                                        continue;
-                                    }
-                                };
+                                    };
 
                                 let batch_results: Vec<BatchResult> = results
                                     .into_iter()

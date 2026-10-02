@@ -1,22 +1,21 @@
 //! Dead-letter queue writer.
 //!
-//! Wraps `BrokerAppend`, pre-resolved to a single DLQ stream at construction.
+//! Wraps the broker [`Log`], pre-resolved to a single DLQ stream at construction.
 //! Owned by each connector task when `dlq_stream` is configured; `None`
 //! otherwise (drop-with-metric behavior preserved).
 
 use std::sync::Arc;
 
-use exspeed_broker::broker_append::BrokerAppend;
+use exspeed_broker::log::{Log, LogError};
 use exspeed_common::StreamName;
 use exspeed_streams::record::Record;
-use exspeed_streams::StorageError;
 use tracing::{debug, error};
 
 use crate::config::ConnectorConfig;
 use crate::traits::{PoisonReason, SinkRecord};
 
 pub struct DlqWriter {
-    broker: Arc<BrokerAppend>,
+    broker: Arc<Log>,
     stream: StreamName,
     origin: String,
 }
@@ -37,10 +36,7 @@ pub(crate) fn parse_dlq_config(config: &ConnectorConfig) -> Result<Option<Stream
 impl DlqWriter {
     /// Returns `Ok(None)` when the connector's `dlq_stream` setting is unset.
     /// Otherwise validates the stream name and returns a writer bound to it.
-    pub fn from_config(
-        broker: Arc<BrokerAppend>,
-        config: &ConnectorConfig,
-    ) -> Result<Option<Self>, String> {
+    pub fn from_config(broker: Arc<Log>, config: &ConnectorConfig) -> Result<Option<Self>, String> {
         match parse_dlq_config(config)? {
             None => Ok(None),
             Some(stream) => Ok(Some(Self {
@@ -59,15 +55,19 @@ impl DlqWriter {
     /// Append a poison record to the DLQ stream. The record's original
     /// payload bytes are preserved verbatim; metadata is added as headers
     /// prefixed `exspeed-dlq-*`.
-    pub async fn write(
-        &self,
-        record: &SinkRecord,
-        reason: &PoisonReason,
-    ) -> Result<(), StorageError> {
+    pub async fn write(&self, record: &SinkRecord, reason: &PoisonReason) -> Result<(), LogError> {
         let mut headers = record.headers.clone();
         headers.push(("exspeed-dlq-origin".into(), self.origin.clone()));
         headers.push(("exspeed-dlq-reason".into(), reason.label().to_string()));
-        headers.push(("exspeed-dlq-detail".into(), reason.detail()));
+        let mut detail = reason.detail();
+        if detail.len() > 4096 {
+            let mut cut = 4096;
+            while !detail.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            detail.truncate(cut);
+        }
+        headers.push(("exspeed-dlq-detail".into(), detail));
         headers.push((
             "exspeed-dlq-original-offset".into(),
             record.offset.to_string(),
@@ -82,7 +82,7 @@ impl DlqWriter {
             timestamp_ns: None,
         };
 
-        match self.broker.append(&self.stream, &r).await {
+        match self.broker.append(&self.stream, r).await {
             Ok(_) => {
                 debug!(
                     dlq_stream = %self.stream,

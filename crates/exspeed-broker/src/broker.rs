@@ -10,6 +10,7 @@ use crate::consumer_state::{ConsumerGroup, ConsumerState, DeliveryBatch};
 use crate::delivery::{run_delivery, DeliveryConfig};
 use crate::handlers;
 use crate::lease::LeaderLease;
+use crate::log::Log;
 use crate::replication::ReplicationCoordinator;
 use exspeed_common::Metrics;
 use exspeed_protocol::messages::{ClientMessage, ServerMessage};
@@ -23,6 +24,9 @@ pub const DEFAULT_DELIVERY_BUFFER: usize = 8192;
 pub struct Broker {
     pub storage: Arc<dyn StorageEngine>,
     pub broker_append: Arc<BrokerAppend>,
+    /// The single write path. All appends and stream-metadata changes go
+    /// through it.
+    pub log: Arc<Log>,
     pub consumers: RwLock<HashMap<String, ConsumerState>>,
     pub(crate) groups: RwLock<HashMap<String, ConsumerGroup>>,
     pub data_dir: PathBuf,
@@ -53,9 +57,17 @@ impl Broker {
         metrics: Arc<Metrics>,
         delivery_buffer: usize,
     ) -> Self {
+        let dedup_ready = Arc::new(AtomicBool::new(false));
+        let log = Arc::new(Log::new(
+            storage.clone(),
+            broker_append.clone(),
+            metrics.clone(),
+            dedup_ready.clone(),
+        ));
         Self {
             storage,
             broker_append,
+            log,
             consumers: RwLock::new(HashMap::new()),
             groups: RwLock::new(HashMap::new()),
             data_dir,
@@ -66,7 +78,7 @@ impl Broker {
             nack_attempts: RwLock::new(HashMap::new()),
             metrics,
             delivery_buffer,
-            dedup_ready: Arc::new(AtomicBool::new(false)),
+            dedup_ready,
             replication_coordinator: None,
         }
     }
@@ -78,6 +90,7 @@ impl Broker {
         mut self,
         coordinator: Arc<ReplicationCoordinator>,
     ) -> Self {
+        self.log.set_replication(coordinator.clone());
         self.replication_coordinator = Some(coordinator);
         self
     }
@@ -88,40 +101,18 @@ impl Broker {
         self.replication_coordinator.as_ref()
     }
 
-    /// Emit a replication event to any attached coordinator. The event is
-    /// constructed lazily — the `FnOnce` is only invoked when a coordinator
-    /// is present, so single-pod deployments pay no event-construction cost.
-    pub(crate) fn emit_replication_event(
-        &self,
-        make_event: impl FnOnce() -> crate::replication::ReplicationEvent,
-    ) {
-        if let Some(coord) = &self.replication_coordinator {
-            coord.emit(make_event());
-        }
-    }
-
     /// Returns `true` once all startup dedup rebuild tasks have completed.
     pub fn is_dedup_ready(&self) -> bool {
         self.dedup_ready.load(Ordering::Acquire)
     }
 
-    /// Delete a stream and emit a `StreamDeleted` replication event. Thin
-    /// wrapper around the storage trait that exists so multi-pod leaders
-    /// can fan the deletion out to followers. Returns `Err` if storage
-    /// says the stream does not exist (or any other I/O error).
+    /// Delete a stream (through the write path, so it replicates and drops
+    /// the stream's dedup state).
     pub async fn delete_stream(
         &self,
         stream: &exspeed_common::StreamName,
-    ) -> Result<(), exspeed_streams::StorageError> {
-        self.storage.delete_stream(stream).await?;
-        self.emit_replication_event(|| {
-            use crate::replication::ReplicationEvent;
-            use exspeed_protocol::messages::replicate::StreamDeletedEvent;
-            ReplicationEvent::StreamDeleted(StreamDeletedEvent {
-                name: stream.as_str().to_string(),
-            })
-        });
-        Ok(())
+    ) -> Result<(), crate::log::LogError> {
+        self.log.delete_stream(stream).await
     }
 
     /// Load all persisted consumers from the configured ConsumerStore and

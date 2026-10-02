@@ -9,6 +9,43 @@ use exspeed_streams::StorageError;
 use crate::broker::Broker;
 use crate::consumer_state::{ConsumerConfig, ConsumerGroup, ConsumerState};
 
+/// Map a write-path error onto a protocol response.
+pub fn log_error_response(e: crate::log::LogError) -> ServerMessage {
+    use crate::log::LogError;
+    match e {
+        LogError::NotLeader => ServerMessage::Error {
+            code: 503,
+            message: e.to_string(),
+        },
+        LogError::DedupNotReady => ServerMessage::Error {
+            code: 503,
+            message: e.to_string(),
+        },
+        LogError::InvalidRecord(_) | LogError::InvalidConfig(_) => ServerMessage::Error {
+            code: 400,
+            message: e.to_string(),
+        },
+        LogError::Storage(StorageError::KeyCollision { stored_offset }) => {
+            ServerMessage::KeyCollision { stored_offset }
+        }
+        LogError::Storage(StorageError::DedupMapFull { retry_after_secs }) => {
+            ServerMessage::DedupMapFull { retry_after_secs }
+        }
+        LogError::Storage(StorageError::StreamNotFound(s)) => ServerMessage::Error {
+            code: 404,
+            message: format!("stream '{s}' not found"),
+        },
+        LogError::Storage(StorageError::StreamAlreadyExists(s)) => ServerMessage::Error {
+            code: 409,
+            message: format!("stream '{s}' already exists"),
+        },
+        LogError::Storage(e) => ServerMessage::Error {
+            code: 500,
+            message: format!("append failed: {e}"),
+        },
+    }
+}
+
 pub async fn handle_create_stream(broker: &Broker, req: CreateStreamRequest) -> ServerMessage {
     let stream_name = match StreamName::try_from(req.stream_name) {
         Ok(n) => n,
@@ -19,38 +56,10 @@ pub async fn handle_create_stream(broker: &Broker, req: CreateStreamRequest) -> 
             }
         }
     };
-
-    match broker
-        .storage
-        .create_stream(&stream_name, req.max_age_secs, req.max_bytes)
-        .await
-    {
-        Ok(()) => {
-            // Load the stream config that was just persisted (uses defaults for dedup
-            // fields since CreateStreamRequest doesn't carry dedup params yet).
-            let stream_dir = broker.data_dir.join("streams").join(stream_name.as_str());
-            let cfg = exspeed_storage::file::stream_config::StreamConfig::load(&stream_dir)
-                .unwrap_or_default();
-            broker
-                .broker_append
-                .configure_stream(&stream_name, cfg.dedup_window_secs, cfg.dedup_max_entries)
-                .await;
-
-            // Fan out to replication followers (no-op if single-pod).
-            broker.emit_replication_event(|| {
-                use exspeed_protocol::messages::replicate::StreamCreatedEvent;
-                crate::replication::ReplicationEvent::StreamCreated(StreamCreatedEvent {
-                    name: stream_name.as_str().to_string(),
-                    max_age_secs: req.max_age_secs,
-                    max_bytes: req.max_bytes,
-                })
-            });
-            ServerMessage::Ok
-        }
-        Err(e) => ServerMessage::Error {
-            code: 409,
-            message: format!("create_stream failed: {e}"),
-        },
+    let config = exspeed_streams::StreamConfig::from_request(req.max_age_secs, req.max_bytes, 0, 0);
+    match broker.log.create_stream(&stream_name, &config).await {
+        Ok(()) => ServerMessage::Ok,
+        Err(e) => log_error_response(e),
     }
 }
 
@@ -65,105 +74,49 @@ pub async fn handle_publish(broker: &Broker, req: PublishRequest) -> ServerMessa
         }
     };
 
-    // Translate msg_id field → x-idempotency-key header.
-    let mut headers = req.headers;
-    if let Some(ref id) = req.msg_id {
-        // Log at DEBUG when both explicit msg_id and x-idempotency-key header are
-        // present but disagree, so operators can detect misconfigured callers.
-        if let Some((_, existing)) = headers.iter().find(|(k, _)| k == "x-idempotency-key") {
-            if existing != id {
-                tracing::debug!(
-                    stream = %stream_name,
-                    "publish has both explicit msg_id and x-idempotency-key header; using explicit field"
-                );
-            }
-        }
-        headers.retain(|(k, _)| k != "x-idempotency-key");
-        headers.push(("x-idempotency-key".to_string(), id.clone()));
-    }
-
     let record = Record {
         key: req.key,
         value: req.value,
         subject: req.subject,
-        headers,
+        headers: with_msg_id(req.headers, req.msg_id),
         timestamp_ns: None,
     };
 
     let start = std::time::Instant::now();
-    match broker.broker_append.append(&stream_name, &record).await {
-        Ok(crate::broker_append::AppendResult::Written(offset, timestamp_ns)) => {
-            let elapsed_secs = start.elapsed().as_secs_f64();
+    match broker.log.append(&stream_name, record).await {
+        Ok(result) => {
             broker
                 .metrics
-                .record_publish_latency(stream_name.as_str(), elapsed_secs);
-            broker.metrics.record_publish(stream_name.as_str());
-
-            // Fan out to replication followers. Only on `Written` — a
-            // `Duplicate` means the record was persisted on an earlier
-            // publish, which was itself replicated at that time.
-            //
-            // Use the leader-assigned timestamp (converted from ns to ms)
-            // rather than a fresh wall-clock reading, so the follower's
-            // time-index matches the leader's for seek_by_time + windowed
-            // continuous queries.
-            broker.emit_replication_event(|| {
-                use exspeed_protocol::messages::replicate::{RecordsAppended, ReplicatedRecord};
-                // Translate `x-idempotency-key` out of the headers into
-                // the typed `msg_id` field. The follower's apply path
-                // rehydrates it back under the same header name, so this
-                // keeps the wire tight (no duplicated representation) and
-                // lets the follower skip a per-record header dedup pass.
-                let mut headers = record.headers.clone();
-                let mut msg_id = None;
-                headers.retain(|(k, v)| {
-                    if k.eq_ignore_ascii_case("x-idempotency-key") {
-                        msg_id = Some(v.clone());
-                        false
-                    } else {
-                        true
+                .record_publish_latency(stream_name.as_str(), start.elapsed().as_secs_f64());
+            match result {
+                crate::broker_append::AppendResult::Written(offset, _) => {
+                    ServerMessage::PublishOk {
+                        offset: offset.0,
+                        duplicate: false,
                     }
-                });
-                crate::replication::ReplicationEvent::RecordsAppended(RecordsAppended {
-                    stream: stream_name.as_str().to_string(),
-                    base_offset: offset.0,
-                    records: vec![ReplicatedRecord {
-                        subject: record.subject.clone(),
-                        payload: record.value.to_vec(),
-                        headers,
-                        timestamp_ms: timestamp_ns / 1_000_000,
-                        msg_id,
-                    }],
-                })
-            });
-
-            ServerMessage::PublishOk {
-                offset: offset.0,
-                duplicate: false,
+                }
+                crate::broker_append::AppendResult::Duplicate(offset) => ServerMessage::PublishOk {
+                    offset: offset.0,
+                    duplicate: true,
+                },
             }
         }
-        Ok(crate::broker_append::AppendResult::Duplicate(offset)) => {
-            let elapsed_secs = start.elapsed().as_secs_f64();
-            broker
-                .metrics
-                .record_publish_latency(stream_name.as_str(), elapsed_secs);
-            broker.metrics.record_publish(stream_name.as_str());
-            ServerMessage::PublishOk {
-                offset: offset.0,
-                duplicate: true,
-            }
-        }
-        Err(StorageError::KeyCollision { stored_offset }) => {
-            ServerMessage::KeyCollision { stored_offset }
-        }
-        Err(StorageError::DedupMapFull { retry_after_secs }) => {
-            ServerMessage::DedupMapFull { retry_after_secs }
-        }
-        Err(e) => ServerMessage::Error {
-            code: 500,
-            message: format!("append failed: {e}"),
-        },
+        Err(e) => log_error_response(e),
     }
+}
+
+/// Fold an explicit `msg_id` into the `x-idempotency-key` header (the
+/// explicit field wins over a header the caller also set).
+pub fn with_msg_id(
+    mut headers: Vec<(String, String)>,
+    msg_id: Option<String>,
+) -> Vec<(String, String)> {
+    use crate::broker_append::IDEMPOTENCY_HEADER;
+    if let Some(id) = msg_id {
+        headers.retain(|(k, _)| k != IDEMPOTENCY_HEADER);
+        headers.push((IDEMPOTENCY_HEADER.to_string(), id));
+    }
+    headers
 }
 
 pub async fn handle_fetch(broker: &Broker, req: FetchRequest) -> ServerMessage {
@@ -569,15 +522,11 @@ pub async fn handle_nack(broker: &Broker, req: NackRequest) -> ServerMessage {
             }
         };
 
-        match broker.storage.create_stream(&dlq_stream_name, 0, 0).await {
-            Ok(()) => {}
-            Err(StorageError::StreamAlreadyExists(_)) => {}
-            Err(e) => {
-                return ServerMessage::Error {
-                    code: 500,
-                    message: format!("failed to create DLQ stream: {e}"),
-                }
-            }
+        if let Err(e) = broker.log.ensure_stream(&dlq_stream_name).await {
+            return ServerMessage::Error {
+                code: 500,
+                message: format!("failed to create DLQ stream: {e}"),
+            };
         }
 
         let dlq_record = Record {
@@ -588,7 +537,7 @@ pub async fn handle_nack(broker: &Broker, req: NackRequest) -> ServerMessage {
             timestamp_ns: None,
         };
 
-        if let Err(e) = broker.storage.append(&dlq_stream_name, &dlq_record).await {
+        if let Err(e) = broker.log.append(&dlq_stream_name, dlq_record).await {
             return ServerMessage::Error {
                 code: 500,
                 message: format!("failed to publish to DLQ: {e}"),

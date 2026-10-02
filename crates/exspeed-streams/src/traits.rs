@@ -1,9 +1,40 @@
 use std::path::PathBuf;
 
+use crate::config::StreamConfig;
 use crate::error::StorageError;
 use crate::record::{Record, StoredRecord};
 use async_trait::async_trait;
 use exspeed_common::{Offset, StreamName};
+
+/// Bounds for a [`StorageEngine::read_batch`] call. A batch always contains
+/// at least one record when one is available, even if it exceeds
+/// `max_bytes`, so a single large record can't stall a reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadLimits {
+    pub max_records: usize,
+    pub max_bytes: usize,
+}
+
+impl Default for ReadLimits {
+    fn default() -> Self {
+        Self {
+            max_records: 500,
+            max_bytes: 1024 * 1024,
+        }
+    }
+}
+
+/// Result of a [`StorageEngine::read_batch`] call.
+#[derive(Debug, Clone)]
+pub struct ReadBatch {
+    pub records: Vec<StoredRecord>,
+    /// Where the next read should start: one past the last returned record,
+    /// or `from` (clamped to the earliest retained offset) when empty.
+    pub next_offset: Offset,
+    /// Offset the next append will get (the visible end of the log).
+    /// `next_offset == high_watermark` means the reader is caught up.
+    pub high_watermark: Offset,
+}
 
 #[async_trait]
 pub trait StorageEngine: Send + Sync {
@@ -132,5 +163,76 @@ pub trait StorageEngine: Send + Sync {
             out.push((offset, ts));
         }
         Ok(out)
+    }
+
+    /// Create a stream with a full config (retention + dedup). The default
+    /// implementation only applies retention.
+    async fn create_stream_with(
+        &self,
+        stream: &StreamName,
+        config: &StreamConfig,
+    ) -> Result<(), StorageError> {
+        self.create_stream(stream, config.max_age_secs, config.max_bytes)
+            .await
+    }
+
+    /// Current config of a stream.
+    async fn stream_config(&self, stream: &StreamName) -> Result<StreamConfig, StorageError> {
+        self.stream_bounds(stream).await?;
+        Ok(StreamConfig::default())
+    }
+
+    /// Replace a stream's config.
+    async fn update_stream_config(
+        &self,
+        stream: &StreamName,
+        config: &StreamConfig,
+    ) -> Result<(), StorageError> {
+        let _ = (stream, config);
+        Err(StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this storage engine does not support config updates",
+        )))
+    }
+
+    /// Bounded read that also reports where to resume and the end of the
+    /// log. Prefer this over [`StorageEngine::read`] in new code.
+    async fn read_batch(
+        &self,
+        stream: &StreamName,
+        from: Offset,
+        limits: ReadLimits,
+    ) -> Result<ReadBatch, StorageError> {
+        let (earliest, high_watermark) = self.stream_bounds(stream).await?;
+        let from = Offset(from.0.max(earliest.0));
+        let mut records = self.read(stream, from, limits.max_records.max(1)).await?;
+        let mut bytes = 0usize;
+        let mut keep = 0usize;
+        for r in &records {
+            let size = r.value.len() + r.subject.len() + r.key.as_ref().map_or(0, |k| k.len());
+            if keep > 0 && bytes + size > limits.max_bytes {
+                break;
+            }
+            bytes += size;
+            keep += 1;
+        }
+        records.truncate(keep);
+        let next_offset = records
+            .last()
+            .map(|r| Offset(r.offset.0 + 1))
+            .unwrap_or(from);
+        Ok(ReadBatch {
+            records,
+            next_offset,
+            high_watermark,
+        })
+    }
+
+    /// Subscribe to the stream's high watermark (the offset the next append
+    /// will get). Readers that are caught up can `changed().await` instead of
+    /// polling. `None` means the engine doesn't support notifications.
+    fn watch_appends(&self, stream: &StreamName) -> Option<tokio::sync::watch::Receiver<u64>> {
+        let _ = stream;
+        None
     }
 }
