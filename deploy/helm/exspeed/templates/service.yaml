@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "exspeed.fullname" . }}
+  labels: {{- include "exspeed.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector: {{- include "exspeed.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: tcp
+      port: {{ .Values.ports.tcp }}
+      targetPort: tcp
+    - name: http
+      port: {{ .Values.ports.http }}
+      targetPort: http
+---
+# Headless service: stable per-pod DNS for replication peers.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "exspeed.fullname" . }}-headless
+  labels: {{- include "exspeed.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: {{- include "exspeed.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: tcp
+      port: {{ .Values.ports.tcp }}
+    - name: http
+      port: {{ .Values.ports.http }}
+    - name: cluster
+      port: {{ .Values.ports.cluster }}

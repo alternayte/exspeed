@@ -1,0 +1,149 @@
+{{- $multi := gt (int .Values.replicas) 1 -}}
+{{- if and $multi (not .Values.cluster.postgresUrlSecret) -}}
+{{- fail "replicas > 1 requires cluster.postgresUrlSecret" -}}
+{{- end -}}
+{{- if and $multi (not .Values.cluster.replicatorTokenSecret) -}}
+{{- fail "replicas > 1 requires cluster.replicatorTokenSecret" -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "exspeed.fullname" . }}
+  labels: {{- include "exspeed.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicas }}
+  serviceName: {{ include "exspeed.fullname" . }}-headless
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {{- include "exspeed.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "exspeed.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        runAsNonRoot: true
+      containers:
+        - name: exspeed
+          image: {{ include "exspeed.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - server
+            - --data-dir=/var/lib/exspeed
+            - --bind=0.0.0.0:{{ .Values.ports.tcp }}
+            - --api-bind=0.0.0.0:{{ .Values.ports.http }}
+          ports:
+            - name: tcp
+              containerPort: {{ .Values.ports.tcp }}
+            - name: http
+              containerPort: {{ .Values.ports.http }}
+            {{- if $multi }}
+            - name: cluster
+              containerPort: {{ .Values.ports.cluster }}
+            {{- end }}
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            {{- range $k, $v := .Values.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+            {{- if .Values.auth.tokenSecret }}
+            - name: EXSPEED_AUTH_TOKEN
+              valueFrom: { secretKeyRef: { name: {{ .Values.auth.tokenSecret }}, key: token } }
+            {{- end }}
+            {{- if .Values.auth.credentialsSecret }}
+            - name: EXSPEED_CREDENTIALS_FILE
+              value: /etc/exspeed/credentials.toml
+            {{- end }}
+            {{- if .Values.tls.secretName }}
+            - name: EXSPEED_TLS_CERT
+              value: /etc/exspeed/tls/tls.crt
+            - name: EXSPEED_TLS_KEY
+              value: /etc/exspeed/tls/tls.key
+            {{- end }}
+            {{- if $multi }}
+            - name: EXSPEED_CONSUMER_STORE
+              value: postgres
+            - name: EXSPEED_OFFSET_STORE_POSTGRES_URL
+              valueFrom: { secretKeyRef: { name: {{ .Values.cluster.postgresUrlSecret }}, key: url } }
+            - name: EXSPEED_REPLICATOR_CREDENTIAL
+              valueFrom: { secretKeyRef: { name: {{ .Values.cluster.replicatorTokenSecret }}, key: token } }
+            - name: EXSPEED_CLUSTER_BIND
+              value: "0.0.0.0:{{ .Values.ports.cluster }}"
+            - name: EXSPEED_CLUSTER_ADVERTISE
+              value: "$(POD_NAME).{{ include "exspeed.fullname" . }}-headless.$(POD_NAMESPACE).svc.cluster.local:{{ .Values.ports.cluster }}"
+            - name: EXSPEED_LEASE_TTL_SECS
+              value: {{ .Values.cluster.leaseTtlSecs | quote }}
+            - name: EXSPEED_LEASE_HEARTBEAT_SECS
+              value: {{ .Values.cluster.leaseHeartbeatSecs | quote }}
+            {{- end }}
+          startupProbe:
+            httpGet: { path: /readyz, port: http, scheme: {{ if .Values.tls.secretName }}HTTPS{{ else }}HTTP{{ end }} }
+            periodSeconds: 2
+            failureThreshold: 150
+          readinessProbe:
+            httpGet: { path: /readyz, port: http, scheme: {{ if .Values.tls.secretName }}HTTPS{{ else }}HTTP{{ end }} }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /readyz, port: http, scheme: {{ if .Values.tls.secretName }}HTTPS{{ else }}HTTP{{ end }} }
+            periodSeconds: 10
+            failureThreshold: 6
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/exspeed
+            {{- if .Values.auth.credentialsSecret }}
+            - name: credentials
+              mountPath: /etc/exspeed/credentials.toml
+              subPath: credentials.toml
+              readOnly: true
+            {{- end }}
+            {{- if .Values.tls.secretName }}
+            - name: tls
+              mountPath: /etc/exspeed/tls
+              readOnly: true
+            {{- end }}
+      volumes:
+        {{- if not .Values.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+        {{- if .Values.auth.credentialsSecret }}
+        - name: credentials
+          secret: { secretName: {{ .Values.auth.credentialsSecret }} }
+        {{- end }}
+        {{- if .Values.tls.secretName }}
+        - name: tls
+          secret: { secretName: {{ .Values.tls.secretName }} }
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- if .Values.persistence.storageClass }}
+        storageClassName: {{ .Values.persistence.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+  {{- end }}

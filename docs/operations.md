@@ -10,6 +10,7 @@ For every flag and environment variable, see [configuration.md](configuration.md
 ## Contents
 
 - [Docker](#docker)
+- [Kubernetes (Helm)](#kubernetes-helm)
 - [Structured logging](#structured-logging)
 - [Connection cap](#connection-cap)
 - [Exclusive data-dir lock](#exclusive-data-dir-lock)
@@ -32,12 +33,40 @@ docker run -d --name exspeed \
   nayth/exspeed:latest
 ```
 
-The image runs `exspeed server --data-dir /var/lib/exspeed`. It has no
-`HEALTHCHECK`, so probe `GET /readyz` from your orchestrator.
+The image runs `exspeed server --data-dir /var/lib/exspeed` and has a
+`HEALTHCHECK` that runs `exspeed healthcheck`. That command exits 0 when
+`/readyz` answers 200, and you can also use it in other probes.
 
 The repository's `docker-compose.yml` starts Exspeed together with
 Postgres, RabbitMQ, MinIO, MySQL and SQL Server. It is meant for developing
 connectors; see [development.md](development.md).
+
+## Kubernetes (Helm)
+
+The chart lives in [`deploy/helm/exspeed`](../deploy/helm/exspeed). By default it deploys
+a single-node StatefulSet with these settings:
+
+- a persistent volume
+- `fsGroup: 1000`
+- startup, readiness and liveness probes on `/readyz`
+- a 30 s termination grace period
+
+```bash
+helm install exspeed deploy/helm/exspeed \
+  --set persistence.size=50Gi \
+  --set auth.credentialsSecret=exspeed-credentials   # Secret with credentials.toml
+```
+
+These values cover the common cases:
+
+| Value | Purpose |
+|-------|---------|
+| `auth.tokenSecret` | Secret with a shared admin token (key `token`) |
+| `auth.credentialsSecret` | Secret with `credentials.toml` |
+| `tls.secretName` | `kubernetes.io/tls` Secret; serves TLS on both listeners |
+| `env` | Any server env var from [configuration.md](configuration.md) |
+| `serviceMonitor.enabled` | Prometheus Operator scraping of `/metrics` |
+| `replicas` | `>1` enables multi-pod mode (experimental — needs `cluster.*` secrets) |
 
 ## Structured logging
 

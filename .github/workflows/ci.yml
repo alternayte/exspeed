@@ -97,3 +97,24 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+
+  helm:
+    name: Helm chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: helm lint deploy/helm/exspeed
+      - name: Render single-node and multi-pod values
+        run: |
+          helm template t deploy/helm/exspeed > /dev/null
+          helm template t deploy/helm/exspeed \
+            --set replicas=3 \
+            --set cluster.postgresUrlSecret=pg \
+            --set cluster.replicatorTokenSecret=rep \
+            --set tls.secretName=tls \
+            --set auth.credentialsSecret=creds \
+            --set serviceMonitor.enabled=true \
+            --set podDisruptionBudget.enabled=true > /dev/null
+          # Multi-pod without the required secrets must fail fast.
+          ! helm template t deploy/helm/exspeed --set replicas=3 > /dev/null 2>&1
