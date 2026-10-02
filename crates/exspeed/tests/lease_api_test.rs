@@ -4,8 +4,8 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 async fn start_server(auth_token: Option<String>) -> (u16, TempDir) {
-    let api_port = portpicker::pick_unused_port().unwrap();
-    let tcp_port = portpicker::pick_unused_port().unwrap();
+    let api_port = exspeed_testkit::pick_unused_port().unwrap();
+    let tcp_port = exspeed_testkit::pick_unused_port().unwrap();
     let tmp = tempfile::tempdir().unwrap();
 
     let args = exspeed::cli::server::ServerArgs {

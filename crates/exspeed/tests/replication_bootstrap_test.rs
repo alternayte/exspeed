@@ -101,9 +101,9 @@ fn clear_shared_env() {
 /// can set `EXSPEED_CLUSTER_BIND` before the server reads it. Each pod
 /// gets its own tempdir (data_dir).
 async fn spawn_pod() -> PodHandle {
-    let api_port = portpicker::pick_unused_port().unwrap();
-    let tcp_port = portpicker::pick_unused_port().unwrap();
-    let cluster_port = portpicker::pick_unused_port().unwrap();
+    let api_port = exspeed_testkit::pick_unused_port().unwrap();
+    let tcp_port = exspeed_testkit::pick_unused_port().unwrap();
+    let cluster_port = exspeed_testkit::pick_unused_port().unwrap();
     let tmp = tempfile::tempdir().unwrap();
 
     let cred_path = write_credentials_toml(tmp.path());

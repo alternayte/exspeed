@@ -1416,10 +1416,10 @@ dependencies = [
  "exspeed-protocol",
  "exspeed-storage",
  "exspeed-streams",
+ "exspeed-testkit",
  "flate2",
  "fs4",
  "futures-util",
- "portpicker",
  "rand 0.8.5",
  "rcgen",
  "reqwest",
@@ -1479,9 +1479,9 @@ dependencies = [
  "exspeed",
  "exspeed-common",
  "exspeed-protocol",
+ "exspeed-testkit",
  "futures-util",
  "hdrhistogram",
- "portpicker",
  "rdkafka",
  "reqwest",
  "serde",
@@ -1650,6 +1650,10 @@ dependencies = [
  "exspeed-common",
  "thiserror 2.0.18",
 ]
+
+[[package]]
+name = "exspeed-testkit"
+version = "0.5.0"
 
 [[package]]
 name = "fallible-iterator"
@@ -3353,15 +3357,6 @@ dependencies = [
  "pin-project-lite",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "portpicker"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be97d76faf1bfab666e1375477b23fde79eccf0276e9b63b92a39d676a889ba9"
-dependencies = [
- "rand 0.8.5",
 ]
 
 [[package]]

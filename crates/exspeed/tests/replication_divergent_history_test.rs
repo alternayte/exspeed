@@ -133,9 +133,9 @@ fn clear_shared_env() {
 }
 
 async fn spawn_pod(slow_ms: Option<u64>) -> PodHandle {
-    let api_port = portpicker::pick_unused_port().unwrap();
-    let tcp_port = portpicker::pick_unused_port().unwrap();
-    let cluster_port = portpicker::pick_unused_port().unwrap();
+    let api_port = exspeed_testkit::pick_unused_port().unwrap();
+    let tcp_port = exspeed_testkit::pick_unused_port().unwrap();
+    let cluster_port = exspeed_testkit::pick_unused_port().unwrap();
     let tmp = tempfile::tempdir().unwrap();
 
     let cred_path = write_credentials_toml(tmp.path());

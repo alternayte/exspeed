@@ -12,8 +12,8 @@ use tokio::time::timeout;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 async fn start_server(auth_token: Option<String>) -> (String, TempDir) {
-    let port = portpicker::pick_unused_port().unwrap();
-    let api_port = portpicker::pick_unused_port().unwrap();
+    let port = exspeed_testkit::pick_unused_port().unwrap();
+    let api_port = exspeed_testkit::pick_unused_port().unwrap();
     let bind = format!("127.0.0.1:{port}");
     let api_bind = format!("127.0.0.1:{api_port}");
     let tmp = tempfile::tempdir().unwrap();
@@ -137,8 +137,8 @@ async fn auth_enabled_blocks_ops_before_connect() {
 async fn start_server_with_api(
     auth_token: Option<String>,
 ) -> (String, u16, TempDir) {
-    let port = portpicker::pick_unused_port().unwrap();
-    let api_port = portpicker::pick_unused_port().unwrap();
+    let port = exspeed_testkit::pick_unused_port().unwrap();
+    let api_port = exspeed_testkit::pick_unused_port().unwrap();
     let bind = format!("127.0.0.1:{port}");
     let api_bind = format!("127.0.0.1:{api_port}");
     let tmp = tempfile::tempdir().unwrap();

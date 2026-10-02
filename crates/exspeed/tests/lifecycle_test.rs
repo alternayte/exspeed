@@ -24,8 +24,8 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
 async fn start_test_server(max_conns: u32) -> (String, tempfile::TempDir) {
-    let port = portpicker::pick_unused_port().unwrap();
-    let api_port = portpicker::pick_unused_port().unwrap();
+    let port = exspeed_testkit::pick_unused_port().unwrap();
+    let api_port = exspeed_testkit::pick_unused_port().unwrap();
     let bind = format!("127.0.0.1:{port}");
     let api_bind = format!("127.0.0.1:{api_port}");
     let tmp = tempfile::tempdir().unwrap();
@@ -97,8 +97,8 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 
 #[tokio::test]
 async fn sigterm_signal_token_stops_accept_loop() {
-    let port = portpicker::pick_unused_port().unwrap();
-    let api_port = portpicker::pick_unused_port().unwrap();
+    let port = exspeed_testkit::pick_unused_port().unwrap();
+    let api_port = exspeed_testkit::pick_unused_port().unwrap();
     let bind = format!("127.0.0.1:{port}");
     let api_bind = format!("127.0.0.1:{api_port}");
     let tmp = tempfile::tempdir().unwrap();
@@ -161,8 +161,8 @@ async fn sigterm_signal_token_stops_accept_loop() {
 
 #[tokio::test]
 async fn readyz_returns_503_when_data_dir_unwritable() {
-    let port = portpicker::pick_unused_port().unwrap();
-    let api_port = portpicker::pick_unused_port().unwrap();
+    let port = exspeed_testkit::pick_unused_port().unwrap();
+    let api_port = exspeed_testkit::pick_unused_port().unwrap();
     let bind = format!("127.0.0.1:{port}");
     let api_bind = format!("127.0.0.1:{api_port}");
     let tmp = tempfile::tempdir().unwrap();
@@ -200,6 +200,11 @@ async fn readyz_returns_503_when_data_dir_unwritable() {
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&data_for_chmod, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root ignores directory permissions; the probe can't be made to fail.
+        if std::fs::write(data_for_chmod.join(".probe-as-root"), b"x").is_ok() {
+            eprintln!("skipping: running as root, chmod does not block writes");
+            return;
+        }
     }
 
     let bad = reqwest::get(&url).await.unwrap();

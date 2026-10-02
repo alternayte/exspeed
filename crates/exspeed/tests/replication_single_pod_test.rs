@@ -43,8 +43,8 @@ async fn start_single_pod_server() -> SinglePodHarness {
     std::env::remove_var("EXSPEED_CONSUMER_STORE");
     std::env::remove_var("EXSPEED_OFFSET_STORE");
 
-    let api_port = portpicker::pick_unused_port().unwrap();
-    let tcp_port = portpicker::pick_unused_port().unwrap();
+    let api_port = exspeed_testkit::pick_unused_port().unwrap();
+    let tcp_port = exspeed_testkit::pick_unused_port().unwrap();
     let tmp = tempfile::tempdir().unwrap();
 
     let args = exspeed::cli::server::ServerArgs {

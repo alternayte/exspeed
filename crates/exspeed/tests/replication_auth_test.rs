@@ -107,9 +107,9 @@ struct LeaderHarness {
 /// a bound cluster listener on 127.0.0.1:<random>. Returns the cluster
 /// port address, both bearer tokens, and the API port.
 async fn start_leader(schema: &str) -> LeaderHarness {
-    let api_port = portpicker::pick_unused_port().unwrap();
-    let tcp_port = portpicker::pick_unused_port().unwrap();
-    let cluster_port = portpicker::pick_unused_port().unwrap();
+    let api_port = exspeed_testkit::pick_unused_port().unwrap();
+    let tcp_port = exspeed_testkit::pick_unused_port().unwrap();
+    let cluster_port = exspeed_testkit::pick_unused_port().unwrap();
     let cluster_addr = format!("127.0.0.1:{cluster_port}");
 
     let tmp = tempfile::tempdir().unwrap();
