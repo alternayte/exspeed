@@ -251,7 +251,10 @@ async fn recv_record(
                 headers: first.headers,
             }
         }
-        other => panic!("expected Record or RecordsBatch push frame, got {:?}", other),
+        other => panic!(
+            "expected Record or RecordsBatch push frame, got {:?}",
+            other
+        ),
     }
 }
 
@@ -265,7 +268,11 @@ async fn setup_stream_with_records(
 ) {
     // Connect
     let resp = send_recv(writer, reader, connect_frame(1)).await;
-    assert_eq!(resp.opcode, OpCode::ConnectOk, "CONNECT should return ConnectOk");
+    assert_eq!(
+        resp.opcode,
+        OpCode::ConnectOk,
+        "CONNECT should return ConnectOk"
+    );
 
     // Create stream
     let resp = send_recv(writer, reader, create_stream_frame(stream, 2)).await;
@@ -280,7 +287,12 @@ async fn setup_stream_with_records(
             publish_frame(stream, subject, value.as_bytes(), 100 + i),
         )
         .await;
-        assert_eq!(resp.opcode, OpCode::PublishOk, "PUBLISH {} should return PublishOk", i);
+        assert_eq!(
+            resp.opcode,
+            OpCode::PublishOk,
+            "PUBLISH {} should return PublishOk",
+            i
+        );
     }
 }
 
@@ -401,7 +413,11 @@ async fn resume_after_disconnect() {
 
         // Connect (no need to recreate stream or consumer — they're persisted)
         let resp = send_recv(&mut writer, &mut reader, connect_frame(1)).await;
-        assert_eq!(resp.opcode, OpCode::ConnectOk, "CONNECT should return ConnectOk");
+        assert_eq!(
+            resp.opcode,
+            OpCode::ConnectOk,
+            "CONNECT should return ConnectOk"
+        );
 
         // Subscribe the same consumer again
         let resp = send_recv(&mut writer, &mut reader, subscribe_frame("resumable", 301)).await;

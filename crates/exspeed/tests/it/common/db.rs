@@ -82,14 +82,18 @@ pub async fn drop_table_mssql(url: &str, table: &str) {
         Err(_) => return,
     };
     let mut cfg = tiberius::Config::new();
-    if let Some(h) = u.host_str() { cfg.host(h); }
+    if let Some(h) = u.host_str() {
+        cfg.host(h);
+    }
     cfg.port(u.port().unwrap_or(1433));
     cfg.authentication(tiberius::AuthMethod::sql_server(
         u.username(),
         u.password().unwrap_or(""),
     ));
     let db = u.path().trim_start_matches('/');
-    if !db.is_empty() { cfg.database(db); }
+    if !db.is_empty() {
+        cfg.database(db);
+    }
     for (k, v) in u.query_pairs() {
         if k.eq_ignore_ascii_case("trust_server_certificate") && v.eq_ignore_ascii_case("true") {
             cfg.trust_cert();
@@ -106,7 +110,10 @@ pub async fn drop_table_mssql(url: &str, table: &str) {
         Ok(c) => c,
         Err(_) => return,
     };
-    let sql = format!("IF OBJECT_ID(N'[{t}]', N'U') IS NOT NULL DROP TABLE [{t}]", t = table);
+    let sql = format!(
+        "IF OBJECT_ID(N'[{t}]', N'U') IS NOT NULL DROP TABLE [{t}]",
+        t = table
+    );
     let _ = client.simple_query(sql).await;
 }
 

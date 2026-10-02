@@ -7,9 +7,16 @@ fn cli_prints_help_for_every_subcommand() {
         .arg("--help")
         .output()
         .expect("run --help");
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let help = String::from_utf8(out.stdout).unwrap();
     for cmd in ["publish", "latency", "fanout", "exql", "all", "render"] {
-        assert!(help.contains(cmd), "missing subcommand {cmd} in --help output:\n{help}");
+        assert!(
+            help.contains(cmd),
+            "missing subcommand {cmd} in --help output:\n{help}"
+        );
     }
 }

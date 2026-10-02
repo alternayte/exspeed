@@ -74,12 +74,18 @@ impl BloomFilter {
         let mut magic = [0u8; 4];
         file.read_exact(&mut magic)?;
         if &magic != BLOOM_MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad bloom magic"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad bloom magic",
+            ));
         }
         let mut ver = [0u8; 1];
         file.read_exact(&mut ver)?;
         if ver[0] != BLOOM_VERSION {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad bloom version"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad bloom version",
+            ));
         }
         let mut buf8 = [0u8; 8];
         file.read_exact(&mut buf8)?;
@@ -90,7 +96,11 @@ impl BloomFilter {
         let num_bytes = num_bits.div_ceil(8) as usize;
         let mut bits = vec![0u8; num_bytes];
         file.read_exact(&mut bits)?;
-        Ok(Self { bits, num_bits, num_hashes })
+        Ok(Self {
+            bits,
+            num_bits,
+            num_hashes,
+        })
     }
 }
 
@@ -143,6 +153,9 @@ mod tests {
                 false_positives += 1;
             }
         }
-        assert!(false_positives < 50, "false positive rate too high: {false_positives}/1000");
+        assert!(
+            false_positives < 50,
+            "false positive rate too high: {false_positives}/1000"
+        );
     }
 }

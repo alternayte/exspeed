@@ -44,10 +44,7 @@ async fn readyz_returns_503_while_dedup_rebuilding() {
     use std::sync::atomic::Ordering;
     let state = make_state_with_leader(true).await;
     // Override the dedup_ready flag to simulate an ongoing rebuild.
-    state
-        .broker
-        .dedup_ready
-        .store(false, Ordering::Release);
+    state.broker.dedup_ready.store(false, Ordering::Release);
 
     let app = exspeed_api::handlers::build_router(state);
 

@@ -1,8 +1,8 @@
 use crate::embedded_server;
 use embedded_server::start;
 use exspeed_bench::driver::exspeed::ExspeedClient;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[tokio::test]
@@ -14,7 +14,9 @@ async fn publisher_coalesces_concurrent_publishes_into_batches() {
     let publisher = exspeed_bench::driver::publisher::PublisherBuilder::new(&srv.tcp_addr)
         .batch_window(Duration::from_millis(1))
         .max_batch_records(256)
-        .build().await.unwrap();
+        .build()
+        .await
+        .unwrap();
 
     let mut handles = Vec::new();
     for i in 0..100 {
@@ -48,15 +50,21 @@ async fn publisher_batch_window_zero_disables_coalescing() {
 
     let publisher = exspeed_bench::driver::publisher::PublisherBuilder::new(&srv.tcp_addr)
         .batch_window(Duration::ZERO)
-        .build().await.unwrap();
+        .build()
+        .await
+        .unwrap();
 
-    let offset = publisher.publish(exspeed_protocol::messages::publish::PublishRequest {
-        stream: "zw-stream".into(),
-        subject: "s".into(),
-        key: None, msg_id: None,
-        value: bytes::Bytes::from_static(b"x"),
-        headers: vec![],
-    }).await.unwrap();
+    let offset = publisher
+        .publish(exspeed_protocol::messages::publish::PublishRequest {
+            stream: "zw-stream".into(),
+            subject: "s".into(),
+            key: None,
+            msg_id: None,
+            value: bytes::Bytes::from_static(b"x"),
+            headers: vec![],
+        })
+        .await
+        .unwrap();
     assert_eq!(offset.0, 0);
     publisher.close().await.unwrap();
 }
@@ -67,14 +75,19 @@ async fn publisher_explicit_publish_batch() {
     let mut setup = ExspeedClient::connect(&srv.tcp_addr).await.unwrap();
     setup.ensure_stream("eb-stream").await.unwrap();
 
-    let publisher = exspeed_bench::driver::publisher::Publisher::new(&srv.tcp_addr).await.unwrap();
-    let reqs: Vec<_> = (0..10).map(|i| exspeed_protocol::messages::publish::PublishRequest {
-        stream: "eb-stream".into(),
-        subject: "s".into(),
-        key: None, msg_id: None,
-        value: bytes::Bytes::from(format!("r{i}").into_bytes()),
-        headers: vec![],
-    }).collect();
+    let publisher = exspeed_bench::driver::publisher::Publisher::new(&srv.tcp_addr)
+        .await
+        .unwrap();
+    let reqs: Vec<_> = (0..10)
+        .map(|i| exspeed_protocol::messages::publish::PublishRequest {
+            stream: "eb-stream".into(),
+            subject: "s".into(),
+            key: None,
+            msg_id: None,
+            value: bytes::Bytes::from(format!("r{i}").into_bytes()),
+            headers: vec![],
+        })
+        .collect();
     let results = publisher.publish_batch(reqs).await;
     assert_eq!(results.len(), 10);
     for (i, r) in results.iter().enumerate() {
@@ -109,7 +122,9 @@ async fn producer_sends_at_least_some_records_in_2s() {
         2,
         origin,
         count.clone(),
-    ).await.unwrap();
+    )
+    .await
+    .unwrap();
     assert!(stats.messages > 0, "producer sent 0 messages");
     assert_eq!(stats.messages, count.load(Ordering::Relaxed));
 }
@@ -133,7 +148,8 @@ async fn consumer_records_latency_for_pushed_records() {
             "bench-consumer-1",
             Duration::from_secs(3),
             origin,
-        ).await
+        )
+        .await
     });
 
     // Producer for 2s starting shortly after the consumer subscribes.
@@ -146,14 +162,19 @@ async fn consumer_records_latency_for_pushed_records() {
         1,
         origin,
         producer_count,
-    ).await.unwrap();
+    )
+    .await
+    .unwrap();
 
     let cstats = consumer.await.unwrap().unwrap();
     assert!(cstats.messages > 0, "consumer received 0");
     let p50 = cstats.latency_histogram.value_at_percentile(50.0);
     // With 256 in-flight publishes the queue depth is deeper; allow up to the
     // full 3 s consumer window before declaring the result unreasonable.
-    assert!(p50 > 0 && p50 < 3_000_000, "p50 {p50} us outside sanity range");
+    assert!(
+        p50 > 0 && p50 < 3_000_000,
+        "p50 {p50} us outside sanity range"
+    );
 }
 
 #[tokio::test]
@@ -163,7 +184,9 @@ async fn publisher_pipelines_in_order_acks() {
     let mut setup = ExspeedClient::connect(&srv.tcp_addr).await.unwrap();
     setup.ensure_stream("pipe-stream").await.unwrap();
 
-    let publisher = exspeed_bench::driver::publisher::Publisher::new(&srv.tcp_addr).await.unwrap();
+    let publisher = exspeed_bench::driver::publisher::Publisher::new(&srv.tcp_addr)
+        .await
+        .unwrap();
     let origin = Instant::now();
 
     // Fire 200 in-flight publishes.
@@ -182,9 +205,7 @@ async fn publisher_pipelines_in_order_acks() {
     }
     // Await all concurrently — exercises actual pipelined demux under load.
     let results = futures_util::future::join_all(futs).await;
-    let mut offsets: Vec<u64> = results.into_iter()
-        .map(|r| r.unwrap().0)
-        .collect();
+    let mut offsets: Vec<u64> = results.into_iter().map(|r| r.unwrap().0).collect();
     offsets.sort();
     assert_eq!(offsets, (0..200).collect::<Vec<u64>>());
     let _ = origin.elapsed();
@@ -199,7 +220,9 @@ async fn publisher_blocks_on_max_in_flight() {
 
     let publisher = exspeed_bench::driver::publisher::PublisherBuilder::new(&srv.tcp_addr)
         .max_in_flight(2)
-        .build().await.unwrap();
+        .build()
+        .await
+        .unwrap();
 
     let bytes = bytes::Bytes::from(vec![b'x'; 64]);
     let mk = |i: u32, b: bytes::Bytes| exspeed_protocol::messages::publish::PublishRequest {

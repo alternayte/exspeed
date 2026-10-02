@@ -59,11 +59,7 @@ pub async fn execute_query(
             )
                 .into_response()
         }
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(e.to_json()),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(e.to_json())).into_response(),
     }
 }
 
@@ -86,11 +82,7 @@ pub async fn create_continuous(
             Json(json!({"query_id": query_id, "status": "running"})),
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(e.to_json()),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(e.to_json())).into_response(),
     }
 }
 

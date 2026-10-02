@@ -53,9 +53,7 @@ fn bind_param<'q>(
         Param::I64(i) => q.bind(*i),
         Param::F64(f) => q.bind(*f),
         Param::Text(s) => q.bind(s.clone()),
-        Param::Timestamptz(dt) => {
-            q.bind(dt.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
-        }
+        Param::Timestamptz(dt) => q.bind(dt.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)),
         Param::JsonText(s) => q.bind(s.clone()),
     }
 }

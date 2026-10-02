@@ -43,16 +43,21 @@ pub fn parse_schema(input: &str) -> Result<Vec<ColumnSpec>, ParseError> {
         if frag_trim.is_empty() {
             continue;
         }
-        let colon = frag_trim.find(':').ok_or_else(|| ParseError::MissingColon {
-            idx,
-            fragment: frag_trim.to_string(),
-        })?;
+        let colon = frag_trim
+            .find(':')
+            .ok_or_else(|| ParseError::MissingColon {
+                idx,
+                fragment: frag_trim.to_string(),
+            })?;
 
         let name = frag_trim[..colon].trim();
         let rest = frag_trim[colon + 1..].trim();
 
         if !is_valid_ident(name) {
-            return Err(ParseError::BadIdent { idx, name: name.to_string() });
+            return Err(ParseError::BadIdent {
+                idx,
+                name: name.to_string(),
+            });
         }
 
         let (type_str, nullable) = if let Some(stripped) = rest.strip_suffix('?') {
@@ -67,10 +72,16 @@ pub fn parse_schema(input: &str) -> Result<Vec<ColumnSpec>, ParseError> {
         })?;
 
         if out.iter().any(|c| c.name == name) {
-            return Err(ParseError::Duplicate { name: name.to_string() });
+            return Err(ParseError::Duplicate {
+                name: name.to_string(),
+            });
         }
 
-        out.push(ColumnSpec { name: name.to_string(), json_type, nullable });
+        out.push(ColumnSpec {
+            name: name.to_string(),
+            json_type,
+            nullable,
+        });
     }
 
     if out.is_empty() {
@@ -139,8 +150,14 @@ mod tests {
     #[test]
     fn rejects_empty() {
         assert!(matches!(parse_schema("").unwrap_err(), ParseError::Empty));
-        assert!(matches!(parse_schema("   ").unwrap_err(), ParseError::Empty));
-        assert!(matches!(parse_schema(",,,").unwrap_err(), ParseError::Empty));
+        assert!(matches!(
+            parse_schema("   ").unwrap_err(),
+            ParseError::Empty
+        ));
+        assert!(matches!(
+            parse_schema(",,,").unwrap_err(),
+            ParseError::Empty
+        ));
     }
 
     #[test]
@@ -160,9 +177,17 @@ pub enum BindError {
     #[error("field '{field}': missing required value")]
     MissingRequired { field: String },
     #[error("field '{field}': expected {expected}, got {got}")]
-    TypeMismatch { field: String, expected: &'static str, got: &'static str },
+    TypeMismatch {
+        field: String,
+        expected: &'static str,
+        got: &'static str,
+    },
     #[error("field '{field}': could not parse as RFC3339 timestamp: {source}")]
-    TimestampParse { field: String, #[source] source: chrono::ParseError },
+    TimestampParse {
+        field: String,
+        #[source]
+        source: chrono::ParseError,
+    },
 }
 
 fn json_kind(v: &serde_json::Value) -> &'static str {
@@ -191,7 +216,9 @@ pub fn bind_json_as_type(
 
     if matches!(value, None | Some(V::Null)) {
         if !spec.nullable {
-            return Err(BindError::MissingRequired { field: field.clone() });
+            return Err(BindError::MissingRequired {
+                field: field.clone(),
+            });
         }
         return Ok(Param::Null);
     }
@@ -235,7 +262,10 @@ pub fn bind_json_as_type(
         JsonType::Timestamptz => match v {
             V::String(s) => match chrono::DateTime::parse_from_rfc3339(s) {
                 Ok(dt) => Ok(Param::Timestamptz(dt.with_timezone(&chrono::Utc))),
-                Err(e) => Err(BindError::TimestampParse { field: field.clone(), source: e }),
+                Err(e) => Err(BindError::TimestampParse {
+                    field: field.clone(),
+                    source: e,
+                }),
             },
             _ => Err(BindError::TypeMismatch {
                 field: field.clone(),
@@ -256,7 +286,11 @@ mod bind_tests {
     use serde_json::json;
 
     fn spec(name: &str, t: JsonType, nullable: bool) -> ColumnSpec {
-        ColumnSpec { name: name.to_string(), json_type: t, nullable }
+        ColumnSpec {
+            name: name.to_string(),
+            json_type: t,
+            nullable,
+        }
     }
 
     #[test]
@@ -274,7 +308,11 @@ mod bind_tests {
         let s = spec("n", JsonType::Bigint, false);
         let v = json!("42");
         match bind_json_as_type(&s, Some(&v)) {
-            Err(BindError::TypeMismatch { expected: "bigint", got: "string", .. }) => {}
+            Err(BindError::TypeMismatch {
+                expected: "bigint",
+                got: "string",
+                ..
+            }) => {}
             Err(e) => panic!("wrong error: {e}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
@@ -333,7 +371,7 @@ mod bind_tests {
     #[test]
     fn jsonb_accepts_any() {
         let s = spec("j", JsonType::Jsonb, false);
-        for v in [json!({"a":1}), json!([1,2,3]), json!("str")] {
+        for v in [json!({"a":1}), json!([1, 2, 3]), json!("str")] {
             match bind_json_as_type(&s, Some(&v)).unwrap() {
                 Param::JsonText(_) => {}
                 p => panic!("expected JsonText, got {p:?}"),

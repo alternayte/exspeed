@@ -23,9 +23,7 @@ pub struct DlqWriter {
 
 /// Pure parse: returns the configured DLQ stream name, if any.
 /// Unit-testable without a broker.
-pub(crate) fn parse_dlq_config(
-    config: &ConnectorConfig,
-) -> Result<Option<StreamName>, String> {
+pub(crate) fn parse_dlq_config(config: &ConnectorConfig) -> Result<Option<StreamName>, String> {
     let dlq_name = config.setting_or("dlq_stream", "");
     let dlq_name = dlq_name.trim();
     if dlq_name.is_empty() {
@@ -74,10 +72,7 @@ impl DlqWriter {
             "exspeed-dlq-original-offset".into(),
             record.offset.to_string(),
         ));
-        headers.push((
-            "exspeed-dlq-timestamp".into(),
-            record.timestamp.to_string(),
-        ));
+        headers.push(("exspeed-dlq-timestamp".into(), record.timestamp.to_string()));
 
         let r = Record {
             key: record.key.clone(),

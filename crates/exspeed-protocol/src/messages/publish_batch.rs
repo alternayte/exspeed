@@ -1,5 +1,5 @@
-use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crate::error::ProtocolError;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 const FLAG_HAS_KEY: u8 = 0x01;
 const FLAG_HAS_MSG_ID: u8 = 0x02;
@@ -48,8 +48,12 @@ impl PublishBatchRequest {
             dst.extend_from_slice(sub);
 
             let mut flags: u8 = 0;
-            if r.key.is_some() { flags |= FLAG_HAS_KEY; }
-            if r.msg_id.is_some() { flags |= FLAG_HAS_MSG_ID; }
+            if r.key.is_some() {
+                flags |= FLAG_HAS_KEY;
+            }
+            if r.msg_id.is_some() {
+                flags |= FLAG_HAS_MSG_ID;
+            }
             dst.put_u8(flags);
 
             if let Some(ref k) = r.key {
@@ -77,72 +81,124 @@ impl PublishBatchRequest {
 
     pub fn decode(mut src: Bytes) -> Result<Self, ProtocolError> {
         if src.remaining() < 4 {
-            return Err(ProtocolError::Decode("PublishBatchRequest too short".into()));
+            return Err(ProtocolError::Decode(
+                "PublishBatchRequest too short".into(),
+            ));
         }
         let stream_len = src.get_u16_le() as usize;
         if src.remaining() < stream_len {
-            return Err(ProtocolError::Decode("PublishBatchRequest truncated at stream".into()));
+            return Err(ProtocolError::Decode(
+                "PublishBatchRequest truncated at stream".into(),
+            ));
         }
         let stream = String::from_utf8(src.split_to(stream_len).to_vec())
             .map_err(|e| ProtocolError::Decode(format!("invalid stream UTF-8: {e}")))?;
 
         if src.remaining() < 2 {
-            return Err(ProtocolError::Decode("PublishBatchRequest missing record_count".into()));
+            return Err(ProtocolError::Decode(
+                "PublishBatchRequest missing record_count".into(),
+            ));
         }
         let record_count = src.get_u16_le() as usize;
         if record_count == 0 {
-            return Err(ProtocolError::Decode("PublishBatchRequest has empty batch".into()));
+            return Err(ProtocolError::Decode(
+                "PublishBatchRequest has empty batch".into(),
+            ));
         }
 
         let mut records = Vec::with_capacity(record_count);
         for _ in 0..record_count {
-            if src.remaining() < 2 { return Err(ProtocolError::Decode("record missing subject_len".into())); }
+            if src.remaining() < 2 {
+                return Err(ProtocolError::Decode("record missing subject_len".into()));
+            }
             let sub_len = src.get_u16_le() as usize;
-            if src.remaining() < sub_len { return Err(ProtocolError::Decode("record truncated at subject".into())); }
+            if src.remaining() < sub_len {
+                return Err(ProtocolError::Decode("record truncated at subject".into()));
+            }
             let subject = String::from_utf8(src.split_to(sub_len).to_vec())
                 .map_err(|e| ProtocolError::Decode(format!("invalid subject: {e}")))?;
 
-            if src.remaining() < 1 { return Err(ProtocolError::Decode("record missing flags".into())); }
+            if src.remaining() < 1 {
+                return Err(ProtocolError::Decode("record missing flags".into()));
+            }
             let flags = src.get_u8();
 
             let key = if flags & FLAG_HAS_KEY != 0 {
-                if src.remaining() < 4 { return Err(ProtocolError::Decode("record missing key_len".into())); }
+                if src.remaining() < 4 {
+                    return Err(ProtocolError::Decode("record missing key_len".into()));
+                }
                 let kl = src.get_u32_le() as usize;
-                if src.remaining() < kl { return Err(ProtocolError::Decode("record truncated at key".into())); }
+                if src.remaining() < kl {
+                    return Err(ProtocolError::Decode("record truncated at key".into()));
+                }
                 Some(src.split_to(kl))
-            } else { None };
+            } else {
+                None
+            };
 
             let msg_id = if flags & FLAG_HAS_MSG_ID != 0 {
-                if src.remaining() < 2 { return Err(ProtocolError::Decode("record missing msg_id_len".into())); }
+                if src.remaining() < 2 {
+                    return Err(ProtocolError::Decode("record missing msg_id_len".into()));
+                }
                 let ml = src.get_u16_le() as usize;
-                if ml > MAX_MSG_ID_BYTES { return Err(ProtocolError::Decode(format!("msg_id {ml} > {MAX_MSG_ID_BYTES}"))); }
-                if src.remaining() < ml { return Err(ProtocolError::Decode("record truncated at msg_id".into())); }
-                Some(String::from_utf8(src.split_to(ml).to_vec())
-                    .map_err(|e| ProtocolError::Decode(format!("invalid msg_id: {e}")))?)
-            } else { None };
+                if ml > MAX_MSG_ID_BYTES {
+                    return Err(ProtocolError::Decode(format!(
+                        "msg_id {ml} > {MAX_MSG_ID_BYTES}"
+                    )));
+                }
+                if src.remaining() < ml {
+                    return Err(ProtocolError::Decode("record truncated at msg_id".into()));
+                }
+                Some(
+                    String::from_utf8(src.split_to(ml).to_vec())
+                        .map_err(|e| ProtocolError::Decode(format!("invalid msg_id: {e}")))?,
+                )
+            } else {
+                None
+            };
 
-            if src.remaining() < 4 { return Err(ProtocolError::Decode("record missing value_len".into())); }
+            if src.remaining() < 4 {
+                return Err(ProtocolError::Decode("record missing value_len".into()));
+            }
             let vl = src.get_u32_le() as usize;
-            if src.remaining() < vl { return Err(ProtocolError::Decode("record truncated at value".into())); }
+            if src.remaining() < vl {
+                return Err(ProtocolError::Decode("record truncated at value".into()));
+            }
             let value = src.split_to(vl);
 
-            if src.remaining() < 2 { return Err(ProtocolError::Decode("record missing header_count".into())); }
+            if src.remaining() < 2 {
+                return Err(ProtocolError::Decode("record missing header_count".into()));
+            }
             let hc = src.get_u16_le() as usize;
             let mut headers = Vec::with_capacity(hc);
             for _ in 0..hc {
-                if src.remaining() < 2 { return Err(ProtocolError::Decode("header missing key_len".into())); }
+                if src.remaining() < 2 {
+                    return Err(ProtocolError::Decode("header missing key_len".into()));
+                }
                 let hkl = src.get_u16_le() as usize;
-                if src.remaining() < hkl { return Err(ProtocolError::Decode("header truncated at key".into())); }
+                if src.remaining() < hkl {
+                    return Err(ProtocolError::Decode("header truncated at key".into()));
+                }
                 let hk = String::from_utf8(src.split_to(hkl).to_vec())
                     .map_err(|e| ProtocolError::Decode(format!("invalid header key: {e}")))?;
-                if src.remaining() < 2 { return Err(ProtocolError::Decode("header missing val_len".into())); }
+                if src.remaining() < 2 {
+                    return Err(ProtocolError::Decode("header missing val_len".into()));
+                }
                 let hvl = src.get_u16_le() as usize;
-                if src.remaining() < hvl { return Err(ProtocolError::Decode("header truncated at val".into())); }
+                if src.remaining() < hvl {
+                    return Err(ProtocolError::Decode("header truncated at val".into()));
+                }
                 let hv = String::from_utf8(src.split_to(hvl).to_vec())
                     .map_err(|e| ProtocolError::Decode(format!("invalid header val: {e}")))?;
                 headers.push((hk, hv));
             }
-            records.push(PublishBatchRecord { subject, key, msg_id, value, headers });
+            records.push(PublishBatchRecord {
+                subject,
+                key,
+                msg_id,
+                value,
+                headers,
+            });
         }
         Ok(PublishBatchRequest { stream, records })
     }
@@ -157,7 +213,10 @@ impl PublishBatchOkResponse {
                     dst.put_u8(0);
                     dst.put_u64_le(*offset);
                 }
-                BatchResult::Duplicate { offset, duplicate_of } => {
+                BatchResult::Duplicate {
+                    offset,
+                    duplicate_of,
+                } => {
                     dst.put_u8(1);
                     dst.put_u64_le(*offset);
                     dst.put_u64_le(*duplicate_of);
@@ -174,33 +233,54 @@ impl PublishBatchOkResponse {
     }
 
     pub fn decode(mut src: Bytes) -> Result<Self, ProtocolError> {
-        if src.remaining() < 2 { return Err(ProtocolError::Decode("PublishBatchOk missing count".into())); }
+        if src.remaining() < 2 {
+            return Err(ProtocolError::Decode("PublishBatchOk missing count".into()));
+        }
         let count = src.get_u16_le() as usize;
         let mut results = Vec::with_capacity(count);
         for _ in 0..count {
-            if src.remaining() < 1 { return Err(ProtocolError::Decode("result missing status".into())); }
+            if src.remaining() < 1 {
+                return Err(ProtocolError::Decode("result missing status".into()));
+            }
             let status = src.get_u8();
             match status {
                 0 => {
-                    if src.remaining() < 8 { return Err(ProtocolError::Decode("Written truncated".into())); }
-                    results.push(BatchResult::Written { offset: src.get_u64_le() });
+                    if src.remaining() < 8 {
+                        return Err(ProtocolError::Decode("Written truncated".into()));
+                    }
+                    results.push(BatchResult::Written {
+                        offset: src.get_u64_le(),
+                    });
                 }
                 1 => {
-                    if src.remaining() < 16 { return Err(ProtocolError::Decode("Duplicate truncated".into())); }
+                    if src.remaining() < 16 {
+                        return Err(ProtocolError::Decode("Duplicate truncated".into()));
+                    }
                     let offset = src.get_u64_le();
                     let duplicate_of = src.get_u64_le();
-                    results.push(BatchResult::Duplicate { offset, duplicate_of });
+                    results.push(BatchResult::Duplicate {
+                        offset,
+                        duplicate_of,
+                    });
                 }
                 2 => {
-                    if src.remaining() < 4 { return Err(ProtocolError::Decode("Error missing code/len".into())); }
+                    if src.remaining() < 4 {
+                        return Err(ProtocolError::Decode("Error missing code/len".into()));
+                    }
                     let code = src.get_u16_le();
                     let ml = src.get_u16_le() as usize;
-                    if src.remaining() < ml { return Err(ProtocolError::Decode("Error message truncated".into())); }
+                    if src.remaining() < ml {
+                        return Err(ProtocolError::Decode("Error message truncated".into()));
+                    }
                     let message = String::from_utf8(src.split_to(ml).to_vec())
                         .map_err(|e| ProtocolError::Decode(format!("invalid error msg: {e}")))?;
                     results.push(BatchResult::Error { code, message });
                 }
-                other => return Err(ProtocolError::Decode(format!("unknown batch result status: {other}"))),
+                other => {
+                    return Err(ProtocolError::Decode(format!(
+                        "unknown batch result status: {other}"
+                    )))
+                }
             }
         }
         Ok(PublishBatchOkResponse { results })
@@ -249,23 +329,50 @@ mod tests {
         let resp = PublishBatchOkResponse {
             results: vec![
                 BatchResult::Written { offset: 100 },
-                BatchResult::Duplicate { offset: 50, duplicate_of: 42 },
-                BatchResult::Error { code: 0x1001, message: "collision".into() },
+                BatchResult::Duplicate {
+                    offset: 50,
+                    duplicate_of: 42,
+                },
+                BatchResult::Error {
+                    code: 0x1001,
+                    message: "collision".into(),
+                },
             ],
         };
         let mut buf = BytesMut::new();
         resp.encode(&mut buf);
         let decoded = PublishBatchOkResponse::decode(buf.freeze()).unwrap();
         assert_eq!(decoded.results.len(), 3);
-        match &decoded.results[0] { BatchResult::Written { offset } => assert_eq!(*offset, 100), _ => panic!("wrong variant") }
-        match &decoded.results[1] { BatchResult::Duplicate { offset, duplicate_of } => { assert_eq!(*offset, 50); assert_eq!(*duplicate_of, 42); }, _ => panic!() }
-        match &decoded.results[2] { BatchResult::Error { code, message } => { assert_eq!(*code, 0x1001); assert_eq!(message, "collision"); }, _ => panic!() }
+        match &decoded.results[0] {
+            BatchResult::Written { offset } => assert_eq!(*offset, 100),
+            _ => panic!("wrong variant"),
+        }
+        match &decoded.results[1] {
+            BatchResult::Duplicate {
+                offset,
+                duplicate_of,
+            } => {
+                assert_eq!(*offset, 50);
+                assert_eq!(*duplicate_of, 42);
+            }
+            _ => panic!(),
+        }
+        match &decoded.results[2] {
+            BatchResult::Error { code, message } => {
+                assert_eq!(*code, 0x1001);
+                assert_eq!(message, "collision");
+            }
+            _ => panic!(),
+        }
     }
 
     #[test]
     fn publish_batch_empty_fails_decode() {
         let mut buf = BytesMut::new();
-        let req = PublishBatchRequest { stream: "s".into(), records: vec![] };
+        let req = PublishBatchRequest {
+            stream: "s".into(),
+            records: vec![],
+        };
         req.encode(&mut buf);
         let err = PublishBatchRequest::decode(buf.freeze()).unwrap_err();
         assert!(err.to_string().contains("empty batch"));

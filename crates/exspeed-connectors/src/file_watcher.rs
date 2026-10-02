@@ -67,7 +67,12 @@ async fn sync_connectors(manager: &Arc<ConnectorManager>, connectors_dir: &PathB
         if running_names.contains(filename) {
             // Already running — check if the file content changed.
             let new_hash = ConnectorManager::hash_file(&path);
-            let old_hash = manager.toml_hashes.read().await.get(&connector_name).copied();
+            let old_hash = manager
+                .toml_hashes
+                .read()
+                .await
+                .get(&connector_name)
+                .copied();
 
             if new_hash.is_some() && new_hash != old_hash {
                 // Config changed — reload.

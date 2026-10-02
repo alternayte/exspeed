@@ -43,7 +43,8 @@ async fn start_server() -> (String, String) {
             storage_sync_bytes: 4 * 1024 * 1024,
             delivery_buffer: 8192,
         })
-        .await.unwrap();
+        .await
+        .unwrap();
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
     (tcp_addr, format!("http://127.0.0.1:{http_port}"))
@@ -55,30 +56,59 @@ type FWriter = FramedWrite<tokio::net::tcp::OwnedWriteHalf, ExspeedCodec>;
 async fn connect_to(addr: &str) -> (FReader, FWriter) {
     let s = TcpStream::connect(addr).await.unwrap();
     let (r, w) = s.into_split();
-    (FramedRead::new(r, ExspeedCodec::new()), FramedWrite::new(w, ExspeedCodec::new()))
+    (
+        FramedRead::new(r, ExspeedCodec::new()),
+        FramedWrite::new(w, ExspeedCodec::new()),
+    )
 }
 
 async fn send_recv(w: &mut FWriter, r: &mut FReader, f: Frame) -> Frame {
     w.send(f).await.unwrap();
-    timeout(Duration::from_secs(5), r.next()).await.unwrap().unwrap().unwrap()
+    timeout(Duration::from_secs(5), r.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
 }
 
 async fn fetch_records(tcp_addr: &str, stream: &str, max: u32) -> Vec<(u64, Vec<u8>)> {
     let (mut r, mut w) = connect_to(tcp_addr).await;
     let mut buf = BytesMut::new();
-    ConnectRequest { client_id: "test".into(), auth_type: AuthType::None, auth_payload: Bytes::new() }.encode(&mut buf);
+    ConnectRequest {
+        client_id: "test".into(),
+        auth_type: AuthType::None,
+        auth_payload: Bytes::new(),
+    }
+    .encode(&mut buf);
     let resp = send_recv(&mut w, &mut r, Frame::new(OpCode::Connect, 1, buf.freeze())).await;
     assert_eq!(resp.opcode, OpCode::ConnectOk);
 
     let mut buf = BytesMut::new();
-    FetchRequest { stream: stream.into(), offset: 0, max_records: max, subject_filter: String::new() }.encode(&mut buf);
+    FetchRequest {
+        stream: stream.into(),
+        offset: 0,
+        max_records: max,
+        subject_filter: String::new(),
+    }
+    .encode(&mut buf);
     let resp = send_recv(&mut w, &mut r, Frame::new(OpCode::Fetch, 2, buf.freeze())).await;
-    if resp.opcode != OpCode::RecordsBatch { return Vec::new(); }
+    if resp.opcode != OpCode::RecordsBatch {
+        return Vec::new();
+    }
     let batch = RecordsBatch::decode(resp.payload.clone()).unwrap();
-    batch.records.into_iter().map(|rec| (rec.offset, rec.value.to_vec())).collect()
+    batch
+        .records
+        .into_iter()
+        .map(|rec| (rec.offset, rec.value.to_vec()))
+        .collect()
 }
 
-async fn wait_for_records(tcp_addr: &str, stream: &str, want: usize, deadline_secs: u64) -> Vec<(u64, Vec<u8>)> {
+async fn wait_for_records(
+    tcp_addr: &str,
+    stream: &str,
+    want: usize,
+    deadline_secs: u64,
+) -> Vec<(u64, Vec<u8>)> {
     let deadline = std::time::Instant::now() + Duration::from_secs(deadline_secs);
     loop {
         let recs = fetch_records(tcp_addr, stream, 100).await;
@@ -99,19 +129,30 @@ async fn sqlite_poll_source_emits_new_rows() {
     // Pre-seed table with 3 rows.
     let pool = sqlx::sqlite::SqlitePool::connect(&url).await.unwrap();
     sqlx::query("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
-        .execute(&pool).await.unwrap();
+        .execute(&pool)
+        .await
+        .unwrap();
     for (i, n) in [(1i64, "alpha"), (2, "beta"), (3, "gamma")] {
         sqlx::query("INSERT INTO items (id, name) VALUES (?, ?)")
-            .bind(i).bind(n).execute(&pool).await.unwrap();
+            .bind(i)
+            .bind(n)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     let (tcp, http) = start_server().await;
     let client = reqwest::Client::new();
 
-    client.post(format!("{http}/api/v1/streams"))
-        .json(&serde_json::json!({"name": "items"})).send().await.unwrap();
+    client
+        .post(format!("{http}/api/v1/streams"))
+        .json(&serde_json::json!({"name": "items"}))
+        .send()
+        .await
+        .unwrap();
 
-    let resp = client.post(format!("{http}/api/v1/connectors"))
+    let resp = client
+        .post(format!("{http}/api/v1/connectors"))
         .json(&serde_json::json!({
             "name": "poll-items",
             "type": "source",
@@ -124,7 +165,9 @@ async fn sqlite_poll_source_emits_new_rows() {
                 "schema": "id:bigint, name:text"
             }
         }))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 201, "create: {}", resp.text().await.unwrap());
 
     // Allow two polling cycles to pick up the seeded rows.
@@ -143,7 +186,11 @@ async fn sqlite_poll_source_emits_new_rows() {
 
     // Insert a new row — should get picked up on the next poll.
     sqlx::query("INSERT INTO items (id, name) VALUES (?, ?)")
-        .bind(4i64).bind("delta").execute(&pool).await.unwrap();
+        .bind(4i64)
+        .bind("delta")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let recs = wait_for_records(&tcp, "items", 4, 10).await;
     assert_eq!(recs.len(), 4);
@@ -176,10 +223,14 @@ async fn mssql_connect(
             cfg.trust_cert();
         }
     }
-    let tcp = tokio::net::TcpStream::connect(cfg.get_addr()).await.unwrap();
+    let tcp = tokio::net::TcpStream::connect(cfg.get_addr())
+        .await
+        .unwrap();
     tcp.set_nodelay(true).ok();
     use tokio_util::compat::TokioAsyncWriteCompatExt;
-    tiberius::Client::connect(cfg, tcp.compat_write()).await.unwrap()
+    tiberius::Client::connect(cfg, tcp.compat_write())
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
@@ -195,13 +246,25 @@ async fn mssql_poll_source_emits_new_rows() {
              CREATE TABLE [{t}] (id BIGINT NOT NULL PRIMARY KEY, name NVARCHAR(MAX) NOT NULL)",
             t = table
         );
-        conn.simple_query(sql).await.unwrap().into_results().await.unwrap();
+        conn.simple_query(sql)
+            .await
+            .unwrap()
+            .into_results()
+            .await
+            .unwrap();
         for (i, n) in [(1i64, "alpha"), (2, "beta"), (3, "gamma")] {
             let sql = format!(
                 "INSERT INTO [{t}] (id, name) VALUES ({i}, '{n}')",
-                t = table, i = i, n = n
+                t = table,
+                i = i,
+                n = n
             );
-            conn.simple_query(sql).await.unwrap().into_results().await.unwrap();
+            conn.simple_query(sql)
+                .await
+                .unwrap()
+                .into_results()
+                .await
+                .unwrap();
         }
     }
 
@@ -211,7 +274,9 @@ async fn mssql_poll_source_emits_new_rows() {
     client
         .post(format!("{http}/api/v1/streams"))
         .json(&serde_json::json!({"name": "mssql-poll-stream"}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
 
     let resp = client
         .post(format!("{http}/api/v1/connectors"))
@@ -227,7 +292,9 @@ async fn mssql_poll_source_emits_new_rows() {
                 "schema": "id:bigint, name:text"
             }
         }))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 201, "create: {}", resp.text().await.unwrap());
 
     let recs = wait_for_records(&tcp, "mssql-poll-stream", 3, 15).await;

@@ -139,11 +139,8 @@ impl ExqlEngine {
                     "field_path": field_path,
                 });
                 let path = index_dir.join(format!("{name}.json"));
-                std::fs::write(
-                    &path,
-                    serde_json::to_string_pretty(&meta).unwrap(),
-                )
-                .map_err(|e| ExqlError::Storage(e.to_string()))?;
+                std::fs::write(&path, serde_json::to_string_pretty(&meta).unwrap())
+                    .map_err(|e| ExqlError::Storage(e.to_string()))?;
 
                 // Register on running partitions immediately
                 if let Ok(sn) = exspeed_common::StreamName::try_from(stream.as_str()) {
@@ -171,19 +168,13 @@ impl ExqlEngine {
         let stmt = crate::parser::parse(sql)?;
         match stmt {
             crate::parser::ExqlStatement::DropIndex(name) => {
-                let path = self
-                    .data_dir()
-                    .join("indexes")
-                    .join(format!("{name}.json"));
+                let path = self.data_dir().join("indexes").join(format!("{name}.json"));
                 if path.exists() {
-                    std::fs::remove_file(&path)
-                        .map_err(|e| ExqlError::Storage(e.to_string()))?;
+                    std::fs::remove_file(&path).map_err(|e| ExqlError::Storage(e.to_string()))?;
                 }
                 Ok(name)
             }
-            _ => Err(ExqlError::Execution(
-                "expected DROP INDEX statement".into(),
-            )),
+            _ => Err(ExqlError::Execution("expected DROP INDEX statement".into())),
         }
     }
 
@@ -212,10 +203,7 @@ impl ExqlEngine {
                             defs.push(runtime::bounded::IndexDef {
                                 name: meta["name"].as_str().unwrap_or("").to_string(),
                                 stream: meta["stream"].as_str().unwrap_or("").to_string(),
-                                field_path: meta["field_path"]
-                                    .as_str()
-                                    .unwrap_or("")
-                                    .to_string(),
+                                field_path: meta["field_path"].as_str().unwrap_or("").to_string(),
                             });
                         }
                     }
@@ -228,10 +216,7 @@ impl ExqlEngine {
     /// Resume every persisted continuous query under `token`. Called once
     /// per leadership tenure by the leader supervisor. Returns when
     /// `token.cancelled()` fires (demotion or shutdown).
-    pub async fn resume_all_and_run(
-        self: Arc<Self>,
-        token: CancellationToken,
-    ) {
+    pub async fn resume_all_and_run(self: Arc<Self>, token: CancellationToken) {
         let queries = self.query_registry.list();
         for query in queries {
             let engine = self.clone();
@@ -458,13 +443,10 @@ mod tests {
         storage: Arc<dyn StorageEngine>,
         data_dir: std::path::PathBuf,
     ) -> (Arc<ClusterLeadership>, Arc<ExqlEngine>) {
-        let lease: Arc<dyn exspeed_broker::LeaderLease> =
-            Arc::new(NoopLeaderLease::new());
+        let lease: Arc<dyn exspeed_broker::LeaderLease> = Arc::new(NoopLeaderLease::new());
         let (metrics, _r) = exspeed_common::Metrics::new();
         let metrics = Arc::new(metrics);
-        let leadership = Arc::new(
-            ClusterLeadership::spawn(lease, metrics.clone(), None).await,
-        );
+        let leadership = Arc::new(ClusterLeadership::spawn(lease, metrics.clone(), None).await);
         // Wait for Noop to grant leadership.
         for _ in 0..40 {
             if leadership.is_currently_leader() {
@@ -493,8 +475,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let (_leadership, engine) =
-            make_leadership_and_engine(storage, dir.path().to_path_buf())
-                .await;
+            make_leadership_and_engine(storage, dir.path().to_path_buf()).await;
 
         let id = engine
             .create_continuous(r#"CREATE VIEW derived AS SELECT * FROM "src""#)
@@ -521,13 +502,10 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let (_leadership, engine) =
-            make_leadership_and_engine(storage, dir.path().to_path_buf())
-                .await;
+            make_leadership_and_engine(storage, dir.path().to_path_buf()).await;
 
         let id = engine
-            .create_materialized_view(
-                r#"CREATE MATERIALIZED VIEW mv AS SELECT * FROM "src""#,
-            )
+            .create_materialized_view(r#"CREATE MATERIALIZED VIEW mv AS SELECT * FROM "src""#)
             .await
             .expect("create_materialized_view ok");
 

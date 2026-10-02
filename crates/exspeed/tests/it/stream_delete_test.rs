@@ -253,7 +253,12 @@ async fn force_delete_cascades() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "force-delete should succeed: body={:?}", resp.text().await);
+    assert_eq!(
+        resp.status(),
+        200,
+        "force-delete should succeed: body={:?}",
+        resp.text().await
+    );
 
     // Connector should be gone.
     let resp = client
@@ -263,8 +268,11 @@ async fn force_delete_cascades() {
         .unwrap();
     let body: Value = resp.json().await.unwrap();
     let arr = body.as_array().unwrap();
-    assert!(arr.iter().all(|c| c["name"] != "hook-c"),
-        "hook-c should have been removed, got: {:?}", arr);
+    assert!(
+        arr.iter().all(|c| c["name"] != "hook-c"),
+        "hook-c should have been removed, got: {:?}",
+        arr
+    );
 
     // Stream should be gone.
     let resp = client
@@ -350,7 +358,10 @@ async fn delete_during_inflight_publish_is_safe() {
 
     stop.store(true, Ordering::Relaxed);
     let total = publisher.await.unwrap();
-    assert!(total > 0, "publisher should have emitted at least one record");
+    assert!(
+        total > 0,
+        "publisher should have emitted at least one record"
+    );
 
     // Server still healthy: create a new stream, publish, delete — full loop.
     let resp = client

@@ -5,9 +5,9 @@ pub mod s3;
 pub mod stream;
 
 use async_trait::async_trait;
+use exspeed_streams::StorageEngine;
 use std::path::Path;
 use std::sync::Arc;
-use exspeed_streams::StorageEngine;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OffsetStoreError {
@@ -29,17 +29,11 @@ pub trait OffsetStore: Send + Sync {
     ) -> Result<(), OffsetStoreError>;
 
     /// Load a source connector's last saved position. None = fresh start.
-    async fn load_source_offset(
-        &self,
-        connector: &str,
-    ) -> Result<Option<String>, OffsetStoreError>;
+    async fn load_source_offset(&self, connector: &str)
+        -> Result<Option<String>, OffsetStoreError>;
 
     /// Save a sink connector's stream offset.
-    async fn save_sink_offset(
-        &self,
-        connector: &str,
-        offset: u64,
-    ) -> Result<(), OffsetStoreError>;
+    async fn save_sink_offset(&self, connector: &str, offset: u64) -> Result<(), OffsetStoreError>;
 
     /// Load a sink connector's last saved offset. 0 = start of stream.
     async fn load_sink_offset(&self, connector: &str) -> Result<u64, OffsetStoreError>;

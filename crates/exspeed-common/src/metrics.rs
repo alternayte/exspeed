@@ -279,7 +279,9 @@ impl Metrics {
         let replication_truncated_records_total = meter
             .u64_counter("exspeed_replication_truncated_records_total")
             .build();
-        let replication_reseed_total = meter.u64_counter("exspeed_replication_reseed_total").build();
+        let replication_reseed_total = meter
+            .u64_counter("exspeed_replication_reseed_total")
+            .build();
         let replication_follower_queue_drops_total = meter
             .u64_counter("exspeed_replication_follower_queue_drops_total")
             .build();
@@ -364,10 +366,7 @@ impl Metrics {
                 KeyValue::new("reason", "sink_rejected"),
             ],
         );
-        connector_dlq_failures_total.add(
-            0,
-            &[KeyValue::new("connector", "__init__")],
-        );
+        connector_dlq_failures_total.add(0, &[KeyValue::new("connector", "__init__")]);
         connector_retry_attempts_total.add(
             0,
             &[
@@ -663,10 +662,8 @@ impl Metrics {
     }
 
     pub fn inc_replication_follower_queue_drop(&self, follower_id: &str) {
-        self.replication_follower_queue_drops_total.add(
-            1,
-            &[KeyValue::new("follower_id", follower_id.to_string())],
-        );
+        self.replication_follower_queue_drops_total
+            .add(1, &[KeyValue::new("follower_id", follower_id.to_string())]);
     }
 
     pub fn inc_replication_truncated_records(&self, stream: &str, count: u64) {
@@ -680,10 +677,8 @@ impl Metrics {
     }
 
     pub fn record_replication_connect_attempt(&self, ok: bool) {
-        self.replication_connect_attempts_total.add(
-            1,
-            &[KeyValue::new("result", if ok { "ok" } else { "err" })],
-        );
+        self.replication_connect_attempts_total
+            .add(1, &[KeyValue::new("result", if ok { "ok" } else { "err" })]);
     }
 
     /// Increment `exspeed_replication_records_applied_total` by `count` for
@@ -702,8 +697,10 @@ impl Metrics {
     /// the README recipe `rate(exspeed_replication_lag_seconds[...]) > 10`
     /// behaves the way operators expect.
     pub fn set_replication_lag_seconds(&self, stream: &str, secs: f64) {
-        self.replication_lag_seconds
-            .record(secs.max(0.0), &[KeyValue::new("stream", stream.to_string())]);
+        self.replication_lag_seconds.record(
+            secs.max(0.0),
+            &[KeyValue::new("stream", stream.to_string())],
+        );
     }
 
     /// Set the follower's observed offset-lag (`leader_latest - follower_next`)

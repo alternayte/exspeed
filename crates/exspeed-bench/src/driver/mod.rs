@@ -1,7 +1,7 @@
 pub mod exspeed;
-pub mod publisher;
 #[cfg(feature = "comparison")]
 pub mod kafka;
+pub mod publisher;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Target {

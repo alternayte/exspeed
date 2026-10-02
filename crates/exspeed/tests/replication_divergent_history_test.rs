@@ -148,10 +148,7 @@ async fn spawn_pod(slow_ms: Option<u64>) -> PodHandle {
     // should have any records to apply during the initial publish burst
     // anyway.
     if let Some(ms) = slow_ms {
-        std::env::set_var(
-            "EXSPEED_TEST_REPLICATION_APPLY_SLEEP_MS",
-            ms.to_string(),
-        );
+        std::env::set_var("EXSPEED_TEST_REPLICATION_APPLY_SLEEP_MS", ms.to_string());
     } else {
         std::env::remove_var("EXSPEED_TEST_REPLICATION_APPLY_SLEEP_MS");
     }
@@ -164,13 +161,13 @@ async fn spawn_pod(slow_ms: Option<u64>) -> PodHandle {
         credentials_file: Some(cred_path),
         tls_cert: None,
         tls_key: None,
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
+        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+        storage_flush_window_us: 500,
+        storage_flush_threshold_records: 256,
+        storage_flush_threshold_bytes: 1_048_576,
+        storage_sync_interval_ms: 10,
+        storage_sync_bytes: 4 * 1024 * 1024,
+        delivery_buffer: 8192,
     };
 
     let task = tokio::spawn(async move {
@@ -399,9 +396,7 @@ async fn failover_truncates_ahead_follower_when_behind_follower_wins() {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
             loop {
                 if tokio::time::Instant::now() > deadline {
-                    eprintln!(
-                        "slow won but truncate counter didn't move in 30s (before={before})"
-                    );
+                    eprintln!("slow won but truncate counter didn't move in 30s (before={before})");
                     break;
                 }
                 let now = truncated_records(live_fast.api_port, stream).await;

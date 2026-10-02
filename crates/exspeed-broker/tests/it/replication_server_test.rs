@@ -635,4 +635,3 @@ async fn catchup_empty_read_with_stream_deleted_logs_and_continues() {
 
     cancel.cancel();
 }
-

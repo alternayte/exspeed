@@ -182,7 +182,10 @@ impl Broker {
         let is_grouped = !consumer.config.group.is_empty();
 
         if !is_grouped && !consumer.subscribers.is_empty() {
-            return Err(format!("consumer '{}' is already subscribed", consumer_name));
+            return Err(format!(
+                "consumer '{}' is already subscribed",
+                consumer_name
+            ));
         }
 
         if consumer.subscribers.contains_key(subscriber_id) {
@@ -328,12 +331,7 @@ mod tests {
             .await
     }
 
-    async fn publish(
-        broker: &Broker,
-        stream: &str,
-        subject: &str,
-        value: &[u8],
-    ) -> ServerMessage {
+    async fn publish(broker: &Broker, stream: &str, subject: &str, value: &[u8]) -> ServerMessage {
         broker
             .handle_message(ClientMessage::Publish(PublishRequest {
                 stream: stream.into(),
@@ -435,12 +433,9 @@ mod tests {
     async fn publish_sequential_offsets() {
         let (broker, _dir) = make_broker();
         create_stream(&broker, "orders").await;
-        let o0 =
-            unwrap_publish_offset(publish(&broker, "orders", "orders.created", b"a").await);
-        let o1 =
-            unwrap_publish_offset(publish(&broker, "orders", "orders.created", b"b").await);
-        let o2 =
-            unwrap_publish_offset(publish(&broker, "orders", "orders.created", b"c").await);
+        let o0 = unwrap_publish_offset(publish(&broker, "orders", "orders.created", b"a").await);
+        let o1 = unwrap_publish_offset(publish(&broker, "orders", "orders.created", b"b").await);
+        let o2 = unwrap_publish_offset(publish(&broker, "orders", "orders.created", b"c").await);
         assert_eq!(o0, 0);
         assert_eq!(o1, 1);
         assert_eq!(o2, 2);

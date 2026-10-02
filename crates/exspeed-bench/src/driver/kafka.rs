@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -22,9 +22,7 @@ pub async fn ensure_topic(brokers: &str, topic: &str) -> Result<()> {
         .create()
         .context("ensure_topic: create producer")?;
 
-    let record: FutureRecord<str, str> = FutureRecord::to(topic)
-        .payload("")
-        .key("init");
+    let record: FutureRecord<str, str> = FutureRecord::to(topic).payload("").key("init");
 
     producer
         .send(record, Duration::from_secs(5))
@@ -71,11 +69,10 @@ pub async fn run_producer(
             while Instant::now() < deadline {
                 let us = origin.elapsed().as_micros() as u64;
                 let ts_str = us.to_string();
-                let headers = OwnedHeaders::new()
-                    .insert(rdkafka::message::Header {
-                        key: PUBLISH_TS_HEADER,
-                        value: Some(ts_str.as_bytes()),
-                    });
+                let headers = OwnedHeaders::new().insert(rdkafka::message::Header {
+                    key: PUBLISH_TS_HEADER,
+                    value: Some(ts_str.as_bytes()),
+                });
 
                 let record: FutureRecord<str, [u8]> = FutureRecord::to(&topic)
                     .payload(payload.as_slice())
@@ -131,8 +128,7 @@ pub async fn run_consumer(
         .subscribe(&[topic])
         .context("run_consumer: subscribe")?;
 
-    let mut hist = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3)
-        .expect("histogram bounds");
+    let mut hist = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).expect("histogram bounds");
     let mut messages: u64 = 0;
     let deadline = Instant::now() + duration;
 

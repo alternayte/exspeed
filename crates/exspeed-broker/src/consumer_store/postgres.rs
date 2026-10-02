@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls};
 
-use crate::consumer_state::ConsumerConfig;
 use super::{ConsumerStore, ConsumerStoreError};
+use crate::consumer_state::ConsumerConfig;
 
 pub struct PostgresConsumerStore {
     client: Mutex<Client>,

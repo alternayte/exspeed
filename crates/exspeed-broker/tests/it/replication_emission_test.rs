@@ -20,17 +20,14 @@ use exspeed_storage::memory::MemoryStorage;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 
-fn make_broker(
-    coord: Arc<ReplicationCoordinator>,
-) -> (Broker, TempDir) {
+fn make_broker(coord: Arc<ReplicationCoordinator>) -> (Broker, TempDir) {
     let dir = TempDir::new().unwrap();
     let storage = Arc::new(MemoryStorage::new());
     let broker_append = Arc::new(BrokerAppend::new(storage.clone(), 300));
     let consumer_store = Arc::new(
         exspeed_broker::consumer_store::file::FileConsumerStore::new(dir.path().to_path_buf()),
     );
-    let work_coordinator =
-        Arc::new(exspeed_broker::work_coordinator::noop::NoopWorkCoordinator);
+    let work_coordinator = Arc::new(exspeed_broker::work_coordinator::noop::NoopWorkCoordinator);
     let lease = Arc::new(exspeed_broker::lease::NoopLeaderLease::new());
     let metrics = Arc::new(Metrics::new().0);
     let broker = Broker::new(
@@ -55,9 +52,7 @@ fn metrics() -> Arc<Metrics> {
 /// arrived within the budget.
 async fn drain(rx: &mut mpsc::Receiver<ReplicationEvent>) -> Vec<ReplicationEvent> {
     let mut out = Vec::new();
-    while let Ok(Some(ev)) =
-        tokio::time::timeout(Duration::from_millis(100), rx.recv()).await
-    {
+    while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
         out.push(ev);
     }
     out

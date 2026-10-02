@@ -47,7 +47,10 @@ async fn crash_recovery_replays_wal() {
     // Phase 2: reopen and verify all records survived.
     {
         let storage = FileStorage::open(dir.path()).unwrap();
-        let records = storage.read(&stream("crash"), Offset(0), 100).await.unwrap();
+        let records = storage
+            .read(&stream("crash"), Offset(0), 100)
+            .await
+            .unwrap();
         assert_eq!(records.len(), 10);
         for i in 0u64..10 {
             assert_eq!(records[i as usize].offset, Offset(i));
@@ -65,7 +68,10 @@ async fn data_persists_across_restart() {
 
     {
         let storage = FileStorage::new(dir.path()).unwrap();
-        storage.create_stream(&stream("persist"), 0, 0).await.unwrap();
+        storage
+            .create_stream(&stream("persist"), 0, 0)
+            .await
+            .unwrap();
         storage
             .append(&stream("persist"), &record(b"p0-data"))
             .await
@@ -75,7 +81,10 @@ async fn data_persists_across_restart() {
     {
         let storage = FileStorage::open(dir.path()).unwrap();
 
-        let p0 = storage.read(&stream("persist"), Offset(0), 10).await.unwrap();
+        let p0 = storage
+            .read(&stream("persist"), Offset(0), 10)
+            .await
+            .unwrap();
         assert_eq!(p0.len(), 1);
         assert_eq!(p0[0].offset, Offset(0));
         assert_eq!(p0[0].value, Bytes::from_static(b"p0-data"));
@@ -88,7 +97,10 @@ async fn data_persists_across_restart() {
 async fn segment_rolling() {
     let dir = TempDir::new().unwrap();
     let storage = FileStorage::new(dir.path()).unwrap();
-    storage.create_stream(&stream("rolling"), 0, 0).await.unwrap();
+    storage
+        .create_stream(&stream("rolling"), 0, 0)
+        .await
+        .unwrap();
 
     for i in 0u64..1000 {
         let val = format!("rec-{:04}", i);
@@ -99,7 +111,10 @@ async fn segment_rolling() {
         assert_eq!(offset, Offset(i));
     }
 
-    let records = storage.read(&stream("rolling"), Offset(0), 1000).await.unwrap();
+    let records = storage
+        .read(&stream("rolling"), Offset(0), 1000)
+        .await
+        .unwrap();
     assert_eq!(records.len(), 1000);
     assert_eq!(records[0].offset, Offset(0));
     assert_eq!(records[0].value, Bytes::from(String::from("rec-0000")));
@@ -115,7 +130,10 @@ async fn milestone_10k_records_crash_recover() {
     // Phase 1: write 10,000 records then drop (crash).
     {
         let storage = FileStorage::new(dir.path()).unwrap();
-        storage.create_stream(&stream("milestone"), 0, 0).await.unwrap();
+        storage
+            .create_stream(&stream("milestone"), 0, 0)
+            .await
+            .unwrap();
 
         for i in 0u64..10_000 {
             let val = format!("record-{:05}", i);
@@ -446,7 +464,10 @@ async fn truncate_from_survives_reopen() {
 
     {
         let storage = FileStorage::new(dir.path()).unwrap();
-        storage.create_stream(&stream("trunc-reopen"), 0, 0).await.unwrap();
+        storage
+            .create_stream(&stream("trunc-reopen"), 0, 0)
+            .await
+            .unwrap();
         for i in 0u64..10 {
             let val = format!("val-{}", i);
             storage
@@ -454,16 +475,25 @@ async fn truncate_from_survives_reopen() {
                 .await
                 .unwrap();
         }
-        storage.truncate_from(&stream("trunc-reopen"), Offset(6)).await.unwrap();
+        storage
+            .truncate_from(&stream("trunc-reopen"), Offset(6))
+            .await
+            .unwrap();
     }
 
     {
         let storage = FileStorage::open(dir.path()).unwrap();
-        let (earliest, next) = storage.stream_bounds(&stream("trunc-reopen")).await.unwrap();
+        let (earliest, next) = storage
+            .stream_bounds(&stream("trunc-reopen"))
+            .await
+            .unwrap();
         assert_eq!(earliest, Offset(0));
         assert_eq!(next, Offset(6));
 
-        let records = storage.read(&stream("trunc-reopen"), Offset(0), 100).await.unwrap();
+        let records = storage
+            .read(&stream("trunc-reopen"), Offset(0), 100)
+            .await
+            .unwrap();
         assert_eq!(records.len(), 6);
         assert_eq!(records.last().unwrap().offset, Offset(5));
 
@@ -549,7 +579,10 @@ async fn read_below_earliest_after_retention_returns_out_of_range() {
         "expected retention to delete some sealed segments"
     );
     let new_earliest = partition.earliest_offset();
-    assert!(new_earliest > 0, "earliest must advance past trimmed offsets");
+    assert!(
+        new_earliest > 0,
+        "earliest must advance past trimmed offsets"
+    );
 
     // Reopen via FileStorage — this is the public surface broker uses.
     drop(partition);
@@ -559,7 +592,10 @@ async fn read_below_earliest_after_retention_returns_out_of_range() {
     // Read from a trimmed-away offset must error, not silently skip.
     let err = storage.read(&s, Offset(0), 10).await.unwrap_err();
     match err {
-        StorageError::OffsetOutOfRange { requested, earliest } => {
+        StorageError::OffsetOutOfRange {
+            requested,
+            earliest,
+        } => {
             assert_eq!(requested, 0);
             assert_eq!(earliest, new_earliest);
         }

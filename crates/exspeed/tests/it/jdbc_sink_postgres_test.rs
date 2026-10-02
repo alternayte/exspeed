@@ -277,7 +277,10 @@ async fn typed_schema_rejects_mismatched_json_type() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(got, 1, "bad record should have been skipped; only valid one should land");
+    assert_eq!(
+        got, 1,
+        "bad record should have been skipped; only valid one should land"
+    );
 
     let (id,): (i64,) = sqlx::query_as(&format!("SELECT id FROM \"{}\"", table))
         .fetch_one(&pool)

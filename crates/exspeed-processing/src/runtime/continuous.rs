@@ -201,7 +201,8 @@ async fn run_inner(
                     &right_stream_name,
                     &join_info.right_key_expr,
                     join_info.right_alias.as_deref(),
-                ).await?;
+                )
+                .await?;
                 let elapsed = start.elapsed().as_secs_f64();
                 info!(
                     "query '{}' rebuilding join lookup from '{}': {} records in {:.3}s",
@@ -264,7 +265,8 @@ async fn run_inner(
                                             target_stream_name.as_ref(),
                                             &mv_state,
                                             &pipeline.group_by_exprs,
-                                        ).await?;
+                                        )
+                                        .await?;
                                     }
                                 }
                                 continue;
@@ -296,7 +298,8 @@ async fn run_inner(
                             target_stream_name.as_ref(),
                             &mv_state,
                             &pipeline.group_by_exprs,
-                        ).await?;
+                        )
+                        .await?;
                     }
                 }
 
@@ -356,7 +359,8 @@ async fn run_inner(
                             target_stream_name.as_ref(),
                             &mv_state,
                             &group_by,
-                        ).await?;
+                        )
+                        .await?;
                     }
 
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -383,7 +387,8 @@ async fn run_inner(
                             target_stream_name.as_ref(),
                             &mv_state,
                             &group_by,
-                        ).await?;
+                        )
+                        .await?;
                     }
                 }
 
@@ -398,7 +403,8 @@ async fn run_inner(
                         target_stream_name.as_ref(),
                         &mv_state,
                         &group_by,
-                    ).await?;
+                    )
+                    .await?;
                 }
 
                 current_offset = last_offset + 1;
@@ -466,7 +472,8 @@ async fn run_inner(
                                 target_stream_name.as_ref(),
                                 &mv_state,
                                 &pipeline.group_by_exprs,
-                            ).await?;
+                            )
+                            .await?;
                         }
                     }
                     left_offset = record.offset.0 + 1;
@@ -495,7 +502,8 @@ async fn run_inner(
                                 target_stream_name.as_ref(),
                                 &mv_state,
                                 &pipeline.group_by_exprs,
-                            ).await?;
+                            )
+                            .await?;
                         }
                     }
                     right_offset = record.offset.0 + 1;
@@ -625,7 +633,12 @@ fn decompose_plan(plan: &PhysicalPlan) -> Result<ContinuousPipeline, String> {
                 filter = Some(predicate.clone());
                 current = input;
             }
-            PhysicalPlan::SeqScan { stream, alias, predicate, .. } => {
+            PhysicalPlan::SeqScan {
+                stream,
+                alias,
+                predicate,
+                ..
+            } => {
                 // If predicate pushdown absorbed a filter into the scan,
                 // recover it for the continuous pipeline.
                 if filter.is_none() {
@@ -1555,7 +1568,10 @@ mod tests {
 
         // Process right (purchases)
         let purchase_stream = StreamName::try_from("purchases").unwrap();
-        let purchase_batch = storage.read(&purchase_stream, Offset(0), 100).await.unwrap();
+        let purchase_batch = storage
+            .read(&purchase_stream, Offset(0), 100)
+            .await
+            .unwrap();
 
         for record in &purchase_batch {
             let row = stored_record_to_row(record, None);

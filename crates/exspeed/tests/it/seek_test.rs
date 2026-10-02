@@ -109,7 +109,10 @@ async fn recv_record(
     }
 
     let frame = recv_frame(reader, secs).await;
-    assert_eq!(frame.correlation_id, 0, "push frame should have correlation_id=0");
+    assert_eq!(
+        frame.correlation_id, 0,
+        "push frame should have correlation_id=0"
+    );
 
     match frame.opcode {
         OpCode::Record => RecordDelivery::decode(frame.payload).expect("failed to decode Record"),
@@ -141,7 +144,10 @@ async fn recv_record(
                 headers: first.headers,
             }
         }
-        other => panic!("expected Record or RecordsBatch push frame, got {:?}", other),
+        other => panic!(
+            "expected Record or RecordsBatch push frame, got {:?}",
+            other
+        ),
     }
 }
 
@@ -278,7 +284,11 @@ async fn seek_repositions_consumer() {
 
     // 1. Connect
     let resp = send_recv(&mut writer, &mut reader, connect_frame(1)).await;
-    assert_eq!(resp.opcode, OpCode::ConnectOk, "CONNECT should return ConnectOk");
+    assert_eq!(
+        resp.opcode,
+        OpCode::ConnectOk,
+        "CONNECT should return ConnectOk"
+    );
 
     // 2. Create stream "events"
     let resp = send_recv(&mut writer, &mut reader, create_stream_frame("events", 2)).await;
@@ -293,7 +303,12 @@ async fn seek_repositions_consumer() {
             publish_frame("events", "evt.data", value.as_bytes(), 10 + i),
         )
         .await;
-        assert_eq!(resp.opcode, OpCode::PublishOk, "PUBLISH {} should return PublishOk", i);
+        assert_eq!(
+            resp.opcode,
+            OpCode::PublishOk,
+            "PUBLISH {} should return PublishOk",
+            i
+        );
         // Brief sleep to ensure distinct timestamps from the server
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -341,7 +356,11 @@ async fn seek_repositions_consumer() {
         seek_frame("seeker", seek_timestamp, 203),
     )
     .await;
-    assert_eq!(resp.opcode, OpCode::PublishOk, "SEEK should return PublishOk");
+    assert_eq!(
+        resp.opcode,
+        OpCode::PublishOk,
+        "SEEK should return PublishOk"
+    );
 
     // The payload contains the new offset (u64 LE)
     let mut payload = resp.payload;
@@ -440,7 +459,11 @@ async fn create_stream_with_retention() {
 
     // 1. Connect
     let resp = send_recv(&mut writer, &mut reader, connect_frame(1)).await;
-    assert_eq!(resp.opcode, OpCode::ConnectOk, "CONNECT should return ConnectOk");
+    assert_eq!(
+        resp.opcode,
+        OpCode::ConnectOk,
+        "CONNECT should return ConnectOk"
+    );
 
     // 2. Create stream "short-lived" with max_age_secs=1, max_bytes=0
     let resp = send_recv(
@@ -464,7 +487,12 @@ async fn create_stream_with_retention() {
             publish_frame("short-lived", "data.tick", value.as_bytes(), 10 + i),
         )
         .await;
-        assert_eq!(resp.opcode, OpCode::PublishOk, "PUBLISH {} should return PublishOk", i);
+        assert_eq!(
+            resp.opcode,
+            OpCode::PublishOk,
+            "PUBLISH {} should return PublishOk",
+            i
+        );
     }
 
     // 4. FETCH from offset 0 -- records should be there

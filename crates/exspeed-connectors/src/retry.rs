@@ -26,14 +26,26 @@ pub struct RetryPolicy {
     pub jitter: bool,
 }
 
-fn default_max_retries() -> u32 { 5 }
-fn default_initial_backoff_ms() -> u64 { 100 }
-fn default_max_backoff_ms() -> u64 { 30_000 }
-fn default_multiplier() -> f64 { 2.0 }
-fn default_jitter() -> bool { true }
+fn default_max_retries() -> u32 {
+    5
+}
+fn default_initial_backoff_ms() -> u64 {
+    100
+}
+fn default_max_backoff_ms() -> u64 {
+    30_000
+}
+fn default_multiplier() -> f64 {
+    2.0
+}
+fn default_jitter() -> bool {
+    true
+}
 
 impl Default for RetryPolicy {
-    fn default() -> Self { Self::default_transient() }
+    fn default() -> Self {
+        Self::default_transient()
+    }
 }
 
 impl RetryPolicy {
@@ -48,7 +60,10 @@ impl RetryPolicy {
     }
 
     pub fn disabled() -> Self {
-        Self { max_retries: 0, ..Self::default_transient() }
+        Self {
+            max_retries: 0,
+            ..Self::default_transient()
+        }
     }
 
     /// Returns the delay before the next retry, or `None` if retries are
@@ -112,7 +127,10 @@ mod tests {
 
     #[test]
     fn delay_for_returns_none_past_max_retries() {
-        let p = RetryPolicy { max_retries: 3, ..RetryPolicy::default_transient() };
+        let p = RetryPolicy {
+            max_retries: 3,
+            ..RetryPolicy::default_transient()
+        };
         assert!(p.delay_for(0).is_some());
         assert!(p.delay_for(2).is_some());
         assert!(p.delay_for(3).is_none());

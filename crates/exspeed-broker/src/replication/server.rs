@@ -692,10 +692,9 @@ where
     // Count the payload bytes; 10 frame-header bytes are negligible and
     // keep the accounting simple (matches how the replication coordinator
     // would count payload sizes in Wave 5 bandwidth dashboards).
-    metrics.replication_bytes_total.add(
-        payload_len as u64,
-        &[KeyValue::new("direction", "out")],
-    );
+    metrics
+        .replication_bytes_total
+        .add(payload_len as u64, &[KeyValue::new("direction", "out")]);
     Ok(())
 }
 

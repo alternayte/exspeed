@@ -187,12 +187,7 @@ impl LeaderLease for PostgresLeaseBackend {
 
 /// Spawn a heartbeat task that refreshes the lease every
 /// `heartbeat_interval` and releases on drop. Returns the LeaseGuard.
-fn spawn_heartbeat(
-    inner: Arc<Inner>,
-    name: String,
-    holder_id: Uuid,
-    ttl: Duration,
-) -> LeaseGuard {
+fn spawn_heartbeat(inner: Arc<Inner>, name: String, holder_id: Uuid, ttl: Duration) -> LeaseGuard {
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
     let (lost_tx, lost_rx) = watch::channel(false);
 

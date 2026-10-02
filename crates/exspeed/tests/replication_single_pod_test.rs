@@ -55,13 +55,13 @@ async fn start_single_pod_server() -> SinglePodHarness {
         credentials_file: None,
         tls_cert: None,
         tls_key: None,
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
+        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+        storage_flush_window_us: 500,
+        storage_flush_threshold_records: 256,
+        storage_flush_threshold_bytes: 1_048_576,
+        storage_sync_interval_ms: 10,
+        storage_sync_bytes: 4 * 1024 * 1024,
+        delivery_buffer: 8192,
     };
 
     tokio::spawn(async move {
@@ -88,11 +88,7 @@ async fn cluster_port_is_not_bound_in_single_pod_mode() {
     // guarding against is a successful connect, which would mean the
     // guard in server.rs regressed.
     let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
-    let connect = tokio::time::timeout_at(
-        deadline,
-        TcpStream::connect("127.0.0.1:5934"),
-    )
-    .await;
+    let connect = tokio::time::timeout_at(deadline, TcpStream::connect("127.0.0.1:5934")).await;
 
     match connect {
         Err(_elapsed) => { /* timed out — nothing accepted */ }

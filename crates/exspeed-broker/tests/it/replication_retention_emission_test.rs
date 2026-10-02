@@ -36,9 +36,7 @@ fn record(value: &[u8]) -> Record {
 
 async fn drain(rx: &mut mpsc::Receiver<ReplicationEvent>) -> Vec<ReplicationEvent> {
     let mut out = Vec::new();
-    while let Ok(Some(ev)) =
-        tokio::time::timeout(Duration::from_millis(100), rx.recv()).await
-    {
+    while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
         out.push(ev);
     }
     out
@@ -120,19 +118,17 @@ async fn retention_trim_emits_one_event_per_stream_advanced() {
     let mut seen_beta = false;
     for ev in events {
         match ev {
-            ReplicationEvent::RetentionTrimmed(t) => {
-                match t.stream.as_str() {
-                    "alpha" => {
-                        assert!(t.new_earliest_offset > 0);
-                        seen_alpha = true;
-                    }
-                    "beta" => {
-                        assert!(t.new_earliest_offset > 0);
-                        seen_beta = true;
-                    }
-                    other => panic!("unexpected stream in retention event: {other}"),
+            ReplicationEvent::RetentionTrimmed(t) => match t.stream.as_str() {
+                "alpha" => {
+                    assert!(t.new_earliest_offset > 0);
+                    seen_alpha = true;
                 }
-            }
+                "beta" => {
+                    assert!(t.new_earliest_offset > 0);
+                    seen_beta = true;
+                }
+                other => panic!("unexpected stream in retention event: {other}"),
+            },
             other => panic!("expected RetentionTrimmed, got {other:?}"),
         }
     }

@@ -1,10 +1,10 @@
 //! Single integration-test binary for this crate (one link step instead of
 //! one per file). Each submodule is one former `tests/*.rs` file.
 
-mod common;
 mod api_test;
 mod broker_test;
 mod cluster_followers_endpoint_test;
+mod common;
 mod connect_test;
 mod connector_dlq_test;
 mod connector_test;

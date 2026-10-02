@@ -27,13 +27,13 @@ async fn start_server(auth_token: Option<String>) -> (String, TempDir) {
         credentials_file: None,
         tls_cert: None,
         tls_key: None,
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
+        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+        storage_flush_window_us: 500,
+        storage_flush_threshold_records: 256,
+        storage_flush_threshold_bytes: 1_048_576,
+        storage_sync_interval_ms: 10,
+        storage_sync_bytes: 4 * 1024 * 1024,
+        delivery_buffer: 8192,
     };
 
     tokio::spawn(async move {
@@ -65,9 +65,13 @@ async fn auth_disabled_accepts_any_connect() {
 
     // AuthType::None is accepted.
     fw.send(encode_connect("c", AuthType::None, b""))
-        .await.unwrap();
+        .await
+        .unwrap();
     let resp = timeout(Duration::from_secs(1), fr.next())
-        .await.unwrap().unwrap().unwrap();
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert_eq!(resp.opcode, OpCode::ConnectOk);
 }
 
@@ -79,9 +83,14 @@ async fn auth_enabled_rejects_missing_token() {
     let mut fr = FramedRead::new(r, ExspeedCodec::new());
     let mut fw = FramedWrite::new(w, ExspeedCodec::new());
 
-    fw.send(encode_connect("c", AuthType::None, b"")).await.unwrap();
+    fw.send(encode_connect("c", AuthType::None, b""))
+        .await
+        .unwrap();
     let resp = timeout(Duration::from_secs(1), fr.next())
-        .await.unwrap().unwrap().unwrap();
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert_eq!(resp.opcode, OpCode::Error);
 }
 
@@ -93,9 +102,14 @@ async fn auth_enabled_rejects_wrong_token() {
     let mut fr = FramedRead::new(r, ExspeedCodec::new());
     let mut fw = FramedWrite::new(w, ExspeedCodec::new());
 
-    fw.send(encode_connect("c", AuthType::Token, b"wrong")).await.unwrap();
+    fw.send(encode_connect("c", AuthType::Token, b"wrong"))
+        .await
+        .unwrap();
     let resp = timeout(Duration::from_secs(1), fr.next())
-        .await.unwrap().unwrap().unwrap();
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert_eq!(resp.opcode, OpCode::Error);
 }
 
@@ -107,15 +121,23 @@ async fn auth_enabled_accepts_correct_token() {
     let mut fr = FramedRead::new(r, ExspeedCodec::new());
     let mut fw = FramedWrite::new(w, ExspeedCodec::new());
 
-    fw.send(encode_connect("c", AuthType::Token, b"secret123")).await.unwrap();
+    fw.send(encode_connect("c", AuthType::Token, b"secret123"))
+        .await
+        .unwrap();
     let resp = timeout(Duration::from_secs(1), fr.next())
-        .await.unwrap().unwrap().unwrap();
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert_eq!(resp.opcode, OpCode::ConnectOk);
 
     // Can Ping now.
     fw.send(Frame::empty(OpCode::Ping, 99)).await.unwrap();
     let pong = timeout(Duration::from_secs(1), fr.next())
-        .await.unwrap().unwrap().unwrap();
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert_eq!(pong.opcode, OpCode::Pong);
 }
 
@@ -130,13 +152,14 @@ async fn auth_enabled_blocks_ops_before_connect() {
     // Try to Ping without authenticating first.
     fw.send(Frame::empty(OpCode::Ping, 7)).await.unwrap();
     let resp = timeout(Duration::from_secs(1), fr.next())
-        .await.unwrap().unwrap().unwrap();
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert_eq!(resp.opcode, OpCode::Error);
 }
 
-async fn start_server_with_api(
-    auth_token: Option<String>,
-) -> (String, u16, TempDir) {
+async fn start_server_with_api(auth_token: Option<String>) -> (String, u16, TempDir) {
     let port = exspeed_testkit::pick_unused_port().unwrap();
     let api_port = exspeed_testkit::pick_unused_port().unwrap();
     let bind = format!("127.0.0.1:{port}");
@@ -152,13 +175,13 @@ async fn start_server_with_api(
         credentials_file: None,
         tls_cert: None,
         tls_key: None,
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
+        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+        storage_flush_window_us: 500,
+        storage_flush_threshold_records: 256,
+        storage_flush_threshold_bytes: 1_048_576,
+        storage_sync_interval_ms: 10,
+        storage_sync_bytes: 4 * 1024 * 1024,
+        delivery_buffer: 8192,
     };
 
     tokio::spawn(async move {
@@ -173,7 +196,8 @@ async fn start_server_with_api(
 async fn http_rejects_missing_bearer() {
     let (_, api_port, _tmp) = start_server_with_api(Some("secret123".into())).await;
     let resp = reqwest::get(format!("http://127.0.0.1:{api_port}/api/v1/streams"))
-        .await.unwrap();
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 401);
 }
 
@@ -183,7 +207,9 @@ async fn http_rejects_malformed_authorization() {
     let resp = reqwest::Client::new()
         .get(format!("http://127.0.0.1:{api_port}/api/v1/streams"))
         .header("Authorization", "Basic abc")
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 401);
 }
 
@@ -193,7 +219,9 @@ async fn http_rejects_wrong_bearer() {
     let resp = reqwest::Client::new()
         .get(format!("http://127.0.0.1:{api_port}/api/v1/streams"))
         .header("Authorization", "Bearer wrong-token")
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 401);
 }
 
@@ -203,21 +231,27 @@ async fn http_accepts_valid_bearer() {
     let resp = reqwest::Client::new()
         .get(format!("http://127.0.0.1:{api_port}/api/v1/streams"))
         .header("Authorization", "Bearer secret123")
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
 }
 
 #[tokio::test]
 async fn http_healthz_bypasses_auth() {
     let (_, api_port, _tmp) = start_server_with_api(Some("secret123".into())).await;
-    let resp = reqwest::get(format!("http://127.0.0.1:{api_port}/healthz")).await.unwrap();
+    let resp = reqwest::get(format!("http://127.0.0.1:{api_port}/healthz"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
 }
 
 #[tokio::test]
 async fn http_readyz_bypasses_auth() {
     let (_, api_port, _tmp) = start_server_with_api(Some("secret123".into())).await;
-    let resp = reqwest::get(format!("http://127.0.0.1:{api_port}/readyz")).await.unwrap();
+    let resp = reqwest::get(format!("http://127.0.0.1:{api_port}/readyz"))
+        .await
+        .unwrap();
     // /readyz returns 200 when ready, 503 when not. Either is fine; it must
     // NOT return 401 — that's the auth check.
     assert_ne!(resp.status(), 401);
@@ -226,7 +260,9 @@ async fn http_readyz_bypasses_auth() {
 #[tokio::test]
 async fn http_metrics_bypasses_auth() {
     let (_, api_port, _tmp) = start_server_with_api(Some("secret123".into())).await;
-    let resp = reqwest::get(format!("http://127.0.0.1:{api_port}/metrics")).await.unwrap();
+    let resp = reqwest::get(format!("http://127.0.0.1:{api_port}/metrics"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
 }
 
@@ -238,7 +274,9 @@ async fn http_webhooks_bypass_auth() {
     let resp = reqwest::Client::new()
         .post(format!("http://127.0.0.1:{api_port}/webhooks/nonexistent"))
         .body("{}")
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_ne!(resp.status(), 401);
 }
 
@@ -250,8 +288,7 @@ async fn cli_client_sends_bearer_when_env_set() {
 
     std::env::set_var("EXSPEED_AUTH_TOKEN", "cli-secret");
     // Use the same CliClient the CLI binary uses.
-    let client =
-        exspeed::cli::client::CliClient::new(&format!("http://127.0.0.1:{api_port}"));
+    let client = exspeed::cli::client::CliClient::new(&format!("http://127.0.0.1:{api_port}"));
     std::env::remove_var("EXSPEED_AUTH_TOKEN");
 
     // GET /api/v1/streams is the standard list-streams call (see cli/stream.rs::list).

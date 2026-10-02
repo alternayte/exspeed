@@ -21,12 +21,11 @@ pub struct S3OffsetStore {
 
 impl S3OffsetStore {
     pub fn from_env() -> Result<Self, OffsetStoreError> {
-        let bucket_name =
-            std::env::var("EXSPEED_OFFSET_STORE_S3_BUCKET").map_err(|_| {
-                OffsetStoreError::Connection(
-                    "EXSPEED_OFFSET_STORE_S3_BUCKET environment variable is required".to_string(),
-                )
-            })?;
+        let bucket_name = std::env::var("EXSPEED_OFFSET_STORE_S3_BUCKET").map_err(|_| {
+            OffsetStoreError::Connection(
+                "EXSPEED_OFFSET_STORE_S3_BUCKET environment variable is required".to_string(),
+            )
+        })?;
 
         let prefix = std::env::var("EXSPEED_OFFSET_STORE_S3_PREFIX")
             .unwrap_or_else(|_| "exspeed/offsets/".to_string());
@@ -39,11 +38,9 @@ impl S3OffsetStore {
                 region: region_name,
                 endpoint,
             },
-            Err(_) => region_name
-                .parse()
-                .map_err(|e: std::str::Utf8Error| {
-                    OffsetStoreError::Connection(format!("invalid S3 region: {}", e))
-                })?,
+            Err(_) => region_name.parse().map_err(|e: std::str::Utf8Error| {
+                OffsetStoreError::Connection(format!("invalid S3 region: {}", e))
+            })?,
         };
 
         let credentials = match (
@@ -51,11 +48,13 @@ impl S3OffsetStore {
             std::env::var("EXSPEED_OFFSET_STORE_S3_SECRET_KEY"),
         ) {
             (Ok(access_key), Ok(secret_key)) => {
-                Credentials::new(Some(&access_key), Some(&secret_key), None, None, None)
-                    .map_err(|e| OffsetStoreError::Connection(format!("S3 credentials error: {}", e)))?
+                Credentials::new(Some(&access_key), Some(&secret_key), None, None, None).map_err(
+                    |e| OffsetStoreError::Connection(format!("S3 credentials error: {}", e)),
+                )?
             }
-            _ => Credentials::default()
-                .map_err(|e| OffsetStoreError::Connection(format!("S3 credentials error: {}", e)))?,
+            _ => Credentials::default().map_err(|e| {
+                OffsetStoreError::Connection(format!("S3 credentials error: {}", e))
+            })?,
         };
 
         let bucket = Bucket::new(&bucket_name, region, credentials)
@@ -71,8 +70,8 @@ impl S3OffsetStore {
 
     async fn put_data(&self, connector: &str, data: &OffsetData) -> Result<(), OffsetStoreError> {
         let key = self.object_key(connector);
-        let body = serde_json::to_vec(data)
-            .map_err(|e| OffsetStoreError::Serialization(e.to_string()))?;
+        let body =
+            serde_json::to_vec(data).map_err(|e| OffsetStoreError::Serialization(e.to_string()))?;
         self.bucket
             .put_object(&key, &body)
             .await
@@ -120,11 +119,7 @@ impl OffsetStore for S3OffsetStore {
         }
     }
 
-    async fn save_sink_offset(
-        &self,
-        connector: &str,
-        offset: u64,
-    ) -> Result<(), OffsetStoreError> {
+    async fn save_sink_offset(&self, connector: &str, offset: u64) -> Result<(), OffsetStoreError> {
         let data = OffsetData {
             offset_type: "sink".to_string(),
             position: None,

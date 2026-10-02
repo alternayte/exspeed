@@ -27,13 +27,13 @@ async fn tls_cert_without_key_refuses_to_start() {
         credentials_file: None,
         tls_cert: Some(fake_cert),
         tls_key: None,
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
+        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+        storage_flush_window_us: 500,
+        storage_flush_threshold_records: 256,
+        storage_flush_threshold_bytes: 1_048_576,
+        storage_sync_interval_ms: 10,
+        storage_sync_bytes: 4 * 1024 * 1024,
+        delivery_buffer: 8192,
     };
 
     let result = exspeed::cli::server::run(args).await;
@@ -59,13 +59,13 @@ async fn tls_key_without_cert_refuses_to_start() {
         credentials_file: None,
         tls_cert: None,
         tls_key: Some(fake_key),
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
+        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+        storage_flush_window_us: 500,
+        storage_flush_threshold_records: 256,
+        storage_flush_threshold_bytes: 1_048_576,
+        storage_sync_interval_ms: 10,
+        storage_sync_bytes: 4 * 1024 * 1024,
+        delivery_buffer: 8192,
     };
 
     let result = exspeed::cli::server::run(args).await;
@@ -74,11 +74,9 @@ async fn tls_key_without_cert_refuses_to_start() {
 }
 
 fn generate_self_signed() -> (std::path::PathBuf, std::path::PathBuf, tempfile::TempDir) {
-    let cert = rcgen::generate_simple_self_signed(vec![
-        "localhost".to_string(),
-        "127.0.0.1".to_string(),
-    ])
-    .unwrap();
+    let cert =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
     let cert_path = tmp.path().join("cert.pem");
@@ -110,13 +108,13 @@ async fn tls_enabled_tcp_handshakes_with_rustls() {
         credentials_file: None,
         tls_cert: Some(cert_path.clone()),
         tls_key: Some(key_path),
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
+        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+        storage_flush_window_us: 500,
+        storage_flush_threshold_records: 256,
+        storage_flush_threshold_bytes: 1_048_576,
+        storage_sync_interval_ms: 10,
+        storage_sync_bytes: 4 * 1024 * 1024,
+        delivery_buffer: 8192,
     };
 
     tokio::spawn(async move {
@@ -137,7 +135,9 @@ async fn tls_enabled_tcp_handshakes_with_rustls() {
         .with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(client_cfg));
 
-    let tcp = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
+    let tcp = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
     let server_name = ServerName::try_from("localhost".to_string()).unwrap();
     let tls_stream = connector.connect(server_name, tcp).await.unwrap();
 
@@ -179,13 +179,13 @@ async fn tls_enabled_http_responds_to_rustls_request() {
         credentials_file: None,
         tls_cert: Some(cert_path.clone()),
         tls_key: Some(key_path),
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
+        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+        storage_flush_window_us: 500,
+        storage_flush_threshold_records: 256,
+        storage_flush_threshold_bytes: 1_048_576,
+        storage_sync_interval_ms: 10,
+        storage_sync_bytes: 4 * 1024 * 1024,
+        delivery_buffer: 8192,
     };
 
     tokio::spawn(async move {
@@ -201,7 +201,9 @@ async fn tls_enabled_http_responds_to_rustls_request() {
 
     let resp = client
         .get(format!("https://localhost:{api_port}/healthz"))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
 
     assert_eq!(resp.status(), 200);
 }
@@ -221,13 +223,13 @@ async fn auth_and_tls_together_end_to_end() {
         credentials_file: None,
         tls_cert: Some(cert_path.clone()),
         tls_key: Some(key_path),
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
+        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+        storage_flush_window_us: 500,
+        storage_flush_threshold_records: 256,
+        storage_flush_threshold_bytes: 1_048_576,
+        storage_sync_interval_ms: 10,
+        storage_sync_bytes: 4 * 1024 * 1024,
+        delivery_buffer: 8192,
     };
 
     tokio::spawn(async move {
@@ -244,12 +246,16 @@ async fn auth_and_tls_together_end_to_end() {
     let resp = client
         .get(format!("https://localhost:{api_port}/api/v1/streams"))
         .header("Authorization", "Bearer e2e-secret")
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
 
     // Same request without bearer → 401 even over TLS.
     let resp = client
         .get(format!("https://localhost:{api_port}/api/v1/streams"))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 401);
 }

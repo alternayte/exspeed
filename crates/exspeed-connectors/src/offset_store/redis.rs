@@ -20,8 +20,8 @@ impl RedisOffsetStore {
         let key_prefix = std::env::var("EXSPEED_OFFSET_STORE_REDIS_KEY_PREFIX")
             .unwrap_or_else(|_| "exspeed:offsets:".to_string());
 
-        let client = redis::Client::open(url)
-            .map_err(|e| OffsetStoreError::Connection(e.to_string()))?;
+        let client =
+            redis::Client::open(url).map_err(|e| OffsetStoreError::Connection(e.to_string()))?;
 
         let conn = client
             .get_multiplexed_async_connection()
@@ -67,17 +67,16 @@ impl OffsetStore for RedisOffsetStore {
         Ok(value)
     }
 
-    async fn save_sink_offset(
-        &self,
-        connector: &str,
-        offset: u64,
-    ) -> Result<(), OffsetStoreError> {
+    async fn save_sink_offset(&self, connector: &str, offset: u64) -> Result<(), OffsetStoreError> {
         let key = self.key(connector);
         let offset_str = offset.to_string();
         let mut conn = self.conn.lock().await;
-        conn.hset_multiple::<_, _, _, ()>(&key, &[("type", "sink"), ("sink_offset", offset_str.as_str())])
-            .await
-            .map_err(|e| OffsetStoreError::Connection(e.to_string()))?;
+        conn.hset_multiple::<_, _, _, ()>(
+            &key,
+            &[("type", "sink"), ("sink_offset", offset_str.as_str())],
+        )
+        .await
+        .map_err(|e| OffsetStoreError::Connection(e.to_string()))?;
         Ok(())
     }
 

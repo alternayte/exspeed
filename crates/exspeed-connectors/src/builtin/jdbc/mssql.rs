@@ -9,9 +9,15 @@ impl Dialect for MssqlDialect {
     fn placeholder(&self, n: usize) -> String {
         format!("@P{}", n)
     }
-    fn json_blob_type(&self) -> &'static str { "NVARCHAR(MAX)" }
-    fn timestamptz_type(&self) -> &'static str { "DATETIMEOFFSET(6)" }
-    fn double_type(&self) -> &'static str { "FLOAT(53)" }
+    fn json_blob_type(&self) -> &'static str {
+        "NVARCHAR(MAX)"
+    }
+    fn timestamptz_type(&self) -> &'static str {
+        "DATETIMEOFFSET(6)"
+    }
+    fn double_type(&self) -> &'static str {
+        "FLOAT(53)"
+    }
 
     fn create_table_blob_sql(&self, table: &str) -> String {
         let t_lit = format!("[{}]", table);
@@ -31,12 +37,7 @@ impl Dialect for MssqlDialect {
         )
     }
 
-    fn create_table_typed_sql(
-        &self,
-        table: &str,
-        cols: &[ColumnSpec],
-        pk_cols: &[&str],
-    ) -> String {
+    fn create_table_typed_sql(&self, table: &str, cols: &[ColumnSpec], pk_cols: &[&str]) -> String {
         use crate::builtin::jdbc::dialect::JsonType;
         let t_lit = format!("[{}]", table);
         let t_q = self.quote_ident(table);
@@ -52,7 +53,12 @@ impl Dialect for MssqlDialect {
                     JsonType::Jsonb => self.json_blob_type(),
                 };
                 let nullability = if c.nullable { " NULL" } else { " NOT NULL" };
-                format!("    {} {}{}", self.quote_ident(&c.name), sql_type, nullability)
+                format!(
+                    "    {} {}{}",
+                    self.quote_ident(&c.name),
+                    sql_type,
+                    nullability
+                )
             })
             .collect();
         let mut body = col_lines.join(",\n");
@@ -135,7 +141,11 @@ mod tests {
     use crate::builtin::jdbc::dialect::JsonType;
 
     fn spec(name: &str, t: JsonType, nullable: bool) -> ColumnSpec {
-        ColumnSpec { name: name.to_string(), json_type: t, nullable }
+        ColumnSpec {
+            name: name.to_string(),
+            json_type: t,
+            nullable,
+        }
     }
 
     #[test]
@@ -199,26 +209,44 @@ mod tests {
 
     #[test]
     fn upsert_sql_uses_merge_with_holdlock() {
-        let sql = MssqlDialect.upsert_sql("events", &["offset", "subject", "key", "value"], &["offset"]);
-        assert!(sql.starts_with("MERGE INTO [events] WITH (HOLDLOCK) AS t"), "sql: {sql}");
-        assert!(sql.contains("USING (VALUES (@P1, @P2, @P3, @P4)) AS s ([offset], [subject], [key], [value])"));
+        let sql = MssqlDialect.upsert_sql(
+            "events",
+            &["offset", "subject", "key", "value"],
+            &["offset"],
+        );
+        assert!(
+            sql.starts_with("MERGE INTO [events] WITH (HOLDLOCK) AS t"),
+            "sql: {sql}"
+        );
+        assert!(sql.contains(
+            "USING (VALUES (@P1, @P2, @P3, @P4)) AS s ([offset], [subject], [key], [value])"
+        ));
         assert!(sql.contains("ON t.[offset] = s.[offset]"));
         assert!(sql.contains("WHEN MATCHED THEN\n    UPDATE SET [subject] = s.[subject], [key] = s.[key], [value] = s.[value]"));
         assert!(sql.contains("WHEN NOT MATCHED THEN\n    INSERT ([offset], [subject], [key], [value]) VALUES (s.[offset], s.[subject], s.[key], s.[value])"));
-        assert!(sql.trim_end().ends_with(';'), "MERGE must terminate with ; — sql: {sql}");
+        assert!(
+            sql.trim_end().ends_with(';'),
+            "MERGE must terminate with ; — sql: {sql}"
+        );
     }
 
     #[test]
     fn upsert_sql_all_keys_has_no_matched_clause() {
         let sql = MssqlDialect.upsert_sql("t", &["id"], &["id"]);
-        assert!(!sql.contains("WHEN MATCHED"), "no update clause when every column is a key — sql: {sql}");
+        assert!(
+            !sql.contains("WHEN MATCHED"),
+            "no update clause when every column is a key — sql: {sql}"
+        );
         assert!(sql.contains("WHEN NOT MATCHED"));
     }
 
     #[test]
     fn upsert_sql_composite_key() {
         let sql = MssqlDialect.upsert_sql("t", &["a", "b", "v"], &["a", "b"]);
-        assert!(sql.contains("ON t.[a] = s.[a] AND t.[b] = s.[b]"), "sql: {sql}");
+        assert!(
+            sql.contains("ON t.[a] = s.[a] AND t.[b] = s.[b]"),
+            "sql: {sql}"
+        );
         assert!(sql.contains("UPDATE SET [v] = s.[v]"));
     }
 }

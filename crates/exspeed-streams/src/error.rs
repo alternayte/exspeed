@@ -37,18 +37,29 @@ mod tests {
     #[test]
     fn key_collision_display() {
         let err = StorageError::KeyCollision { stored_offset: 42 };
-        assert_eq!(err.to_string(), "key collision: body differs from stored record at offset 42");
+        assert_eq!(
+            err.to_string(),
+            "key collision: body differs from stored record at offset 42"
+        );
     }
 
     #[test]
     fn dedup_map_full_display() {
-        let err = StorageError::DedupMapFull { retry_after_secs: 30 };
-        assert_eq!(err.to_string(), "dedup map full for this stream; retry after 30s");
+        let err = StorageError::DedupMapFull {
+            retry_after_secs: 30,
+        };
+        assert_eq!(
+            err.to_string(),
+            "dedup map full for this stream; retry after 30s"
+        );
     }
 
     #[test]
     fn offset_out_of_range_display() {
-        let err = StorageError::OffsetOutOfRange { requested: 50, earliest: 100 };
+        let err = StorageError::OffsetOutOfRange {
+            requested: 50,
+            earliest: 100,
+        };
         assert_eq!(
             err.to_string(),
             "offset 50 is below earliest retained offset 100 (records trimmed by retention)"

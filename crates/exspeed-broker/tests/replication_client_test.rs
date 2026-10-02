@@ -108,11 +108,7 @@ async fn spawn_stub_leader(
 }
 
 /// Push a ReplicationEvent-style payload to the stub's writer.
-async fn push_frame<T: serde::Serialize>(
-    framed_write: &mut FramedW,
-    opcode: OpCode,
-    payload: &T,
-) {
+async fn push_frame<T: serde::Serialize>(framed_write: &mut FramedW, opcode: OpCode, payload: &T) {
     let bytes = bincode::serialize(payload).unwrap();
     framed_write
         .send(Frame::new(opcode, 0, Bytes::from(bytes)))

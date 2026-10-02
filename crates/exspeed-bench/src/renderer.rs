@@ -22,8 +22,14 @@ pub fn readme_snippet(r: &BenchResult) -> String {
         ram_gb = r.host.ram_gb,
         storage = r.host.storage,
     );
-    let _ = writeln!(s, "| Workload              | Result                          |");
-    let _ = writeln!(s, "|-----------------------|---------------------------------|");
+    let _ = writeln!(
+        s,
+        "| Workload              | Result                          |"
+    );
+    let _ = writeln!(
+        s,
+        "|-----------------------|---------------------------------|"
+    );
     if let Some(p) = pub_1k {
         let mb = p.mb_per_sec;
         let _ = writeln!(
@@ -71,7 +77,9 @@ pub fn readme_snippet(r: &BenchResult) -> String {
 /// local profile run (guards against accidentally committing laptop numbers).
 pub fn readme_snippet_strict(r: &BenchResult) -> Result<String> {
     if r.profile == ProfileKind::Local {
-        return Err(anyhow!("refusing to render readme snippet from local profile"));
+        return Err(anyhow!(
+            "refusing to render readme snippet from local profile"
+        ));
     }
     Ok(readme_snippet(r))
 }
@@ -109,7 +117,10 @@ pub fn benchmarks_md(r: &BenchResult) -> String {
     let _ = writeln!(s, "```bash");
     let _ = writeln!(s, "git checkout {}", r.git_sha);
     let _ = writeln!(s, "cargo build --release -p exspeed-bench");
-    let _ = writeln!(s, "./target/release/exspeed-bench all --profile reference \\");
+    let _ = writeln!(
+        s,
+        "./target/release/exspeed-bench all --profile reference \\"
+    );
     let _ = writeln!(s, "  --output bench/results/refresh.json");
     let _ = writeln!(
         s,

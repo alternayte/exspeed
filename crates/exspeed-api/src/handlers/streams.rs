@@ -13,7 +13,7 @@ use exspeed_common::auth::Identity;
 use exspeed_common::StreamName;
 use exspeed_protocol::messages::{ClientMessage, DeleteConsumerRequest, ServerMessage};
 use exspeed_storage::file::stream_config::StreamConfig;
-use exspeed_streams::{Record, StorageError, StorageEngine};
+use exspeed_streams::{Record, StorageEngine, StorageError};
 
 use crate::state::AppState;
 
@@ -279,11 +279,7 @@ pub async fn patch_stream(
 
     // Guard against shrinking dedup_max_entries below the current live count.
     if let Some(new_cap) = req.dedup_max_entries {
-        let current = state
-            .broker
-            .broker_append
-            .entry_count(&stream_name)
-            .await;
+        let current = state.broker.broker_append.entry_count(&stream_name).await;
         if (new_cap as usize) < current {
             return (
                 StatusCode::BAD_REQUEST,
@@ -418,7 +414,12 @@ pub async fn publish_to_stream(
     };
 
     let start = std::time::Instant::now();
-    match state.broker.broker_append.append(&stream_name, &record).await {
+    match state
+        .broker
+        .broker_append
+        .append(&stream_name, &record)
+        .await
+    {
         Ok(AppendResult::Written(offset, _)) => {
             let elapsed_secs = start.elapsed().as_secs_f64();
             state

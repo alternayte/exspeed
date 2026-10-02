@@ -44,11 +44,7 @@ impl OffsetStore for FileOffsetStore {
         Ok(result)
     }
 
-    async fn save_sink_offset(
-        &self,
-        connector: &str,
-        offset: u64,
-    ) -> Result<(), OffsetStoreError> {
+    async fn save_sink_offset(&self, connector: &str, offset: u64) -> Result<(), OffsetStoreError> {
         let path = self.offset_path(connector);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -99,10 +95,7 @@ mod tests {
     async fn sink_offset_roundtrip() {
         let dir = TempDir::new().unwrap();
         let store = FileOffsetStore::new(dir.path().to_path_buf());
-        store
-            .save_sink_offset("my-sink", 12345)
-            .await
-            .unwrap();
+        store.save_sink_offset("my-sink", 12345).await.unwrap();
         let loaded = store.load_sink_offset("my-sink").await.unwrap();
         assert_eq!(loaded, 12345);
     }

@@ -24,7 +24,11 @@ pub fn spawn_uploader(
     tokio::spawn(async move {
         while let Some(info) = rx.recv().await {
             let stream = &info.stream_name;
-            info!(stream, base_offset = info.base_offset, "uploading sealed segment to S3");
+            info!(
+                stream,
+                base_offset = info.base_offset,
+                "uploading sealed segment to S3"
+            );
 
             // Upload .seg / .idx / .tix with retry.
             if let Err(e) = upload_with_retry(&bucket, &prefix, &info).await {
@@ -32,7 +36,11 @@ pub fn spawn_uploader(
                 continue;
             }
 
-            info!(stream, base_offset = info.base_offset, "S3 upload complete, updating manifest");
+            info!(
+                stream,
+                base_offset = info.base_offset,
+                "S3 upload complete, updating manifest"
+            );
 
             // Load the existing manifest, add the new entry, and PUT it back.
             let mut manifest = load_manifest(&bucket, &prefix, stream).await;
@@ -78,11 +86,38 @@ pub async fn download_segment(
     let base_name = format!("{base_offset:020}");
 
     // .seg is required.
-    download_file(bucket, prefix, stream, partition_id, &format!("{base_name}.seg"), local_dir, true).await?;
+    download_file(
+        bucket,
+        prefix,
+        stream,
+        partition_id,
+        &format!("{base_name}.seg"),
+        local_dir,
+        true,
+    )
+    .await?;
 
     // .idx and .tix are optional.
-    download_file(bucket, prefix, stream, partition_id, &format!("{base_name}.idx"), local_dir, false).await?;
-    download_file(bucket, prefix, stream, partition_id, &format!("{base_name}.tix"), local_dir, false).await?;
+    download_file(
+        bucket,
+        prefix,
+        stream,
+        partition_id,
+        &format!("{base_name}.idx"),
+        local_dir,
+        false,
+    )
+    .await?;
+    download_file(
+        bucket,
+        prefix,
+        stream,
+        partition_id,
+        &format!("{base_name}.tix"),
+        local_dir,
+        false,
+    )
+    .await?;
 
     Ok(())
 }
@@ -217,10 +252,7 @@ async fn upload_file(
         Ok(d) => d,
         Err(e) => {
             if required {
-                return Err(format!(
-                    "failed to read {}: {e}",
-                    local_path.display()
-                ));
+                return Err(format!("failed to read {}: {e}", local_path.display()));
             } else {
                 // Optional file doesn't exist — skip silently.
                 return Ok(());
@@ -312,11 +344,7 @@ async fn load_manifest(bucket: &Bucket, prefix: &str, stream: &str) -> Manifest 
 }
 
 /// Serialize and PUT the manifest to S3.
-async fn save_manifest(
-    bucket: &Bucket,
-    prefix: &str,
-    manifest: &Manifest,
-) -> Result<(), String> {
+async fn save_manifest(bucket: &Bucket, prefix: &str, manifest: &Manifest) -> Result<(), String> {
     let key = manifest_key(prefix, &manifest.stream);
     let data = manifest
         .to_json()

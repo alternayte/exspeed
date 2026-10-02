@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
-use async_trait::async_trait;
 use crate::error::StorageError;
 use crate::record::{Record, StoredRecord};
+use async_trait::async_trait;
 use exspeed_common::{Offset, StreamName};
 
 #[async_trait]
@@ -33,7 +33,11 @@ pub trait StorageEngine: Send + Sync {
     ) -> Result<Vec<StoredRecord>, StorageError>;
 
     /// Find the offset of the first record at or after the given timestamp.
-    async fn seek_by_time(&self, stream: &StreamName, timestamp: u64) -> Result<Offset, StorageError>;
+    async fn seek_by_time(
+        &self,
+        stream: &StreamName,
+        timestamp: u64,
+    ) -> Result<Offset, StorageError>;
 
     /// List all stream names known to this storage engine.
     async fn list_streams(&self) -> Result<Vec<StreamName>, StorageError>;
@@ -43,11 +47,7 @@ pub trait StorageEngine: Send + Sync {
     /// the segment containing `keep_from` is preserved; earlier segments
     /// are removed. Also updates any offset / time indexes to reflect the
     /// new earliest offset.
-    async fn trim_up_to(
-        &self,
-        stream: &StreamName,
-        keep_from: Offset,
-    ) -> Result<(), StorageError>;
+    async fn trim_up_to(&self, stream: &StreamName, keep_from: Offset) -> Result<(), StorageError>;
 
     /// Remove the stream entirely — all segments, indexes, and stream
     /// configuration. Idempotent: deleting a non-existent stream returns
@@ -62,10 +62,7 @@ pub trait StorageEngine: Send + Sync {
     /// first, falling back to a remote/tiered manifest when the backend
     /// has one. No backend returns `(0, 0)` for a stream it knows nothing
     /// about — that case is always `StorageError::StreamNotFound`.
-    async fn stream_bounds(
-        &self,
-        stream: &StreamName,
-    ) -> Result<(Offset, Offset), StorageError>;
+    async fn stream_bounds(&self, stream: &StreamName) -> Result<(Offset, Offset), StorageError>;
 
     /// Drop records at offsets `>= drop_from`. Complement to
     /// [`StorageEngine::trim_up_to`]. Used by the follower's

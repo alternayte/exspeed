@@ -85,7 +85,10 @@ pub fn collect_columns(expr: &Expr, out: &mut ColumnSet) {
             collect_columns(expr, out);
         }
         Expr::Cast { expr, .. } => collect_columns(expr, out),
-        Expr::Case { conditions, else_val } => {
+        Expr::Case {
+            conditions,
+            else_val,
+        } => {
             for (c, r) in conditions {
                 collect_columns(c, out);
                 collect_columns(r, out);
@@ -104,7 +107,9 @@ pub fn collect_columns(expr: &Expr, out: &mut ColumnSet) {
                 collect_columns(e, out);
             }
         }
-        Expr::Between { expr, low, high, .. } => {
+        Expr::Between {
+            expr, low, high, ..
+        } => {
             collect_columns(expr, out);
             collect_columns(low, out);
             collect_columns(high, out);
@@ -139,10 +144,15 @@ mod tests {
     use crate::parser::ast::{BinaryOperator, Expr, LiteralValue};
 
     fn col(name: &str) -> Expr {
-        Expr::Column { table: None, name: name.into() }
+        Expr::Column {
+            table: None,
+            name: name.into(),
+        }
     }
 
-    fn cs() -> ColumnSet { ColumnSet::default() }
+    fn cs() -> ColumnSet {
+        ColumnSet::default()
+    }
 
     #[test]
     fn bare_virtual_column() {

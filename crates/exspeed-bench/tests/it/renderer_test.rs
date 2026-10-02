@@ -1,4 +1,4 @@
-use exspeed_bench::{host::Host, profile::ProfileKind, report::*, renderer};
+use exspeed_bench::{host::Host, profile::ProfileKind, renderer, report::*};
 
 fn sample() -> BenchResult {
     BenchResult {
@@ -67,7 +67,14 @@ fn readme_snippet_contains_headline_numbers() {
 #[test]
 fn benchmarks_md_renders_per_scenario_sections() {
     let s = renderer::benchmarks_md(&sample());
-    for needle in ["## Publish", "## Latency", "## Fan-out", "## ExQL", "git_sha", "reproduce"] {
+    for needle in [
+        "## Publish",
+        "## Latency",
+        "## Fan-out",
+        "## ExQL",
+        "git_sha",
+        "reproduce",
+    ] {
         assert!(s.contains(needle), "missing {needle}");
     }
 }

@@ -32,7 +32,10 @@ async fn latency_scenario_reports_sensible_percentiles() {
     assert!(r.latency_us.p50 > 0);
     assert!(r.latency_us.p99 >= r.latency_us.p50);
     assert!(r.latency_us.max >= r.latency_us.p99);
-    assert!(r.latency_us.p50 < 1_000_000, "p50 should be < 1s in an embedded test");
+    assert!(
+        r.latency_us.p50 < 1_000_000,
+        "p50 should be < 1s in an embedded test"
+    );
 }
 
 #[tokio::test]
@@ -61,9 +64,9 @@ async fn exql_scenario_reports_a_sustained_rate() {
         &srv.tcp_addr,
         &srv.api_addr,
         &profile,
-        1_000,    // low
-        4_000,    // high
-        4,        // iterations
+        1_000, // low
+        4_000, // high
+        4,     // iterations
     )
     .await
     .unwrap();
@@ -89,11 +92,16 @@ async fn exql_returns_zero_with_warning_when_no_candidate_passes() {
         &srv.tcp_addr,
         &srv.api_addr,
         &profile,
-        10_000_000,   // low — unachievable
-        100_000_000,  // high — also unachievable
+        10_000_000,  // low — unachievable
+        100_000_000, // high — also unachievable
         2,
-    ).await.unwrap();
-    assert_eq!(r.sustained_input_rate, 0, "should be 0 when no candidate passes");
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        r.sustained_input_rate, 0,
+        "should be 0 when no candidate passes"
+    );
     assert!(r.warning.is_some(), "warning should be set");
     assert!(r.warning.as_ref().unwrap().contains("no-candidate-passed"));
 }

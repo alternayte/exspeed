@@ -36,13 +36,13 @@ async fn start_server() -> (String, u16, tempfile::TempDir) {
         credentials_file: None,
         tls_cert: None,
         tls_key: None,
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
+        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+        storage_flush_window_us: 500,
+        storage_flush_threshold_records: 256,
+        storage_flush_threshold_bytes: 1_048_576,
+        storage_sync_interval_ms: 10,
+        storage_sync_bytes: 4 * 1024 * 1024,
+        delivery_buffer: 8192,
     };
 
     tokio::spawn(async move {
@@ -132,7 +132,11 @@ async fn over_long_consumer_name_rejected() {
     let (mut reader, mut writer) = connect_to(&addr).await;
 
     let resp = send_recv(&mut writer, &mut reader, connect_frame(1)).await;
-    assert_eq!(resp.opcode, OpCode::ConnectOk, "CONNECT should return ConnectOk");
+    assert_eq!(
+        resp.opcode,
+        OpCode::ConnectOk,
+        "CONNECT should return ConnectOk"
+    );
 
     let resp = send_recv(&mut writer, &mut reader, create_stream_frame("events", 2)).await;
     assert_eq!(resp.opcode, OpCode::Ok, "CREATE_STREAM should return Ok");
@@ -164,7 +168,11 @@ async fn publish_latency_histogram_reported_via_metrics() {
         .send()
         .await
         .unwrap();
-    assert!(resp.status().is_success(), "create stream: {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "create stream: {}",
+        resp.status()
+    );
 
     // Publish a record via the HTTP API.
     let resp = client

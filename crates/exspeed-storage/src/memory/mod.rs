@@ -127,9 +127,7 @@ impl StorageEngine for MemoryStorage {
 
         // Records are stored in offset order; find the first record whose
         // offset >= `from` and take up to `max_records` from there.
-        let first_idx = state
-            .records
-            .partition_point(|r| r.offset.0 < from.0);
+        let first_idx = state.records.partition_point(|r| r.offset.0 < from.0);
         if first_idx >= state.records.len() {
             return Ok(Vec::new());
         }
@@ -137,7 +135,11 @@ impl StorageEngine for MemoryStorage {
         Ok(state.records[first_idx..end].to_vec())
     }
 
-    async fn seek_by_time(&self, stream: &StreamName, timestamp: u64) -> Result<Offset, StorageError> {
+    async fn seek_by_time(
+        &self,
+        stream: &StreamName,
+        timestamp: u64,
+    ) -> Result<Offset, StorageError> {
         let map = self.streams.read().unwrap();
         let name = stream.as_str().to_string();
         let state = map
@@ -161,11 +163,7 @@ impl StorageEngine for MemoryStorage {
         Ok(streams)
     }
 
-    async fn trim_up_to(
-        &self,
-        stream: &StreamName,
-        keep_from: Offset,
-    ) -> Result<(), StorageError> {
+    async fn trim_up_to(&self, stream: &StreamName, keep_from: Offset) -> Result<(), StorageError> {
         let mut map = self.streams.write().unwrap();
         let state = map
             .get_mut(stream.as_str())
@@ -182,10 +180,7 @@ impl StorageEngine for MemoryStorage {
         Ok(())
     }
 
-    async fn stream_bounds(
-        &self,
-        stream: &StreamName,
-    ) -> Result<(Offset, Offset), StorageError> {
+    async fn stream_bounds(&self, stream: &StreamName) -> Result<(Offset, Offset), StorageError> {
         let map = self.streams.read().unwrap();
         let state = map
             .get(stream.as_str())

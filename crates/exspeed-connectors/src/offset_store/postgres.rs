@@ -110,12 +110,7 @@ impl OffsetStore for PostgresOffsetStore {
         client
             .execute(
                 &sql,
-                &[
-                    &connector,
-                    &"source",
-                    &Some(position),
-                    &(None::<i64>),
-                ],
+                &[&connector, &"source", &Some(position), &(None::<i64>)],
             )
             .await
             .map_err(|e| OffsetStoreError::Connection(e.to_string()))?;
@@ -142,23 +137,14 @@ impl OffsetStore for PostgresOffsetStore {
         }
     }
 
-    async fn save_sink_offset(
-        &self,
-        connector: &str,
-        offset: u64,
-    ) -> Result<(), OffsetStoreError> {
+    async fn save_sink_offset(&self, connector: &str, offset: u64) -> Result<(), OffsetStoreError> {
         let sql = self.upsert_sql();
         let sink_offset = offset as i64;
         let client = self.client.lock().await;
         client
             .execute(
                 &sql,
-                &[
-                    &connector,
-                    &"sink",
-                    &(None::<String>),
-                    &Some(sink_offset),
-                ],
+                &[&connector, &"sink", &(None::<String>), &Some(sink_offset)],
             )
             .await
             .map_err(|e| OffsetStoreError::Connection(e.to_string()))?;

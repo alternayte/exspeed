@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use exspeed_broker::lease::{LeaderLease, LeaseError, LeaseGuard, LeaseInfo};
 use exspeed_broker::leadership::ClusterLeadership;
+use exspeed_broker::lease::{LeaderLease, LeaseError, LeaseGuard, LeaseInfo};
 use exspeed_common::Metrics;
 
 /// Lease backend that always rejects. Used to put a `ClusterLeadership`
@@ -52,8 +52,7 @@ pub async fn make_state_with_leader(leader: bool) -> Arc<exspeed_api::AppState> 
         Arc::new(AlwaysRejectLease)
     };
 
-    let leadership =
-        Arc::new(ClusterLeadership::spawn(lease.clone(), metrics.clone(), None).await);
+    let leadership = Arc::new(ClusterLeadership::spawn(lease.clone(), metrics.clone(), None).await);
 
     if leader {
         // Wait for Noop promotion (~1 tick = max(TTL/3, 1s)). Default

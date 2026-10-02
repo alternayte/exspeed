@@ -9,18 +9,12 @@ use crate::types::{Row, Value};
 ///
 /// If `cs.select_star` is true, every column is emitted regardless of the
 /// other flags (matching the semantics of `SELECT *`).
-pub fn stored_record_to_row(
-    record: &StoredRecord,
-    alias: Option<&str>,
-    cs: &ColumnSet,
-) -> Row {
+pub fn stored_record_to_row(record: &StoredRecord, alias: Option<&str>, cs: &ColumnSet) -> Row {
     let prefix = alias.map(|a| format!("{a}.")).unwrap_or_default();
     let mut columns = Vec::with_capacity(5);
     let mut values = Vec::with_capacity(5);
 
-    let want = |col: &str| -> bool {
-        cs.select_star || cs.virtual_cols.contains(col)
-    };
+    let want = |col: &str| -> bool { cs.select_star || cs.virtual_cols.contains(col) };
 
     if want("offset") {
         columns.push(format!("{prefix}offset"));
@@ -85,7 +79,10 @@ mod tests {
     fn select_star_emits_everything() {
         let cs = ColumnSet::needs_everything();
         let r = stored_record_to_row(&rec(br#"{"a":1}"#), None, &cs);
-        assert_eq!(r.columns, vec!["offset", "timestamp", "key", "subject", "payload"]);
+        assert_eq!(
+            r.columns,
+            vec!["offset", "timestamp", "key", "subject", "payload"]
+        );
         assert_eq!(r.values[0], Value::Int(7));
         // Fixture is 1_700_000_000_000_000_000 ns; divided by 1_000_000 → ms.
         assert_eq!(r.values[1], Value::Timestamp(1_700_000_000_000));
@@ -103,7 +100,10 @@ mod tests {
 
     #[test]
     fn payload_referenced_without_star_includes_only_payload() {
-        let cs = ColumnSet { payload_referenced: true, ..ColumnSet::default() };
+        let cs = ColumnSet {
+            payload_referenced: true,
+            ..ColumnSet::default()
+        };
         let r = stored_record_to_row(&rec(br#"{"a":1}"#), None, &cs);
         assert_eq!(r.columns, vec!["payload"]);
         assert!(matches!(r.values[0], Value::RawJson(_)));
@@ -111,7 +111,10 @@ mod tests {
 
     #[test]
     fn non_utf8_payload_falls_back_to_text() {
-        let cs = ColumnSet { payload_referenced: true, ..ColumnSet::default() };
+        let cs = ColumnSet {
+            payload_referenced: true,
+            ..ColumnSet::default()
+        };
         let r = stored_record_to_row(&rec(&[0xFF, 0xFE]), None, &cs);
         assert!(matches!(r.values[0], Value::Text(_)));
     }
@@ -120,7 +123,10 @@ mod tests {
     fn alias_prefixes_column_names() {
         let cs = ColumnSet::needs_everything();
         let r = stored_record_to_row(&rec(br#"{"a":1}"#), Some("o"), &cs);
-        assert_eq!(r.columns, vec!["o.offset", "o.timestamp", "o.key", "o.subject", "o.payload"]);
+        assert_eq!(
+            r.columns,
+            vec!["o.offset", "o.timestamp", "o.key", "o.subject", "o.payload"]
+        );
     }
 
     #[test]

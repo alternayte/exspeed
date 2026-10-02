@@ -28,10 +28,7 @@ pub async fn handle_create_stream(broker: &Broker, req: CreateStreamRequest) -> 
         Ok(()) => {
             // Load the stream config that was just persisted (uses defaults for dedup
             // fields since CreateStreamRequest doesn't carry dedup params yet).
-            let stream_dir = broker
-                .data_dir
-                .join("streams")
-                .join(stream_name.as_str());
+            let stream_dir = broker.data_dir.join("streams").join(stream_name.as_str());
             let cfg = exspeed_storage::file::stream_config::StreamConfig::load(&stream_dir)
                 .unwrap_or_default();
             broker
@@ -294,7 +291,11 @@ pub async fn handle_create_consumer(broker: &Broker, req: CreateConsumerRequest)
         StartFrom::Latest => {
             // Read a large batch to find the last offset.
             // We scan for the highest offset available.
-            match broker.storage.read(&stream_name, Offset(0), usize::MAX).await {
+            match broker
+                .storage
+                .read(&stream_name, Offset(0), usize::MAX)
+                .await
+            {
                 Ok(records) => {
                     if let Some(last) = records.last() {
                         last.offset.0 + 1
@@ -520,7 +521,11 @@ pub async fn handle_nack(broker: &Broker, req: NackRequest) -> ServerMessage {
             }
         };
 
-        let records = match broker.storage.read(&stream_name, Offset(req.offset), 1).await {
+        let records = match broker
+            .storage
+            .read(&stream_name, Offset(req.offset), 1)
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 return ServerMessage::Error {
@@ -644,7 +649,11 @@ pub async fn handle_seek(broker: &Broker, req: SeekRequest) -> ServerMessage {
         }
     };
 
-    match broker.storage.seek_by_time(&stream_name, req.timestamp).await {
+    match broker
+        .storage
+        .seek_by_time(&stream_name, req.timestamp)
+        .await
+    {
         Ok(offset) => {
             // Re-acquire lock after .await to update consumer state; clone config out before awaiting the store.
             let config_to_save = {

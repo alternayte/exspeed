@@ -199,7 +199,9 @@ async fn run_retry_loop(inner: Arc<Inner>) {
                 inner.metrics.set_is_leader(true);
                 inner.metrics.set_lease_held(LEASE_NAME, true);
                 inner.metrics.record_leader_transition("acquired");
-                inner.metrics.record_lease_acquire_attempt(LEASE_NAME, "acquired");
+                inner
+                    .metrics
+                    .record_lease_acquire_attempt(LEASE_NAME, "acquired");
                 info!(
                     holder = %inner.holder_id,
                     role = "leader",
@@ -216,11 +218,15 @@ async fn run_retry_loop(inner: Arc<Inner>) {
                 });
             }
             Ok(None) => {
-                inner.metrics.record_lease_acquire_attempt(LEASE_NAME, "rejected");
+                inner
+                    .metrics
+                    .record_lease_acquire_attempt(LEASE_NAME, "rejected");
                 debug!("cluster:leader held by another pod; staying standby");
             }
             Err(e) => {
-                inner.metrics.record_lease_acquire_attempt(LEASE_NAME, "error");
+                inner
+                    .metrics
+                    .record_lease_acquire_attempt(LEASE_NAME, "error");
                 warn!(error = %e, "cluster:leader acquire failed");
             }
         }

@@ -42,7 +42,9 @@ pub struct DeliveryBatch {
 
 impl DeliveryBatch {
     pub fn single(record: DeliveryRecord) -> Self {
-        Self { records: vec![record] }
+        Self {
+            records: vec![record],
+        }
     }
 }
 

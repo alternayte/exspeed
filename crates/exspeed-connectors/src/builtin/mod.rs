@@ -23,7 +23,9 @@ pub fn create_source(
     config: &ConnectorConfig,
 ) -> Result<Box<dyn SourceConnector>, ConnectorError> {
     match plugin {
-        "postgres_outbox" => Ok(Box::new(postgres_outbox::PostgresOutboxSource::new(config)?)),
+        "postgres_outbox" => Ok(Box::new(postgres_outbox::PostgresOutboxSource::new(
+            config,
+        )?)),
         "postgres" => Ok(Box::new(postgres::PostgresSource::new(config)?)),
         "jdbc_poll" => Ok(Box::new(jdbc_poll::JdbcPollSource::new(config)?)),
         "mssql_cdc" => Ok(Box::new(mssql_cdc::MssqlCdcSource::new(config)?)),

@@ -59,9 +59,9 @@ impl Value {
     pub fn as_json(&self) -> Option<std::borrow::Cow<'_, serde_json::Value>> {
         match self {
             Value::Json(v) => Some(std::borrow::Cow::Borrowed(v)),
-            Value::RawJson(b) => {
-                serde_json::from_slice::<serde_json::Value>(b).ok().map(std::borrow::Cow::Owned)
-            }
+            Value::RawJson(b) => serde_json::from_slice::<serde_json::Value>(b)
+                .ok()
+                .map(std::borrow::Cow::Owned),
             _ => None,
         }
     }

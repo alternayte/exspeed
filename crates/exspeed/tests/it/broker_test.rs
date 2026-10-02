@@ -136,7 +136,11 @@ async fn publish_and_fetch() {
 
     // 1. Connect
     let resp = send_recv(&mut writer, &mut reader, connect_frame(1)).await;
-    assert_eq!(resp.opcode, OpCode::ConnectOk, "CONNECT should return ConnectOk");
+    assert_eq!(
+        resp.opcode,
+        OpCode::ConnectOk,
+        "CONNECT should return ConnectOk"
+    );
     assert_eq!(resp.correlation_id, 1);
 
     // 2. Create stream "orders"
@@ -153,7 +157,12 @@ async fn publish_and_fetch() {
             publish_frame("orders", "order.created", value.as_bytes(), 10 + i),
         )
         .await;
-        assert_eq!(resp.opcode, OpCode::PublishOk, "PUBLISH {} should return PublishOk", i);
+        assert_eq!(
+            resp.opcode,
+            OpCode::PublishOk,
+            "PUBLISH {} should return PublishOk",
+            i
+        );
         assert_eq!(resp.correlation_id, 10 + i);
     }
 

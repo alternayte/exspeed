@@ -82,9 +82,8 @@ impl JdbcPollSource {
                 "jdbc_poll: 'schema' setting is required — declares columns to SELECT".into(),
             ));
         }
-        let schema_cols = parse_schema(&schema_raw).map_err(|e| {
-            ConnectorError::Config(format!("jdbc_poll: schema DSL error: {e}"))
-        })?;
+        let schema_cols = parse_schema(&schema_raw)
+            .map_err(|e| ConnectorError::Config(format!("jdbc_poll: schema DSL error: {e}")))?;
 
         if !schema_cols.iter().any(|c| c.name == tracking_column) {
             return Err(ConnectorError::Config(format!(
@@ -119,15 +118,27 @@ impl JdbcPollSource {
         match self.kind {
             DialectKind::Postgres => format!(
                 "SELECT {} FROM {} WHERE {} > $1 ORDER BY {} ASC LIMIT {}",
-                cols_sql.join(", "), table_q, tc_q, tc_q, batch
+                cols_sql.join(", "),
+                table_q,
+                tc_q,
+                tc_q,
+                batch
             ),
             DialectKind::MySql | DialectKind::Sqlite => format!(
                 "SELECT {} FROM {} WHERE {} > ? ORDER BY {} ASC LIMIT {}",
-                cols_sql.join(", "), table_q, tc_q, tc_q, batch
+                cols_sql.join(", "),
+                table_q,
+                tc_q,
+                tc_q,
+                batch
             ),
             DialectKind::Mssql => format!(
                 "SELECT TOP ({}) {} FROM {} WHERE {} > @P1 ORDER BY {} ASC",
-                batch, cols_sql.join(", "), table_q, tc_q, tc_q
+                batch,
+                cols_sql.join(", "),
+                table_q,
+                tc_q,
+                tc_q
             ),
         }
     }
@@ -232,7 +243,9 @@ fn parse_mssql_url(raw: &str) -> Result<tiberius::Config, ConnectorError> {
         .map_err(|e| ConnectorError::Config(format!("jdbc_poll url parse: {e}")))?;
 
     let mut cfg = tiberius::Config::new();
-    if let Some(h) = u.host_str() { cfg.host(h); }
+    if let Some(h) = u.host_str() {
+        cfg.host(h);
+    }
     cfg.port(u.port().unwrap_or(1433));
     if !u.username().is_empty() {
         let user = percent_encoding::percent_decode_str(u.username())
@@ -249,7 +262,9 @@ fn parse_mssql_url(raw: &str) -> Result<tiberius::Config, ConnectorError> {
         cfg.authentication(tiberius::AuthMethod::sql_server(&user, &pass));
     }
     let db = u.path().trim_start_matches('/');
-    if !db.is_empty() { cfg.database(db); }
+    if !db.is_empty() {
+        cfg.database(db);
+    }
     for (k, v) in u.query_pairs() {
         if k.eq_ignore_ascii_case("trust_server_certificate") && v.eq_ignore_ascii_case("true") {
             cfg.trust_cert();
@@ -321,7 +336,9 @@ impl SourceConnector for JdbcPollSource {
                     .bind(self.last_value)
                     .fetch_all(pool)
                     .await
-                    .map_err(|e| ConnectorError::Connection(format!("jdbc_poll sqlx query: {e}")))?;
+                    .map_err(|e| {
+                        ConnectorError::Connection(format!("jdbc_poll sqlx query: {e}"))
+                    })?;
                 for row in &rows {
                     let mut obj = serde_json::Map::with_capacity(self.schema_cols.len());
                     for (idx, col) in self.schema_cols.iter().enumerate() {
@@ -367,7 +384,8 @@ impl SourceConnector for JdbcPollSource {
                         if v > high_water {
                             high_water = v;
                         }
-                    } else if let Ok(Some(v)) = row.try_get::<i32, _>(self.tracking_column.as_str()) {
+                    } else if let Ok(Some(v)) = row.try_get::<i32, _>(self.tracking_column.as_str())
+                    {
                         let v = v as i64;
                         if v > high_water {
                             high_water = v;
@@ -385,7 +403,10 @@ impl SourceConnector for JdbcPollSource {
             None
         };
 
-        Ok(SourceBatch { records: out, position })
+        Ok(SourceBatch {
+            records: out,
+            position,
+        })
     }
 
     async fn commit(&mut self, _position: String) -> Result<(), ConnectorError> {

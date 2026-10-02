@@ -19,13 +19,13 @@ async fn start_server() -> (String, String) {
         credentials_file: None,
         tls_cert: None,
         tls_key: None,
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
+        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+        storage_flush_window_us: 500,
+        storage_flush_threshold_records: 256,
+        storage_flush_threshold_bytes: 1_048_576,
+        storage_sync_interval_ms: 10,
+        storage_sync_bytes: 4 * 1024 * 1024,
+        delivery_buffer: 8192,
     };
 
     tokio::spawn(async move {
@@ -57,8 +57,7 @@ async fn healthz_returns_ok() {
 
     let body: Value = resp.json().await.unwrap();
     assert_eq!(
-        body["leader"],
-        true,
+        body["leader"], true,
         "single-pod server should always be leader; body: {:?}",
         body
     );
@@ -281,7 +280,11 @@ async fn patch_rejects_invalid_dedup_config() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 400, "expected 400 for retention < dedup window");
+    assert_eq!(
+        resp.status(),
+        400,
+        "expected 400 for retention < dedup window"
+    );
 }
 
 #[tokio::test]

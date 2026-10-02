@@ -54,21 +54,23 @@ async fn start_server_temp() -> (String, String, PathBuf, CancellationToken) {
         credentials_file: None,
         tls_cert: None,
         tls_key: None,
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
+        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+        storage_flush_window_us: 500,
+        storage_flush_threshold_records: 256,
+        storage_flush_threshold_bytes: 1_048_576,
+        storage_sync_interval_ms: 10,
+        storage_sync_bytes: 4 * 1024 * 1024,
+        delivery_buffer: 8192,
     };
     let cancel_for_server = cancel.clone();
     tokio::spawn(async move {
         let _tmp = tmp; // keep temp dir alive for the lifetime of this task
-        // Move the token into the async block; use an owned future so the
-        // reference doesn't escape the block's lifetime.
+                        // Move the token into the async block; use an owned future so the
+                        // reference doesn't escape the block's lifetime.
         let shutdown_fut = async move { cancel_for_server.cancelled().await };
-        exspeed::cli::server::run_with_shutdown(args, shutdown_fut).await.ok();
+        exspeed::cli::server::run_with_shutdown(args, shutdown_fut)
+            .await
+            .ok();
     });
 
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -92,18 +94,20 @@ async fn start_server_at(data_dir: PathBuf) -> (String, String, CancellationToke
         credentials_file: None,
         tls_cert: None,
         tls_key: None,
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
+        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+        storage_flush_window_us: 500,
+        storage_flush_threshold_records: 256,
+        storage_flush_threshold_bytes: 1_048_576,
+        storage_sync_interval_ms: 10,
+        storage_sync_bytes: 4 * 1024 * 1024,
+        delivery_buffer: 8192,
     };
     let cancel_for_server = cancel.clone();
     tokio::spawn(async move {
         let shutdown_fut = async move { cancel_for_server.cancelled().await };
-        exspeed::cli::server::run_with_shutdown(args, shutdown_fut).await.ok();
+        exspeed::cli::server::run_with_shutdown(args, shutdown_fut)
+            .await
+            .ok();
     });
 
     // Wait for the server to become ready by polling the TCP port.
@@ -329,7 +333,12 @@ async fn dedup_different_body_same_key_returns_collision() {
 
     let (mut reader, mut writer) = connect_to(&tcp_addr).await;
     send_recv(&mut writer, &mut reader, connect_frame(1)).await;
-    send_recv(&mut writer, &mut reader, create_stream_frame("coll-stream", 2)).await;
+    send_recv(
+        &mut writer,
+        &mut reader,
+        create_stream_frame("coll-stream", 2),
+    )
+    .await;
 
     // First publish
     let r1 = send_recv(
@@ -350,7 +359,10 @@ async fn dedup_different_body_same_key_returns_collision() {
     let msg = decode_error_frame(r2, ERR_KEY_COLLISION);
     match msg {
         ServerMessage::KeyCollision { stored_offset: so } => {
-            assert_eq!(so, stored_offset, "collision must point to the original offset");
+            assert_eq!(
+                so, stored_offset,
+                "collision must point to the original offset"
+            );
         }
         other => panic!("expected KeyCollision, got {other:?}"),
     }
@@ -604,7 +616,10 @@ async fn no_msg_id_publishes_unaffected_by_cap() {
     )
     .await;
     let (_, dup) = decode_publish_ok(r2);
-    assert!(!dup, "pass-through publish must succeed even when dedup cap is full");
+    assert!(
+        !dup,
+        "pass-through publish must succeed even when dedup cap is full"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -617,7 +632,12 @@ async fn legacy_header_path_still_works() {
 
     let (mut reader, mut writer) = connect_to(&tcp_addr).await;
     send_recv(&mut writer, &mut reader, connect_frame(1)).await;
-    send_recv(&mut writer, &mut reader, create_stream_frame("legacy-stream", 2)).await;
+    send_recv(
+        &mut writer,
+        &mut reader,
+        create_stream_frame("legacy-stream", 2),
+    )
+    .await;
 
     // First publish using the header, not the msg_id field
     let r1 = send_recv(

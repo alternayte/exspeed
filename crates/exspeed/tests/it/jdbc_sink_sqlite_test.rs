@@ -40,7 +40,12 @@ async fn start_server() -> (String, String) {
     (tcp_addr, format!("http://127.0.0.1:{}", http_port))
 }
 
-async fn wait_for_rows(pool: &sqlx::sqlite::SqlitePool, table: &str, want: i64, deadline_secs: u64) -> i64 {
+async fn wait_for_rows(
+    pool: &sqlx::sqlite::SqlitePool,
+    table: &str,
+    want: i64,
+    deadline_secs: u64,
+) -> i64 {
     let deadline = std::time::Instant::now() + Duration::from_secs(deadline_secs);
     loop {
         let sql = format!("SELECT COUNT(*) FROM \"{}\"", table);
@@ -66,7 +71,9 @@ async fn sqlite_blob_mode_creates_table_and_writes() {
     client
         .post(format!("{}/api/v1/streams", http))
         .json(&serde_json::json!({"name": "sqlite-blob-stream"}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
 
     let resp = client
         .post(format!("{}/api/v1/connectors", http))
@@ -82,14 +89,21 @@ async fn sqlite_blob_mode_creates_table_and_writes() {
                 "auto_create_table": "true"
             }
         }))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 201, "create: {}", resp.text().await.unwrap());
 
     for n in 0..3 {
         client
-            .post(format!("{}/api/v1/streams/sqlite-blob-stream/publish", http))
+            .post(format!(
+                "{}/api/v1/streams/sqlite-blob-stream/publish",
+                http
+            ))
             .json(&serde_json::json!({"data": {"n": n}}))
-            .send().await.unwrap();
+            .send()
+            .await
+            .unwrap();
     }
 
     let pool = sqlx::sqlite::SqlitePool::connect(&url).await.unwrap();
@@ -111,7 +125,9 @@ async fn sqlite_typed_schema_round_trip() {
     client
         .post(format!("{}/api/v1/streams", http))
         .json(&serde_json::json!({"name": "sqlite-typed-stream"}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
 
     client
         .post(format!("{}/api/v1/connectors", http))
@@ -129,22 +145,36 @@ async fn sqlite_typed_schema_round_trip() {
                 "schema": "order_id:bigint, total_cents:bigint, name:text"
             }
         }))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
 
     client
-        .post(format!("{}/api/v1/streams/sqlite-typed-stream/publish", http))
+        .post(format!(
+            "{}/api/v1/streams/sqlite-typed-stream/publish",
+            http
+        ))
         .json(&serde_json::json!({"data": {"order_id": 1, "total_cents": 123, "name": "x"}}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     client
-        .post(format!("{}/api/v1/streams/sqlite-typed-stream/publish", http))
+        .post(format!(
+            "{}/api/v1/streams/sqlite-typed-stream/publish",
+            http
+        ))
         .json(&serde_json::json!({"data": {"order_id": 2, "total_cents": 500, "name": "y"}}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
 
     let pool = sqlx::sqlite::SqlitePool::connect(&url).await.unwrap();
     wait_for_rows(&pool, "orders", 2, 10).await;
 
     let (sum,): (i64,) = sqlx::query_as("SELECT SUM(total_cents) FROM \"orders\"")
-        .fetch_one(&pool).await.unwrap();
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(sum, 623);
     pool.close().await;
 }

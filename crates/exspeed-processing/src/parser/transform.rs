@@ -236,7 +236,8 @@ fn transform_select_item(item: sp::SelectItem) -> Result<SelectItem, ParseError>
                 sp::SelectItemQualifiedWildcardKind::Expr(_) => {
                     return Err(ParseError::Unsupported {
                         feature: "expression wildcard".into(),
-                        hint: "ExQL supports SELECT with WHERE, JOIN, GROUP BY, ORDER BY, LIMIT".into(),
+                        hint: "ExQL supports SELECT with WHERE, JOIN, GROUP BY, ORDER BY, LIMIT"
+                            .into(),
                     });
                 }
             };

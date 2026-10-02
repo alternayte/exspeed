@@ -63,10 +63,14 @@ async fn mssql_connect(
             cfg.trust_cert();
         }
     }
-    let tcp = tokio::net::TcpStream::connect(cfg.get_addr()).await.unwrap();
+    let tcp = tokio::net::TcpStream::connect(cfg.get_addr())
+        .await
+        .unwrap();
     tcp.set_nodelay(true).ok();
     use tokio_util::compat::TokioAsyncWriteCompatExt;
-    tiberius::Client::connect(cfg, tcp.compat_write()).await.unwrap()
+    tiberius::Client::connect(cfg, tcp.compat_write())
+        .await
+        .unwrap()
 }
 
 async fn count_rows_mssql(url: &str, table: &str, want: i64, deadline_secs: u64) -> i64 {
@@ -104,7 +108,9 @@ async fn blob_mode_creates_table_and_writes() {
     client
         .post(format!("{}/api/v1/streams", http))
         .json(&serde_json::json!({"name": "blob-ms-stream"}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
 
     let resp = client
         .post(format!("{}/api/v1/connectors", http))
@@ -120,14 +126,23 @@ async fn blob_mode_creates_table_and_writes() {
                 "auto_create_table": "true"
             }
         }))
-        .send().await.unwrap();
-    assert_eq!(resp.status(), 201, "create connector: {}", resp.text().await.unwrap());
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        201,
+        "create connector: {}",
+        resp.text().await.unwrap()
+    );
 
     for n in 0..3 {
         client
             .post(format!("{}/api/v1/streams/blob-ms-stream/publish", http))
             .json(&serde_json::json!({"data": {"n": n, "name": format!("item-{n}")}}))
-            .send().await.unwrap();
+            .send()
+            .await
+            .unwrap();
     }
 
     let got = count_rows_mssql(&ms_url, &table, 3, 10).await;
@@ -146,7 +161,9 @@ async fn blob_mode_upsert_is_idempotent_on_offset() {
     client
         .post(format!("{}/api/v1/streams", http))
         .json(&serde_json::json!({"name": "idem-ms-stream"}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
 
     client
         .post(format!("{}/api/v1/connectors", http))
@@ -162,20 +179,26 @@ async fn blob_mode_upsert_is_idempotent_on_offset() {
                 "auto_create_table": "true"
             }
         }))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
 
     for n in 0..5 {
         client
             .post(format!("{}/api/v1/streams/idem-ms-stream/publish", http))
             .json(&serde_json::json!({"data": {"n": n}}))
-            .send().await.unwrap();
+            .send()
+            .await
+            .unwrap();
     }
 
     count_rows_mssql(&ms_url, &table, 5, 10).await;
 
     client
         .delete(format!("{}/api/v1/connectors/sink-idem-ms", http))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     client
         .post(format!("{}/api/v1/connectors", http))
         .json(&serde_json::json!({
@@ -190,12 +213,17 @@ async fn blob_mode_upsert_is_idempotent_on_offset() {
                 "auto_create_table": "true"
             }
         }))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let got = count_rows_mssql(&ms_url, &table, 5, 5).await;
-    assert_eq!(got, 5, "should still be 5 rows after replay (MERGE upsert was idempotent)");
+    assert_eq!(
+        got, 5,
+        "should still be 5 rows after replay (MERGE upsert was idempotent)"
+    );
 
     common::db::drop_table_mssql(&ms_url, &table).await;
 }
@@ -210,7 +238,9 @@ async fn typed_schema_binds_correct_types() {
     client
         .post(format!("{}/api/v1/streams", http))
         .json(&serde_json::json!({"name": "typed-ms-stream"}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
 
     client
         .post(format!("{}/api/v1/connectors", http))
@@ -239,7 +269,9 @@ async fn typed_schema_binds_correct_types() {
             "items": [{"sku": "x1"}, {"sku": "y2"}],
             "coupon": null
         }}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
 
     client
         .post(format!("{}/api/v1/streams/typed-ms-stream/publish", http))
@@ -249,7 +281,9 @@ async fn typed_schema_binds_correct_types() {
             "placed_at": "2026-04-22T11:00:00Z",
             "items": []
         }}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
 
     count_rows_mssql(&ms_url, &table, 2, 10).await;
 
@@ -297,7 +331,9 @@ async fn typed_schema_rejects_mismatched_json_type() {
     client
         .post(format!("{}/api/v1/streams", http))
         .json(&serde_json::json!({"name": "mismatch-ms-stream"}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
 
     client
         .post(format!("{}/api/v1/connectors", http))
@@ -314,16 +350,28 @@ async fn typed_schema_rejects_mismatched_json_type() {
                 "schema": "id:bigint, email:text"
             }
         }))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
 
     client
-        .post(format!("{}/api/v1/streams/mismatch-ms-stream/publish", http))
+        .post(format!(
+            "{}/api/v1/streams/mismatch-ms-stream/publish",
+            http
+        ))
         .json(&serde_json::json!({"data": {"id": "not-a-number", "email": "x@y"}}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     client
-        .post(format!("{}/api/v1/streams/mismatch-ms-stream/publish", http))
+        .post(format!(
+            "{}/api/v1/streams/mismatch-ms-stream/publish",
+            http
+        ))
         .json(&serde_json::json!({"data": {"id": 2, "email": "ok@y"}}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -334,7 +382,10 @@ async fn typed_schema_rejects_mismatched_json_type() {
         .unwrap();
     let rows = stream.into_first_result().await.unwrap();
     let got: i32 = rows.first().and_then(|r| r.get(0)).unwrap();
-    assert_eq!(got, 1, "bad record should have been skipped; only valid one should land");
+    assert_eq!(
+        got, 1,
+        "bad record should have been skipped; only valid one should land"
+    );
 
     let stream = conn
         .simple_query(format!("SELECT id FROM [{}]", table))
@@ -345,8 +396,11 @@ async fn typed_schema_rejects_mismatched_json_type() {
     assert_eq!(id, 2);
 
     let metrics_body = reqwest::get(format!("{}/metrics", http))
-        .await.unwrap()
-        .text().await.unwrap();
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert!(
         metrics_body.contains("exspeed_connector_records_skipped_total")
             && metrics_body.contains("type_mismatch"),
@@ -365,7 +419,9 @@ async fn table_name_injection_rejected_at_create() {
     client
         .post(format!("{}/api/v1/streams", http))
         .json(&serde_json::json!({"name": "inj-ms-stream"}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
 
     let resp = client
         .post(format!("{}/api/v1/connectors", http))
@@ -380,7 +436,9 @@ async fn table_name_injection_rejected_at_create() {
                 "auto_create_table": "true"
             }
         }))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert!(
         !resp.status().is_success(),
         "create connector should fail; body={}",
@@ -398,7 +456,12 @@ async fn concurrent_upserts_no_duplicate_keys() {
         let d = dialect_for(DialectKind::Mssql);
         let sql = d.create_table_blob_sql(&table);
         let mut conn = mssql_connect(&ms_url).await;
-        conn.simple_query(sql).await.unwrap().into_results().await.unwrap();
+        conn.simple_query(sql)
+            .await
+            .unwrap()
+            .into_results()
+            .await
+            .unwrap();
     }
 
     // Four concurrent workers, each upserts 100 records drawn from a shared
@@ -420,10 +483,7 @@ async fn concurrent_upserts_no_duplicate_keys() {
                     .replace("@P1", &i.to_string())
                     .replace("@P2", "NULL")
                     .replace("@P3", "NULL")
-                    .replace(
-                        "@P4",
-                        &format!("'{{\"w\":{worker},\"i\":{i}}}'"),
-                    );
+                    .replace("@P4", &format!("'{{\"w\":{worker},\"i\":{i}}}'"));
                 conn.simple_query(row_sql).await.expect("merge ok");
             }
         }));

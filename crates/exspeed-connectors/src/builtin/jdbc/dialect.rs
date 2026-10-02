@@ -86,12 +86,7 @@ pub trait Dialect: Send + Sync {
     fn timestamptz_type(&self) -> &'static str;
     fn double_type(&self) -> &'static str;
     fn create_table_blob_sql(&self, table: &str) -> String;
-    fn create_table_typed_sql(
-        &self,
-        table: &str,
-        cols: &[ColumnSpec],
-        pk_cols: &[&str],
-    ) -> String;
+    fn create_table_typed_sql(&self, table: &str, cols: &[ColumnSpec], pk_cols: &[&str]) -> String;
     fn insert_sql(&self, table: &str, cols: &[&str]) -> String;
     fn upsert_sql(&self, table: &str, cols: &[&str], keys: &[&str]) -> String;
 }
@@ -132,9 +127,18 @@ mod tests {
 
     #[test]
     fn kind_from_sqlite_url() {
-        assert_eq!(DialectKind::from_url("sqlite:///tmp/x.db").unwrap(), DialectKind::Sqlite);
-        assert_eq!(DialectKind::from_url("sqlite::memory:").unwrap(), DialectKind::Sqlite);
-        assert_eq!(DialectKind::from_url("SQLITE:data.db").unwrap(), DialectKind::Sqlite);
+        assert_eq!(
+            DialectKind::from_url("sqlite:///tmp/x.db").unwrap(),
+            DialectKind::Sqlite
+        );
+        assert_eq!(
+            DialectKind::from_url("sqlite::memory:").unwrap(),
+            DialectKind::Sqlite
+        );
+        assert_eq!(
+            DialectKind::from_url("SQLITE:data.db").unwrap(),
+            DialectKind::Sqlite
+        );
     }
 
     #[test]

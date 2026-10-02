@@ -1,13 +1,13 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use bytes::{Buf, Bytes, BytesMut};
 use futures_util::stream::FuturesUnordered;
 use futures_util::{SinkExt, StreamExt};
-use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::TcpStream;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 use hdrhistogram::Histogram;
@@ -59,8 +59,14 @@ impl ExspeedClient {
         let mut buf = BytesMut::new();
         req.encode(&mut buf);
         let corr = self.alloc_corr();
-        self.writer.send(Frame::new(OpCode::Connect, corr, buf.freeze())).await?;
-        let resp = self.reader.next().await.ok_or_else(|| anyhow!("connect closed"))??;
+        self.writer
+            .send(Frame::new(OpCode::Connect, corr, buf.freeze()))
+            .await?;
+        let resp = self
+            .reader
+            .next()
+            .await
+            .ok_or_else(|| anyhow!("connect closed"))??;
         if resp.opcode != OpCode::ConnectOk {
             return Err(anyhow!("expected ConnectOk, got {:?}", resp.opcode));
         }
@@ -76,8 +82,14 @@ impl ExspeedClient {
         let mut buf = BytesMut::new();
         req.encode(&mut buf);
         let corr = self.alloc_corr();
-        self.writer.send(Frame::new(OpCode::CreateStream, corr, buf.freeze())).await?;
-        let resp = self.reader.next().await.ok_or_else(|| anyhow!("closed"))??;
+        self.writer
+            .send(Frame::new(OpCode::CreateStream, corr, buf.freeze()))
+            .await?;
+        let resp = self
+            .reader
+            .next()
+            .await
+            .ok_or_else(|| anyhow!("closed"))??;
         match resp.opcode {
             OpCode::Ok => Ok(()),
             OpCode::Error => {
@@ -103,7 +115,12 @@ impl ExspeedClient {
     }
 
     /// Publishes a single record with the publish_us header encoded as ASCII decimal.
-    pub async fn publish_once(&mut self, stream: &str, value: &Bytes, origin: Instant) -> Result<()> {
+    pub async fn publish_once(
+        &mut self,
+        stream: &str,
+        value: &Bytes,
+        origin: Instant,
+    ) -> Result<()> {
         let us = origin.elapsed().as_micros() as u64;
         let req = PublishRequest {
             stream: stream.into(),
@@ -116,13 +133,23 @@ impl ExspeedClient {
         let mut buf = BytesMut::new();
         req.encode(&mut buf);
         let corr = self.alloc_corr();
-        self.writer.send(Frame::new(OpCode::Publish, corr, buf.freeze())).await?;
-        let resp = self.reader.next().await.ok_or_else(|| anyhow!("closed"))??;
+        self.writer
+            .send(Frame::new(OpCode::Publish, corr, buf.freeze()))
+            .await?;
+        let resp = self
+            .reader
+            .next()
+            .await
+            .ok_or_else(|| anyhow!("closed"))??;
         match resp.opcode {
             OpCode::PublishOk => Ok(()),
             OpCode::Error => {
                 let mut p = resp.payload;
-                let code = if p.remaining() >= 2 { p.get_u16_le() } else { 0 };
+                let code = if p.remaining() >= 2 {
+                    p.get_u16_le()
+                } else {
+                    0
+                };
                 let msg = if p.remaining() >= 2 {
                     let len = p.get_u16_le() as usize;
                     if p.remaining() >= len {
@@ -225,7 +252,9 @@ pub async fn run_producer(
     }
 
     let mut total: u64 = 0;
-    for h in handles { total += h.await??; }
+    for h in handles {
+        total += h.await??;
+    }
     publisher.close().await.ok();
 
     Ok(ProducerStats {
@@ -307,7 +336,10 @@ pub async fn run_consumer(
     let mut buf = BytesMut::new();
     create_req.encode(&mut buf);
     let corr = client.alloc_corr();
-    client.writer.send(Frame::new(OpCode::CreateConsumer, corr, buf.freeze())).await?;
+    client
+        .writer
+        .send(Frame::new(OpCode::CreateConsumer, corr, buf.freeze()))
+        .await?;
     match client.reader.next().await {
         Some(Ok(_)) => {} // Ok or Error(AlreadyExists) — either means we can proceed
         Some(Err(e)) => return Err(e.into()),
@@ -322,14 +354,20 @@ pub async fn run_consumer(
     let mut buf = BytesMut::new();
     sub_req.encode(&mut buf);
     let corr = client.alloc_corr();
-    client.writer.send(Frame::new(OpCode::Subscribe, corr, buf.freeze())).await?;
-    let resp = client.reader.next().await.ok_or_else(|| anyhow!("closed"))??;
+    client
+        .writer
+        .send(Frame::new(OpCode::Subscribe, corr, buf.freeze()))
+        .await?;
+    let resp = client
+        .reader
+        .next()
+        .await
+        .ok_or_else(|| anyhow!("closed"))??;
     if !matches!(resp.opcode, OpCode::Ok) {
         return Err(anyhow!("subscribe: unexpected opcode {:?}", resp.opcode));
     }
 
-    let mut hist = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3)
-        .expect("histogram bounds");
+    let mut hist = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).expect("histogram bounds");
     let mut messages: u64 = 0;
     let deadline = Instant::now() + duration;
 
@@ -352,21 +390,20 @@ pub async fn run_consumer(
             Err(_) => break, // deadline reached
         };
         // Dispatch: accept both Record (0x82) and RecordsBatch (0x83); skip everything else.
-        let deliveries: Vec<(u64, Vec<(String, String)>)> =
-            if next.opcode == OpCode::Record {
-                let d = RecordDelivery::decode(next.payload)?;
-                vec![(d.offset, d.headers)]
-            } else if next.opcode == OpCode::RecordsBatch {
-                use exspeed_protocol::messages::records_batch::RecordsBatch;
-                let batch = RecordsBatch::decode(next.payload)?;
-                batch
-                    .records
-                    .into_iter()
-                    .map(|r| (r.offset, r.headers))
-                    .collect()
-            } else {
-                continue;
-            };
+        let deliveries: Vec<(u64, Vec<(String, String)>)> = if next.opcode == OpCode::Record {
+            let d = RecordDelivery::decode(next.payload)?;
+            vec![(d.offset, d.headers)]
+        } else if next.opcode == OpCode::RecordsBatch {
+            use exspeed_protocol::messages::records_batch::RecordsBatch;
+            let batch = RecordsBatch::decode(next.payload)?;
+            batch
+                .records
+                .into_iter()
+                .map(|r| (r.offset, r.headers))
+                .collect()
+        } else {
+            continue;
+        };
 
         for (offset, headers) in deliveries {
             // Find publish_us header; ignore records without it (shouldn't happen in bench runs).

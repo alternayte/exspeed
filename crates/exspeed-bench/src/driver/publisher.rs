@@ -9,14 +9,14 @@
 //! can be in flight concurrently, bounded by the semaphore.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
-use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Mutex, Notify, Semaphore};
 use tokio_util::codec::{FramedRead, FramedWrite};
 
@@ -132,13 +132,7 @@ struct PublisherInner {
 impl Publisher {
     /// Convenience constructor — default settings (max_in_flight=1024, window=100µs, max_batch=256).
     pub async fn new(addr: &str) -> Result<Self> {
-        Self::with_config(
-            addr,
-            1024,
-            std::time::Duration::from_micros(100),
-            256,
-        )
-        .await
+        Self::with_config(addr, 1024, std::time::Duration::from_micros(100), 256).await
     }
 
     pub async fn with_config(
@@ -207,9 +201,12 @@ impl Publisher {
         let (tx, rx) = oneshot::channel();
         {
             let mut q = self.inner.coalesce_queue.lock().await;
-            q.push(QueuedPublish { req, respond_to: tx });
-            let notify = q.len() >= self.inner.max_batch_records
-                || self.inner.batch_window.is_zero();
+            q.push(QueuedPublish {
+                req,
+                respond_to: tx,
+            });
+            let notify =
+                q.len() >= self.inner.max_batch_records || self.inner.batch_window.is_zero();
             if notify {
                 self.inner.flush_notify.notify_one();
             }
@@ -268,7 +265,12 @@ impl Publisher {
 
         {
             let mut p = self.inner.pending.lock().await;
-            p.insert(corr, PendingBatch { responders: senders });
+            p.insert(
+                corr,
+                PendingBatch {
+                    responders: senders,
+                },
+            );
         }
 
         let batch_req = PublishBatchRequest { stream, records };
@@ -314,8 +316,7 @@ impl Publisher {
     pub async fn flush(&self) -> Result<(), PublisherError> {
         loop {
             let queue_empty = self.inner.coalesce_queue.lock().await.is_empty();
-            let in_flight_zero =
-                self.inner.flusher_in_flight.load(Ordering::Acquire) == 0;
+            let in_flight_zero = self.inner.flusher_in_flight.load(Ordering::Acquire) == 0;
             let pending_empty = self.inner.pending.lock().await.is_empty();
             if queue_empty && in_flight_zero && pending_empty {
                 break;
@@ -401,10 +402,7 @@ fn spawn_flusher(inner: Arc<PublisherInner>) {
             // Group by stream so each stream gets exactly one frame.
             let mut by_stream: HashMap<String, Vec<QueuedPublish>> = HashMap::new();
             for qp in drained {
-                by_stream
-                    .entry(qp.req.stream.clone())
-                    .or_default()
-                    .push(qp);
+                by_stream.entry(qp.req.stream.clone()).or_default().push(qp);
             }
 
             // C1: collect into a Vec so that on write_tx failure we can
@@ -501,11 +499,7 @@ fn spawn_reader(mut reader: FramedRead<OwnedReadHalf, ExspeedCodec>, inner: Arc<
                 };
                 let mut map = inner.pending.lock().await;
                 if let Some(batch) = map.remove(&frame.correlation_id) {
-                    for (tx, result) in batch
-                        .responders
-                        .into_iter()
-                        .zip(resp.results.into_iter())
-                    {
+                    for (tx, result) in batch.responders.into_iter().zip(resp.results.into_iter()) {
                         let _ = tx.send(match result {
                             BatchResult::Written { offset } => Ok(Offset(offset)),
                             BatchResult::Duplicate { offset, .. } => Ok(Offset(offset)),
@@ -517,7 +511,11 @@ fn spawn_reader(mut reader: FramedRead<OwnedReadHalf, ExspeedCodec>, inner: Arc<
                 }
             } else if frame.opcode == OpCode::Error {
                 let mut p = frame.payload.clone();
-                let code = if p.remaining() >= 2 { p.get_u16_le() } else { 0 };
+                let code = if p.remaining() >= 2 {
+                    p.get_u16_le()
+                } else {
+                    0
+                };
                 let ml = if p.remaining() >= 2 {
                     p.get_u16_le() as usize
                 } else {

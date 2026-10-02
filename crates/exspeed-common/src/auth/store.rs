@@ -58,10 +58,7 @@ impl CredentialStore {
     ///   credential with global admin.
     /// - Both None is a programming error (caller should not wrap None
     ///   in a store); this returns an empty store anyway for robustness.
-    pub fn build(
-        from_file: Option<&Path>,
-        env_token: Option<&str>,
-    ) -> Result<Self, AuthError> {
+    pub fn build(from_file: Option<&Path>, env_token: Option<&str>) -> Result<Self, AuthError> {
         let mut by_hash: HashMap<[u8; 32], IdentityRef> = HashMap::new();
         let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut hash_to_name: HashMap<[u8; 32], String> = HashMap::new();
@@ -130,7 +127,11 @@ impl CredentialStore {
             legacy_admin_present = true;
         }
 
-        Ok(Self { by_hash, file_count, legacy_admin_present })
+        Ok(Self {
+            by_hash,
+            file_count,
+            legacy_admin_present,
+        })
     }
 
     /// O(1) lookup by sha256 of the raw token bytes.
@@ -153,8 +154,14 @@ impl CredentialStore {
 }
 
 fn validate_name_charset(name: &str) -> Result<(), AuthError> {
-    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-        return Err(AuthError::InvalidName { name: name.to_string() });
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(AuthError::InvalidName {
+            name: name.to_string(),
+        });
     }
     Ok(())
 }
@@ -168,16 +175,24 @@ fn compile_credential(wc: &WireCredential) -> Result<Identity, AuthError> {
         let mut actions = EnumSet::<Action>::new();
         for a in &wp.actions {
             match a.as_str() {
-                "publish" => { actions |= Action::Publish; }
-                "subscribe" => { actions |= Action::Subscribe; }
-                "admin" => { actions |= Action::Admin; }
+                "publish" => {
+                    actions |= Action::Publish;
+                }
+                "subscribe" => {
+                    actions |= Action::Subscribe;
+                }
+                "admin" => {
+                    actions |= Action::Admin;
+                }
                 // `replicate` is the cluster-replication verb
                 // (`Action::Replicate`, added in Plan G Wave 1). Follower
                 // pods dial the leader's cluster port and the leader-side
                 // server enforces this permission on Connect. A credential
                 // with `actions = ["replicate"]` is the usual way to gate
                 // replication access on a shared credentials.toml.
-                "replicate" => { actions |= Action::Replicate; }
+                "replicate" => {
+                    actions |= Action::Replicate;
+                }
                 other => {
                     return Err(AuthError::UnknownAction {
                         name: wc.name.clone(),
@@ -189,17 +204,28 @@ fn compile_credential(wc: &WireCredential) -> Result<Identity, AuthError> {
         permissions.push(Permission { streams, actions });
     }
 
-    Ok(Identity { name: wc.name.clone(), permissions })
+    Ok(Identity {
+        name: wc.name.clone(),
+        permissions,
+    })
 }
 
 fn decode_hash(raw: &str, credential_name: &str) -> Result<[u8; 32], AuthError> {
-    if raw.len() != 64 || !raw.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) {
-        return Err(AuthError::InvalidTokenHash { name: credential_name.to_string() });
+    if raw.len() != 64
+        || !raw
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
+        return Err(AuthError::InvalidTokenHash {
+            name: credential_name.to_string(),
+        });
     }
     let mut out = [0u8; 32];
     for i in 0..32 {
         let byte = u8::from_str_radix(&raw[i * 2..i * 2 + 2], 16).map_err(|_| {
-            AuthError::InvalidTokenHash { name: credential_name.to_string() }
+            AuthError::InvalidTokenHash {
+                name: credential_name.to_string(),
+            }
         })?;
         out[i] = byte;
     }
@@ -262,7 +288,10 @@ permissions = [
         let digest: [u8; 32] = sha2::Sha256::digest(b"tok-orders").into();
         let id = store.lookup(&digest).unwrap();
         assert_eq!(id.name, "orders-service");
-        assert!(id.authorize(Action::Publish, &crate::types::StreamName::try_from("orders-placed").unwrap()));
+        assert!(id.authorize(
+            Action::Publish,
+            &crate::types::StreamName::try_from("orders-placed").unwrap()
+        ));
     }
 
     #[test]
@@ -431,7 +460,9 @@ permissions = [{{ streams = "*", actions = ["replicate"] }}]
         ));
         let store = CredentialStore::build(Some(file.path()), None).unwrap();
         let digest: [u8; 32] = sha2::Sha256::digest(b"rep-token").into();
-        let id = store.lookup(&digest).expect("replicate credential resolves");
+        let id = store
+            .lookup(&digest)
+            .expect("replicate credential resolves");
         assert!(
             id.permissions
                 .iter()
@@ -452,10 +483,11 @@ token_sha256 = "{}"
             hash_of("x"),
         ));
         let store = CredentialStore::build(Some(file.path()), None).unwrap();
-        let id = store
-            .lookup(&sha2::Sha256::digest(b"x").into())
-            .unwrap();
-        assert!(!id.authorize(Action::Publish, &crate::types::StreamName::try_from("x").unwrap()));
+        let id = store.lookup(&sha2::Sha256::digest(b"x").into()).unwrap();
+        assert!(!id.authorize(
+            Action::Publish,
+            &crate::types::StreamName::try_from("x").unwrap()
+        ));
         assert!(!id.has_any_admin_permission());
     }
 }

@@ -34,8 +34,8 @@ const DEFAULT_CLUSTER_BIND: &str = "0.0.0.0:5934";
 /// Parse `EXSPEED_CLUSTER_BIND` (default `0.0.0.0:5934`). Returns `None` on
 /// parse failure so the caller can fall back rather than panicking at startup.
 fn cluster_bind_addr() -> Option<SocketAddr> {
-    let raw = std::env::var("EXSPEED_CLUSTER_BIND")
-        .unwrap_or_else(|_| DEFAULT_CLUSTER_BIND.to_string());
+    let raw =
+        std::env::var("EXSPEED_CLUSTER_BIND").unwrap_or_else(|_| DEFAULT_CLUSTER_BIND.to_string());
     match raw.parse() {
         Ok(a) => Some(a),
         Err(e) => {
@@ -203,7 +203,11 @@ pub struct ServerArgs {
     pub storage_flush_threshold_records: usize,
 
     /// Flush the appender batch early when this many bytes are queued.
-    #[arg(long, default_value_t = 1_048_576, env = "EXSPEED_FLUSH_THRESHOLD_BYTES")]
+    #[arg(
+        long,
+        default_value_t = 1_048_576,
+        env = "EXSPEED_FLUSH_THRESHOLD_BYTES"
+    )]
     pub storage_flush_threshold_bytes: usize,
 
     /// Interval in milliseconds between periodic fsyncs in async sync mode.
@@ -860,11 +864,7 @@ where
         // lose the on-disk offset every time we flapped.
         let client = {
             let cursor_path = args.data_dir.join("replication").join("cursor.json");
-            match ReplicationClient::new(
-                storage.clone(),
-                cursor_path,
-                metrics.clone(),
-            ) {
+            match ReplicationClient::new(storage.clone(), cursor_path, metrics.clone()) {
                 Ok(c) => Arc::new(c),
                 Err(e) => {
                     // Hard fail: if we can't load the follower cursor,
@@ -1005,7 +1005,10 @@ where
         // dashboards don't interpret the default (`0/0/0`) as "unknown
         // state". Also makes the posture grep-able.
         metrics.set_replication_role("standalone");
-        info!(role = "standalone", "exspeed replication: single-instance mode");
+        info!(
+            role = "standalone",
+            "exspeed replication: single-instance mode"
+        );
     }
 
     // Spawn dedup eviction task (runs every 60 seconds)

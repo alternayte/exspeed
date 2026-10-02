@@ -78,8 +78,11 @@ impl IndexScanOperator {
         // Fetch each matching record from indexed (sealed) segments
         for offset in &all_offsets {
             let batch = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(self.storage.read(&self.stream, Offset(*offset), 1))
+                tokio::runtime::Handle::current().block_on(self.storage.read(
+                    &self.stream,
+                    Offset(*offset),
+                    1,
+                ))
             });
 
             if let Ok(records) = batch {
@@ -109,7 +112,8 @@ impl IndexScanOperator {
                     let name_str = name.to_str().unwrap_or("");
                     if name_str.ends_with(".seg") {
                         if let Ok(base) = name_str.trim_end_matches(".seg").parse::<u64>() {
-                            max_sealed_offset = Some(max_sealed_offset.map_or(base, |prev: u64| prev.max(base)));
+                            max_sealed_offset =
+                                Some(max_sealed_offset.map_or(base, |prev: u64| prev.max(base)));
                         }
                     }
                 }
@@ -124,8 +128,11 @@ impl IndexScanOperator {
         let mut cursor = Offset(active_start);
         loop {
             let batch = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(self.storage.read(&self.stream, cursor, batch_size))
+                tokio::runtime::Handle::current().block_on(self.storage.read(
+                    &self.stream,
+                    cursor,
+                    batch_size,
+                ))
             });
 
             let records = match batch {

@@ -21,12 +21,8 @@ pub struct EncodedFrame {
 
 pub fn encode_event(event: &ReplicationEvent) -> Result<EncodedFrame, ReplicationError> {
     let (opcode, bytes) = match event {
-        ReplicationEvent::StreamCreated(v) => {
-            (OpCode::StreamCreatedEvent, bincode::serialize(v)?)
-        }
-        ReplicationEvent::StreamDeleted(v) => {
-            (OpCode::StreamDeletedEvent, bincode::serialize(v)?)
-        }
+        ReplicationEvent::StreamCreated(v) => (OpCode::StreamCreatedEvent, bincode::serialize(v)?),
+        ReplicationEvent::StreamDeleted(v) => (OpCode::StreamDeletedEvent, bincode::serialize(v)?),
         ReplicationEvent::RetentionUpdated(v) => {
             (OpCode::RetentionUpdatedEvent, bincode::serialize(v)?)
         }
@@ -40,21 +36,25 @@ pub fn encode_event(event: &ReplicationEvent) -> Result<EncodedFrame, Replicatio
 
 pub fn decode_event(opcode: OpCode, bytes: &[u8]) -> Result<ReplicationEvent, ReplicationError> {
     match opcode {
-        OpCode::StreamCreatedEvent => Ok(ReplicationEvent::StreamCreated(
-            bincode::deserialize::<StreamCreatedEvent>(bytes)?,
-        )),
-        OpCode::StreamDeletedEvent => Ok(ReplicationEvent::StreamDeleted(
-            bincode::deserialize::<StreamDeletedEvent>(bytes)?,
-        )),
-        OpCode::RetentionUpdatedEvent => Ok(ReplicationEvent::RetentionUpdated(
-            bincode::deserialize::<RetentionUpdatedEvent>(bytes)?,
-        )),
-        OpCode::RetentionTrimmedEvent => Ok(ReplicationEvent::RetentionTrimmed(
-            bincode::deserialize::<RetentionTrimmedEvent>(bytes)?,
-        )),
-        OpCode::RecordsAppended => Ok(ReplicationEvent::RecordsAppended(
-            bincode::deserialize::<RecordsAppended>(bytes)?,
-        )),
+        OpCode::StreamCreatedEvent => Ok(ReplicationEvent::StreamCreated(bincode::deserialize::<
+            StreamCreatedEvent,
+        >(bytes)?)),
+        OpCode::StreamDeletedEvent => Ok(ReplicationEvent::StreamDeleted(bincode::deserialize::<
+            StreamDeletedEvent,
+        >(bytes)?)),
+        OpCode::RetentionUpdatedEvent => {
+            Ok(ReplicationEvent::RetentionUpdated(bincode::deserialize::<
+                RetentionUpdatedEvent,
+            >(bytes)?))
+        }
+        OpCode::RetentionTrimmedEvent => {
+            Ok(ReplicationEvent::RetentionTrimmed(bincode::deserialize::<
+                RetentionTrimmedEvent,
+            >(bytes)?))
+        }
+        OpCode::RecordsAppended => Ok(ReplicationEvent::RecordsAppended(bincode::deserialize::<
+            RecordsAppended,
+        >(bytes)?)),
         // StreamReseed is leader→follower but not a ReplicationEvent on the leader side —
         // it's a handshake-time signal. Still allow decoding for clients / tests.
         OpCode::StreamReseedEvent => Err(ReplicationError::Protocol(

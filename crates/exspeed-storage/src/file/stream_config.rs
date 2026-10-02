@@ -20,8 +20,12 @@ pub struct StreamConfig {
     pub dedup_max_entries: u64,
 }
 
-fn default_dedup_window_secs() -> u64 { DEFAULT_DEDUP_WINDOW_SECS }
-fn default_dedup_max_entries() -> u64 { DEFAULT_DEDUP_MAX_ENTRIES }
+fn default_dedup_window_secs() -> u64 {
+    DEFAULT_DEDUP_WINDOW_SECS
+}
+fn default_dedup_max_entries() -> u64 {
+    DEFAULT_DEDUP_MAX_ENTRIES
+}
 
 impl Default for StreamConfig {
     fn default() -> Self {

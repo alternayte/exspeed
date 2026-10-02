@@ -110,11 +110,7 @@ async fn redis_endpoint_is_stored_and_preserved_across_heartbeats() {
     let b = make_backend().await;
 
     let _g = b
-        .try_acquire(
-            "endpoint-1",
-            Duration::from_secs(5),
-            Some("10.0.0.2:5934"),
-        )
+        .try_acquire("endpoint-1", Duration::from_secs(5), Some("10.0.0.2:5934"))
         .await
         .unwrap()
         .expect("first acquire wins");

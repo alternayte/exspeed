@@ -79,9 +79,13 @@ impl DedupMap {
         match self.seen.get(key) {
             Some(entry) if entry.inserted_at.elapsed() < self.window => {
                 if entry.body_hash == body_hash {
-                    DedupCheckResult::HitSameBody { offset: entry.offset }
+                    DedupCheckResult::HitSameBody {
+                        offset: entry.offset,
+                    }
                 } else {
-                    DedupCheckResult::HitDifferentBody { stored_offset: entry.offset }
+                    DedupCheckResult::HitDifferentBody {
+                        stored_offset: entry.offset,
+                    }
                 }
             }
             _ => DedupCheckResult::Miss,
@@ -191,12 +195,7 @@ impl BrokerAppend {
 
     /// Configure per-stream dedup parameters. Creates the map if not present,
     /// updates window and cap if it already exists.
-    pub async fn configure_stream(
-        &self,
-        stream: &StreamName,
-        window_secs: u64,
-        max_entries: u64,
-    ) {
+    pub async fn configure_stream(&self, stream: &StreamName, window_secs: u64, max_entries: u64) {
         let mut maps = self.dedup_maps.write().await;
         maps.entry(stream.clone())
             .and_modify(|m| {
@@ -605,42 +604,42 @@ impl BrokerAppend {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
 
-        let snapshot_covers_through_unix_ms: Option<u64> = match crate::broker_append_snapshot::read_snapshot(
-            &crate::broker_append_snapshot::snapshot_path(stream_dir),
-        ) {
-            Ok(snap) => {
-                let covers = snap.covers_through_unix_ms;
-                let mut maps = self.dedup_maps.write().await;
-                let map = maps.entry(stream.clone()).or_insert_with(|| {
-                    DedupMap::new(Duration::from_secs(window_secs), max_entries)
-                });
-                for e in snap.entries {
-                    let age_ms = now_ms.saturating_sub(e.inserted_at_unix_ms);
-                    if age_ms >= window_secs * 1000 {
-                        continue; // already expired
+        let snapshot_covers_through_unix_ms: Option<u64> =
+            match crate::broker_append_snapshot::read_snapshot(
+                &crate::broker_append_snapshot::snapshot_path(stream_dir),
+            ) {
+                Ok(snap) => {
+                    let covers = snap.covers_through_unix_ms;
+                    let mut maps = self.dedup_maps.write().await;
+                    let map = maps.entry(stream.clone()).or_insert_with(|| {
+                        DedupMap::new(Duration::from_secs(window_secs), max_entries)
+                    });
+                    for e in snap.entries {
+                        let age_ms = now_ms.saturating_sub(e.inserted_at_unix_ms);
+                        if age_ms >= window_secs * 1000 {
+                            continue; // already expired
+                        }
+                        let inserted_at = Instant::now() - Duration::from_millis(age_ms);
+                        map.seen.insert(
+                            e.msg_id,
+                            DedupEntry {
+                                offset: e.offset,
+                                inserted_at,
+                                body_hash: e.body_hash,
+                            },
+                        );
                     }
-                    let inserted_at =
-                        Instant::now() - Duration::from_millis(age_ms);
-                    map.seen.insert(
-                        e.msg_id,
-                        DedupEntry {
-                            offset: e.offset,
-                            inserted_at,
-                            body_hash: e.body_hash,
-                        },
-                    );
+                    Some(covers)
                 }
-                Some(covers)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    stream = %stream,
-                    error = %e,
-                    "dedup snapshot invalid, falling back to full log scan"
-                );
-                None
-            }
-        };
+                Err(e) => {
+                    tracing::warn!(
+                        stream = %stream,
+                        error = %e,
+                        "dedup snapshot invalid, falling back to full log scan"
+                    );
+                    None
+                }
+            };
 
         // Determine where to start scanning the log.
         let cutoff_unix_ms = snapshot_covers_through_unix_ms
@@ -664,17 +663,13 @@ impl BrokerAppend {
                 break;
             }
             for rec in &batch {
-                if let Some((_, idemp)) = rec
-                    .headers
-                    .iter()
-                    .find(|(k, _)| k == IDEMPOTENCY_HEADER)
+                if let Some((_, idemp)) = rec.headers.iter().find(|(k, _)| k == IDEMPOTENCY_HEADER)
                 {
                     let body_hash = hash_body(&rec.value);
                     let rec_ms = rec.timestamp / 1_000_000;
                     let age_ms = now_ms.saturating_sub(rec_ms);
                     let clamped_age = age_ms.min(window_secs * 1000);
-                    let inserted_at =
-                        Instant::now() - Duration::from_millis(clamped_age);
+                    let inserted_at = Instant::now() - Duration::from_millis(clamped_age);
                     let mut maps = self.dedup_maps.write().await;
                     let map = maps.entry(stream.clone()).or_insert_with(|| {
                         DedupMap::new(Duration::from_secs(window_secs), max_entries)
@@ -753,10 +748,8 @@ impl BrokerAppend {
                 for record in &records {
                     // Only index records within the dedup window.
                     if record.timestamp >= cutoff_ns {
-                        if let Some((_, v)) = record
-                            .headers
-                            .iter()
-                            .find(|(k, _)| k == IDEMPOTENCY_HEADER)
+                        if let Some((_, v)) =
+                            record.headers.iter().find(|(k, _)| k == IDEMPOTENCY_HEADER)
                         {
                             let body_hash = hash_body(&record.value);
                             map.insert(v.clone(), record.offset.0, body_hash);
@@ -859,8 +852,14 @@ mod tests {
         let ba = make_broker_append().await;
         let stream = StreamName::try_from("events").unwrap();
         let body = Bytes::from_static(b"hello");
-        let r1 = ba.append(&stream, &make_record(Some("key-A"), body.clone())).await.unwrap();
-        let r2 = ba.append(&stream, &make_record(Some("key-A"), body.clone())).await.unwrap();
+        let r1 = ba
+            .append(&stream, &make_record(Some("key-A"), body.clone()))
+            .await
+            .unwrap();
+        let r2 = ba
+            .append(&stream, &make_record(Some("key-A"), body.clone()))
+            .await
+            .unwrap();
         assert!(matches!(r1, AppendResult::Written(_, _)));
         assert!(matches!(r2, AppendResult::Duplicate(_)));
         assert_eq!(r1.offset(), r2.offset());
@@ -870,10 +869,24 @@ mod tests {
     async fn duplicate_different_body_returns_key_collision() {
         let ba = make_broker_append().await;
         let stream = StreamName::try_from("events").unwrap();
-        let r1 = ba.append(&stream, &make_record(Some("key-A"), Bytes::from_static(b"hello"))).await.unwrap();
-        let err = ba.append(&stream, &make_record(Some("key-A"), Bytes::from_static(b"world"))).await.unwrap_err();
+        let r1 = ba
+            .append(
+                &stream,
+                &make_record(Some("key-A"), Bytes::from_static(b"hello")),
+            )
+            .await
+            .unwrap();
+        let err = ba
+            .append(
+                &stream,
+                &make_record(Some("key-A"), Bytes::from_static(b"world")),
+            )
+            .await
+            .unwrap_err();
         match err {
-            StorageError::KeyCollision { stored_offset } => assert_eq!(stored_offset, r1.offset().0),
+            StorageError::KeyCollision { stored_offset } => {
+                assert_eq!(stored_offset, r1.offset().0)
+            }
             other => panic!("expected KeyCollision, got {other:?}"),
         }
     }
@@ -885,9 +898,16 @@ mod tests {
         let ba = BrokerAppend::new_with_cap(make_storage().await, 300, 2);
         let stream = StreamName::try_from("test").unwrap();
         ba.configure_stream(&stream, 300, 2).await;
-        ba.append(&stream, &make_record(Some("k1"), Bytes::from_static(b"a"))).await.unwrap();
-        ba.append(&stream, &make_record(Some("k2"), Bytes::from_static(b"b"))).await.unwrap();
-        let err = ba.append(&stream, &make_record(Some("k3"), Bytes::from_static(b"c"))).await.unwrap_err();
+        ba.append(&stream, &make_record(Some("k1"), Bytes::from_static(b"a")))
+            .await
+            .unwrap();
+        ba.append(&stream, &make_record(Some("k2"), Bytes::from_static(b"b")))
+            .await
+            .unwrap();
+        let err = ba
+            .append(&stream, &make_record(Some("k3"), Bytes::from_static(b"c")))
+            .await
+            .unwrap_err();
         assert!(matches!(err, StorageError::DedupMapFull { .. }));
     }
 
@@ -896,21 +916,36 @@ mod tests {
         let ba = BrokerAppend::new_with_cap(make_storage().await, 300, 1);
         let stream = StreamName::try_from("test").unwrap();
         ba.configure_stream(&stream, 300, 1).await;
-        ba.append(&stream, &make_record(Some("k1"), Bytes::from_static(b"a"))).await.unwrap();
-        let res = ba.append(&stream, &make_record(None, Bytes::from_static(b"b"))).await.unwrap();
+        ba.append(&stream, &make_record(Some("k1"), Bytes::from_static(b"a")))
+            .await
+            .unwrap();
+        let res = ba
+            .append(&stream, &make_record(None, Bytes::from_static(b"b")))
+            .await
+            .unwrap();
         assert!(matches!(res, AppendResult::Written(..)));
     }
 
     #[tokio::test]
     async fn per_stream_config_overrides_defaults() {
         let storage = Arc::new(MemoryStorage::new());
-        storage.create_stream(&StreamName::try_from("short").unwrap(), 0, 0).await.unwrap();
+        storage
+            .create_stream(&StreamName::try_from("short").unwrap(), 0, 0)
+            .await
+            .unwrap();
         let ba = BrokerAppend::new_with_cap(storage, 300, 500_000);
         let stream = StreamName::try_from("short").unwrap();
         ba.configure_stream(&stream, 300, 2).await;
-        ba.append(&stream, &make_record(Some("k1"), Bytes::from_static(b"a"))).await.unwrap();
-        ba.append(&stream, &make_record(Some("k2"), Bytes::from_static(b"b"))).await.unwrap();
-        let err = ba.append(&stream, &make_record(Some("k3"), Bytes::from_static(b"c"))).await.unwrap_err();
+        ba.append(&stream, &make_record(Some("k1"), Bytes::from_static(b"a")))
+            .await
+            .unwrap();
+        ba.append(&stream, &make_record(Some("k2"), Bytes::from_static(b"b")))
+            .await
+            .unwrap();
+        let err = ba
+            .append(&stream, &make_record(Some("k3"), Bytes::from_static(b"c")))
+            .await
+            .unwrap_err();
         assert!(matches!(err, StorageError::DedupMapFull { .. }));
     }
 
@@ -1039,10 +1074,18 @@ mod tests {
 
         let (r1, r2) = tokio::join!(
             tokio::spawn(async move {
-                ba1.append(&s1, &make_record(Some("race-key"), Bytes::from_static(b"body"))).await
+                ba1.append(
+                    &s1,
+                    &make_record(Some("race-key"), Bytes::from_static(b"body")),
+                )
+                .await
             }),
             tokio::spawn(async move {
-                ba2.append(&s2, &make_record(Some("race-key"), Bytes::from_static(b"body"))).await
+                ba2.append(
+                    &s2,
+                    &make_record(Some("race-key"), Bytes::from_static(b"body")),
+                )
+                .await
             }),
         );
 
@@ -1060,8 +1103,14 @@ mod tests {
                     + matches!(r2, AppendResult::Duplicate(_)) as u32,
             ),
         };
-        assert_eq!(written_count, 1, "expected exactly 1 Written; got r1={r1:?}, r2={r2:?}");
-        assert_eq!(duplicate_count, 1, "expected exactly 1 Duplicate; got r1={r1:?}, r2={r2:?}");
+        assert_eq!(
+            written_count, 1,
+            "expected exactly 1 Written; got r1={r1:?}, r2={r2:?}"
+        );
+        assert_eq!(
+            duplicate_count, 1,
+            "expected exactly 1 Duplicate; got r1={r1:?}, r2={r2:?}"
+        );
         assert_eq!(r1.offset(), r2.offset(), "offsets must agree");
     }
 

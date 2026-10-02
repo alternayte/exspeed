@@ -143,7 +143,12 @@ async fn publish_batch_returns_duplicate_for_repeat_msg_id() {
     let (mut reader, mut writer) = connect_to(&addr).await;
 
     send_recv(&mut writer, &mut reader, connect_frame(1)).await;
-    send_recv(&mut writer, &mut reader, create_stream_frame("dedup-stream", 2)).await;
+    send_recv(
+        &mut writer,
+        &mut reader,
+        create_stream_frame("dedup-stream", 2),
+    )
+    .await;
 
     // First batch: msg_id = "m-1"
     let req1 = PublishBatchRequest {
@@ -198,5 +203,8 @@ async fn publish_batch_returns_duplicate_for_repeat_msg_id() {
     let decoded = PublishBatchOkResponse::decode(resp.payload).unwrap();
     assert_eq!(decoded.results.len(), 2);
     assert!(matches!(decoded.results[0], BatchResult::Duplicate { .. }));
-    assert!(matches!(decoded.results[1], BatchResult::Written { offset: 1 }));
+    assert!(matches!(
+        decoded.results[1],
+        BatchResult::Written { offset: 1 }
+    ));
 }

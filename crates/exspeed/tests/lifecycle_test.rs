@@ -115,13 +115,13 @@ async fn sigterm_signal_token_stops_accept_loop() {
                 credentials_file: None,
                 tls_cert: None,
                 tls_key: None,
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
+                storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+                storage_flush_window_us: 500,
+                storage_flush_threshold_records: 256,
+                storage_flush_threshold_bytes: 1_048_576,
+                storage_sync_interval_ms: 10,
+                storage_sync_bytes: 4 * 1024 * 1024,
+                delivery_buffer: 8192,
             },
             async {
                 let _ = rx.await;
@@ -134,7 +134,9 @@ async fn sigterm_signal_token_stops_accept_loop() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Open a connection, send CONNECT, then trigger shutdown.
-    let stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
+    let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
     let (reader, writer) = stream.into_split();
     let mut framed_read = FramedRead::new(reader, ExspeedCodec::new());
     let mut framed_write = FramedWrite::new(writer, ExspeedCodec::new());
@@ -208,7 +210,11 @@ async fn readyz_returns_503_when_data_dir_unwritable() {
     }
 
     let bad = reqwest::get(&url).await.unwrap();
-    assert_eq!(bad.status(), 503, "should be unready when data_dir is unwritable");
+    assert_eq!(
+        bad.status(),
+        503,
+        "should be unready when data_dir is unwritable"
+    );
 
     #[cfg(unix)]
     {

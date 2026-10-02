@@ -1,12 +1,12 @@
 pub mod backend;
+pub mod dialect;
+pub mod mssql;
+pub mod mysql;
+pub mod postgres;
+pub mod schema;
+pub mod sqlite;
 pub(super) mod sqlx_backend;
 pub(super) mod tiberius_backend;
-pub mod dialect;
-pub mod postgres;
-pub mod mysql;
-pub mod mssql;
-pub mod sqlite;
-pub mod schema;
 
 use async_trait::async_trait;
 use tracing::{error, info, warn};
@@ -47,11 +47,17 @@ fn classify_backend_err(err: &BackendError) -> ErrClass {
             // PK violation: Postgres 23505, MySQL 1062, MSSQL 2627.
             "23505" | "1062" | "2627" => ErrClass::DuplicateKey,
             // NOT NULL violation.
-            "23502" => ErrClass::Poison { detail: format!("not-null violation: {message}") },
+            "23502" => ErrClass::Poison {
+                detail: format!("not-null violation: {message}"),
+            },
             // Numeric value out of range.
-            "22003" => ErrClass::Poison { detail: format!("numeric overflow: {message}") },
+            "22003" => ErrClass::Poison {
+                detail: format!("numeric overflow: {message}"),
+            },
             // Invalid text representation (e.g. bad timestamp parsed by DB).
-            "22P02" => ErrClass::Poison { detail: format!("invalid text: {message}") },
+            "22P02" => ErrClass::Poison {
+                detail: format!("invalid text: {message}"),
+            },
             // Anything else — unknown, default to transient.
             _ => ErrClass::Transient,
         },
@@ -61,9 +67,12 @@ fn classify_backend_err(err: &BackendError) -> ErrClass {
 fn step_error_from_backend(e: &BackendError) -> StepError {
     match classify_backend_err(e) {
         ErrClass::DuplicateKey => StepError::DuplicateKeyIgnored,
-        ErrClass::Poison { detail } =>
-            StepError::Poison { reason: PoisonReason::SinkRejected { detail } },
-        ErrClass::Transient => StepError::Transient { msg: format!("execute failed: {e}") },
+        ErrClass::Poison { detail } => StepError::Poison {
+            reason: PoisonReason::SinkRejected { detail },
+        },
+        ErrClass::Transient => StepError::Transient {
+            msg: format!("execute failed: {e}"),
+        },
     }
 }
 
@@ -125,13 +134,14 @@ impl JdbcSinkConnector {
             .eq_ignore_ascii_case("true");
 
         let schema_raw = config.setting_or("schema", "");
-        let schema_cols = if schema_raw.trim().is_empty() {
-            None
-        } else {
-            Some(parse_schema(&schema_raw).map_err(|e| {
-                ConnectorError::Config(format!("jdbc sink: schema DSL error: {e}"))
-            })?)
-        };
+        let schema_cols =
+            if schema_raw.trim().is_empty() {
+                None
+            } else {
+                Some(parse_schema(&schema_raw).map_err(|e| {
+                    ConnectorError::Config(format!("jdbc sink: schema DSL error: {e}"))
+                })?)
+            };
 
         if schema_cols.is_some() && mode == "upsert" && upsert_keys.is_empty() {
             return Err(ConnectorError::Config(
@@ -233,9 +243,8 @@ impl JdbcSinkConnector {
             Some(b) => Param::Text(String::from_utf8_lossy(b).into_owned()),
             None => Param::Null,
         };
-        let value_param = Param::JsonText(
-            serde_json::to_string(json).unwrap_or_else(|_| "null".to_string()),
-        );
+        let value_param =
+            Param::JsonText(serde_json::to_string(json).unwrap_or_else(|_| "null".to_string()));
 
         let params = vec![
             Param::I64(record.offset as i64),
@@ -261,14 +270,20 @@ impl JdbcSinkConnector {
 
         let obj = match json.as_object() {
             Some(o) => o,
-            None => return Err(StepError::Poison { reason: PoisonReason::NonJsonRecord }),
+            None => {
+                return Err(StepError::Poison {
+                    reason: PoisonReason::NonJsonRecord,
+                })
+            }
         };
 
         for c in cols {
             if !c.nullable && !obj.contains_key(&c.name) {
                 warn!(offset = record.offset, field = %c.name, "jdbc sink: missing required field");
                 return Err(StepError::Poison {
-                    reason: PoisonReason::MissingRequiredField { field: c.name.clone() },
+                    reason: PoisonReason::MissingRequiredField {
+                        field: c.name.clone(),
+                    },
                 });
             }
         }
@@ -288,7 +303,11 @@ impl JdbcSinkConnector {
                 Ok(p) => params.push(p),
                 Err(e) => {
                     let reason = match e {
-                        BindError::TypeMismatch { field, expected, got } => {
+                        BindError::TypeMismatch {
+                            field,
+                            expected,
+                            got,
+                        } => {
                             warn!(offset = record.offset, %field, %expected, %got,
                                   "jdbc sink: type mismatch");
                             PoisonReason::TypeMismatch {
@@ -462,7 +481,10 @@ mod classify_tests {
     use super::*;
 
     fn sql(code: &str) -> BackendError {
-        BackendError::Sql { sqlstate: code.into(), message: "msg".into() }
+        BackendError::Sql {
+            sqlstate: code.into(),
+            message: "msg".into(),
+        }
     }
 
     #[test]
@@ -479,15 +501,24 @@ mod classify_tests {
     }
     #[test]
     fn not_null_is_poison() {
-        assert!(matches!(classify_backend_err(&sql("23502")), ErrClass::Poison { .. }));
+        assert!(matches!(
+            classify_backend_err(&sql("23502")),
+            ErrClass::Poison { .. }
+        ));
     }
     #[test]
     fn numeric_overflow_is_poison() {
-        assert!(matches!(classify_backend_err(&sql("22003")), ErrClass::Poison { .. }));
+        assert!(matches!(
+            classify_backend_err(&sql("22003")),
+            ErrClass::Poison { .. }
+        ));
     }
     #[test]
     fn invalid_text_is_poison() {
-        assert!(matches!(classify_backend_err(&sql("22P02")), ErrClass::Poison { .. }));
+        assert!(matches!(
+            classify_backend_err(&sql("22P02")),
+            ErrClass::Poison { .. }
+        ));
     }
     #[test]
     fn unknown_code_is_transient() {

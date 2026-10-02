@@ -7,8 +7,9 @@ use exspeed_streams::StorageEngine;
 const MAX_RESULT_ROWS: usize = 10_000;
 
 /// Boxed future returned by the recursive `build_operator` helper.
-type BuildOperatorFuture<'a> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn Operator>, ExqlError>> + Send + 'a>>;
+type BuildOperatorFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Box<dyn Operator>, ExqlError>> + Send + 'a>,
+>;
 
 use crate::error::ExqlError;
 use crate::external::connections::ConnectionRegistry;
@@ -118,175 +119,215 @@ fn build_operator<'a>(
     indexes: &'a [IndexDef],
 ) -> BuildOperatorFuture<'a> {
     Box::pin(async move {
-    match plan {
-        PhysicalPlan::SeqScan { stream, alias, required_columns, predicate, reverse_limit, timestamp_lower_bound, key_eq_filter } => {
-            // Check materialized views first
-            if let Some(mv_reg) = mv_registry {
-                if let Some((_columns, rows)) = mv_reg.get_rows(stream) {
-                    let scan: Box<dyn Operator> = Box::new(ScanOperator::from_rows(rows));
-                    // If predicate was pushed down, re-apply as a FilterOperator
-                    // since MV rows bypass storage-level filtering.
-                    if let Some(pred) = predicate {
-                        return Ok(Box::new(FilterOperator::new(scan, pred.clone())) as Box<dyn Operator>);
+        match plan {
+            PhysicalPlan::SeqScan {
+                stream,
+                alias,
+                required_columns,
+                predicate,
+                reverse_limit,
+                timestamp_lower_bound,
+                key_eq_filter,
+            } => {
+                // Check materialized views first
+                if let Some(mv_reg) = mv_registry {
+                    if let Some((_columns, rows)) = mv_reg.get_rows(stream) {
+                        let scan: Box<dyn Operator> = Box::new(ScanOperator::from_rows(rows));
+                        // If predicate was pushed down, re-apply as a FilterOperator
+                        // since MV rows bypass storage-level filtering.
+                        if let Some(pred) = predicate {
+                            return Ok(Box::new(FilterOperator::new(scan, pred.clone()))
+                                as Box<dyn Operator>);
+                        }
+                        return Ok(scan);
                     }
-                    return Ok(scan);
                 }
-            }
 
-            let stream_name = StreamName::try_from(stream.as_str()).map_err(|e| {
-                ExqlError::Storage(format!("invalid stream name '{}': {}", stream, e))
-            })?;
+                let stream_name = StreamName::try_from(stream.as_str()).map_err(|e| {
+                    ExqlError::Storage(format!("invalid stream name '{}': {}", stream, e))
+                })?;
 
-            // Check if an index can serve this query (only for forward scans
-            // without reverse_limit or timestamp bounds).
-            if reverse_limit.is_none() && timestamp_lower_bound.is_none() {
-                if let Some(ref pred) = predicate {
-                    if let Some((idx_name, _field, lookup_val)) =
-                        find_indexed_payload_eq(pred, indexes, stream)
-                    {
-                        if let Some(partition_dir) = storage.partition_dir_path(stream, 0) {
-                            return Ok(Box::new(IndexScanOperator::new(
-                                storage.clone(),
-                                stream_name,
-                                alias.clone(),
-                                required_columns.clone(),
-                                partition_dir,
-                                idx_name,
-                                lookup_val,
-                                predicate.clone(),
-                            )) as Box<dyn Operator>);
+                // Check if an index can serve this query (only for forward scans
+                // without reverse_limit or timestamp bounds).
+                if reverse_limit.is_none() && timestamp_lower_bound.is_none() {
+                    if let Some(ref pred) = predicate {
+                        if let Some((idx_name, _field, lookup_val)) =
+                            find_indexed_payload_eq(pred, indexes, stream)
+                        {
+                            if let Some(partition_dir) = storage.partition_dir_path(stream, 0) {
+                                return Ok(Box::new(IndexScanOperator::new(
+                                    storage.clone(),
+                                    stream_name,
+                                    alias.clone(),
+                                    required_columns.clone(),
+                                    partition_dir,
+                                    idx_name,
+                                    lookup_val,
+                                    predicate.clone(),
+                                )) as Box<dyn Operator>);
+                            }
                         }
                     }
                 }
+
+                if let Some(limit) = reverse_limit {
+                    Ok(Box::new(ScanOperator::reverse_tail(
+                        storage.clone(),
+                        stream_name,
+                        alias.clone(),
+                        required_columns.clone(),
+                        predicate.clone(),
+                        *limit,
+                    )) as Box<dyn Operator>)
+                } else {
+                    let start = if let Some(ts_bound) = timestamp_lower_bound {
+                        storage
+                            .seek_by_time(&stream_name, *ts_bound)
+                            .await
+                            .unwrap_or(Offset(0))
+                    } else {
+                        Offset(0)
+                    };
+                    Ok(Box::new(ScanOperator::streaming_from(
+                        storage.clone(),
+                        stream_name,
+                        alias.clone(),
+                        required_columns.clone(),
+                        predicate.clone(),
+                        start,
+                        key_eq_filter.clone(),
+                    )) as Box<dyn Operator>)
+                }
             }
 
-            if let Some(limit) = reverse_limit {
-                Ok(Box::new(ScanOperator::reverse_tail(
-                    storage.clone(), stream_name, alias.clone(),
-                    required_columns.clone(), predicate.clone(), *limit,
+            PhysicalPlan::ExternalScan {
+                connection,
+                table,
+                alias: _,
+                driver,
+            } => {
+                // Resolve the driver and URL for this external scan.
+                let (resolved_driver, url) =
+                    resolve_external_connection(connection, driver.as_deref(), connections)?;
+
+                // Run the async query synchronously. We use block_in_place so the
+                // tokio runtime can still make progress on other tasks while we wait.
+                let rows = run_external_query(&resolved_driver, &url, table)?;
+                Ok(Box::new(ScanOperator::new(rows)) as Box<dyn Operator>)
+            }
+
+            PhysicalPlan::Filter { input, predicate } => {
+                let child =
+                    build_operator(input, storage, connections, mv_registry, indexes).await?;
+                Ok(Box::new(FilterOperator::new(child, predicate.clone())) as Box<dyn Operator>)
+            }
+
+            PhysicalPlan::Project { input, items } => {
+                let child =
+                    build_operator(input, storage, connections, mv_registry, indexes).await?;
+                Ok(Box::new(ProjectOperator::new(child, items.clone())) as Box<dyn Operator>)
+            }
+
+            PhysicalPlan::HashJoin {
+                left,
+                right,
+                on,
+                join_type,
+            } => {
+                let left_op =
+                    build_operator(left, storage, connections, mv_registry, indexes).await?;
+                let right_op =
+                    build_operator(right, storage, connections, mv_registry, indexes).await?;
+                Ok(Box::new(HashJoinOperator::new(
+                    left_op,
+                    right_op,
+                    join_type.clone(),
+                    on.clone(),
                 )) as Box<dyn Operator>)
-            } else {
-                let start = if let Some(ts_bound) = timestamp_lower_bound {
-                    storage.seek_by_time(&stream_name, *ts_bound).await.unwrap_or(Offset(0))
-                } else {
-                    Offset(0)
-                };
-                Ok(Box::new(ScanOperator::streaming_from(
+            }
+
+            PhysicalPlan::HashAggregate {
+                input,
+                group_by,
+                select_items,
+            } => {
+                let child =
+                    build_operator(input, storage, connections, mv_registry, indexes).await?;
+                Ok(Box::new(AggregateOperator::new(
+                    child,
+                    group_by.clone(),
+                    select_items.clone(),
+                )) as Box<dyn Operator>)
+            }
+
+            PhysicalPlan::Sort { input, order_by } => {
+                let child =
+                    build_operator(input, storage, connections, mv_registry, indexes).await?;
+                Ok(Box::new(SortOperator::new(child, order_by.clone())) as Box<dyn Operator>)
+            }
+
+            PhysicalPlan::Limit {
+                input,
+                limit,
+                offset,
+            } => {
+                let child =
+                    build_operator(input, storage, connections, mv_registry, indexes).await?;
+                Ok(
+                    Box::new(LimitOperator::new(child, *limit, offset.unwrap_or(0)))
+                        as Box<dyn Operator>,
+                )
+            }
+
+            PhysicalPlan::TopN {
+                input,
+                order_by,
+                limit,
+            } => {
+                let child =
+                    build_operator(input, storage, connections, mv_registry, indexes).await?;
+                Ok(Box::new(crate::runtime::operators::topn::TopNOperator::new(
+                    child,
+                    order_by.clone(),
+                    *limit,
+                )) as Box<dyn Operator>)
+            }
+
+            PhysicalPlan::WindowedAggregate { .. } => Err(ExqlError::Execution(
+                "WindowedAggregate is not supported in bounded execution".into(),
+            )),
+
+            PhysicalPlan::StreamStreamJoin { .. } => Err(ExqlError::Execution(
+                "StreamStreamJoin is not supported in bounded execution".into(),
+            )),
+
+            PhysicalPlan::IndexScan {
+                stream,
+                alias,
+                required_columns,
+                index_name,
+                field_path: _,
+                lookup_value,
+                predicate,
+            } => {
+                let stream_name = StreamName::try_from(stream.as_str()).map_err(|e| {
+                    ExqlError::Storage(format!("invalid stream name '{}': {}", stream, e))
+                })?;
+                let partition_dir = storage
+                    .partition_dir_path(stream, 0)
+                    .ok_or_else(|| ExqlError::Storage("no partition directory available".into()))?;
+                Ok(Box::new(IndexScanOperator::new(
                     storage.clone(),
                     stream_name,
                     alias.clone(),
                     required_columns.clone(),
+                    partition_dir,
+                    index_name.clone(),
+                    lookup_value.clone(),
                     predicate.clone(),
-                    start,
-                    key_eq_filter.clone(),
                 )) as Box<dyn Operator>)
             }
         }
-
-        PhysicalPlan::ExternalScan {
-            connection,
-            table,
-            alias: _,
-            driver,
-        } => {
-            // Resolve the driver and URL for this external scan.
-            let (resolved_driver, url) =
-                resolve_external_connection(connection, driver.as_deref(), connections)?;
-
-            // Run the async query synchronously. We use block_in_place so the
-            // tokio runtime can still make progress on other tasks while we wait.
-            let rows = run_external_query(&resolved_driver, &url, table)?;
-            Ok(Box::new(ScanOperator::new(rows)) as Box<dyn Operator>)
-        }
-
-        PhysicalPlan::Filter { input, predicate } => {
-            let child = build_operator(input, storage, connections, mv_registry, indexes).await?;
-            Ok(Box::new(FilterOperator::new(child, predicate.clone())) as Box<dyn Operator>)
-        }
-
-        PhysicalPlan::Project { input, items } => {
-            let child = build_operator(input, storage, connections, mv_registry, indexes).await?;
-            Ok(Box::new(ProjectOperator::new(child, items.clone())) as Box<dyn Operator>)
-        }
-
-        PhysicalPlan::HashJoin {
-            left,
-            right,
-            on,
-            join_type,
-        } => {
-            let left_op = build_operator(left, storage, connections, mv_registry, indexes).await?;
-            let right_op = build_operator(right, storage, connections, mv_registry, indexes).await?;
-            Ok(Box::new(HashJoinOperator::new(
-                left_op,
-                right_op,
-                join_type.clone(),
-                on.clone(),
-            )) as Box<dyn Operator>)
-        }
-
-        PhysicalPlan::HashAggregate {
-            input,
-            group_by,
-            select_items,
-        } => {
-            let child = build_operator(input, storage, connections, mv_registry, indexes).await?;
-            Ok(Box::new(AggregateOperator::new(
-                child,
-                group_by.clone(),
-                select_items.clone(),
-            )) as Box<dyn Operator>)
-        }
-
-        PhysicalPlan::Sort { input, order_by } => {
-            let child = build_operator(input, storage, connections, mv_registry, indexes).await?;
-            Ok(Box::new(SortOperator::new(child, order_by.clone())) as Box<dyn Operator>)
-        }
-
-        PhysicalPlan::Limit {
-            input,
-            limit,
-            offset,
-        } => {
-            let child = build_operator(input, storage, connections, mv_registry, indexes).await?;
-            Ok(Box::new(LimitOperator::new(
-                child,
-                *limit,
-                offset.unwrap_or(0),
-            )) as Box<dyn Operator>)
-        }
-
-        PhysicalPlan::TopN { input, order_by, limit } => {
-            let child = build_operator(input, storage, connections, mv_registry, indexes).await?;
-            Ok(Box::new(crate::runtime::operators::topn::TopNOperator::new(child, order_by.clone(), *limit)) as Box<dyn Operator>)
-        }
-
-        PhysicalPlan::WindowedAggregate { .. } => Err(ExqlError::Execution(
-            "WindowedAggregate is not supported in bounded execution".into(),
-        )),
-
-        PhysicalPlan::StreamStreamJoin { .. } => Err(ExqlError::Execution(
-            "StreamStreamJoin is not supported in bounded execution".into(),
-        )),
-
-        PhysicalPlan::IndexScan { stream, alias, required_columns, index_name, field_path: _, lookup_value, predicate } => {
-            let stream_name = StreamName::try_from(stream.as_str()).map_err(|e| {
-                ExqlError::Storage(format!("invalid stream name '{}': {}", stream, e))
-            })?;
-            let partition_dir = storage.partition_dir_path(stream, 0)
-                .ok_or_else(|| ExqlError::Storage("no partition directory available".into()))?;
-            Ok(Box::new(IndexScanOperator::new(
-                storage.clone(),
-                stream_name,
-                alias.clone(),
-                required_columns.clone(),
-                partition_dir,
-                index_name.clone(),
-                lookup_value.clone(),
-                predicate.clone(),
-            )) as Box<dyn Operator>)
-        }
-    }
     })
 }
 
@@ -439,8 +480,8 @@ async fn dispatch_external_query(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use crate::types::Value;
+    use bytes::Bytes;
     use exspeed_storage::memory::MemoryStorage;
     use exspeed_streams::Record;
 
@@ -476,14 +517,18 @@ mod tests {
     #[tokio::test]
     async fn select_star() {
         let storage = setup_test_data().await;
-        let result = execute_bounded("SELECT * FROM \"orders\"", &storage).await.unwrap();
+        let result = execute_bounded("SELECT * FROM \"orders\"", &storage)
+            .await
+            .unwrap();
         assert_eq!(result.rows.len(), 5);
     }
 
     #[tokio::test]
     async fn select_with_limit() {
         let storage = setup_test_data().await;
-        let result = execute_bounded("SELECT * FROM \"orders\" LIMIT 2", &storage).await.unwrap();
+        let result = execute_bounded("SELECT * FROM \"orders\" LIMIT 2", &storage)
+            .await
+            .unwrap();
         assert_eq!(result.rows.len(), 2);
     }
 
@@ -515,7 +560,9 @@ mod tests {
     #[tokio::test]
     async fn select_with_aggregate() {
         let storage = setup_test_data().await;
-        let result = execute_bounded("SELECT COUNT(*) AS cnt FROM \"orders\"", &storage).await.unwrap();
+        let result = execute_bounded("SELECT COUNT(*) AS cnt FROM \"orders\"", &storage)
+            .await
+            .unwrap();
         assert_eq!(result.rows.len(), 1);
         // count should be 5
         assert_eq!(result.rows[0].get("cnt"), Some(&Value::Int(5)));
@@ -723,12 +770,20 @@ mod tests {
         let result = execute_bounded(
             r#"SELECT offset FROM "orders" ORDER BY offset DESC LIMIT 3"#,
             &storage,
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         assert_eq!(result.rows.len(), 3);
-        let offsets: Vec<i64> = result.rows.iter()
+        let offsets: Vec<i64> = result
+            .rows
+            .iter()
             .filter_map(|r| r.get("offset").and_then(|v| v.to_i64()))
             .collect();
-        assert_eq!(offsets, vec![4, 3, 2], "should return last 3 offsets in DESC order");
+        assert_eq!(
+            offsets,
+            vec![4, 3, 2],
+            "should return last 3 offsets in DESC order"
+        );
     }
 
     #[tokio::test]
@@ -737,9 +792,13 @@ mod tests {
         let result = execute_bounded(
             r#"SELECT offset FROM "orders" ORDER BY offset ASC LIMIT 3"#,
             &storage,
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         assert_eq!(result.rows.len(), 3);
-        let offsets: Vec<i64> = result.rows.iter()
+        let offsets: Vec<i64> = result
+            .rows
+            .iter()
             .filter_map(|r| r.get("offset").and_then(|v| v.to_i64()))
             .collect();
         assert_eq!(offsets, vec![0, 1, 2]);

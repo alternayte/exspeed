@@ -199,9 +199,9 @@ impl ServerMessage {
                 };
                 Ok(ServerMessage::PublishOk { offset, duplicate })
             }
-            OpCode::ConnectOk => {
-                Ok(ServerMessage::ConnectOk(ConnectResponse::decode(frame.payload)?))
-            }
+            OpCode::ConnectOk => Ok(ServerMessage::ConnectOk(ConnectResponse::decode(
+                frame.payload,
+            )?)),
             OpCode::Error => {
                 let mut src = frame.payload;
                 if src.remaining() < 4 {
@@ -657,9 +657,8 @@ mod tests {
 
     #[test]
     fn query_result_to_frame_and_back() {
-        let json_payload = Bytes::from(
-            r#"{"columns":["id"],"rows":[[1]],"row_count":1,"execution_time_ms":5}"#,
-        );
+        let json_payload =
+            Bytes::from(r#"{"columns":["id"],"rows":[[1]],"row_count":1,"execution_time_ms":5}"#);
         let frame = ServerMessage::QueryResult(json_payload.clone()).into_frame(200);
         assert_eq!(frame.opcode, OpCode::QueryResult);
         assert_eq!(frame.correlation_id, 200);

@@ -292,7 +292,9 @@ impl ReplicationClient {
             return SessionOutcome::Clean;
         }
 
-        if let Err(e) = send_replicate_resume(&mut framed_write, self.follower_id, &self.cursor).await {
+        if let Err(e) =
+            send_replicate_resume(&mut framed_write, self.follower_id, &self.cursor).await
+        {
             return SessionOutcome::ErrBeforeManifest(e);
         }
 
@@ -330,10 +332,7 @@ impl ReplicationClient {
     ///     (divergent history after failover).
     ///   * if follower has no local stream → create it with the manifest's
     ///     retention config so the follower mirrors leader's config.
-    async fn reconcile_manifest(
-        &self,
-        manifest: &ClusterManifest,
-    ) -> Result<(), ReplicationError> {
+    async fn reconcile_manifest(&self, manifest: &ClusterManifest) -> Result<(), ReplicationError> {
         let mut cursor = self.cursor.lock().await;
         let mut mutated = false;
 
@@ -494,10 +493,9 @@ impl ReplicationClient {
                 self.apply_records_appended(batch).await
             }
             other => {
-                self.metrics.replication_apply_errors_total.add(
-                    1,
-                    &[KeyValue::new("reason", "unknown_opcode")],
-                );
+                self.metrics
+                    .replication_apply_errors_total
+                    .add(1, &[KeyValue::new("reason", "unknown_opcode")]);
                 Err(ReplicationError::Protocol(format!(
                     "unexpected opcode in apply loop: {other:?}"
                 )))
@@ -505,12 +503,10 @@ impl ReplicationClient {
         }
     }
 
-    async fn apply_stream_created(
-        &self,
-        ev: StreamCreatedEvent,
-    ) -> Result<(), ReplicationError> {
-        let name = StreamName::try_from(ev.name.as_str())
-            .map_err(|e| ReplicationError::Protocol(format!("invalid stream name {}: {e}", ev.name)))?;
+    async fn apply_stream_created(&self, ev: StreamCreatedEvent) -> Result<(), ReplicationError> {
+        let name = StreamName::try_from(ev.name.as_str()).map_err(|e| {
+            ReplicationError::Protocol(format!("invalid stream name {}: {e}", ev.name))
+        })?;
         match self
             .storage
             .create_stream(&name, ev.max_age_secs, ev.max_bytes)
@@ -529,12 +525,10 @@ impl ReplicationClient {
         }
     }
 
-    async fn apply_stream_deleted(
-        &self,
-        ev: StreamDeletedEvent,
-    ) -> Result<(), ReplicationError> {
-        let name = StreamName::try_from(ev.name.as_str())
-            .map_err(|e| ReplicationError::Protocol(format!("invalid stream name {}: {e}", ev.name)))?;
+    async fn apply_stream_deleted(&self, ev: StreamDeletedEvent) -> Result<(), ReplicationError> {
+        let name = StreamName::try_from(ev.name.as_str()).map_err(|e| {
+            ReplicationError::Protocol(format!("invalid stream name {}: {e}", ev.name))
+        })?;
         self.storage.delete_stream(&name).await?;
         let mut cursor = self.cursor.lock().await;
         cursor.remove(&ev.name);
@@ -547,8 +541,9 @@ impl ReplicationClient {
         &self,
         ev: RetentionTrimmedEvent,
     ) -> Result<(), ReplicationError> {
-        let name = StreamName::try_from(ev.stream.as_str())
-            .map_err(|e| ReplicationError::Protocol(format!("invalid stream name {}: {e}", ev.stream)))?;
+        let name = StreamName::try_from(ev.stream.as_str()).map_err(|e| {
+            ReplicationError::Protocol(format!("invalid stream name {}: {e}", ev.stream))
+        })?;
         self.storage
             .trim_up_to(&name, Offset(ev.new_earliest_offset))
             .await?;
@@ -572,12 +567,10 @@ impl ReplicationClient {
         Ok(())
     }
 
-    async fn apply_stream_reseed(
-        &self,
-        ev: StreamReseedEvent,
-    ) -> Result<(), ReplicationError> {
-        let name = StreamName::try_from(ev.stream.as_str())
-            .map_err(|e| ReplicationError::Protocol(format!("invalid stream name {}: {e}", ev.stream)))?;
+    async fn apply_stream_reseed(&self, ev: StreamReseedEvent) -> Result<(), ReplicationError> {
+        let name = StreamName::try_from(ev.stream.as_str()).map_err(|e| {
+            ReplicationError::Protocol(format!("invalid stream name {}: {e}", ev.stream))
+        })?;
         // Drop + recreate empty. Retention goes to 0/0 here because the
         // manifest already seeded retention on the pre-create; a subsequent
         // `RetentionUpdatedEvent` (Wave 6) would correct any drift.
@@ -596,12 +589,10 @@ impl ReplicationClient {
         Ok(())
     }
 
-    async fn apply_records_appended(
-        &self,
-        batch: RecordsAppended,
-    ) -> Result<(), ReplicationError> {
-        let name = StreamName::try_from(batch.stream.as_str())
-            .map_err(|e| ReplicationError::Protocol(format!("invalid stream name {}: {e}", batch.stream)))?;
+    async fn apply_records_appended(&self, batch: RecordsAppended) -> Result<(), ReplicationError> {
+        let name = StreamName::try_from(batch.stream.as_str()).map_err(|e| {
+            ReplicationError::Protocol(format!("invalid stream name {}: {e}", batch.stream))
+        })?;
 
         let batch_len = batch.records.len();
         if batch_len == 0 {
@@ -671,7 +662,8 @@ impl ReplicationClient {
             let (assigned, _ts) = self.storage.append(&name, &record).await?;
             // Counter per applied record. Label cardinality is bounded
             // by stream count (same precedent as `truncated_records_total`).
-            self.metrics.inc_replication_records_applied(&batch.stream, 1);
+            self.metrics
+                .inc_replication_records_applied(&batch.stream, 1);
             last_rec_ts_ms = rec_ts_ms;
 
             let expected = base + i as u64;
@@ -685,10 +677,9 @@ impl ReplicationClient {
                     assigned = assigned.0,
                     "replicated record offset mismatch — tearing down session"
                 );
-                self.metrics.replication_apply_errors_total.add(
-                    1,
-                    &[KeyValue::new("reason", "offset_mismatch")],
-                );
+                self.metrics
+                    .replication_apply_errors_total
+                    .add(1, &[KeyValue::new("reason", "offset_mismatch")]);
                 return Err(ReplicationError::Protocol(format!(
                     "offset mismatch on stream {}: expected {expected}, got {}",
                     batch.stream, assigned.0
@@ -729,8 +720,7 @@ impl ReplicationClient {
             let bumped = std::cmp::max(current, new_next);
             tails.insert(batch.stream.clone(), bumped);
             let lag = bumped.saturating_sub(new_next) as i64;
-            self.metrics
-                .set_replication_lag_records(&batch.stream, lag);
+            self.metrics.set_replication_lag_records(&batch.stream, lag);
         }
 
         debug!(
@@ -899,4 +889,3 @@ fn next_backoff(current: Duration) -> Duration {
         doubled
     }
 }
-

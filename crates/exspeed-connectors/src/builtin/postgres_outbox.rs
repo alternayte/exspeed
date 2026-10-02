@@ -51,7 +51,13 @@ pub struct PostgresOutboxSource {
 /// Sanitize connector name to valid Postgres identifier chars (alphanumeric + underscore).
 pub fn sanitize_pg_name(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -76,26 +82,16 @@ fn parse_connection_string(
         })
         .unwrap_or_else(|| "127.0.0.1".to_string());
 
-    let port = pg_config
-        .get_ports()
-        .first()
-        .copied()
-        .unwrap_or(5432);
+    let port = pg_config.get_ports().first().copied().unwrap_or(5432);
 
-    let user = pg_config
-        .get_user()
-        .unwrap_or("postgres")
-        .to_string();
+    let user = pg_config.get_user().unwrap_or("postgres").to_string();
 
     let password = pg_config
         .get_password()
         .map(|p| String::from_utf8_lossy(p).into_owned())
         .unwrap_or_default();
 
-    let database = pg_config
-        .get_dbname()
-        .unwrap_or("postgres")
-        .to_string();
+    let database = pg_config.get_dbname().unwrap_or("postgres").to_string();
 
     Ok((host, port, user, password, database))
 }
@@ -122,9 +118,7 @@ fn extract_outbox_record(
     let id = col_map
         .get(cols.id)
         .and_then(|v| v.clone())
-        .ok_or_else(|| {
-            ConnectorError::Data(format!("CDC insert missing '{}' column", cols.id))
-        })?;
+        .ok_or_else(|| ConnectorError::Data(format!("CDC insert missing '{}' column", cols.id)))?;
 
     let agg_type = col_map
         .get(cols.aggregate_type)
@@ -259,9 +253,8 @@ impl PostgresOutboxSource {
 
         // 3. Parse the last_position as an LSN to resume from
         let start_lsn = match &last_position {
-            Some(pos) => Lsn::parse(pos).map_err(|e| {
-                ConnectorError::Data(format!("invalid LSN position '{pos}': {e}"))
-            })?,
+            Some(pos) => Lsn::parse(pos)
+                .map_err(|e| ConnectorError::Data(format!("invalid LSN position '{pos}': {e}")))?,
             None => Lsn::ZERO,
         };
 
@@ -324,33 +317,29 @@ impl PostgresOutboxSource {
             }
 
             // Use a timeout to avoid blocking forever when no events are available
-            let event = match tokio::time::timeout(
-                std::time::Duration::from_secs(1),
-                repl_client.recv(),
-            )
-            .await
-            {
-                Ok(Ok(Some(ev))) => ev,
-                Ok(Ok(None)) => {
-                    // Stream ended
-                    debug!("CDC replication stream ended");
-                    break;
-                }
-                Ok(Err(e)) => {
-                    return Err(ConnectorError::Connection(format!(
-                        "replication error: {e}"
-                    )));
-                }
-                Err(_) => {
-                    // Timeout — return what we have so far
-                    break;
-                }
-            };
+            let event =
+                match tokio::time::timeout(std::time::Duration::from_secs(1), repl_client.recv())
+                    .await
+                {
+                    Ok(Ok(Some(ev))) => ev,
+                    Ok(Ok(None)) => {
+                        // Stream ended
+                        debug!("CDC replication stream ended");
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        return Err(ConnectorError::Connection(format!(
+                            "replication error: {e}"
+                        )));
+                    }
+                    Err(_) => {
+                        // Timeout — return what we have so far
+                        break;
+                    }
+                };
 
             match event {
-                ReplicationEvent::XLogData {
-                    data, wal_end, ..
-                } => {
+                ReplicationEvent::XLogData { data, wal_end, .. } => {
                     // Parse the pgoutput message using our existing parser
                     let wal_event = match pgoutput::parse_pgoutput_message(&data) {
                         Ok(ev) => ev,
@@ -405,8 +394,7 @@ impl PostgresOutboxSource {
                             // Report progress for this WAL position
                             repl_client.update_applied_lsn(wal_end);
                         }
-                        pgoutput::WalEvent::Update { .. }
-                        | pgoutput::WalEvent::Delete { .. } => {
+                        pgoutput::WalEvent::Update { .. } | pgoutput::WalEvent::Delete { .. } => {
                             // Outbox pattern only cares about inserts — skip
                             debug!("skipping non-insert WAL event in outbox CDC");
                         }
@@ -424,9 +412,7 @@ impl PostgresOutboxSource {
                         }
                     }
                 }
-                ReplicationEvent::Commit {
-                    end_lsn, ..
-                } => {
+                ReplicationEvent::Commit { end_lsn, .. } => {
                     // High-level commit event from pgwire-replication
                     commit_lsn = Some(end_lsn);
                     repl_client.update_applied_lsn(end_lsn);
@@ -492,8 +478,11 @@ impl PostgresOutboxSource {
                 placeholders.join(", ")
             );
 
-            let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-                self.pending_ids.iter().map(|id| id as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+            let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = self
+                .pending_ids
+                .iter()
+                .map(|id| id as &(dyn tokio_postgres::types::ToSql + Sync))
+                .collect();
 
             if let Err(e) = client.execute(&delete_sql, &params).await {
                 warn!(
@@ -579,8 +568,10 @@ impl PostgresOutboxSource {
                 ),
             };
 
-        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| &**p as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| &**p as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
         let rows = client
             .query(&query, &params_ref)

@@ -145,11 +145,7 @@ impl WorkCoordinator for PostgresWorkCoordinator {
             .collect())
     }
 
-    async fn enqueue(
-        &self,
-        group: &str,
-        offsets: &[u64],
-    ) -> Result<(), WorkCoordinatorError> {
+    async fn enqueue(&self, group: &str, offsets: &[u64]) -> Result<(), WorkCoordinatorError> {
         if offsets.is_empty() {
             return Ok(());
         }

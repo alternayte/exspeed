@@ -9,9 +9,15 @@ impl Dialect for PostgresDialect {
     fn placeholder(&self, n: usize) -> String {
         format!("${}", n)
     }
-    fn json_blob_type(&self) -> &'static str { "JSONB" }
-    fn timestamptz_type(&self) -> &'static str { "TIMESTAMPTZ" }
-    fn double_type(&self) -> &'static str { "DOUBLE PRECISION" }
+    fn json_blob_type(&self) -> &'static str {
+        "JSONB"
+    }
+    fn timestamptz_type(&self) -> &'static str {
+        "TIMESTAMPTZ"
+    }
+    fn double_type(&self) -> &'static str {
+        "DOUBLE PRECISION"
+    }
 
     fn create_table_blob_sql(&self, table: &str) -> String {
         let t = self.quote_ident(table);
@@ -26,12 +32,7 @@ impl Dialect for PostgresDialect {
         )
     }
 
-    fn create_table_typed_sql(
-        &self,
-        table: &str,
-        cols: &[ColumnSpec],
-        pk_cols: &[&str],
-    ) -> String {
+    fn create_table_typed_sql(&self, table: &str, cols: &[ColumnSpec], pk_cols: &[&str]) -> String {
         use crate::builtin::jdbc::dialect::JsonType;
         let t = self.quote_ident(table);
         let col_lines: Vec<String> = cols
@@ -46,7 +47,12 @@ impl Dialect for PostgresDialect {
                     JsonType::Jsonb => self.json_blob_type(),
                 };
                 let nullability = if c.nullable { "" } else { " NOT NULL" };
-                format!("    {} {}{}", self.quote_ident(&c.name), sql_type, nullability)
+                format!(
+                    "    {} {}{}",
+                    self.quote_ident(&c.name),
+                    sql_type,
+                    nullability
+                )
             })
             .collect();
         let mut body = col_lines.join(",\n");
@@ -97,7 +103,11 @@ mod tests {
     use crate::builtin::jdbc::dialect::JsonType;
 
     fn spec(name: &str, t: JsonType, nullable: bool) -> ColumnSpec {
-        ColumnSpec { name: name.to_string(), json_type: t, nullable }
+        ColumnSpec {
+            name: name.to_string(),
+            json_type: t,
+            nullable,
+        }
     }
 
     #[test]
@@ -151,8 +161,10 @@ mod tests {
         ), "sql was: {sql}");
         assert!(sql.contains("\"email\" = EXCLUDED.\"email\""));
         assert!(sql.contains("\"price\" = EXCLUDED.\"price\""));
-        assert!(!sql.contains("\"id\" = EXCLUDED.\"id\""),
-            "PK column must not appear in DO UPDATE SET");
+        assert!(
+            !sql.contains("\"id\" = EXCLUDED.\"id\""),
+            "PK column must not appear in DO UPDATE SET"
+        );
     }
 
     #[test]

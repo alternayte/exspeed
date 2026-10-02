@@ -31,13 +31,13 @@ async fn start_server() -> (String, String) {
         credentials_file: None,
         tls_cert: None,
         tls_key: None,
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
+        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+        storage_flush_window_us: 500,
+        storage_flush_threshold_records: 256,
+        storage_flush_threshold_bytes: 1_048_576,
+        storage_sync_interval_ms: 10,
+        storage_sync_bytes: 4 * 1024 * 1024,
+        delivery_buffer: 8192,
     };
 
     tokio::spawn(async move {
@@ -118,7 +118,11 @@ async fn setup_stream(stream_name: &str, records: &[(&str, &str)], tcp_addr: &st
     // Publish records via TCP
     let (mut reader, mut writer) = connect_to(tcp_addr).await;
     let resp = send_recv(&mut writer, &mut reader, connect_frame(1)).await;
-    assert_eq!(resp.opcode, OpCode::ConnectOk, "CONNECT should return ConnectOk");
+    assert_eq!(
+        resp.opcode,
+        OpCode::ConnectOk,
+        "CONNECT should return ConnectOk"
+    );
 
     for (i, (subject, payload)) in records.iter().enumerate() {
         let resp = send_recv(
@@ -332,7 +336,12 @@ async fn continuous_query_creates_stream() {
 /// Each record is a `(subject, json_payload)` pair.  Much faster than the
 /// one-at-a-time `setup_stream` for large datasets because it avoids an
 /// individual round-trip per record.
-async fn setup_stream_bulk(stream_name: &str, records: &[(&str, String)], tcp_addr: &str, http_url: &str) {
+async fn setup_stream_bulk(
+    stream_name: &str,
+    records: &[(&str, String)],
+    tcp_addr: &str,
+    http_url: &str,
+) {
     let client = reqwest::Client::new();
 
     // Create stream via HTTP
@@ -342,12 +351,21 @@ async fn setup_stream_bulk(stream_name: &str, records: &[(&str, String)], tcp_ad
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 201, "failed to create stream '{}'", stream_name);
+    assert_eq!(
+        resp.status(),
+        201,
+        "failed to create stream '{}'",
+        stream_name
+    );
 
     // Publish via TCP using PublishBatch in chunks of 1 000
     let (mut reader, mut writer) = connect_to(tcp_addr).await;
     let resp = send_recv(&mut writer, &mut reader, connect_frame(1)).await;
-    assert_eq!(resp.opcode, OpCode::ConnectOk, "CONNECT should return ConnectOk");
+    assert_eq!(
+        resp.opcode,
+        OpCode::ConnectOk,
+        "CONNECT should return ConnectOk"
+    );
 
     const CHUNK: usize = 1_000;
     let mut corr: u32 = 10;
@@ -541,7 +559,12 @@ async fn tcp_query_returns_result() {
     let sql = r#"SELECT * FROM "tcp_query_orders""#;
     let query_frame = Frame::new(OpCode::Query, 100, Bytes::from(sql.as_bytes().to_vec()));
     let resp = send_recv(&mut writer, &mut reader, query_frame).await;
-    assert_eq!(resp.opcode, OpCode::QueryResult, "expected QueryResult, got {:?}", resp.opcode);
+    assert_eq!(
+        resp.opcode,
+        OpCode::QueryResult,
+        "expected QueryResult, got {:?}",
+        resp.opcode
+    );
 
     let body: Value = serde_json::from_slice(&resp.payload).unwrap();
     assert_eq!(body["row_count"], 3);

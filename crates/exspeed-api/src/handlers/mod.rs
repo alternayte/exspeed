@@ -69,7 +69,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // answer "who's the leader?".
     let leases_router = Router::new()
         .route("/api/v1/leases", get(leases::list_leases))
-        .layer(from_fn_with_state(state.clone(), crate::middleware::require_admin))
+        .layer(from_fn_with_state(
+            state.clone(),
+            crate::middleware::require_admin,
+        ))
         .with_state(state.clone());
 
     // Whoami endpoint: the one non-admin HTTP surface. Any authenticated
@@ -142,10 +145,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/v1/indexes",
             get(queries::list_indexes).post(queries::create_index),
         )
-        .route(
-            "/api/v1/indexes/{name}",
-            delete(queries::drop_index),
-        )
+        .route("/api/v1/indexes/{name}", delete(queries::drop_index))
         .route(
             "/api/v1/connections",
             get(connections::list_connections).post(connections::create_connection),
@@ -154,13 +154,19 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/v1/connections/{name}",
             delete(connections::delete_connection),
         )
-        .route(
-            "/api/v1/cluster/followers",
-            get(cluster::list_followers),
-        )
-        .layer(from_fn_with_state(state.clone(), crate::middleware::leader_gate))
-        .layer(from_fn_with_state(state.clone(), crate::middleware::require_admin))
+        .route("/api/v1/cluster/followers", get(cluster::list_followers))
+        .layer(from_fn_with_state(
+            state.clone(),
+            crate::middleware::leader_gate,
+        ))
+        .layer(from_fn_with_state(
+            state.clone(),
+            crate::middleware::require_admin,
+        ))
         .with_state(state);
 
-    unauth.merge(leases_router).merge(whoami_router).merge(authed)
+    unauth
+        .merge(leases_router)
+        .merge(whoami_router)
+        .merge(authed)
 }

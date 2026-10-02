@@ -91,11 +91,9 @@ pub fn read_snapshot(path: &Path) -> io::Result<Snapshot> {
             format!("snapshot version {version} unsupported"),
         ));
     }
-    let covers_through_unix_ms =
-        u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+    let covers_through_unix_ms = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
     off += 8;
-    let entry_count =
-        u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+    let entry_count = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
     off += 4;
 
     let mut entries = Vec::with_capacity(entry_count);
@@ -106,8 +104,7 @@ pub fn read_snapshot(path: &Path) -> io::Result<Snapshot> {
                 "snapshot truncated at msg_id len",
             ));
         }
-        let id_len =
-            u16::from_le_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+        let id_len = u16::from_le_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
         off += 2;
         if off + id_len + 8 + 8 + 8 > body_len {
             return Err(io::Error::new(
@@ -124,8 +121,7 @@ pub fn read_snapshot(path: &Path) -> io::Result<Snapshot> {
         off += id_len;
         let offset = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
         off += 8;
-        let inserted_at_unix_ms =
-            u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+        let inserted_at_unix_ms = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
         off += 8;
         let body_hash = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
         off += 8;

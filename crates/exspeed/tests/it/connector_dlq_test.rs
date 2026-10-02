@@ -161,7 +161,11 @@ async fn tcp_connect_handshake(tcp_addr: &str) -> (FramedReader, FramedWriter) {
     (r, w)
 }
 
-async fn fetch_records(tcp_addr: &str, stream: &str, max: u32) -> Vec<(u64, Vec<u8>, Vec<(String, String)>)> {
+async fn fetch_records(
+    tcp_addr: &str,
+    stream: &str,
+    max: u32,
+) -> Vec<(u64, Vec<u8>, Vec<(String, String)>)> {
     let (mut r, mut w) = tcp_connect_handshake(tcp_addr).await;
     let req = FetchRequest {
         stream: stream.into(),
@@ -234,7 +238,12 @@ async fn poison_record_routes_to_dlq_stream() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 201, "create connector: {}", resp.text().await.unwrap());
+    assert_eq!(
+        resp.status(),
+        201,
+        "create connector: {}",
+        resp.text().await.unwrap()
+    );
 
     client
         .post(format!("{http}/api/v1/streams/dlq-src-1/publish"))
@@ -249,15 +258,21 @@ async fn poison_record_routes_to_dlq_stream() {
     // Inspect DLQ metadata headers.
     let headers: &[(String, String)] = &recs[0].2;
     assert!(
-        headers.iter().any(|(k, v)| k == "exspeed-dlq-origin" && v == "dlq-sink-1"),
+        headers
+            .iter()
+            .any(|(k, v)| k == "exspeed-dlq-origin" && v == "dlq-sink-1"),
         "header exspeed-dlq-origin missing/wrong: {headers:?}"
     );
     assert!(
-        headers.iter().any(|(k, v)| k == "exspeed-dlq-reason" && v == "http_client_error"),
+        headers
+            .iter()
+            .any(|(k, v)| k == "exspeed-dlq-reason" && v == "http_client_error"),
         "header exspeed-dlq-reason missing/wrong: {headers:?}"
     );
     assert!(
-        headers.iter().any(|(k, _)| k == "exspeed-dlq-original-offset"),
+        headers
+            .iter()
+            .any(|(k, _)| k == "exspeed-dlq-original-offset"),
         "header exspeed-dlq-original-offset missing"
     );
     assert!(mock_state.received.load(Ordering::Relaxed) >= 1);
@@ -396,7 +411,11 @@ async fn dlq_batch_on_transient_exhausted() {
     }
 
     let recs = wait_for_records(&tcp, "dlq-out-5", 3, 10).await;
-    assert_eq!(recs.len(), 3, "all 3 records should have been routed to dlq_batch");
+    assert_eq!(
+        recs.len(),
+        3,
+        "all 3 records should have been routed to dlq_batch"
+    );
 
     // Each DLQ record carries reason=sink_rejected (transient exhaustion).
     for (_, _, headers) in &recs {
