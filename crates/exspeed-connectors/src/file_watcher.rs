@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,19 +8,24 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::config::ConnectorConfig;
-use crate::manager::ConnectorManager;
+use crate::manager::{ConnectorManager, TomlFile};
 
-/// Scan `connectors_dir` for `.toml` files and reconcile with running connectors.
+/// Scan `connectors_dir` for `.toml` files and reconcile the connectors that
+/// came from that directory.
 ///
-/// - Files present in the directory but not in `manager` → load TOML + create.
-/// - Files present and running but content changed → restart with new config.
-/// - Files absent from the directory but still running in `manager` → delete.
-async fn sync_connectors(manager: &Arc<ConnectorManager>, connectors_dir: &PathBuf) {
+/// - New file → create the connector it defines.
+/// - Changed file, same connector name → update the config in place and
+///   restart it, **keeping its offsets**.
+/// - Changed file that now names a different connector → delete the old
+///   connector, create the new one.
+/// - File removed → delete the connector it defined.
+///
+/// Connectors created through the HTTP API are never touched.
+pub(crate) async fn sync_connectors(manager: &Arc<ConnectorManager>, connectors_dir: &PathBuf) {
     if !connectors_dir.exists() {
         return;
     }
 
-    // Build the set of filenames currently on disk.
     let entries = match std::fs::read_dir(connectors_dir) {
         Ok(e) => e,
         Err(err) => {
@@ -29,119 +34,94 @@ async fn sync_connectors(manager: &Arc<ConnectorManager>, connectors_dir: &PathB
         }
     };
 
-    let mut current: HashSet<String> = HashSet::new();
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(err) => {
-                warn!(error = %err, "file_watcher: failed to read dir entry");
-                continue;
-            }
-        };
+    let mut on_disk: HashMap<String, PathBuf> = HashMap::new();
+    for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("toml") {
             continue;
         }
         if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-            current.insert(filename.to_string());
+            on_disk.insert(filename.to_string(), path.clone());
         }
     }
 
-    // Build the set of connector names currently running (from TOML-managed ones).
-    // We match by deriving the expected filename: <name>.toml.
-    let running_names: HashSet<String> = manager
-        .list()
-        .await
-        .into_iter()
-        .map(|info| format!("{}.toml", info.name))
-        .collect();
+    let known: HashMap<String, TomlFile> = manager.toml_files.read().await.clone();
 
     // New or modified files.
-    for filename in &current {
-        let path = connectors_dir.join(filename);
-        let connector_name = filename
-            .strip_suffix(".toml")
-            .unwrap_or(filename.as_str())
-            .to_string();
-
-        if running_names.contains(filename) {
-            // Already running — check if the file content changed.
-            let new_hash = ConnectorManager::hash_file(&path);
-            let old_hash = manager
-                .toml_hashes
-                .read()
-                .await
-                .get(&connector_name)
-                .copied();
-
-            if new_hash.is_some() && new_hash != old_hash {
-                // Config changed — reload.
-                match ConnectorConfig::load_toml(&path) {
-                    Ok(mut config) => {
-                        config.resolve_env_vars();
-                        info!(
-                            connector = connector_name.as_str(),
-                            file = ?path,
-                            "file_watcher: TOML connector config changed, restarting"
-                        );
-                        if let Err(e) = manager.delete(&connector_name).await {
-                            warn!(connector = connector_name.as_str(), error = %e, "file_watcher: failed to stop connector for reload");
-                            continue;
-                        }
-                        if let Err(e) = manager.create(config).await {
-                            warn!(file = ?path, error = %e, "file_watcher: failed to recreate connector after config change");
-                        }
-                        if let Some(h) = new_hash {
-                            manager.toml_hashes.write().await.insert(connector_name, h);
-                        }
-                    }
-                    Err(e) => {
-                        warn!(file = ?path, error = %e, "file_watcher: failed to parse modified TOML connector config");
-                    }
-                }
-            }
-        } else {
-            // New file — create connector.
-            match ConnectorConfig::load_toml(&path) {
-                Ok(mut config) => {
-                    config.resolve_env_vars();
-                    info!(
-                        connector = config.name.as_str(),
-                        file = ?path,
-                        "file_watcher: new TOML connector config detected"
-                    );
-                    let name = config.name.clone();
-                    if let Err(e) = manager.create(config).await {
-                        warn!(file = ?path, error = %e, "file_watcher: failed to create connector from TOML");
-                    }
-                    if let Some(h) = ConnectorManager::hash_file(&path) {
-                        manager.toml_hashes.write().await.insert(name, h);
-                    }
-                }
-                Err(e) => {
-                    warn!(file = ?path, error = %e, "file_watcher: failed to parse TOML connector config");
-                }
-            }
+    for (filename, path) in &on_disk {
+        let Some(hash) = ConnectorManager::hash_file(path) else {
+            continue;
+        };
+        let previous = known.get(filename);
+        if previous.map(|p| p.hash) == Some(hash) {
+            continue; // unchanged
         }
+        let mut config = match ConnectorConfig::load_toml(path) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(file = ?path, error = %e, "file_watcher: failed to parse TOML connector config");
+                continue;
+            }
+        };
+        config.resolve_env_vars();
+        let name = config.name.clone();
+
+        let result = match previous {
+            Some(prev) if prev.connector_name == name => {
+                info!(connector = name.as_str(), file = ?path,
+                      "file_watcher: connector config changed, restarting (offsets kept)");
+                manager.update_config(config).await
+            }
+            Some(prev) => {
+                info!(old = prev.connector_name.as_str(), new = name.as_str(), file = ?path,
+                      "file_watcher: file now defines a different connector");
+                if let Err(e) = manager.delete(&prev.connector_name).await {
+                    warn!(connector = prev.connector_name.as_str(), error = %e,
+                          "file_watcher: failed to delete replaced connector");
+                }
+                manager.create_from_file(config).await
+            }
+            None => {
+                if manager.get_status(&name).await.is_some() {
+                    // Same name as an API-created connector: adopt the file
+                    // as the definition, keeping offsets.
+                    info!(connector = name.as_str(), file = ?path,
+                          "file_watcher: file redefines an existing connector");
+                    manager.update_config(config).await
+                } else {
+                    info!(connector = name.as_str(), file = ?path,
+                          "file_watcher: new connector config detected");
+                    manager.create_from_file(config).await
+                }
+            }
+        };
+        if let Err(e) = result {
+            warn!(file = ?path, error = %e, "file_watcher: failed to apply connector config");
+        }
+        manager.toml_files.write().await.insert(
+            filename.clone(),
+            TomlFile {
+                connector_name: name,
+                hash,
+            },
+        );
     }
 
-    // Deleted files: running but no longer on disk.
-    for filename in &running_names {
-        if !current.contains(filename) {
-            let connector_name = filename
-                .strip_suffix(".toml")
-                .unwrap_or(filename.as_str())
-                .to_string();
-            info!(
-                connector = connector_name.as_str(),
-                file = filename.as_str(),
-                "file_watcher: TOML connector config removed"
-            );
-            if let Err(e) = manager.delete(&connector_name).await {
-                warn!(connector = connector_name.as_str(), error = %e, "file_watcher: failed to delete connector");
-            }
-            manager.toml_hashes.write().await.remove(&connector_name);
+    // Removed files: delete only the connectors they defined.
+    for (filename, prev) in &known {
+        if on_disk.contains_key(filename) {
+            continue;
         }
+        info!(
+            connector = prev.connector_name.as_str(),
+            file = filename.as_str(),
+            "file_watcher: connector config file removed"
+        );
+        if let Err(e) = manager.delete(&prev.connector_name).await {
+            warn!(connector = prev.connector_name.as_str(), error = %e,
+                  "file_watcher: failed to delete connector");
+        }
+        manager.toml_files.write().await.remove(filename);
     }
 }
 

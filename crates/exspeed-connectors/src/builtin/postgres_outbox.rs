@@ -339,7 +339,7 @@ impl PostgresOutboxSource {
                 };
 
             match event {
-                ReplicationEvent::XLogData { data, wal_end, .. } => {
+                ReplicationEvent::XLogData { data, .. } => {
                     // Parse the pgoutput message using our existing parser
                     let wal_event = match pgoutput::parse_pgoutput_message(&data) {
                         Ok(ev) => ev,
@@ -392,7 +392,6 @@ impl PostgresOutboxSource {
                             }
 
                             // Report progress for this WAL position
-                            repl_client.update_applied_lsn(wal_end);
                         }
                         pgoutput::WalEvent::Update { .. } | pgoutput::WalEvent::Delete { .. } => {
                             // Outbox pattern only cares about inserts — skip
@@ -404,7 +403,6 @@ impl PostgresOutboxSource {
                         pgoutput::WalEvent::Commit { end_lsn, .. } => {
                             // Transaction boundary — record the LSN and stop this batch
                             commit_lsn = Some(Lsn::from_u64(end_lsn));
-                            repl_client.update_applied_lsn(Lsn::from_u64(end_lsn));
                             break;
                         }
                         pgoutput::WalEvent::Unknown(tag) => {
@@ -415,7 +413,6 @@ impl PostgresOutboxSource {
                 ReplicationEvent::Commit { end_lsn, .. } => {
                     // High-level commit event from pgwire-replication
                     commit_lsn = Some(end_lsn);
-                    repl_client.update_applied_lsn(end_lsn);
                     break;
                 }
                 ReplicationEvent::Begin { .. } => {
@@ -451,6 +448,13 @@ impl PostgresOutboxSource {
             ConnectorError::Data(format!("invalid LSN in commit position '{position}': {e}"))
         })?;
         self.last_lsn = Some(lsn);
+        // Only now — after the manager has durably appended every record up
+        // to `lsn` — may Postgres advance the slot's confirmed_flush_lsn.
+        // Confirming earlier (inside poll) loses data on a crash because
+        // Postgres refuses to replay WAL older than the confirmed position.
+        if let Some(repl_client) = self.repl_client.as_ref() {
+            repl_client.update_applied_lsn(lsn);
+        }
         self.last_position = Some(position);
 
         // If cleanup_mode=delete, DELETE the processed rows using the regular client

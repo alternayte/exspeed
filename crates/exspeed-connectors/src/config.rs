@@ -68,8 +68,12 @@ fn default_batch_size() -> u32 {
 fn default_poll_interval() -> u64 {
     50
 }
+/// Off by default: with no `dedup_key`, dedup keys on the record key, which
+/// for most sources is an entity id (outbox aggregate_id, AMQP routing key),
+/// so enabling it silently drops every event after the first per entity.
+/// Broker-level idempotency (`x-idempotency-key`) still applies.
 fn default_dedup_enabled() -> bool {
-    true
+    false
 }
 fn default_dedup_window() -> u64 {
     86400

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{oneshot, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -57,6 +57,15 @@ pub struct ConnectorInfo {
 // RunningConnector
 // ---------------------------------------------------------------------------
 
+/// A connector config file in `connectors.d/` and what it currently defines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TomlFile {
+    /// `[connector].name` from the file (need not match the file name).
+    pub connector_name: String,
+    /// Content hash used for change detection.
+    pub hash: u64,
+}
+
 pub struct RunningConnector {
     pub config: ConnectorConfig,
     pub status: ConnectorStatus,
@@ -75,8 +84,10 @@ pub struct ConnectorManager {
     pub data_dir: PathBuf,
     pub metrics: Arc<Metrics>,
     pub offset_store: Arc<dyn crate::offset_store::OffsetStore>,
-    /// Tracks content hashes of TOML connector files for change detection.
-    pub toml_hashes: RwLock<HashMap<String, u64>>,
+    /// Connectors that came from `connectors.d/*.toml`, keyed by file name.
+    /// The file watcher only ever reconciles these; connectors created via
+    /// the HTTP API are never touched by it.
+    pub toml_files: RwLock<HashMap<String, TomlFile>>,
     /// Cluster-leader lease wrapper. Used to check whether this pod is
     /// currently the leader before starting connector tasks, and to obtain
     /// the current leader `CancellationToken` for the spawned tasks.
@@ -99,7 +110,7 @@ impl ConnectorManager {
             data_dir,
             metrics,
             offset_store,
-            toml_hashes: RwLock::new(HashMap::new()),
+            toml_files: RwLock::new(HashMap::new()),
             leadership,
         }
     }
@@ -130,6 +141,55 @@ impl ConnectorManager {
 
     /// Create and start a new connector. Persists config to disk.
     pub async fn create(&self, config: ConnectorConfig) -> Result<(), String> {
+        self.create_inner(config, true).await
+    }
+
+    /// Create a connector defined by a `connectors.d/` file. The file stays
+    /// the source of truth, so nothing is persisted (in particular, secrets
+    /// resolved from `${VAR}` are never written to disk).
+    pub async fn create_from_file(&self, config: ConnectorConfig) -> Result<(), String> {
+        self.create_inner(config, false).await
+    }
+
+    /// Replace a connector's config and restart it, keeping its offsets.
+    pub async fn update_config(&self, config: ConnectorConfig) -> Result<(), String> {
+        let name = config.name.clone();
+        let exists = self.connectors.read().await.contains_key(&name);
+        if !exists {
+            return self.create_from_file(config).await;
+        }
+        self.stop_connector(&name).await?;
+        self.connectors.write().await.remove(&name);
+        // Keep a REST-persisted copy in sync if one exists.
+        let json = self.config_path(&name);
+        if json.exists() {
+            config
+                .save_json(&json)
+                .map_err(|e| format!("failed to save config: {e}"))?;
+        }
+        if self.leadership.is_currently_leader() {
+            self.start_connector(config).await
+        } else {
+            self.register_stopped(config).await;
+            Ok(())
+        }
+    }
+
+    /// Record a config without starting it (followers, or before leadership).
+    async fn register_stopped(&self, config: ConnectorConfig) {
+        let mut map = self.connectors.write().await;
+        map.insert(
+            config.name.clone(),
+            RunningConnector {
+                config,
+                status: ConnectorStatus::Stopped,
+                cancel_tx: None,
+                started_at: Instant::now(),
+            },
+        );
+    }
+
+    async fn create_inner(&self, config: ConnectorConfig, persist: bool) -> Result<(), String> {
         // Validate name
         if config.name.is_empty() {
             return Err("connector name cannot be empty".into());
@@ -159,14 +219,23 @@ impl ConnectorManager {
         self.ensure_stream_exists(&stream_name).await?;
 
         // Persist config
-        let dir = self.configs_dir();
-        std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create configs dir: {e}"))?;
-        config
-            .save_json(&self.config_path(&config.name))
-            .map_err(|e| format!("failed to save config: {e}"))?;
+        if persist {
+            let dir = self.configs_dir();
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| format!("failed to create configs dir: {e}"))?;
+            config
+                .save_json(&self.config_path(&config.name))
+                .map_err(|e| format!("failed to save config: {e}"))?;
+        }
 
-        // Start the connector
-        self.start_connector(config).await
+        // Start the connector (followers only register it; the leader
+        // supervisor starts everything on promotion).
+        if self.leadership.is_currently_leader() {
+            self.start_connector(config).await
+        } else {
+            self.register_stopped(config).await;
+            Ok(())
+        }
     }
 
     /// Stop and delete a connector, removing config and offset files.
@@ -278,19 +347,27 @@ impl ConnectorManager {
                         file = ?path,
                         "loaded TOML connector config"
                     );
+                    // The file is the source of truth: it replaces any
+                    // stale REST/JSON copy (older versions persisted TOML
+                    // configs, secrets included, to connectors/*.json).
+                    let stale_json = self.config_path(&connector_name);
+                    if stale_json.exists() {
+                        let _ = std::fs::remove_file(&stale_json);
+                    }
                     // Register config without starting (leader supervisor handles startup).
-                    let mut map = self.connectors.write().await;
-                    map.entry(connector_name.clone())
-                        .or_insert_with(|| RunningConnector {
-                            config,
-                            status: ConnectorStatus::Stopped,
-                            cancel_tx: None,
-                            started_at: Instant::now(),
-                        });
-                    drop(map);
+                    self.register_stopped(config).await;
                     // Record file hash for change detection.
-                    if let Some(hash) = Self::hash_file(&path) {
-                        self.toml_hashes.write().await.insert(connector_name, hash);
+                    if let (Some(hash), Some(file_name)) = (
+                        Self::hash_file(&path),
+                        path.file_name().and_then(|n| n.to_str()),
+                    ) {
+                        self.toml_files.write().await.insert(
+                            file_name.to_string(),
+                            TomlFile {
+                                connector_name,
+                                hash,
+                            },
+                        );
                     }
                 }
                 Err(e) => {
@@ -683,7 +760,26 @@ impl ConnectorManager {
                             timestamp_ns: None,
                         };
 
-                        let result = broker_append.append(&stream_name, &storage_record).await;
+                        // Transient append failures (disk full, dedup map full,
+                        // stream briefly missing) are retried: committing the
+                        // source position past a record that was never stored
+                        // would lose it. Only a key collision (same idempotency
+                        // key, different body) is treated as poison.
+                        let mut append_attempt: u32 = 0;
+                        let result = loop {
+                            match broker_append.append(&stream_name, &storage_record).await {
+                                Err(e) if !matches!(e, StorageError::KeyCollision { .. }) => {
+                                    let delay = source_retry_policy
+                                        .delay_for(append_attempt)
+                                        .unwrap_or(poll_interval.max(Duration::from_secs(1)));
+                                    warn!(connector = task_name.as_str(), attempt = append_attempt,
+                                          error = %e, "source append failed; retrying");
+                                    tokio::time::sleep(delay).await;
+                                    append_attempt = append_attempt.saturating_add(1);
+                                }
+                                other => break other,
+                            }
+                        };
 
                         match result {
                             Ok(exspeed_broker::broker_append::AppendResult::Written(..)) => {

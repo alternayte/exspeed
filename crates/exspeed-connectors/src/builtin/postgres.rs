@@ -335,7 +335,6 @@ impl PostgresSource {
 
                             let record = build_cdc_record(relation, &new_tuple, "insert", wal_end)?;
                             records.push(record);
-                            repl_client.update_applied_lsn(wal_end);
                         }
                         pgoutput::WalEvent::Update {
                             relation_id,
@@ -358,7 +357,6 @@ impl PostgresSource {
 
                             let record = build_cdc_record(relation, &new_tuple, "update", wal_end)?;
                             records.push(record);
-                            repl_client.update_applied_lsn(wal_end);
                         }
                         pgoutput::WalEvent::Delete {
                             relation_id,
@@ -380,14 +378,12 @@ impl PostgresSource {
 
                             let record = build_cdc_record(relation, &old_tuple, "delete", wal_end)?;
                             records.push(record);
-                            repl_client.update_applied_lsn(wal_end);
                         }
                         pgoutput::WalEvent::Begin { .. } => {
                             // Transaction boundary — continue collecting
                         }
                         pgoutput::WalEvent::Commit { end_lsn, .. } => {
                             commit_lsn = Some(Lsn::from_u64(end_lsn));
-                            repl_client.update_applied_lsn(Lsn::from_u64(end_lsn));
                             break;
                         }
                         pgoutput::WalEvent::Unknown(tag) => {
@@ -397,7 +393,6 @@ impl PostgresSource {
                 }
                 ReplicationEvent::Commit { end_lsn, .. } => {
                     commit_lsn = Some(end_lsn);
-                    repl_client.update_applied_lsn(end_lsn);
                     break;
                 }
                 ReplicationEvent::Begin { .. } => {
@@ -430,6 +425,13 @@ impl PostgresSource {
             ConnectorError::Data(format!("invalid LSN in commit position '{position}': {e}"))
         })?;
         self.last_lsn = Some(lsn);
+        // Only now — after the manager has durably appended every record up
+        // to `lsn` — may Postgres advance the slot's confirmed_flush_lsn.
+        // Confirming earlier (inside poll) loses data on a crash because
+        // Postgres refuses to replay WAL older than the confirmed position.
+        if let Some(repl_client) = self.repl_client.as_ref() {
+            repl_client.update_applied_lsn(lsn);
+        }
         Ok(())
     }
 

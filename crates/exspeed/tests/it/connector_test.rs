@@ -267,3 +267,120 @@ async fn connector_status() {
         "response should include uptime_secs"
     );
 }
+
+async fn start_server_in(data_dir: std::path::PathBuf) -> String {
+    let tcp_port = exspeed_testkit::pick_unused_port().unwrap();
+    let http_port = exspeed_testkit::pick_unused_port().unwrap();
+    tokio::spawn(async move {
+        exspeed::cli::server::run(exspeed::cli::server::ServerArgs {
+            bind: format!("127.0.0.1:{tcp_port}"),
+            api_bind: format!("127.0.0.1:{http_port}"),
+            data_dir,
+            auth_token: None,
+            credentials_file: None,
+            tls_cert: None,
+            tls_key: None,
+            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
+            storage_flush_window_us: 500,
+            storage_flush_threshold_records: 256,
+            storage_flush_threshold_bytes: 1_048_576,
+            storage_sync_interval_ms: 10,
+            storage_sync_bytes: 4 * 1024 * 1024,
+            delivery_buffer: 8192,
+        })
+        .await
+        .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    format!("http://127.0.0.1:{http_port}")
+}
+
+async fn connector_names(client: &reqwest::Client, http: &str) -> Vec<String> {
+    let body: Value = client
+        .get(format!("{http}/api/v1/connectors"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mut names: Vec<String> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Regression (REVIEW blocker 15): the connectors.d watcher used to delete
+/// every connector without a matching `<name>.toml`, i.e. all API-created
+/// connectors, on the first filesystem event.
+#[tokio::test]
+async fn file_watcher_leaves_api_created_connectors_alone() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let http = start_server_in(dir.path().to_path_buf()).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{http}/api/v1/connectors"))
+        .json(&serde_json::json!({
+            "name": "api-hook",
+            "type": "source",
+            "plugin": "http_webhook",
+            "stream": "api-events",
+            "settings": {"path": "api-hook"}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "create: {}", resp.status());
+
+    // A file whose name differs from the connector it defines.
+    std::fs::write(
+        dir.path().join("connectors.d").join("hooks.toml"),
+        "[connector]\nname = \"file-hook\"\ntype = \"source\"\nplugin = \"http_webhook\"\n\
+         stream = \"file-events\"\n\n[settings]\npath = \"file-hook\"\n",
+    )
+    .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let names = connector_names(&client, &http).await;
+        if names.contains(&"file-hook".to_string()) {
+            assert!(
+                names.contains(&"api-hook".to_string()),
+                "API-created connector was deleted by the watcher: {names:?}"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "file connector never appeared"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Give the watcher a few more cycles; nothing should flap.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        connector_names(&client, &http).await,
+        vec!["api-hook".to_string(), "file-hook".to_string()]
+    );
+
+    // Removing the file removes only the connector it defined.
+    std::fs::remove_file(dir.path().join("connectors.d").join("hooks.toml")).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let names = connector_names(&client, &http).await;
+        if names == vec!["api-hook".to_string()] {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "unexpected: {names:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
