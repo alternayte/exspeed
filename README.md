@@ -53,7 +53,7 @@ on TCP port 5933. The HTTP API is on port 8080.
 | Push consumers, ack/nack | ⚠️ cursor semantics only; no redelivery or ack timeout yet |
 | Consumer groups | ⚠️ only with a Postgres or Redis coordinator; broadcast on single node |
 | Idempotent publish (`msg_id`) | ✅ single node · ⚠️ gaps in batches and on failover |
-| Auth (scoped tokens) and TLS | ✅ HTTP · ⚠️ TCP query/ack authz gaps |
+| Auth (scoped tokens) and TLS | ✅ · ⚠️ scoped admins can list all streams |
 | ExQL bounded queries | ✅ filter/project · ⚠️ joins, JSON numerics, many clauses ([§3.5](docs/REVIEW.md#35-exql-exspeed-processing)) |
 | ExQL continuous queries, windows, joins, views | ⚠️ partial; state is not durable |
 | Connectors | ⚠️ see per-plugin status in [docs/connectors.md](docs/connectors.md) |

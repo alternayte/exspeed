@@ -7,6 +7,18 @@
 > to `crates/` unless stated otherwise and point at the state of `main` at
 > commit `b0eed34`.
 
+## Progress
+
+| Phase | Status |
+|-------|--------|
+| 0. Guard rails | ✅ CI, single test binary per crate, clippy clean, blockers 1, 2, 7, 10, 14, 15 fixed, JDBC Postgres sink fixed |
+| 1. Core log | ⏳ next |
+| 2. Consumers + protocol v2 | — |
+| 3. Ops | — |
+| 4. ExQL v2 | — |
+| 5. Connectors v2 | — |
+| 6. HA | — |
+
 ## Contents
 
 1. [Verdict](#1-verdict)

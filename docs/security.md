@@ -3,17 +3,16 @@
 Auth and TLS are both off by default. You turn each one on separately with
 environment variables (or the equivalent flags; see [configuration.md](configuration.md)).
 
-> ⚠️ **Known authorization gaps (v0.5).** Until these are fixed, don't give
-> credentials to tenants who must not see each other's data. Details are in
+> ⚠️ **Known authorization gaps.** Details are in
 > [REVIEW.md §3.7](REVIEW.md#37-server-http-api-auth).
 >
-> - **TCP `Query` has no authorization check.** Any authenticated client can
->   read any stream, and any registered external database, with SQL.
-> - **TCP `Ack`/`Nack` can move another consumer's offset.**
 > - **Scoped admins can list every tenant's streams and consumers.**
 > - **`/metrics` is unauthenticated** and exposes every stream and consumer
 >   name.
 > - **Webhook connectors default to `auth_type = "none"`.**
+>
+> SQL queries need a **global admin** credential, over both TCP and HTTP.
+> Ack and nack only apply to the consumer the connection subscribed to.
 
 ## Token authentication
 

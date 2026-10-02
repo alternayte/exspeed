@@ -60,8 +60,7 @@ Errors are structured:
 
 The TypeScript SDK can also run bounded queries over TCP with `client.query(sql)`.
 
-> 🔒 HTTP queries require a global admin credential. TCP queries currently
-> have **no** authorization check (see REVIEW.md, blocker 10).
+> 🔒 Queries require a global admin credential, over both HTTP and TCP.
 
 ## Bounded queries
 
