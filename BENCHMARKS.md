@@ -1,5 +1,16 @@
 # Exspeed Benchmarks
 
+> ⚠️ **These numbers are stale and partly inconsistent.**
+>
+> - They were measured on v0.2.0 on macOS, with the driver and the broker on
+>   the same host.
+> - The fan-out table reports the producer's achieved rate, not fan-out
+>   throughput.
+> - The sync-mode latency row claims a sustained 10k/s, which is above sync
+>   mode's maximum throughput.
+>
+> Re-run on Linux before you quote them. See [docs/REVIEW.md §3.9](docs/REVIEW.md#39-build-ci-deploy-benchmarks).
+
 _Last refreshed: **2026-04-21** (git `9782c1d`, exspeed 0.2.0)_
 
 ## How these numbers were produced

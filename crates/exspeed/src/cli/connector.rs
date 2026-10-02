@@ -7,11 +7,14 @@ use exspeed_connectors::builtin::{create_sink, create_source};
 use exspeed_connectors::config::ConnectorConfig;
 use exspeed_connectors::transform::Transform;
 
-// Known source plugins (excluding http_webhook which is passive).
+// Known source plugins. Must match `exspeed_connectors::builtin::create_source`
+// (plus `http_webhook`, which is passive and registered by the manager).
 const KNOWN_SOURCE_PLUGINS: &[&str] = &[
     "http_webhook",
     "postgres_outbox",
-    "postgres_cdc",
+    "postgres",
+    "jdbc_poll",
+    "mssql_cdc",
     "rabbitmq",
     "http_poll",
 ];
