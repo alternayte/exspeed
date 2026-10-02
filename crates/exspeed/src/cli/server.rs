@@ -1668,7 +1668,13 @@ where
                                     .await?;
                                     continue;
                                 };
-                                if !id.authorize(Action::Subscribe, stream_name) {
+                                // The ack must target the consumer this connection
+                                // subscribed to; otherwise a client could move any
+                                // other consumer's offset.
+                                let owns_consumer = active_subscription
+                                    .as_ref()
+                                    .is_some_and(|(c, _)| c == &req.consumer_name);
+                                if !owns_consumer || !id.authorize(Action::Subscribe, stream_name) {
                                     reject_forbidden(
                                         &mut framed_write,
                                         correlation_id,
@@ -1706,7 +1712,13 @@ where
                                     .await?;
                                     continue;
                                 };
-                                if !id.authorize(Action::Subscribe, stream_name) {
+                                // The ack must target the consumer this connection
+                                // subscribed to; otherwise a client could move any
+                                // other consumer's offset.
+                                let owns_consumer = active_subscription
+                                    .as_ref()
+                                    .is_some_and(|(c, _)| c == &req.consumer_name);
+                                if !owns_consumer || !id.authorize(Action::Subscribe, stream_name) {
                                     reject_forbidden(
                                         &mut framed_write,
                                         correlation_id,
@@ -1881,6 +1893,30 @@ where
                             }
                             Ok(ClientMessage::Query(sql)) => {
                                 use exspeed_processing::types::value_to_json;
+
+                                // A query can read any stream (and registered
+                                // external databases), so it needs global admin —
+                                // the same rule as POST /api/v1/queries.
+                                let Some(id) = identity.as_ref() else {
+                                    reject_unauthenticated(
+                                        &mut framed_write,
+                                        correlation_id,
+                                        &metrics,
+                                        "Query",
+                                    )
+                                    .await?;
+                                    continue;
+                                };
+                                if !id.has_global_admin() {
+                                    reject_forbidden(
+                                        &mut framed_write,
+                                        correlation_id,
+                                        &metrics,
+                                        "Query",
+                                    )
+                                    .await?;
+                                    continue;
+                                }
 
                                 let result = exql.execute_bounded(&sql).await;
                                 let response = match result {

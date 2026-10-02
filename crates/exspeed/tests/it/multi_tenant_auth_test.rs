@@ -1226,3 +1226,73 @@ token_sha256 = "{}"
         "auth lint on duplicate-name file should exit non-zero"
     );
 }
+
+// Regression (REVIEW blocker 10) ---------------------------------------------
+#[tokio::test]
+async fn tcp_query_requires_global_admin() {
+    let creds = write_creds(&format!(
+        r#"
+[[credentials]]
+name = "scoped"
+token_sha256 = "{scoped_hash}"
+permissions = [{{ streams = "orders-*", actions = ["publish", "subscribe", "admin"] }}]
+
+[[credentials]]
+name = "admin"
+token_sha256 = "{admin_hash}"
+permissions = [{{ streams = "*", actions = ["admin", "publish", "subscribe"] }}]
+"#,
+        scoped_hash = sha256_hex("scoped-tok"),
+        admin_hash = sha256_hex("admin-tok"),
+    ));
+    let srv = start_server(Some(creds.path().to_path_buf()), None).await;
+    admin_setup_stream_and_consumer(&srv.tcp_addr, "admin-tok", "payments", "pc").await;
+
+    let query = |sql: &str, corr: u32| {
+        Frame::new(OpCode::Query, corr, Bytes::copy_from_slice(sql.as_bytes()))
+    };
+
+    let (mut r, mut w) = connect_to(&srv.tcp_addr).await;
+    send_recv(&mut w, &mut r, connect_frame("s", Some("scoped-tok"), 1)).await;
+    let resp = send_recv(&mut w, &mut r, query("SELECT * FROM payments", 2)).await;
+    assert_error(resp, 403);
+
+    let (mut r, mut w) = connect_to(&srv.tcp_addr).await;
+    send_recv(&mut w, &mut r, connect_frame("a", Some("admin-tok"), 1)).await;
+    let resp = send_recv(&mut w, &mut r, query("SELECT * FROM payments", 2)).await;
+    assert_eq!(resp.opcode, OpCode::QueryResult);
+}
+
+// Regression (REVIEW blocker 10) ---------------------------------------------
+#[tokio::test]
+async fn ack_cannot_target_another_consumer() {
+    let creds = write_creds(&format!(
+        r#"
+[[credentials]]
+name = "admin"
+token_sha256 = "{admin_hash}"
+permissions = [{{ streams = "*", actions = ["admin", "publish", "subscribe"] }}]
+"#,
+        admin_hash = sha256_hex("admin-tok"),
+    ));
+    let srv = start_server(Some(creds.path().to_path_buf()), None).await;
+    admin_setup_stream_and_consumer(&srv.tcp_addr, "admin-tok", "events", "mine").await;
+    {
+        let (mut r, mut w) = connect_to(&srv.tcp_addr).await;
+        send_recv(&mut w, &mut r, connect_frame("a", Some("admin-tok"), 1)).await;
+        let resp = send_recv(&mut w, &mut r, create_consumer_frame("victim", "events", 2)).await;
+        assert_eq!(resp.opcode, OpCode::Ok);
+    }
+
+    let (mut r, mut w) = connect_to(&srv.tcp_addr).await;
+    send_recv(&mut w, &mut r, connect_frame("a", Some("admin-tok"), 1)).await;
+    let resp = send_recv(&mut w, &mut r, subscribe_frame("mine", 2)).await;
+    assert_eq!(resp.opcode, OpCode::Ok);
+
+    let resp = send_recv(&mut w, &mut r, ack_frame("victim", 1_000, 3)).await;
+    assert_error(resp, 403);
+    let resp = send_recv(&mut w, &mut r, nack_frame("victim", 0, 4)).await;
+    assert_error(resp, 403);
+    let resp = send_recv(&mut w, &mut r, ack_frame("mine", 0, 5)).await;
+    assert_eq!(resp.opcode, OpCode::Ok);
+}
