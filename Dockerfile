@@ -1,42 +1,26 @@
-FROM rust:1.94 AS builder
+# syntax=docker/dockerfile:1
+
+# --- Dependency planning (cargo-chef) -------------------------------------
+# Caches the dependency build in its own layer, keyed on the lockfile and
+# manifests only, so source edits don't recompile ~400 crates.
+FROM rust:1.97 AS chef
+RUN cargo install cargo-chef --locked
 WORKDIR /app
 
-# Cache dependencies: copy manifests first, build a dummy to cache deps
-COPY Cargo.toml Cargo.lock ./
-COPY crates/exspeed/Cargo.toml crates/exspeed/Cargo.toml
-COPY crates/exspeed-common/Cargo.toml crates/exspeed-common/Cargo.toml
-COPY crates/exspeed-protocol/Cargo.toml crates/exspeed-protocol/Cargo.toml
-COPY crates/exspeed-streams/Cargo.toml crates/exspeed-streams/Cargo.toml
-COPY crates/exspeed-storage/Cargo.toml crates/exspeed-storage/Cargo.toml
-COPY crates/exspeed-broker/Cargo.toml crates/exspeed-broker/Cargo.toml
-COPY crates/exspeed-api/Cargo.toml crates/exspeed-api/Cargo.toml
-COPY crates/exspeed-connectors/Cargo.toml crates/exspeed-connectors/Cargo.toml
-COPY crates/exspeed-processing/Cargo.toml crates/exspeed-processing/Cargo.toml
-
-# Create dummy source files so cargo can resolve the workspace
-RUN mkdir -p crates/exspeed/src && echo "fn main() {}" > crates/exspeed/src/main.rs && touch crates/exspeed/src/lib.rs \
-    && mkdir -p crates/exspeed-common/src && touch crates/exspeed-common/src/lib.rs \
-    && mkdir -p crates/exspeed-protocol/src && touch crates/exspeed-protocol/src/lib.rs \
-    && mkdir -p crates/exspeed-streams/src && touch crates/exspeed-streams/src/lib.rs \
-    && mkdir -p crates/exspeed-storage/src && touch crates/exspeed-storage/src/lib.rs \
-    && mkdir -p crates/exspeed-broker/src && touch crates/exspeed-broker/src/lib.rs \
-    && mkdir -p crates/exspeed-api/src && touch crates/exspeed-api/src/lib.rs \
-    && mkdir -p crates/exspeed-connectors/src && touch crates/exspeed-connectors/src/lib.rs \
-    && mkdir -p crates/exspeed-processing/src && touch crates/exspeed-processing/src/lib.rs
-
-# Build dependencies only (cached unless Cargo.toml/Cargo.lock change)
-RUN cargo build --release 2>/dev/null || true
-
-# Now copy the real source and build
+FROM chef AS planner
 COPY . .
-# Touch all source files to ensure cargo rebuilds them (not the cached dummy)
-RUN find crates -name "*.rs" -exec touch {} +
-RUN cargo build --release
+RUN cargo chef prepare --recipe-path recipe.json
 
-# Runtime image
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release -p exspeed --recipe-path recipe.json
+COPY . .
+RUN cargo build --release -p exspeed
+
+# --- Runtime image ----------------------------------------------------------
 FROM debian:trixie-slim
 RUN apt-get update \
- && apt-get install -y ca-certificates \
+ && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
  && groupadd --system --gid 1000 exspeed \
  && useradd --system --uid 1000 --gid 1000 --home-dir /var/lib/exspeed --shell /usr/sbin/nologin exspeed \
@@ -44,7 +28,10 @@ RUN apt-get update \
  && chown -R exspeed:exspeed /var/lib/exspeed
 COPY --from=builder /app/target/release/exspeed /usr/local/bin/exspeed
 USER 1000:1000
-EXPOSE 5933 8080
+# 5933 = binary protocol, 8080 = HTTP API, 5934 = replication (multi-pod)
+EXPOSE 5933 8080 5934
 VOLUME /var/lib/exspeed
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
+  CMD ["exspeed", "healthcheck"]
 ENTRYPOINT ["exspeed"]
 CMD ["server", "--data-dir", "/var/lib/exspeed", "--bind", "0.0.0.0:5933", "--api-bind", "0.0.0.0:8080"]

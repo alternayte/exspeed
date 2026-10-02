@@ -95,6 +95,22 @@ async fn main() -> anyhow::Result<()> {
         cli::Command::View { name } => cli::view::get(&client, &name, json).await,
         cli::Command::Connectors => cli::stream::list_connectors(&client, json).await,
         cli::Command::Snapshot(a) => cli::snapshot::run(a).await,
+        cli::Command::Healthcheck { url, timeout } => healthcheck(&url, timeout).await,
         cli::Command::Auth { cmd } => cli::auth::run(cmd, &client).await,
+    }
+}
+
+/// Probe `url` and exit non-zero unless it answers 200. Accepts self-signed
+/// certificates: a health probe checks liveness, not identity.
+async fn healthcheck(url: &str, timeout_secs: u64) -> anyhow::Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .danger_accept_invalid_certs(true)
+        .build()?;
+    let status = client.get(url).send().await?.status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        anyhow::bail!("{url} returned {status}")
     }
 }

@@ -149,6 +149,16 @@ pub enum Command {
     Connectors,
     /// Snapshot an offline data directory to a .tar.gz file
     Snapshot(snapshot::SnapshotArgs),
+    /// Exit 0 if the server's readiness probe answers 200 (for Docker
+    /// HEALTHCHECK and other probes that can only run a command)
+    Healthcheck {
+        /// Probe URL
+        #[arg(long, default_value = "http://127.0.0.1:8080/readyz")]
+        url: String,
+        /// Timeout in seconds
+        #[arg(long, default_value_t = 3)]
+        timeout: u64,
+    },
     /// Credential management helpers (gen-token, hash, lint, whoami)
     Auth {
         #[command(subcommand)]
