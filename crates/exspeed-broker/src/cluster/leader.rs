@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use opentelemetry::KeyValue;
 use sha2::{Digest, Sha256};
-use tokio::io::BufReader;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncWrite, BufReader};
+use tokio::net::TcpListener;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -54,20 +54,36 @@ pub(crate) async fn serve(cluster: Arc<Cluster>, listener: TcpListener, cancel: 
         let cluster = cluster.clone();
         let cancel = cancel.clone();
         tokio::spawn(async move {
-            if let Err(e) = connection(&cluster, socket, peer, &cancel).await {
+            let res = match cluster.cfg.tls.as_ref() {
+                Some(tls) => {
+                    let acceptor = tokio_rustls::TlsAcceptor::from(tls.server.clone());
+                    match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(socket))
+                        .await
+                    {
+                        Ok(Ok(stream)) => connection(&cluster, stream, peer, &cancel).await,
+                        Ok(Err(e)) => Err(e),
+                        Err(_) => Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "TLS handshake timed out",
+                        )),
+                    }
+                }
+                None => connection(&cluster, socket, peer, &cancel).await,
+            };
+            if let Err(e) = res {
                 debug!(%peer, error = %e, "replication connection closed");
             }
         });
     }
 }
 
-async fn connection(
+async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
     cluster: &Arc<Cluster>,
-    socket: TcpStream,
+    socket: S,
     peer: SocketAddr,
     cancel: &CancellationToken,
 ) -> std::io::Result<()> {
-    let (rd, mut wr) = socket.into_split();
+    let (rd, mut wr) = tokio::io::split(socket);
     let mut rd = BufReader::new(rd);
     let hello = tokio::time::timeout(Duration::from_secs(10), read_msg(&mut rd))
         .await

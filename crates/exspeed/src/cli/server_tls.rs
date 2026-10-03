@@ -33,6 +33,22 @@ pub fn load_tls_config(cert_path: &Path, key_path: &Path) -> Result<Arc<ServerCo
     Ok(Arc::new(config))
 }
 
+/// A rustls ClientConfig trusting the certificates in `ca_path` (PEM).
+pub fn load_client_config(ca_path: &Path) -> Result<Arc<tokio_rustls::rustls::ClientConfig>> {
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+    for cert in load_certs(ca_path).with_context(|| format!("loading CA {}", ca_path.display()))? {
+        roots
+            .add(cert)
+            .with_context(|| format!("adding a trust root from {}", ca_path.display()))?;
+    }
+    Ok(Arc::new(
+        tokio_rustls::rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    ))
+}
+
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);

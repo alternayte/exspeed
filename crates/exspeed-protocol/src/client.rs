@@ -43,6 +43,9 @@ pub mod code {
     /// Not the leader (`detail.leader` = leader address when known), or the
     /// server is still starting.
     pub const UNAVAILABLE: u16 = 503;
+    /// The server's disk is full. Nothing was written; retry once space is
+    /// freed.
+    pub const INSUFFICIENT_STORAGE: u16 = 507;
 }
 
 // ---------------------------------------------------------------------------

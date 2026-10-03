@@ -68,4 +68,6 @@ export const ErrorCode = {
   Internal: 500,
   /** Not the leader (see `ServerError.leaderHint`), or still starting. */
   Unavailable: 503,
+  /** The server's disk is full; nothing was written. Retry once space is freed. */
+  InsufficientStorage: 507,
 } as const;

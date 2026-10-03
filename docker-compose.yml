@@ -13,7 +13,7 @@ services:
     depends_on:
       - postgres
       - rabbitmq
-      - minio
+      - s3
 
   postgres:
     image: postgres:16
@@ -38,15 +38,12 @@ services:
       - "5672:5672"
       - "15672:15672"
 
-  minio:
-    image: minio/minio
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+  # S3-compatible store for the s3 sink tests (any credentials work).
+  # MinIO no longer publishes images on Docker Hub.
+  s3:
+    image: motoserver/moto:latest
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "9000:5000"
 
   mysql:
     image: mysql:8.0
@@ -73,6 +70,7 @@ services:
       ACCEPT_EULA: "Y"
       MSSQL_SA_PASSWORD: "Exspeed_Test!1"
       MSSQL_PID: "Developer"
+      MSSQL_AGENT_ENABLED: "true"   # CDC capture (mssql_cdc)
     ports:
       - "1433:1433"
     healthcheck:

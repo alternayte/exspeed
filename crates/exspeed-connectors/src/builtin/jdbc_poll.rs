@@ -109,7 +109,7 @@ impl JdbcPollSource {
         let cols_sql: Vec<String> = self
             .schema_cols
             .iter()
-            .map(|c| quote_ident(self.kind, &c.name))
+            .map(|c| select_expr(self.kind, &c.name, c.json_type))
             .collect();
         let table_q = quote_ident(self.kind, &self.table);
         let tc_q = quote_ident(self.kind, &self.tracking_column);
@@ -151,6 +151,49 @@ fn quote_ident(kind: DialectKind, name: &str) -> String {
     }
 }
 
+/// `CAST(<col> AS <type>) AS <col>`: cast in SQL to a type the decoder
+/// understands. sqlx's `Any` driver rejects many native types outright
+/// (MySQL `DATETIME`, `DECIMAL`, `TINYINT`, `JSON`; Postgres `timestamptz`,
+/// `numeric`, …), which failed every poll, and tiberius won't read a
+/// `datetime2` as a string.
+fn select_expr(kind: DialectKind, name: &str, ty: JsonType) -> String {
+    let q = quote_ident(kind, name);
+    let expr = match (kind, ty) {
+        (DialectKind::Postgres, JsonType::Bigint) => format!("CAST({q} AS BIGINT)"),
+        (DialectKind::Postgres, JsonType::Double) => format!("CAST({q} AS DOUBLE PRECISION)"),
+        (DialectKind::Postgres, JsonType::Boolean) => format!("CAST({q} AS BOOLEAN)"),
+        (DialectKind::Postgres, _) => format!("CAST({q} AS TEXT)"),
+        (DialectKind::MySql, JsonType::Bigint | JsonType::Boolean) => {
+            format!("CAST({q} AS SIGNED)")
+        }
+        (DialectKind::MySql, JsonType::Double) => format!("CAST({q} AS DOUBLE)"),
+        (DialectKind::MySql, _) => format!("CAST({q} AS CHAR)"),
+        (DialectKind::Sqlite, JsonType::Bigint | JsonType::Boolean) => {
+            format!("CAST({q} AS INTEGER)")
+        }
+        (DialectKind::Sqlite, JsonType::Double) => format!("CAST({q} AS REAL)"),
+        (DialectKind::Sqlite, _) => format!("CAST({q} AS TEXT)"),
+        (DialectKind::Mssql, JsonType::Bigint) => format!("CAST({q} AS BIGINT)"),
+        (DialectKind::Mssql, JsonType::Double) => format!("CAST({q} AS FLOAT)"),
+        (DialectKind::Mssql, JsonType::Boolean) => format!("CAST({q} AS BIT)"),
+        (DialectKind::Mssql, JsonType::Timestamptz) => format!("CONVERT(NVARCHAR(40), {q}, 127)"),
+        (DialectKind::Mssql, _) => format!("CAST({q} AS NVARCHAR(MAX))"),
+    };
+    format!("{expr} AS {q}")
+}
+
+/// A text cell; MySQL may report a long `CAST(… AS CHAR)` as a blob.
+fn sqlx_text(row: &AnyRow, idx: usize) -> Option<String> {
+    match row.try_get::<Option<String>, _>(idx) {
+        Ok(v) => v,
+        Err(_) => row
+            .try_get::<Option<Vec<u8>>, _>(idx)
+            .ok()
+            .flatten()
+            .map(|b| String::from_utf8_lossy(&b).into_owned()),
+    }
+}
+
 /// Decode a sqlx::AnyRow column into `serde_json::Value`.
 fn decode_sqlx_cell(row: &AnyRow, idx: usize, ty: JsonType) -> serde_json::Value {
     use serde_json::Value;
@@ -167,20 +210,21 @@ fn decode_sqlx_cell(row: &AnyRow, idx: usize, ty: JsonType) -> serde_json::Value
             .flatten()
             .and_then(|v| serde_json::Number::from_f64(v).map(Value::Number))
             .unwrap_or(Value::Null),
-        JsonType::Boolean => row
-            .try_get::<Option<bool>, _>(idx)
-            .ok()
-            .flatten()
-            .map(Value::Bool)
-            .unwrap_or(Value::Null),
-        JsonType::Text | JsonType::Timestamptz => row
-            .try_get::<Option<String>, _>(idx)
-            .ok()
-            .flatten()
+        // Postgres casts to a boolean; MySQL and SQLite to an integer.
+        JsonType::Boolean => match row.try_get::<Option<bool>, _>(idx) {
+            Ok(v) => v.map(Value::Bool).unwrap_or(Value::Null),
+            Err(_) => row
+                .try_get::<Option<i64>, _>(idx)
+                .ok()
+                .flatten()
+                .map(|v| Value::Bool(v != 0))
+                .unwrap_or(Value::Null),
+        },
+        JsonType::Text | JsonType::Timestamptz => sqlx_text(row, idx)
             .map(Value::String)
             .unwrap_or(Value::Null),
         JsonType::Jsonb => {
-            let s: Option<String> = row.try_get::<Option<String>, _>(idx).ok().flatten();
+            let s: Option<String> = sqlx_text(row, idx);
             match s {
                 Some(s) => serde_json::from_str::<Value>(&s).unwrap_or(Value::String(s)),
                 None => Value::Null,
@@ -417,6 +461,16 @@ impl SourceConnector for JdbcPollSource {
             }
         }
 
+        // Every returned row has `tracking_column > last_value`, so the
+        // cursor must move. If it can't be read, the next poll would return
+        // the same rows again, forever.
+        if !out.is_empty() && high_water == self.last_value {
+            return Err(ConnectorError::fatal(format!(
+                "jdbc_poll: could not read tracking_column '{}' as an integer in the polled rows",
+                self.tracking_column
+            )));
+        }
+
         let position = if high_water != self.last_value {
             self.last_value = high_water;
             Some(high_water.to_string())
@@ -578,7 +632,8 @@ mod tests {
         let sql = src.build_select_sql(50);
         assert_eq!(
             sql,
-            "SELECT \"id\", \"name\" FROM \"events\" WHERE \"id\" > $1 ORDER BY \"id\" ASC LIMIT 50"
+            "SELECT CAST(\"id\" AS BIGINT) AS \"id\", CAST(\"name\" AS TEXT) AS \"name\" FROM \"events\" \
+             WHERE \"id\" > $1 ORDER BY \"id\" ASC LIMIT 50"
         );
     }
 
@@ -594,7 +649,8 @@ mod tests {
         let sql = src.build_select_sql(50);
         assert_eq!(
             sql,
-            "SELECT `id`, `name` FROM `events` WHERE `id` > ? ORDER BY `id` ASC LIMIT 50"
+            "SELECT CAST(`id` AS SIGNED) AS `id`, CAST(`name` AS CHAR) AS `name` FROM `events` \
+             WHERE `id` > ? ORDER BY `id` ASC LIMIT 50"
         );
     }
 
@@ -625,7 +681,8 @@ mod tests {
         let sql = src.build_select_sql(50);
         assert_eq!(
             sql,
-            "SELECT TOP (50) [id], [name] FROM [events] WHERE [id] > @P1 ORDER BY [id] ASC"
+            "SELECT TOP (50) CAST([id] AS BIGINT) AS [id], CAST([name] AS NVARCHAR(MAX)) AS [name] \
+             FROM [events] WHERE [id] > @P1 ORDER BY [id] ASC"
         );
     }
 }

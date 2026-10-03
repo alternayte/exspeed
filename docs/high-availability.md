@@ -126,7 +126,12 @@ itself included, in the lease record.
 | `acks` | A write is acknowledged when | On leader failure |
 |--------|------------------------------|-------------------|
 | `all` (default) | every in-sync replica has it | no acknowledged write is lost (unless every in-sync replica fails) |
+| `quorum` | every in-sync replica has it, and the in-sync replicas are a majority of `cluster.size` (writes fail with 503 otherwise) | no acknowledged write is lost while a majority of nodes survives |
 | `leader` | the leader has written it locally | writes not yet replicated are lost |
+
+`quorum` is `all` with `min_insync_replicas` raised to a majority of
+`cluster.size` (2 of 3, 3 of 5). Every acknowledged write is on a majority
+of nodes, and only one of those in-sync nodes can be elected.
 
 - **Election:** with `unclean_leader_election = false` (the default), only
   a node in the published ISR can take the lease. A node that is missing
@@ -187,8 +192,30 @@ postgres_url = "postgres://exspeed:...@pg/exspeed"
 advertise = "exspeed-0.exspeed:5934"
 client_advertise = "exspeed-0.exspeed:5933"
 replicator_credential = "..."
-acks = "all"
-min_insync_replicas = 2
+acks = "quorum"
+size = 3
+```
+
+### TLS on the cluster port
+
+With `cluster.tls = true` the cluster port serves the same certificate as
+the client and HTTP ports (`[tls] cert` / `key`), and followers require TLS
+when they connect to the leader. They verify the leader's certificate against the host of
+its advertised endpoint (`cluster.advertise`) using `cluster.tls_ca` as the
+trust roots. The default trust root is the `[tls]` certificate itself, which
+fits one certificate shared by every node. With per-node certificates from a
+CA, point `cluster.tls_ca` at the CA. Certificates need the advertised host
+names (or IPs) as SANs, e.g. `*.exspeed-headless.<ns>.svc.cluster.local` in
+Kubernetes.
+
+```toml
+[tls]
+cert = "/etc/exspeed/tls/tls.crt"
+key = "/etc/exspeed/tls/tls.key"
+
+[cluster]
+tls = true
+tls_ca = "/etc/exspeed/tls/ca.crt"
 ```
 
 Every setting, with environment variables, is in
@@ -268,13 +295,22 @@ traffic and less tolerance for slow backends.
 | `GET /healthz` | 200 on the leader only (with `leader_hint` otherwise) |
 | metrics | `exspeed_is_leader`, `exspeed_replication_role`, `exspeed_replication_lag_records`, `exspeed_replication_records_applied_total`, `exspeed_replication_truncated_records_total`, `exspeed_replication_bytes_total`, `exspeed_lease_*` |
 
+## How it is tested
+
+| Test | What it proves |
+|------|----------------|
+| `cluster_test` (in-process, real TCP replication) | Replication of records, configs, deletes, consumer state, queries and connectors. Failover without losing acknowledged writes. Divergent-leader truncation, follower restart, `min_insync_replicas`. TLS replication, and refusal of an untrusted peer. |
+| `cluster_test::randomized_partitions_and_restarts_lose_no_acknowledged_write` | Jepsen-style. Random lease partitions, replication links cut by a fault-injecting proxy, and node restarts run under a writer that retries with the same `msg_id`. Afterwards every acknowledged write is present exactly once, every value in the log was written by the client, and all nodes hold identical logs. |
+| `crash_test::kill_9_in_a_three_node_cluster_loses_no_acknowledged_write` | Three real processes on a Postgres lease with `acks = "quorum"`, while the leader (usually) or a follower is SIGKILLed and restarted. Same checks. Runs in CI with Postgres. |
+| `postgres_lease_test`, `redis_lease_test`, lease unit tests | One conformance suite for every lease backend: epochs, fencing, ISR-gated election, expiry, release. |
+
 ## Limits
 
-- **Every node has every stream.** There is no partitioning across nodes or
-  per-stream replication factor. A cluster scales reads and availability,
-  not write throughput.
-- **The cluster port has no TLS.** It authenticates followers with a token.
-  Keep it on a private network.
+- **Every node has every stream, by design.** One leader serves every
+  stream, so the node that takes over must already hold all of them. A
+  per-stream replication factor would leave a promoted node missing streams,
+  so it is not planned. To scale writes, partition data across separate
+  clusters. A cluster scales reads and availability, not write throughput.
 - **Followers apply compaction themselves.** Compacted streams converge on
   the same contents, but a follower may keep superseded records slightly
   longer than the leader.

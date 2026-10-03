@@ -568,7 +568,9 @@ async fn consumer_state_stream_is_compacted() {
             tokio::time::sleep(Duration::from_millis(110)).await;
         }
         token.cancel();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The actor writes a final snapshot as it stops; read the bounds only
+        // after that, or the high watermark below is one short.
+        assert!(m.wait_stopped(Duration::from_secs(10)).await);
     }
     let consumers = sn(super::store::CONSUMERS_STREAM);
     let (lo, hi) = fs.stream_bounds(&consumers).await.unwrap();

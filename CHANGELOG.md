@@ -104,6 +104,26 @@ connector config and SDK API all change.
   - poll ties, outbox id types, `mssql_cdc` cursor
   - batched JDBC inserts, HTTP status taxonomy
   - S3 sink idempotent object keys, RabbitMQ confirms
+- Crash/resume tests against real services for every remaining plugin: the
+  RabbitMQ source and sink, the S3 sink (against moto, an S3-compatible server), the JDBC sink and
+  `jdbc_poll` on MySQL, SQL Server and Postgres, `mssql_cdc`, and the
+  Postgres outbox (crash before the delete). Each one crashes the connector
+  mid-stream and checks at-least-once delivery, or no duplicates where the
+  plugin promises effectively-once. The CI service
+  job now also runs RabbitMQ, an S3-compatible store (moto) and SQL Server (with Agent, for CDC).
+  See [docs/connectors.md](docs/connectors.md#testing-against-real-services).
+- Fixes found by these tests:
+  - `jdbc_poll` failed every poll on columns that sqlx's `Any` driver can't
+    map: MySQL `TINYINT(1)`, `DECIMAL`, `DATETIME` and `JSON`, and Postgres
+    `numeric` and `timestamptz`. The error was classified as transient, so
+    the connector restarted forever. On SQL Server, `datetime2` columns came
+    out as `null`. Columns are now cast in SQL to their `schema` type. A
+    tracking value that can't be read now fails the connector instead of
+    re-reading the same rows forever.
+  - `rabbitmq` sink: when a message was returned as unroutable
+    (`mandatory`), every record after it in the batch was published again,
+    once for each returned message in the batch. The rest of the batch is
+    now settled from the publisher confirms that were already received.
 
 ### High availability (Phase 6)
 
@@ -157,6 +177,22 @@ connector config and SDK API all change.
 - Connections defined in `connections.d/` or the environment can no longer
   be deleted through the API (`409`); unparseable `connections.d/` files are
   logged instead of silently skipped.
+
+### Crash safety and HA hardening
+
+- Kill -9 loop tests against the real server binary, under concurrent
+  single and batch publishes and a pulling consumer.
+- Real-disk ENOSPC tests on a small tmpfs (CI mounts one): writes fail
+  cleanly, acknowledged data stays readable, writing resumes once space
+  frees. A full disk now answers `507` on TCP and HTTP instead of `500`.
+- Seeded, model-based storage property tests (appends, restarts,
+  torn-tail crashes, retention).
+- TLS on the cluster port (`cluster.tls`, `cluster.tls_ca`). The Helm chart
+  turns it on with `tls.secretName`.
+- `cluster.acks = "quorum"` with `cluster.size`: `all`, plus never fewer
+  than a majority of nodes in sync.
+- Jepsen-style randomized partition and restart test, and a kill -9 test
+  of a real three-process cluster on a Postgres lease.
 
 ## [0.5.0] — 2026-04-24
 

@@ -309,6 +309,14 @@ pub fn log_error_response(ctx: &SessionContext, e: LogError) -> Response {
         LogError::Storage(StorageError::StreamAlreadyExists(s)) => {
             Response::error(code::CONFLICT, format!("stream '{s}' already exists"))
         }
+        LogError::Storage(StorageError::Io(io))
+            if exspeed_storage::file::io_errors::is_storage_full(&io) =>
+        {
+            Response::error(
+                code::INSUFFICIENT_STORAGE,
+                format!("the server's disk is full; nothing was written: {io}"),
+            )
+        }
         LogError::Storage(e) => Response::error(code::INTERNAL, e.to_string()),
     }
 }

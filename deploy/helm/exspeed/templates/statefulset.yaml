@@ -98,6 +98,16 @@ spec:
               value: {{ .Values.cluster.acks | quote }}
             - name: EXSPEED_MIN_INSYNC_REPLICAS
               value: {{ .Values.cluster.minInsyncReplicas | quote }}
+            - name: EXSPEED_CLUSTER_SIZE
+              value: {{ .Values.replicas | quote }}
+            {{- if .Values.tls.secretName }}
+            - name: EXSPEED_CLUSTER_TLS
+              value: "true"
+            {{- if .Values.cluster.tlsCaKey }}
+            - name: EXSPEED_CLUSTER_TLS_CA
+              value: /etc/exspeed/tls/{{ .Values.cluster.tlsCaKey }}
+            {{- end }}
+            {{- end }}
             {{- end }}
           startupProbe:
             httpGet: { path: /readyz, port: http, scheme: {{ if .Values.tls.secretName }}HTTPS{{ else }}HTTP{{ end }} }

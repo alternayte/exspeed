@@ -167,6 +167,7 @@ servers uses its own protocol on the cluster port (see
 | 429 | Retry later: dedup map full, or too many concurrent waiting requests on this connection (max 64) | `{"retry_after_secs": n}` |
 | 500 | Internal error | |
 | 503 | Not the leader, still starting, or (cluster with `acks = all`) not enough in-sync replicas / replication timed out | `{"leader": "host:port"}` when known; `{"in_sync": n, "required": m}` |
+| 507 | The server's disk is full; nothing was written. Retry once space is freed. | |
 
 ## Consumers
 

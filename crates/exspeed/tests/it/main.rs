@@ -9,6 +9,7 @@ mod common;
 mod connector_dlq_test;
 mod connector_test;
 mod consumer_test;
+mod crash_test;
 mod dedup_test;
 mod exql_test;
 mod exql_windows_test;

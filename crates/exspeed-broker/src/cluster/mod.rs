@@ -67,6 +67,25 @@ pub struct ClusterConfig {
     pub replicator_token: Option<String>,
     pub fetch_max_bytes: u32,
     pub fetch_max_wait: Duration,
+    /// TLS on the cluster port: the listener serves it and followers
+    /// require it when dialing the leader.
+    pub tls: Option<ClusterTls>,
+}
+
+/// TLS settings for the cluster port.
+#[derive(Clone)]
+pub struct ClusterTls {
+    /// Used by this node's cluster listener.
+    pub server: std::sync::Arc<tokio_rustls::rustls::ServerConfig>,
+    /// Used when this node replicates from the leader; verifies the
+    /// leader's certificate against the host of its advertised endpoint.
+    pub client: std::sync::Arc<tokio_rustls::rustls::ClientConfig>,
+}
+
+impl std::fmt::Debug for ClusterTls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClusterTls")
+    }
 }
 
 impl ClusterConfig {
@@ -80,6 +99,7 @@ impl ClusterConfig {
             replicator_token: None,
             fetch_max_bytes: 8 * 1024 * 1024,
             fetch_max_wait: Duration::from_millis(1000),
+            tls: None,
         }
     }
 

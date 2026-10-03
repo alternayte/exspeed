@@ -89,11 +89,14 @@ None of this is needed for a single node. See [high-availability.md](high-availa
 | `cluster.client_advertise` | `EXSPEED_CLIENT_ADVERTISE` | `bind` when it is a specific address | Client-protocol address sent to clients as the leader hint |
 | `cluster.node_id` | `EXSPEED_NODE_ID` | generated into `{data_dir}/node_id` | Stable node identity |
 | `cluster.replicator_credential` | `EXSPEED_REPLICATOR_CREDENTIAL` | — | Token followers present (needs the `replicate` action). Required when auth is on. |
-| `cluster.acks` | `EXSPEED_ACKS` | `all` | `all`: acknowledge once every in-sync replica has the write. `leader`: after the leader's local write. |
+| `cluster.acks` | `EXSPEED_ACKS` | `all` | `all`: acknowledge once every in-sync replica has the write. `quorum`: `all`, with at least a majority of `cluster.size` in sync. `leader`: after the leader's local write. |
+| `cluster.size` | `EXSPEED_CLUSTER_SIZE` | — | Number of nodes. Required for `acks = quorum`. |
 | `cluster.min_insync_replicas` | `EXSPEED_MIN_INSYNC_REPLICAS` | `1` | With `acks = all`, writes fail with 503 while fewer replicas (leader included) are in sync |
 | `cluster.replica_lag_max_ms` | `EXSPEED_REPLICA_LAG_MAX_MS` | `10000` | A follower that hasn't caught up for this long leaves the ISR |
 | `cluster.ack_timeout_ms` | `EXSPEED_ACK_TIMEOUT_MS` | `10000` | How long an `acks = all` write waits for replication before a retryable 503 |
 | `cluster.unclean_leader_election` | `EXSPEED_UNCLEAN_LEADER_ELECTION` | `false` | `true` lets a node outside the ISR take over (availability over durability) |
+| `cluster.tls` | `EXSPEED_CLUSTER_TLS` | `false` | Serve and require TLS on the cluster port, with the `[tls]` certificate |
+| `cluster.tls_ca` | `EXSPEED_CLUSTER_TLS_CA` | the `[tls]` cert | Trust roots for peers' certificates |
 | `connectors.offset_store` | `EXSPEED_CONNECTOR_OFFSET_STORE` | `log` | `log` (the `__connector_offsets` stream; replicates with the data) or `file`. See [connectors.md](connectors.md#offsets). |
 
 Consumer state needs no backend: it lives in the internal `__consumers`

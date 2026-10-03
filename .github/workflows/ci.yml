@@ -33,15 +33,24 @@ jobs:
   test:
     name: cargo test
     runs-on: ubuntu-latest
+    env:
+      # A tiny real filesystem for the disk-full tests.
+      EXSPEED_ENOSPC_DIR: /mnt/exspeed-enospc
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Mount a 16 MiB tmpfs for the disk-full tests
+        run: |
+          sudo mkdir -p "$EXSPEED_ENOSPC_DIR"
+          sudo mount -t tmpfs -o size=16m tmpfs "$EXSPEED_ENOSPC_DIR"
+          sudo chmod 777 "$EXSPEED_ENOSPC_DIR"
       - run: cargo test --workspace
 
   test-services:
-    name: cargo test (Postgres, Redis, MySQL)
+    name: cargo test (Postgres, Redis, MySQL, RabbitMQ, S3, SQL Server)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       EXSPEED_POSTGRES_URL: postgres://testuser:testpass@127.0.0.1:5432/testdb
       EXSPEED_OFFSET_STORE_POSTGRES_URL: postgres://testuser:testpass@127.0.0.1:5432/testdb
@@ -49,10 +58,17 @@ jobs:
       EXSPEED_LEASE_POSTGRES_URL: postgres://testuser:testpass@127.0.0.1:5432/testdb
       EXSPEED_LEASE_REDIS_URL: redis://127.0.0.1:6379
       EXSPEED_MYSQL_URL: mysql://exspeed:exspeed@127.0.0.1:3306/exspeed
+      EXSPEED_RABBITMQ_URL: amqp://guest:guest@127.0.0.1:5672/%2f
+      EXSPEED_S3_ENDPOINT: http://127.0.0.1:9000
+      EXSPEED_S3_ACCESS_KEY: minioadmin
+      EXSPEED_S3_SECRET_KEY: minioadmin
+      MSSQL_SA_PASSWORD: "Exspeed_Test!1"
+      EXSPEED_MSSQL_URL: "mssql://sa:Exspeed_Test!1@127.0.0.1:1433/exspeed?trust_server_certificate=true"
     steps:
       - uses: actions/checkout@v4
       - name: Start services
         # Service containers can't take a command, and CDC needs wal_level=logical.
+        # SQL Server needs its Agent for CDC capture; it boots while we build.
         run: |
           docker run -d --name pg -p 5432:5432 \
             -e POSTGRES_USER=testuser -e POSTGRES_PASSWORD=testpass -e POSTGRES_DB=testdb \
@@ -61,17 +77,39 @@ jobs:
           docker run -d --name mysql -p 3306:3306 \
             -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=exspeed \
             -e MYSQL_USER=exspeed -e MYSQL_PASSWORD=exspeed mysql:8
+          docker run -d --name rabbitmq -p 5672:5672 rabbitmq:3-management
+          # S3-compatible store (MinIO no longer publishes images on Docker Hub).
+          docker run -d --name s3 -p 9000:5000 motoserver/moto:latest
+          docker run -d --name mssql -p 1433:1433 \
+            -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD -e MSSQL_PID=Developer \
+            -e MSSQL_AGENT_ENABLED=true \
+            mcr.microsoft.com/mssql/server:2022-latest
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --tests
       - name: Wait for services
         run: |
-          for i in $(seq 1 60); do
-            docker exec pg pg_isready -U testuser >/dev/null 2>&1 \
-              && docker exec mysql mysqladmin ping -uroot -proot --silent >/dev/null 2>&1 \
-              && break
-            sleep 2
-          done
+          wait_for() {
+            local name=$1; shift
+            for i in $(seq 1 90); do
+              if "$@" >/dev/null 2>&1; then echo "$name ready"; return 0; fi
+              sleep 2
+            done
+            echo "$name did not become ready"
+            docker logs "$name" 2>&1 | tail -50
+            return 1
+          }
+          sqlcmd() {
+            docker exec mssql /opt/mssql-tools18/bin/sqlcmd -C -b -S localhost \
+              -U sa -P "$MSSQL_SA_PASSWORD" "$@"
+          }
+          wait_for pg docker exec pg pg_isready -U testuser
+          wait_for mysql docker exec mysql mysqladmin ping -uroot -proot --silent
+          wait_for rabbitmq docker exec rabbitmq rabbitmq-diagnostics -q check_port_connectivity
+          wait_for s3 curl -s -o /dev/null http://127.0.0.1:9000/
+          wait_for mssql sqlcmd -Q "SELECT 1"
+          # A user database: CDC can't be enabled on master.
+          sqlcmd -Q "IF DB_ID('exspeed') IS NULL CREATE DATABASE exspeed"
       - name: Run service-backed tests
         run: >
           cargo test --workspace --lib --bins

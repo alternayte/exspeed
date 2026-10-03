@@ -244,11 +244,12 @@ pub(crate) fn log_error_response(
             state
                 .metrics
                 .record_storage_write_error(stream.as_str(), kind);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
-            )
-                .into_response()
+            let status = if kind == "storage_full" {
+                StatusCode::INSUFFICIENT_STORAGE
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(json!({"error": e.to_string()}))).into_response()
         }
     }
 }
