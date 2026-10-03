@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod backup;
 pub mod client;
 pub mod connector;
 pub mod consumer_cmd;
@@ -153,6 +154,11 @@ pub enum Command {
     Connectors,
     /// Snapshot an offline data directory to a .tar.gz file
     Snapshot(snapshot::SnapshotArgs),
+    /// Download an online backup of a running server (GET /api/v1/backup)
+    Backup(backup::BackupArgs),
+    /// Restore a backup into a data directory (offline: no server may be
+    /// running on it)
+    Restore(backup::RestoreArgs),
     /// Exit 0 if the server's readiness probe answers 200 (for Docker
     /// HEALTHCHECK and other probes that can only run a command)
     Healthcheck {

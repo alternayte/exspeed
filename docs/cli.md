@@ -123,12 +123,23 @@ exspeed auth whoami                    # identity + permissions of $EXSPEED_AUTH
 
 See [security.md](security.md).
 
-## Snapshot (offline backup)
+## Backup and restore
 
 ```bash
+# Online: download a backup from a running server (global admin).
+exspeed backup [--url http://host:8080] [--token T] --output backup.tar
+
+# Offline: restore into a data directory no server is using.
+exspeed restore --input backup.tar --data-dir /var/lib/exspeed [--force]
+
+# Offline snapshot of a stopped server's data directory, as-is.
 exspeed snapshot --data-dir /var/lib/exspeed --output backup.tar.gz
 ```
 
-This takes the data-directory lock, so the server must be stopped first.
-To restore, extract the archive into an empty data directory. There is no
-online backup or `restore` command yet.
+`backup` uses `--url`, or the global `--server`, and `--token`, or
+`EXSPEED_AUTH_TOKEN`. It prints the manifest (streams with their offset
+ranges) once the archive is complete and verified. `restore` refuses a
+non-empty data directory unless you pass `--force`. Consistency guarantees
+and what the archive contains are in
+[operations.md](operations.md#backup-and-restore).
+

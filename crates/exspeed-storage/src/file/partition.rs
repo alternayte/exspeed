@@ -60,6 +60,10 @@ pub struct PartitionShared {
     watch_tx: watch::Sender<u64>,
     failed: AtomicBool,
     failed_reason: Mutex<Option<String>>,
+    /// Bumped before every truncation rewrites files in place, so a reader
+    /// copying raw segment bytes (online backup) can tell whether the bytes
+    /// it copied may have changed underneath it.
+    truncations: AtomicU64,
     /// Cached `stream.json`. `None` when the file exists but can't be parsed
     /// — retention and compaction then skip this stream instead of guessing.
     config: Mutex<Option<StreamConfig>>,
@@ -85,6 +89,7 @@ impl PartitionShared {
             watch_tx,
             failed: AtomicBool::new(false),
             failed_reason: Mutex::new(None),
+            truncations: AtomicU64::new(0),
             config: Mutex::new(config),
         }
     }
@@ -152,6 +157,17 @@ impl PartitionShared {
                 false
             }
         });
+    }
+
+    /// Number of truncations started so far (see `truncations`).
+    pub fn truncation_epoch(&self) -> u64 {
+        self.truncations.load(Ordering::SeqCst)
+    }
+
+    /// Writer only: called before a truncation hides records or touches
+    /// any file.
+    pub fn begin_truncation(&self) {
+        self.truncations.fetch_add(1, Ordering::SeqCst);
     }
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {
