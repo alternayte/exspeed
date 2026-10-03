@@ -324,7 +324,7 @@ impl RoleHooks for Arc<Cluster> {
         for s in &streams {
             let (_, next) = self
                 .storage
-                .stream_bounds(s)
+                .committed_bounds(s)
                 .await
                 .map_err(|e| format!("bounds of {s}: {e}"))?;
             self.epochs
@@ -342,6 +342,8 @@ impl RoleHooks for Arc<Cluster> {
             self.cfg.tracker(),
             &lease.isr,
         );
+        tracker.apply_floors_to(self.storage.clone());
+        tracker.adopt_floors(streams.iter().map(|s| s.as_str().to_string()));
         if let Some(old) = self.tracker.write().replace(tracker) {
             old.close();
         }
@@ -390,6 +392,9 @@ impl ReplicaSync for Cluster {
                 }
                 if let Err(e) = self.epochs.put(s.as_str(), h) {
                     warn!(stream = %s, error = %e, "could not write the epoch history");
+                }
+                if let Some(t) = self.tracker() {
+                    t.stream_created(s.as_str());
                 }
             }
             MetadataChange::Deleted(s) => self.epochs.remove(s.as_str()),

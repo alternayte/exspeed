@@ -591,9 +591,10 @@ pub fn validate_manifest(m: &BackupManifest) -> io::Result<()> {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RestoreOptions {
     /// Restore into a data directory that already has content. Its
-    /// `streams/`, [`CONFIG_DIRS`], replication state and leftovers of an
-    /// interrupted restore are deleted first; other files (credentials,
-    /// `exspeed.toml`) are kept.
+    /// `streams/`, [`CONFIG_DIRS`], cluster state (`cluster/`: epoch
+    /// histories that describe the old log) and leftovers of an interrupted
+    /// restore are deleted first; other files (credentials, `exspeed.toml`,
+    /// the node's `node_id`) are kept.
     pub force: bool,
 }
 
@@ -665,7 +666,7 @@ pub fn restore_backup<R: Read>(
         for name in existing {
             let doomed = name == "streams"
                 || name == ".trash"
-                || name == "replication"
+                || name == "cluster"
                 || name.starts_with(STAGING_PREFIX)
                 || CONFIG_DIRS.contains(&name.as_str());
             if doomed {

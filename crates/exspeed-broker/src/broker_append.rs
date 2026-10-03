@@ -757,10 +757,24 @@ impl BrokerAppend {
             Err(e) => return Err(e),
         };
 
+        // Read the committed log, above any replication read floor: a
+        // promoted leader must remember keys of records it has but its
+        // followers don't yet.
         let mut cursor = start_offset;
         loop {
-            let batch = match self.storage.read(stream, cursor, 1000).await {
-                Ok(b) => b,
+            let read = self
+                .storage
+                .read_batch_committed(
+                    stream,
+                    cursor,
+                    exspeed_streams::ReadLimits {
+                        max_records: 1000,
+                        max_bytes: 16 * 1024 * 1024,
+                    },
+                )
+                .await;
+            let batch = match read {
+                Ok(b) => b.records,
                 Err(StorageError::StreamNotFound(_)) => break,
                 Err(e) => return Err(e),
             };

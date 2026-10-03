@@ -170,11 +170,11 @@ fn authorized(cluster: &Cluster, token: Option<&str>) -> bool {
     })
 }
 
-/// `stream -> next offset` for every stream on this node.
+/// `stream -> committed next offset` for every stream on this node.
 pub(crate) async fn high_watermarks(cluster: &Cluster) -> HashMap<String, u64> {
     let mut out = HashMap::new();
     for s in cluster.storage.list_streams().await.unwrap_or_default() {
-        if let Ok((_, next)) = cluster.storage.stream_bounds(&s).await {
+        if let Ok((_, next)) = cluster.storage.committed_bounds(&s).await {
             out.insert(s.as_str().to_string(), next.0);
         }
     }
@@ -204,6 +204,7 @@ async fn fetch(
     let deadline = Instant::now() + Duration::from_millis(req.max_wait_ms as u64).min(MAX_WAIT);
     let mut appends = cluster.log.watch_appends();
     let mut meta = cluster.log.watch_metadata();
+    let mut floors = tracker.watch_floors();
 
     // Record progress once per fetch (capped where the follower diverged).
     let progress = progress(cluster, &req).await;
@@ -212,6 +213,7 @@ async fn fetch(
     loop {
         appends.borrow_and_update();
         meta.borrow_and_update();
+        floors.borrow_and_update();
         if tracker.is_closed() {
             return Err(error(code::NOT_LEADER, "not the leader"));
         }
@@ -235,6 +237,7 @@ async fn fetch(
         tokio::select! {
             _ = appends.changed() => {}
             _ = meta.changed() => {}
+            _ = floors.changed() => {}
             _ = tokio::time::sleep_until(deadline) => {}
             _ = tokio::time::sleep(Duration::from_millis(250)) => {} // notice closure
             _ = cancel.cancelled() => return Err(error(code::NOT_LEADER, "shutting down")),
@@ -254,7 +257,7 @@ async fn progress(cluster: &Cluster, req: &FetchRequest) -> HashMap<String, u64>
         let Ok(name) = exspeed_common::StreamName::try_from(p.stream.as_str()) else {
             continue;
         };
-        let Ok((_, next)) = cluster.storage.stream_bounds(&name).await else {
+        let Ok((_, next)) = cluster.storage.committed_bounds(&name).await else {
             continue;
         };
         out.insert(
@@ -289,16 +292,27 @@ async fn build(
             .any(|p| !leader_names.contains(p.stream.as_str()));
 
     let mut hws = HashMap::new();
+    let mut visible = Vec::new();
     let mut data = Vec::new();
     let mut budget = req.max_bytes.max(1) as usize;
     let mut has_data = false;
     let n = streams.len();
     for i in 0..n {
         let s = &streams[(i + round) % n.max(1)];
-        let Ok((earliest, next)) = cluster.storage.stream_bounds(s).await else {
+        // Replication works on the committed log; readers only see up to
+        // the read floor, which followers apply from `high_watermarks`.
+        let Ok((earliest, next)) = cluster.storage.committed_bounds(s).await else {
             continue;
         };
         hws.insert(s.as_str().to_string(), next.0);
+        if !s.is_internal() {
+            if let Ok((_, vis)) = cluster.storage.stream_bounds(s).await {
+                visible.push((s.as_str().to_string(), vis.0));
+                if positions.get(s.as_str()).is_some_and(|p| p.hw < vis.0) {
+                    has_data = true; // the follower's readers are behind
+                }
+            }
+        }
         let Ok(hist) = cluster.epochs.get_or_create(s.as_str()) else {
             continue;
         };
@@ -316,7 +330,7 @@ async fn build(
         } else if p.next < next.0 && budget > 0 {
             match cluster
                 .storage
-                .read_batch(
+                .read_batch_committed(
                     s,
                     Offset(p.next),
                     ReadLimits {
@@ -383,6 +397,7 @@ async fn build(
             metadata_version: version,
             metadata,
             streams: data,
+            high_watermarks: visible,
         },
         hws,
         has_data,

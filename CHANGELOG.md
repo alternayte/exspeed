@@ -254,6 +254,24 @@ with the test that proves it.
   dead-lettered; http_poll keeps validators only after a readable body.
 - The `examples/order-processing` configs load, and CI validates every
   example config.
+- In a cluster, readers on the leader could see a record before the
+  in-sync followers had it, so a record that a failover then dropped could
+  already have been delivered. User streams now have a read floor (Kafka's
+  high watermark): readers see a record once every in-sync replica has it;
+  followers hold their readers to the leader's floor. With `acks = leader`
+  a write becomes readable once the followers have it. The replication
+  protocol between nodes changed (fetch positions and responses carry high
+  watermarks): upgrade every node together.
+- `storage.dedup_window_secs` now sets the dedup window of new streams;
+  it only fed an internal fallback before.
+- `exspeed restore --force` removes the target's `cluster/` state (stale
+  epoch histories) instead of a `replication/` directory nothing creates.
+- A webhook connector with a `[transform]` is rejected; the transform was
+  silently ignored.
+- The old environment names `EXSPEED_CONSUMER_STORE` and
+  `EXSPEED_OFFSET_STORE_{POSTGRES_URL,POSTGRES_SCHEMA,REDIS_URL}` are still
+  read as aliases of `EXSPEED_LEASE_BACKEND` and the lease connection
+  settings, but are no longer documented; use the `EXSPEED_LEASE_*` names.
 - Publishes on one TCP connection were applied one at a time, each waiting
   for its own fsync before the next request was read, so a pipelining
   client got about one record per fsync (under 100/s on a busy host). The

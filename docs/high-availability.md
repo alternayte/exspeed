@@ -136,6 +136,28 @@ itself included, in the lease record.
 `cluster.size` (2 of 3, 3 of 5). Every acknowledged write is on a majority
 of nodes, and only one of those in-sync nodes can be elected.
 
+### What readers see
+
+Readers (stateless reads, consumers, ExQL, sink connectors) see a record of
+a user stream only once **every in-sync replica has it**. This read floor
+(Kafka's high watermark) means a record that a failover could still drop is
+never delivered, whatever `acks` is:
+
+- On the leader, the floor of each stream is the lowest position among the
+  in-sync followers. It only moves up. An `acks = all` write raises it as
+  soon as it is acknowledged, so a writer always reads its own
+  acknowledged writes. With `acks = leader`, a write becomes readable once
+  the in-sync followers have it, usually a few milliseconds after the
+  publish returns.
+- With no follower in sync, there is no floor: the leader alone holds the
+  log.
+- Followers hold their readers to the leader's floor, which every fetch
+  response carries, so a read on a follower never returns a record the
+  leader's readers can't see.
+- Internal streams (`__consumers`, catalogs, checkpoints, connector
+  offsets) have no floor: their readers rebuild state and must see every
+  record. Replication and the dedup rebuild read the committed log too.
+
 - **Election:** with `unclean_leader_election = false` (the default), only
   a node in the published ISR can take the lease. A node that is missing
   acknowledged writes never becomes leader. If every ISR member is gone,

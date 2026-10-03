@@ -214,11 +214,12 @@ timestamp, so it is monotonic even when producer timestamps are not.
 
 **High watermark.** Readers see records only below the high watermark. In
 `sync` mode it advances after the fsync; in `async` mode after the write.
-`watch_appends` wakes subscribers when it moves. `FileStorage` has a
-replication floor hook (`FileStorage::set_replication_floor`) that can hold
-it back further, but the server does not set it: in a cluster, readers on
-the leader see a record once it is durable locally, while an `acks = all`
-publish of it is still waiting for the followers.
+`watch_appends` wakes subscribers when it moves. In a cluster a **read
+floor** holds it back further on user streams: readers see a record only
+once every in-sync replica has it (see
+[high-availability.md](high-availability.md#what-readers-see)). Replication
+and state rebuilds read the committed log above the floor
+(`committed_bounds`, `read_batch_committed`).
 
 **Reads.** Readers never take the writer's lock and never fsync. They load
 the segment list (swapped atomically by the writer), binary-search it, look

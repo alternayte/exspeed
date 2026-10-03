@@ -333,4 +333,45 @@ pub trait StorageEngine: Send + Sync {
         let _ = stream;
         None
     }
+
+    /// Hold what readers see of `stream` at or below `floor` (the offset the
+    /// in-sync replicas have; `None` lifts it). Committed reads
+    /// ([`read_batch_committed`](Self::read_batch_committed)) ignore it.
+    /// Engines without replication support ignore the call.
+    fn set_read_floor(&self, stream: &StreamName, floor: Option<u64>) {
+        let _ = (stream, floor);
+    }
+
+    /// What readers of `stream` can see right now (the high watermark),
+    /// when the engine can tell without I/O.
+    fn visible_end(&self, stream: &StreamName) -> Option<u64> {
+        let _ = stream;
+        None
+    }
+
+    /// The floor set by [`set_read_floor`](Self::set_read_floor), if any.
+    fn read_floor(&self, stream: &StreamName) -> Option<u64> {
+        let _ = stream;
+        None
+    }
+
+    /// Like [`stream_bounds`](Self::stream_bounds), but the end is the
+    /// committed end of the log, above any read floor.
+    async fn committed_bounds(
+        &self,
+        stream: &StreamName,
+    ) -> Result<(Offset, Offset), StorageError> {
+        self.stream_bounds(stream).await
+    }
+
+    /// Like [`read_batch`](Self::read_batch), up to the committed end of the
+    /// log (replication and state rebuilds read records above the floor).
+    async fn read_batch_committed(
+        &self,
+        stream: &StreamName,
+        from: Offset,
+        limits: ReadLimits,
+    ) -> Result<ReadBatch, StorageError> {
+        self.read_batch(stream, from, limits).await
+    }
 }

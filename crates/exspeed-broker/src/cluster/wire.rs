@@ -55,6 +55,9 @@ pub struct FetchPos {
     pub last_epoch: u64,
     /// The follower's earliest retained offset.
     pub earliest: u64,
+    /// The leader high watermark the follower last applied as its read
+    /// floor (user streams; 0 when none).
+    pub hw: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +110,9 @@ pub struct FetchResponse {
     /// out of date.
     pub metadata: Option<Vec<StreamMeta>>,
     pub streams: Vec<StreamData>,
+    /// The leader's high watermark (what its readers see) for every user
+    /// stream: followers hold their readers to it.
+    pub high_watermarks: Vec<(String, u64)>,
 }
 
 impl FetchResponse {
@@ -217,6 +223,7 @@ mod tests {
                 high_watermark: 6,
                 epochs: vec![(1, 0), (3, 4)],
             }],
+            high_watermarks: vec![("a".into(), 6)],
         });
         let mut buf = Vec::new();
         write_msg(&mut buf, &msg).await.unwrap();

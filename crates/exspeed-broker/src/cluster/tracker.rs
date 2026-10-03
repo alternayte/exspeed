@@ -11,10 +11,22 @@
 //! true, acknowledgements wait for every follower in `desired ∪ published`:
 //! a follower leaving the ISR keeps being waited for until its removal is
 //! published.
+//!
+//! The tracker also owns each user stream's **read floor** (the high
+//! watermark, as Kafka calls it): readers on the leader see a record only
+//! once every in-sync follower has it, so a record that a failover could
+//! still drop is never delivered. The floor is the lowest position among
+//! the in-sync followers, only ever moves up, is raised as soon as an
+//! `acks = all` write is acknowledged (so writers read their own writes),
+//! and is lifted while no follower is in sync. Internal (`__`) streams have
+//! no floor: their readers rebuild state and must see every record.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+use exspeed_common::StreamName;
+use exspeed_streams::StorageEngine;
 
 use parking_lot::Mutex;
 use tokio::sync::watch;
@@ -69,6 +81,8 @@ struct State {
     /// A publication is in flight.
     publishing: bool,
     closed: bool,
+    /// Read floor set per user stream (absent: no floor).
+    floors: HashMap<String, u64>,
 }
 
 /// Status of one follower, for the HTTP API.
@@ -88,6 +102,10 @@ pub struct ReplicaTracker {
     cfg: TrackerConfig,
     state: Mutex<State>,
     changed: watch::Sender<u64>,
+    /// Where read floors are applied (unset in unit tests).
+    storage: OnceLock<Arc<dyn StorageEngine>>,
+    /// Bumped whenever a read floor moves.
+    floors_moved: watch::Sender<u64>,
 }
 
 impl ReplicaTracker {
@@ -122,8 +140,11 @@ impl ReplicaTracker {
                 // in the published set).
                 publishing: false,
                 closed: false,
+                floors: HashMap::new(),
             }),
             changed: watch::channel(0).0,
+            storage: OnceLock::new(),
+            floors_moved: watch::channel(0).0,
         });
         t.publish(true);
         let weak = Arc::downgrade(&t);
@@ -143,6 +164,116 @@ impl ReplicaTracker {
 
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// Apply read floors to `storage` from now on.
+    pub fn apply_floors_to(&self, storage: Arc<dyn StorageEngine>) {
+        let _ = self.storage.set(storage);
+    }
+
+    /// Changes whenever a read floor moves.
+    pub fn watch_floors(&self) -> watch::Receiver<u64> {
+        self.floors_moved.subscribe()
+    }
+
+    /// The read floor of `stream`, if it has one.
+    pub fn floor(&self, stream: &str) -> Option<u64> {
+        self.state.lock().floors.get(stream).copied()
+    }
+
+    /// Take over the read floors of `streams` (at promotion: floors left
+    /// from following are lifted when no follower is in sync, and kept as
+    /// the starting point otherwise).
+    pub fn adopt_floors(&self, streams: impl IntoIterator<Item = String>) {
+        let mut st = self.state.lock();
+        self.update_floors(&mut st, streams);
+    }
+
+    /// A user stream was created: hold its records back until the in-sync
+    /// followers have them.
+    pub fn stream_created(&self, stream: &str) {
+        let mut st = self.state.lock();
+        self.update_floors(&mut st, [stream.to_string()]);
+    }
+
+    /// Recompute the floors of `streams` from the in-sync followers'
+    /// positions. Floors only move up; with no follower in sync they are
+    /// lifted.
+    fn update_floors(&self, st: &mut State, streams: impl IntoIterator<Item = String>) {
+        let Some(storage) = self.storage.get() else {
+            return;
+        };
+        let isr: Vec<&String> = st.desired.union(&st.published).collect();
+        let mut moved = false;
+        for s in streams {
+            let Ok(name) = StreamName::try_from(s.as_str()) else {
+                continue;
+            };
+            if name.is_internal() {
+                continue;
+            }
+            if isr.is_empty() {
+                // (A floor may also be left over from this node's time as
+                // a follower.)
+                if st.floors.remove(&s).is_some() || storage.read_floor(&name).is_some() {
+                    storage.set_read_floor(&name, None);
+                    moved = true;
+                }
+                continue;
+            }
+            let target = isr
+                .iter()
+                .map(|id| {
+                    st.followers
+                        .get(*id)
+                        .and_then(|f| f.offsets.get(&s))
+                        .copied()
+                        .unwrap_or(0)
+                })
+                .min()
+                .unwrap_or(0);
+            let new = match st.floors.get(&s) {
+                Some(&cur) => cur.max(target),
+                // Installing a floor never hides what readers already see.
+                None => target.max(storage.visible_end(&name).unwrap_or(target)),
+            };
+            if st.floors.get(&s) != Some(&new) {
+                st.floors.insert(s, new);
+                storage.set_read_floor(&name, Some(new));
+                moved = true;
+            }
+        }
+        if moved {
+            self.floors_moved.send_modify(|v| *v += 1);
+        }
+    }
+
+    /// Every stream the tracker knows about (floors and follower positions).
+    fn known_streams(st: &State) -> Vec<String> {
+        let mut all: BTreeSet<String> = st.floors.keys().cloned().collect();
+        for f in st.followers.values() {
+            all.extend(f.offsets.keys().cloned());
+        }
+        all.into_iter().collect()
+    }
+
+    /// Raise `stream`'s floor to `to` (every in-sync replica has the records
+    /// below it). No-op without a floor.
+    fn raise_floor(&self, stream: &str, to: u64) {
+        let Some(storage) = self.storage.get() else {
+            return;
+        };
+        let mut st = self.state.lock();
+        if let Some(cur) = st.floors.get_mut(stream) {
+            if to > *cur {
+                *cur = to;
+                if let Ok(name) = StreamName::try_from(stream) {
+                    storage.set_read_floor(&name, Some(to));
+                }
+                drop(st);
+                self.floors_moved.send_modify(|v| *v += 1);
+            }
+        }
     }
 
     pub fn is_closed(&self) -> bool {
@@ -176,6 +307,7 @@ impl ReplicaTracker {
                     f.last_caught_up = Some(*at);
                 }
             }
+            self.update_floors(&mut st, positions.keys().cloned());
         }
         self.evaluate();
         self.changed.send_modify(|v| *v += 1);
@@ -208,6 +340,8 @@ impl ReplicaTracker {
             if changed {
                 info!(isr = ?desired, "in-sync replicas changed");
                 st.desired = desired;
+                let all = Self::known_streams(&st);
+                self.update_floors(&mut st, all);
             }
             changed || st.desired != st.published
         };
@@ -240,6 +374,8 @@ impl ReplicaTracker {
                 match res {
                     Ok(true) => {
                         st.published = target;
+                        let all = Self::known_streams(&st);
+                        me.update_floors(&mut st, all);
                         st.desired != st.published
                     }
                     Ok(false) => {
@@ -307,6 +443,9 @@ impl ReplicaTracker {
                         .is_some_and(|&o| o > offset)
                 });
                 if done {
+                    drop(st);
+                    // Every in-sync replica has it: readers may see it now.
+                    self.raise_floor(stream, offset + 1);
                     return Ok(());
                 }
             }

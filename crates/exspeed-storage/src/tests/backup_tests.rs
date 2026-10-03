@@ -368,6 +368,10 @@ async fn restore_refuses_non_empty_dir_unless_forced() {
     std::fs::create_dir_all(dst.path().join("streams/stale/partitions/0")).unwrap();
     std::fs::write(dst.path().join("credentials.toml"), "keep me").unwrap();
     std::fs::write(dst.path().join(".exspeed.lock"), "").unwrap();
+    // Cluster state of a former cluster node describes the old log.
+    std::fs::create_dir_all(dst.path().join("cluster/epochs")).unwrap();
+    std::fs::write(dst.path().join("cluster/epochs/stale.json"), "{}").unwrap();
+    std::fs::write(dst.path().join("node_id"), "node-a\n").unwrap();
     let err =
         restore_backup(Cursor::new(&archive), dst.path(), RestoreOptions::default()).unwrap_err();
     assert!(err.to_string().contains("not empty"), "{err}");
@@ -380,6 +384,15 @@ async fn restore_refuses_non_empty_dir_unless_forced() {
     )
     .unwrap();
     assert!(!dst.path().join("streams/stale").exists());
+    assert!(
+        !dst.path().join("cluster").exists(),
+        "stale epoch histories removed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dst.path().join("node_id")).unwrap(),
+        "node-a\n",
+        "the node keeps its identity"
+    );
     assert_eq!(
         std::fs::read_to_string(dst.path().join("credentials.toml")).unwrap(),
         "keep me"

@@ -844,6 +844,49 @@ impl StorageEngine for FileStorage {
         ))
     }
 
+    async fn committed_bounds(
+        &self,
+        stream: &StreamName,
+    ) -> Result<(Offset, Offset), StorageError> {
+        let h = self.handle(stream)?;
+        let committed = h.shared.committed();
+        let earliest = h
+            .shared
+            .segments()
+            .first()
+            .map_or(committed, |s| s.base_offset)
+            .min(committed);
+        Ok((Offset(earliest), Offset(committed)))
+    }
+
+    async fn read_batch_committed(
+        &self,
+        stream: &StreamName,
+        from: Offset,
+        limits: ReadLimits,
+    ) -> Result<ReadBatch, StorageError> {
+        let h = self.handle(stream)?;
+        blocking(move || {
+            h.shared
+                .read_committed(from.0, limits.max_records.max(1), limits.max_bytes)
+        })
+        .await
+    }
+
+    fn set_read_floor(&self, stream: &StreamName, floor: Option<u64>) {
+        self.set_replication_floor(stream.as_str(), floor);
+    }
+
+    fn visible_end(&self, stream: &StreamName) -> Option<u64> {
+        self.handle_by_name(stream.as_str())
+            .map(|h| h.shared.high_watermark())
+    }
+
+    fn read_floor(&self, stream: &StreamName) -> Option<u64> {
+        self.handle_by_name(stream.as_str())
+            .and_then(|h| h.shared.floor())
+    }
+
     async fn truncate_from(
         &self,
         stream: &StreamName,

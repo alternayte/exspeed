@@ -364,7 +364,16 @@ async fn deposed_leader_truncates_its_divergent_records() {
     let la = a.client().await;
     la.create_stream(StreamSpec::named("s")).await.unwrap();
     crate::common::publish_n(&la, "s", "s.x", 10).await;
-    let common_prefix = read_all(&la, "s").await;
+    // With acks=leader a write is readable once the in-sync follower has
+    // it (the read floor), not necessarily when the publish returns.
+    let common_prefix = eventually(Duration::from_secs(10), || {
+        let la = la.clone();
+        async move {
+            let r = read_all(&la, "s").await;
+            (r.len() == 10).then_some(r)
+        }
+    })
+    .await;
     wait_replicated(&b, "s", &common_prefix).await;
 
     // b goes away; a keeps writing (acks=leader) records b never sees.
@@ -394,8 +403,14 @@ async fn deposed_leader_truncates_its_divergent_records() {
             .await
             .unwrap();
     }
-    let truth = read_all(&lb, "s").await;
-    assert_eq!(truth.len(), 13);
+    let truth = eventually(Duration::from_secs(10), || {
+        let lb = lb.clone();
+        async move {
+            let r = read_all(&lb, "s").await;
+            (r.len() == 13).then_some(r)
+        }
+    })
+    .await;
 
     // a rejoins: its 5 divergent records are truncated, b's 3 copied.
     o.backend().set_partitioned(&node_id(&a), false);
@@ -1012,4 +1027,71 @@ async fn deleted_consumer_stays_deleted_after_failover() {
     .await;
     assert_eq!(names, vec!["keep".to_string()]);
     assert!(lb.consumer_info("drop").await.is_err());
+}
+
+/// Readers on the leader see a record only once every in-sync follower has
+/// it (the read floor / high watermark): a record a failover could still
+/// drop is never delivered. When the follower leaves the ISR, the floor is
+/// lifted and the write completes on the leader alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unreplicated_records_are_invisible_to_leader_readers() {
+    let o = Opts::new();
+    let dirs = Dirs::new(2);
+    let a = start_node(&o, dirs.path(0)).await;
+    assert_eq!(leader_of(&[&a]).await, 0);
+    let mut b = start_node(&o, dirs.path(1)).await;
+    let ca = a.client().await;
+    ca.create_stream(StreamSpec::named("hw")).await.unwrap();
+    // Wait for the follower to join the ISR.
+    eventually(Duration::from_secs(10), || async {
+        let s: serde_json::Value = reqwest::get(a.api_url("/api/v1/cluster"))
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        (s["isr"].as_array()?.len() == 2).then_some(())
+    })
+    .await;
+    ca.publish("hw", PublishRecord::new("s", "replicated"))
+        .await
+        .unwrap();
+    let first = read_all(&ca, "hw").await;
+    assert_eq!(first.len(), 1);
+    wait_replicated(&b, "hw", &first).await;
+
+    // (Consumer state lives in a replicated internal stream: create the
+    // consumer while the follower is up.)
+    ca.create_consumer(ConsumerSpec::new("hw-c", "hw"))
+        .await
+        .unwrap();
+
+    // The follower goes away while still in the ISR: the next write can't
+    // be replicated.
+    b.stop().await;
+    let ca2 = ca.clone();
+    let publish = tokio::spawn(async move {
+        ca2.publish("hw", PublishRecord::new("s", "unreplicated"))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        read_all(&ca, "hw").await.len(),
+        1,
+        "a record no follower has must not be readable on the leader"
+    );
+    let pulled = ca
+        .pull("hw-c", 10, Duration::from_millis(200))
+        .await
+        .unwrap();
+    assert_eq!(pulled.len(), 1, "nor delivered to a consumer");
+
+    // The follower drops out of the ISR (replica_lag_max 1.5 s): the floor
+    // lifts and the write is acknowledged by the leader alone.
+    publish
+        .await
+        .unwrap()
+        .expect("acknowledged once the ISR shrinks");
+    let all = read_all(&ca, "hw").await;
+    assert_eq!(all.len(), 2);
 }
