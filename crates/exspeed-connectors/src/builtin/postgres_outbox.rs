@@ -7,7 +7,9 @@
 //!   inserts through a replication slot.
 //! - Column types: the id may be int4/int8/uuid/text, the payload text,
 //!   json or jsonb — everything is cast to text in SQL.
-//! - Every record carries `x-idempotency-key` = the outbox id, so a replay
+//! - Every record carries `x-idempotency-key = pgoutbox:<schema.table>:<id>`
+//!   (namespaced so two outbox tables with overlapping ids never collide in
+//!   one stream's dedup window), so a replay
 //!   after a crash is dropped by the broker (effectively-once within the
 //!   stream's dedup window).
 //! - `cleanup = "delete"` (default) deletes published rows in `ack()`, i.e.
@@ -131,6 +133,22 @@ impl PostgresOutboxSource {
     pub fn new(init: &PluginInit) -> Result<Self, ConnectorError> {
         let s: OutboxSettings = settings::parse("postgres_outbox", &init.settings)?;
         pg::validate_connection_string(&s.connection)?;
+        if s.mode == OutboxMode::Poll {
+            // These only mean something with a replication slot; accepting
+            // them in poll mode hides a config that silently doesn't do
+            // what it says (e.g. no logical replication at all).
+            let cdc_only = [
+                ("slot_name", s.slot_name.is_some()),
+                ("publication_name", s.publication_name.is_some()),
+                ("drop_slot_on_delete", s.drop_slot_on_delete),
+            ];
+            if let Some((name, _)) = cdc_only.iter().find(|(_, set)| *set) {
+                return Err(ConnectorError::config(format!(
+                    "postgres_outbox: '{name}' only applies to mode = \"cdc\" \
+                     (this connector polls the table; set mode = \"cdc\" or remove it)"
+                )));
+            }
+        }
         let table = TableRef::parse(&s.table)?;
         let slot = s
             .slot_name
@@ -178,7 +196,10 @@ impl PostgresOutboxSource {
             value: Bytes::from(row.payload.into_bytes()),
             subject,
             headers: vec![
-                ("x-idempotency-key".into(), row.id),
+                (
+                    "x-idempotency-key".into(),
+                    format!("pgoutbox:{}:{}", self.table, row.id),
+                ),
                 ("x-aggregate-type".into(), row.aggregate_type),
                 ("x-event-type".into(), row.event_type),
                 ("x-exspeed-source".into(), "postgres_outbox".into()),
@@ -468,6 +489,32 @@ mod tests {
         .is_err());
     }
 
+    /// N4: slot/publication settings in poll mode are a config error, not
+    /// silently ignored; in CDC mode they are accepted.
+    #[test]
+    fn cdc_only_settings_are_rejected_in_poll_mode() {
+        for (k, v) in [
+            ("slot_name", json!("my_slot")),
+            ("publication_name", json!("my_pub")),
+            ("drop_slot_on_delete", json!(true)),
+        ] {
+            let mut poll = json!({"connection": "postgres://h/db"});
+            poll[k] = v.clone();
+            let err = PostgresOutboxSource::new(&init(poll)).err().unwrap();
+            assert!(err.to_string().contains(k), "{err}");
+            assert_eq!(err.kind(), crate::traits::ErrorKind::Fatal);
+
+            let mut cdc = json!({"connection": "postgres://h/db", "mode": "cdc"});
+            cdc[k] = v;
+            PostgresOutboxSource::new(&init(cdc)).unwrap();
+        }
+        // `drop_slot_on_delete = false` is the default and fine anywhere.
+        PostgresOutboxSource::new(&init(
+            json!({"connection": "postgres://h/db", "drop_slot_on_delete": false}),
+        ))
+        .unwrap();
+    }
+
     #[test]
     fn record_shape() {
         let s = PostgresOutboxSource::new(&init(json!({"connection": "postgres://h/db"}))).unwrap();
@@ -480,8 +527,11 @@ mod tests {
         });
         assert_eq!(r.subject, "order.created");
         assert_eq!(r.key.as_deref(), Some(&b"order-1"[..]));
-        assert!(r
-            .headers
-            .contains(&("x-idempotency-key".into(), "7".into())));
+        // Namespaced by table: two outbox tables (or two connectors writing
+        // one stream) with overlapping ids must not dedupe each other.
+        assert!(r.headers.contains(&(
+            "x-idempotency-key".into(),
+            "pgoutbox:public.outbox_events:7".into()
+        )));
     }
 }

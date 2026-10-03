@@ -60,7 +60,7 @@ the stream's dedup window (see [idempotent publish](idempotent-publish.md)).
 | Plugin | Type | Guarantee | Tested against |
 |--------|------|-----------|----------------|
 | `postgres_cdc` | source | at-least-once; effectively-once for replays within the dedup window | real Postgres: envelope and keys, crash + restart without loss or duplicates, non-destructive dry run |
-| `postgres_outbox` | source | effectively-once within the dedup window (`x-idempotency-key` = outbox id); at-least-once beyond it | real Postgres: poll mode with delete cleanup, CDC mode, two crashes before the delete leave each event exactly once |
+| `postgres_outbox` | source | effectively-once within the dedup window (`x-idempotency-key` = `pgoutbox:<table>:<id>`); at-least-once beyond it | real Postgres: poll mode with delete cleanup, CDC mode, two crashes before the delete leave each event exactly once |
 | `postgres_poll` | source | at-least-once (a crash replays the last batch); rows committed late with an older tracking value are missed | real Postgres: timestamp/numeric/uuid/json decoding, tied tracking values, resume |
 | `jdbc_poll` | source | at-least-once (a crash replays the last batch; no idempotency key); integer cursor, so late commits below the cursor are missed | SQLite; real MySQL and SQL Server: a crash between append and checkpoint replays exactly that batch, resume after a restart |
 | `mssql_cdc` | source | at-least-once; effectively-once for replays within the dedup window | real SQL Server: two crashes + restart without loss or duplicates, update/delete/insert while stopped |
@@ -226,19 +226,23 @@ Prometheus metrics (label `connector`):
 | `exspeed_connector_last_success_timestamp_seconds` | last committed batch |
 | `exspeed_connector_records_total{direction}` | `in` (appended by sources) or `out` (committed by sinks) |
 | `exspeed_connector_retry_attempts_total{outcome}` | in-place retries (`retried`) and exhaustions (`exhausted`) |
-| `exspeed_connector_transient_exhausted_total{action}` | `restart`, `fail` or `dlq_batch` |
+| `exspeed_connector_transient_exhausted_total{action}` | `restart`, `fail`, `dlq_batch` or `dlq_record` (a stuck record isolated under `loop_forever`) |
 | `exspeed_connector_dlq_total{reason}` | records written to the DLQ |
 | `exspeed_connector_records_skipped_total{stream,reason}` | poison records dropped (no `dlq_stream`) |
 | `exspeed_connector_dlq_failures_total` | DLQ appends that failed permanently |
 
 ## Errors, retries and the DLQ
 
-Every plugin maps its errors into four classes:
+Every plugin maps its errors into four classes. A source only returns
+**Transient** from `poll` when retrying the call returns the same records
+(nothing upstream was consumed); a replication stream that already moved
+past part of a batch returns **Connection**, so it restarts from the saved
+checkpoint instead of skipping those changes.
 
 | Class | Examples | What happens |
 |-------|----------|--------------|
 | **Transient** | timeout, HTTP 408/425/429/5xx, deadlock, serialization failure | retried in place with `[retry]` (honouring `Retry-After`); when exhausted, `on_transient_exhausted` applies |
-| **Connection** | socket closed, server restart, RabbitMQ channel closed | supervisor restart with backoff (reconnect) |
+| **Connection** | socket closed, server restart, RabbitMQ channel closed, malformed replication message (CDC) | supervisor restart with backoff (reconnect from the last saved checkpoint) |
 | **Poison** | bad JSON, type mismatch, constraint violation, HTTP 4xx, unroutable AMQP message | the record goes to `dlq_stream`, or is dropped and counted; the connector continues |
 | **Fatal** | bad config, HTTP 401/403, missing table, auth failure | connector → `failed` with a clear `last_error` |
 
@@ -246,7 +250,7 @@ Every plugin maps its errors into four classes:
 
 | Value | Behaviour |
 |-------|-----------|
-| `loop_forever` (default) | hand the error to the supervisor, which restarts the connector with bounded backoff (status `backoff`), forever |
+| `loop_forever` (default) | hand the error to the supervisor, which restarts the connector with bounded backoff (status `backoff`), forever. Sinks with a `dlq_stream`: when a write starting at the same offset exhausts its retries 3 times in a row, the runtime retries that batch one record at a time and dead-letters the first record that still fails (`retries_exhausted`), so one record behind an unclassified error can't stall the sink forever |
 | `fail` (alias `halt`) | move the connector to `failed` |
 | `dlq_batch` | sinks only: send the remaining batch to `dlq_stream` and move on (`fail` without a `dlq_stream`) |
 
@@ -409,7 +413,11 @@ cleanup = "delete"               # "delete" (default) | "none"
 # CDC mode only: slot_name, publication_name, drop_slot_on_delete
 ```
 
-- Every record carries `x-idempotency-key` = the outbox id.
+- Every record carries `x-idempotency-key = pgoutbox:<schema.table>:<id>`
+  (namespaced by table, so two outbox tables with overlapping ids never
+  dedupe each other in one stream).
+- `slot_name`, `publication_name` and `drop_slot_on_delete` are rejected
+  in poll mode (they only apply with `mode = "cdc"`).
 - With `cleanup = "delete"`, published rows are deleted in `ack()`, after
   the records are durable. Every remaining row is unpublished, so rows from
   transactions that commit late are picked up on the next poll.

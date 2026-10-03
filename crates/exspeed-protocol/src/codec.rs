@@ -32,8 +32,7 @@ impl Encoder<Frame> for ExspeedCodec {
     type Error = ProtocolError;
 
     fn encode(&mut self, item: Frame, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        item.encode(dst);
-        Ok(())
+        item.encode(dst)
     }
 }
 
@@ -48,7 +47,7 @@ mod tests {
         let mut codec = ExspeedCodec::new();
         let frame = Frame::new(OpCode::Ping, 7, Bytes::from_static(b"test"));
         let mut buf = BytesMut::new();
-        frame.encode(&mut buf);
+        frame.encode(&mut buf).unwrap();
 
         let decoded = codec.decode(&mut buf).unwrap().unwrap();
         assert_eq!(decoded.opcode, OpCode::Ping);

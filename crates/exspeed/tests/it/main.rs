@@ -13,6 +13,8 @@ mod crash_test;
 mod dedup_test;
 mod exql_test;
 mod exql_windows_test;
+mod frame_error_test;
+mod frame_limit_test;
 mod jdbc_poll_test;
 mod jdbc_sink_mssql_test;
 mod jdbc_sink_mysql_test;

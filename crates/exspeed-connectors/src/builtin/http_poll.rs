@@ -243,17 +243,15 @@ impl SourceConnector for HttpPollSource {
                 },
             );
         }
-        if first_page {
+        // Remember the validators only once the body has been turned into
+        // records: if reading or parsing fails, the retried poll must not
+        // send `If-None-Match` for a response it never delivered (a 304
+        // would silently drop that data).
+        let validators = first_page.then(|| {
             let h = response.headers();
-            self.last_etag = h
-                .get("etag")
-                .and_then(|v| v.to_str().ok())
-                .map(String::from);
-            self.last_modified = h
-                .get("last-modified")
-                .and_then(|v| v.to_str().ok())
-                .map(String::from);
-        }
+            let get = |name: &str| h.get(name).and_then(|v| v.to_str().ok()).map(String::from);
+            (get("etag"), get("last-modified"))
+        });
         let text = response
             .text()
             .await
@@ -293,6 +291,10 @@ impl SourceConnector for HttpPollSource {
             });
         }
 
+        if let Some((etag, modified)) = validators {
+            self.last_etag = etag;
+            self.last_modified = modified;
+        }
         self.next_url = self.next_page(&body);
         if self.next_url.is_none() {
             self.last_poll = Some(Instant::now());

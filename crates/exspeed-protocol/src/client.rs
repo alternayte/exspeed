@@ -123,6 +123,21 @@ impl WireRecord {
     pub fn timestamp_ms(&self) -> u64 {
         self.timestamp_ns / 1_000_000
     }
+
+    /// Number of bytes this record takes in a record list (its wire
+    /// encoding), or an error if a field is too long to encode.
+    pub fn encoded_len(&self) -> Result<usize, ProtocolError> {
+        record_format::encoded_len(&record_format::Fields {
+            offset: self.offset,
+            timestamp_ns: self.timestamp_ns,
+            delivery_count: self.delivery_count,
+            subject: &self.subject,
+            key: self.key.as_deref(),
+            value: &self.value,
+            headers: &self.headers,
+        })
+        .map_err(|e| ProtocolError::Encode(e.0))
+    }
 }
 
 /// Records already in wire encoding, ready to be written into a
@@ -154,10 +169,11 @@ impl EncodedRecords {
     }
 
     /// Encode and append one record.
-    pub fn push_record(&mut self, r: &WireRecord) {
+    pub fn push_record(&mut self, r: &WireRecord) -> Result<(), ProtocolError> {
         let mut w = Writer::default();
         w.record(r);
-        self.push_chunk(w.finish(), 1);
+        self.push_chunk(w.finish()?, 1);
+        Ok(())
     }
 
     /// Number of records.
@@ -191,15 +207,17 @@ impl EncodedRecords {
     }
 }
 
-impl From<&[WireRecord]> for EncodedRecords {
-    fn from(records: &[WireRecord]) -> Self {
+impl TryFrom<&[WireRecord]> for EncodedRecords {
+    type Error = ProtocolError;
+
+    fn try_from(records: &[WireRecord]) -> Result<Self, ProtocolError> {
         let mut w = Writer::default();
         for r in records {
             w.record(r);
         }
         let mut out = Self::new();
-        out.push_chunk(w.finish(), records.len() as u32);
-        out
+        out.push_chunk(w.finish()?, records.len() as u32);
+        Ok(out)
     }
 }
 
@@ -449,10 +467,19 @@ impl Request {
         }
     }
 
-    pub fn into_frame(self, correlation_id: u32) -> Frame {
+    /// Encode as a frame. Fails when a field doesn't fit its length prefix
+    /// (e.g. a subject over 65,535 bytes) instead of truncating it.
+    pub fn try_into_frame(self, correlation_id: u32) -> Result<Frame, ProtocolError> {
         let mut w = Writer::default();
         self.encode(&mut w);
-        Frame::new(self.opcode(), correlation_id, w.finish())
+        Ok(Frame::new(self.opcode(), correlation_id, w.finish()?))
+    }
+
+    /// Like [`Request::try_into_frame`]; panics on an unencodable field.
+    /// For requests built from known-small values (tests, tools).
+    pub fn into_frame(self, correlation_id: u32) -> Frame {
+        self.try_into_frame(correlation_id)
+            .expect("request fields fit the wire format")
     }
 
     pub fn encode(&self, w: &mut Writer) {
@@ -749,14 +776,14 @@ impl Response {
         let mut w = Writer::default();
         w.u32(sub_id);
         w.u32(records.count());
-        OutFrame::new(OpCode::Deliver, 0, w.finish(), records.chunks)
+        OutFrame::new(OpCode::Deliver, 0, fixed(w), records.chunks)
     }
 
     /// A `Messages` reply carrying already-encoded records.
     pub fn messages_frame(correlation_id: u32, records: EncodedRecords) -> OutFrame {
         let mut w = Writer::default();
         w.u32(records.count());
-        OutFrame::new(OpCode::Messages, correlation_id, w.finish(), records.chunks)
+        OutFrame::new(OpCode::Messages, correlation_id, fixed(w), records.chunks)
     }
 
     /// A `ReadResult` reply carrying already-encoded records.
@@ -770,12 +797,7 @@ impl Response {
         w.u64(next_offset);
         w.u64(high_watermark);
         w.u32(records.count());
-        OutFrame::new(
-            OpCode::ReadResult,
-            correlation_id,
-            w.finish(),
-            records.chunks,
-        )
+        OutFrame::new(OpCode::ReadResult, correlation_id, fixed(w), records.chunks)
     }
 
     pub fn json(value: &impl Serialize) -> Self {
@@ -801,10 +823,25 @@ impl Response {
         }
     }
 
+    /// Encode as a frame. A response whose fields don't fit their length
+    /// prefixes becomes an `Error 500` naming the problem (never a
+    /// truncated or malformed frame).
     pub fn into_frame(self, correlation_id: u32) -> Frame {
         let mut w = Writer::default();
         self.encode(&mut w);
-        Frame::new(self.opcode(), correlation_id, w.finish())
+        match w.finish() {
+            Ok(payload) => Frame::new(self.opcode(), correlation_id, payload),
+            Err(e) => {
+                let mut w = Writer::default();
+                Response::error(code::INTERNAL, format!("response not encodable: {e}"))
+                    .encode(&mut w);
+                Frame::new(
+                    OpCode::Error,
+                    correlation_id,
+                    w.finish().expect("error responses always encode"),
+                )
+            }
+        }
     }
 
     pub fn encode(&self, w: &mut Writer) {
@@ -934,17 +971,33 @@ impl Response {
 // Encoding primitives
 // ---------------------------------------------------------------------------
 
-/// Little-endian writer. String/byte lengths that don't fit their prefix are
-/// truncated only for error messages (`str_lossy`); callers must validate
-/// other lengths before encoding (the broker's write path does).
+/// The bytes of a writer that only wrote fixed-size integers.
+fn fixed(w: Writer) -> Bytes {
+    w.finish().expect("fixed-size fields always encode")
+}
+
+/// Little-endian writer. A string, byte string, header list or record that
+/// doesn't fit its length prefix is never truncated: the writer remembers
+/// the first such error and [`Writer::finish`] returns it. Only
+/// [`Writer::str_lossy`] (for error messages) truncates, on purpose.
 #[derive(Default)]
 pub struct Writer {
     buf: BytesMut,
+    error: Option<ProtocolError>,
 }
 
 impl Writer {
-    pub fn finish(self) -> Bytes {
-        self.buf.freeze()
+    /// The encoded bytes, or the first encoding error.
+    pub fn finish(self) -> Result<Bytes, ProtocolError> {
+        match self.error {
+            Some(e) => Err(e),
+            None => Ok(self.buf.freeze()),
+        }
+    }
+    fn fail(&mut self, msg: String) {
+        if self.error.is_none() {
+            self.error = Some(ProtocolError::Encode(msg));
+        }
     }
     pub fn u8(&mut self, v: u8) {
         self.buf.put_u8(v);
@@ -962,10 +1015,16 @@ impl Writer {
         self.buf.extend_from_slice(b);
     }
     pub fn str(&mut self, s: &str) {
-        debug_assert!(s.len() <= u16::MAX as usize, "string too long for str");
-        let len = s.len().min(u16::MAX as usize);
-        self.u16(len as u16);
-        self.raw(&s.as_bytes()[..len]);
+        if s.len() > u16::MAX as usize {
+            self.fail(format!(
+                "string of {} bytes exceeds the {} byte limit",
+                s.len(),
+                u16::MAX
+            ));
+            return;
+        }
+        self.u16(s.len() as u16);
+        self.raw(s.as_bytes());
     }
     /// Like `str` but truncates at a char boundary instead of asserting.
     pub fn str_lossy(&mut self, s: &str) {
@@ -979,6 +1038,10 @@ impl Writer {
         self.bytes(s.as_bytes());
     }
     pub fn bytes(&mut self, b: &[u8]) {
+        if b.len() > u32::MAX as usize {
+            self.fail(format!("byte string of {} bytes is too long", b.len()));
+            return;
+        }
         self.u32(b.len() as u32);
         self.raw(b);
     }
@@ -992,8 +1055,16 @@ impl Writer {
         }
     }
     pub fn headers(&mut self, h: &[(String, String)]) {
-        self.u16(h.len().min(u16::MAX as usize) as u16);
-        for (k, v) in h.iter().take(u16::MAX as usize) {
+        if h.len() > u16::MAX as usize {
+            self.fail(format!(
+                "{} headers exceed the limit of {}",
+                h.len(),
+                u16::MAX
+            ));
+            return;
+        }
+        self.u16(h.len() as u16);
+        for (k, v) in h {
             self.str(k);
             self.str(v);
         }
@@ -1016,7 +1087,7 @@ impl Writer {
     /// Encode one record. Panics if a field exceeds its width (the
     /// broker's write path rejects such records before they are stored).
     pub fn record(&mut self, r: &WireRecord) {
-        record_format::encode(
+        let encoded = record_format::encode(
             &mut self.buf,
             &record_format::Fields {
                 offset: r.offset,
@@ -1027,8 +1098,10 @@ impl Writer {
                 value: &r.value,
                 headers: &r.headers,
             },
-        )
-        .expect("record fits the wire format");
+        );
+        if let Err(e) = encoded {
+            self.fail(format!("record at offset {}: {e}", r.offset));
+        }
     }
     fn records(&mut self, records: &[WireRecord]) {
         self.u32(records.len() as u32);
@@ -1374,8 +1447,14 @@ mod tests {
         let records: Vec<WireRecord> = (0..4).map(rec).collect();
         // Split over several chunks, as the server does.
         let mut enc = EncodedRecords::new();
-        enc.push_chunk(EncodedRecords::from(&records[..1]).chunks[0].clone(), 1);
-        enc.push_chunk(EncodedRecords::from(&records[1..]).chunks[0].clone(), 3);
+        enc.push_chunk(
+            EncodedRecords::try_from(&records[..1]).unwrap().chunks[0].clone(),
+            1,
+        );
+        enc.push_chunk(
+            EncodedRecords::try_from(&records[1..]).unwrap().chunks[0].clone(),
+            3,
+        );
         assert_eq!(enc.count(), 4);
         assert_eq!(enc.decode().unwrap(), records);
 
@@ -1411,7 +1490,12 @@ mod tests {
         // sdks/typescript/test/unit/protocol.test.ts.
         let mut w = Writer::default();
         w.record(&rec(2));
-        let hex: String = w.finish().iter().map(|b| format!("{b:02x}")).collect();
+        let hex: String = w
+            .finish()
+            .unwrap()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let want = "36000000 06760cef 0200 0200000000000000 02002a36fe9c9717 \
                     0800 6f72646572732e32 01 02000000 6b32 02000000 0202 \
                     0100 0100 68 0200 7632";
@@ -1423,7 +1507,7 @@ mod tests {
         let mut w = Writer::default();
         w.u32(1);
         w.record(&rec(2));
-        let mut payload = BytesMut::from(&w.finish()[..]);
+        let mut payload = BytesMut::from(&w.finish().unwrap()[..]);
         // Patching delivery_count (bytes 8..10 of the record) keeps the CRC valid.
         let at = 4 + record_format::DELIVERY_COUNT_AT;
         payload[at..at + 2].copy_from_slice(&9u16.to_le_bytes());
@@ -1439,18 +1523,72 @@ mod tests {
     }
 
     #[test]
+    fn wire_record_encoded_len_is_exact() {
+        for r in [
+            WireRecord::default(),
+            rec(7),
+            WireRecord {
+                key: Some(Bytes::from_static(b"key")),
+                headers: vec![("a".into(), "bb".into()), ("ccc".into(), String::new())],
+                ..rec(3)
+            },
+        ] {
+            let mut w = Writer::default();
+            w.record(&r);
+            assert_eq!(w.finish().unwrap().len(), r.encoded_len().unwrap(), "{r:?}");
+        }
+    }
+
+    /// Over-long fields fail the encode instead of being truncated.
+    #[test]
+    fn oversized_fields_fail_instead_of_truncating() {
+        let long = "x".repeat(u16::MAX as usize + 1);
+        let mut w = Writer::default();
+        w.str(&long);
+        assert!(w.finish().unwrap_err().to_string().contains("65535"));
+
+        let mut w = Writer::default();
+        w.headers(&vec![(String::new(), String::new()); u16::MAX as usize + 1]);
+        assert!(w.finish().unwrap_err().to_string().contains("headers"));
+
+        let mut w = Writer::default();
+        w.headers(&[("k".into(), long.clone())]);
+        assert!(w.finish().is_err());
+
+        let req = Request::Publish {
+            stream: "s".into(),
+            record: PublishRecord::new(long.clone(), "v"),
+        };
+        assert!(req.try_into_frame(1).is_err());
+
+        // A response that can't be encoded becomes an Error 500.
+        let resp = Response::ConnectOk {
+            server_version: long,
+            node_id: "n".into(),
+            leader: None,
+        };
+        match Response::from_frame(&resp.into_frame(3)).unwrap() {
+            Response::Error { code, message, .. } => {
+                assert_eq!(code, code::INTERNAL);
+                assert!(message.contains("not encodable"), "{message}");
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn hostile_counts_are_rejected_without_allocating() {
         let mut w = Writer::default();
         w.str("s");
         w.u32(u32::MAX); // claims 4 billion records
-        let err = Request::decode(OpCode::PublishBatch, w.finish()).unwrap_err();
+        let err = Request::decode(OpCode::PublishBatch, w.finish().unwrap()).unwrap_err();
         assert!(err.to_string().contains("exceeds payload"), "{err}");
 
         let mut w = Writer::default();
         w.u64(0);
         w.u64(0);
         w.u32(u32::MAX);
-        assert!(Response::decode(OpCode::ReadResult, w.finish()).is_err());
+        assert!(Response::decode(OpCode::ReadResult, w.finish().unwrap()).is_err());
     }
 
     #[test]

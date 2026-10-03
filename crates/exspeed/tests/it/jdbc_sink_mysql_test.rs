@@ -52,6 +52,7 @@ async fn wait_for_rows(
 }
 
 #[tokio::test]
+#[ignore = "needs EXSPEED_MYSQL_URL (CI runs it with --include-ignored)"]
 async fn mysql_blob_mode_writes() {
     let url = crate::require_mysql!();
     let (_tcp, http) = start_server().await;
@@ -99,6 +100,7 @@ async fn mysql_blob_mode_writes() {
 }
 
 #[tokio::test]
+#[ignore = "needs EXSPEED_MYSQL_URL (CI runs it with --include-ignored)"]
 async fn mysql_typed_binds_correct_types() {
     let url = crate::require_mysql!();
     let (_tcp, http) = start_server().await;

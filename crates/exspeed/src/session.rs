@@ -44,6 +44,7 @@ use exspeed_protocol::client::{
 };
 use exspeed_protocol::codec::ExspeedCodec;
 use exspeed_protocol::frame::OutFrame;
+use exspeed_protocol::ProtocolError;
 use exspeed_streams::{ReadLimits, Record, StorageError, StreamConfig};
 
 /// The first frame must be `Connect` and arrive within this time.
@@ -105,6 +106,23 @@ const WRITE_BUFFER: usize = 64 * 1024;
 /// Write one frame: header, head, then the body chunks (record bytes
 /// straight from a segment read).
 async fn write_frame<W: AsyncWrite + Unpin>(
+    w: &mut BufWriter<W>,
+    f: &OutFrame,
+) -> std::io::Result<()> {
+    // Read/pull/push batches are budgeted so a frame never exceeds the
+    // limit; should one ever do, every decoder would drop the connection,
+    // so answer with an error instead.
+    if let Err(e) = f.check_size() {
+        tracing::error!(opcode = ?f.opcode, error = %e, "response exceeds the frame limit");
+        let err: OutFrame = Response::error(code::INTERNAL, format!("response not sent: {e}"))
+            .into_frame(f.correlation_id)
+            .into();
+        return write_frame_parts(w, &err).await;
+    }
+    write_frame_parts(w, f).await
+}
+
+async fn write_frame_parts<W: AsyncWrite + Unpin>(
     w: &mut BufWriter<W>,
     f: &OutFrame,
 ) -> std::io::Result<()> {
@@ -177,7 +195,24 @@ where
             return Ok(());
         }
         Ok(None) => return Ok(()),
-        Ok(Some(f)) => f?,
+        Ok(Some(Ok(f))) => f,
+        Ok(Some(Err(e))) => {
+            // Undecodable first frame (old client, wrong port, garbage): say
+            // why in a v2 Error frame before closing instead of hanging up
+            // silently.
+            let message = match &e {
+                ProtocolError::UnsupportedVersion(v) => format!(
+                    "unsupported protocol version {v}; this server speaks {}",
+                    exspeed_common::PROTOCOL_VERSION
+                ),
+                other => other.to_string(),
+            };
+            warn!(%peer, error = %e, "undecodable handshake frame");
+            let _ = sink
+                .send(Response::error(code::BAD_REQUEST, message).into_frame(0))
+                .await;
+            return Err(e.into());
+        }
     };
     let corr = first.correlation_id;
     let (client_id, token) = match Request::from_frame(&first) {
@@ -1031,7 +1066,7 @@ async fn read(
         max_bytes: if max_bytes == 0 {
             1024 * 1024
         } else {
-            (max_bytes as usize).min(8 * 1024 * 1024)
+            (max_bytes as usize).min(exspeed_common::MAX_RECORDS_BYTES_PER_FRAME)
         },
     };
     let deadline = tokio::time::Instant::now() + wait.min(Duration::from_secs(300));

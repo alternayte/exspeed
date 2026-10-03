@@ -54,6 +54,7 @@ async fn wait_for_rows(
 }
 
 #[tokio::test]
+#[ignore = "needs EXSPEED_POSTGRES_URL (CI runs it with --include-ignored)"]
 async fn blob_mode_creates_table_and_writes() {
     let pg_url = crate::require_postgres!();
     let (_tcp, http) = start_server().await;
@@ -120,6 +121,7 @@ async fn blob_mode_creates_table_and_writes() {
 }
 
 #[tokio::test]
+#[ignore = "needs EXSPEED_POSTGRES_URL (CI runs it with --include-ignored)"]
 async fn typed_schema_binds_correct_types() {
     let pg_url = crate::require_postgres!();
     let (_tcp, http) = start_server().await;
@@ -225,6 +227,7 @@ async fn typed_schema_binds_correct_types() {
 }
 
 #[tokio::test]
+#[ignore = "needs EXSPEED_POSTGRES_URL (CI runs it with --include-ignored)"]
 async fn typed_schema_rejects_mismatched_json_type() {
     let pg_url = crate::require_postgres!();
     let (_tcp, http) = start_server().await;
@@ -306,6 +309,7 @@ async fn typed_schema_rejects_mismatched_json_type() {
 }
 
 #[tokio::test]
+#[ignore = "needs EXSPEED_POSTGRES_URL (CI runs it with --include-ignored)"]
 async fn table_name_injection_rejected_at_create() {
     let pg_url = crate::require_postgres!();
     let (_tcp, http) = start_server().await;
@@ -342,6 +346,7 @@ async fn table_name_injection_rejected_at_create() {
 }
 
 #[tokio::test]
+#[ignore = "needs EXSPEED_POSTGRES_URL (CI runs it with --include-ignored)"]
 async fn blob_mode_upsert_is_idempotent_on_offset() {
     let pg_url = crate::require_postgres!();
     let (_tcp, http) = start_server().await;

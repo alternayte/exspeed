@@ -377,7 +377,11 @@ async fn outbox_poll_publishes_then_deletes() {
         .iter()
         .map(|r| header(r, "x-idempotency-key").unwrap())
         .collect();
-    assert_eq!(got_ids, ids.iter().map(String::as_str).collect::<Vec<_>>());
+    let want: Vec<String> = ids
+        .iter()
+        .map(|id| format!("pgoutbox:public.{t}:{id}"))
+        .collect();
+    assert_eq!(got_ids, want);
     assert_eq!(recs[0].key.as_deref(), Some(&b"o-1"[..]));
     assert_eq!(json_of(&recs[2]), json!({"total": 7.5}));
 }
@@ -424,8 +428,9 @@ async fn outbox_cdc_streams_inserts() {
 
     assert_eq!(all.len(), 2, "only inserts are published: {all:?}");
     assert_eq!(recs[0].subject, "user.signed_up");
-    assert_eq!(header(&recs[0], "x-idempotency-key"), Some("1"));
-    assert_eq!(header(&recs[1], "x-idempotency-key"), Some("2"));
+    let key = |id: u32| format!("pgoutbox:public.{t}:{id}");
+    assert_eq!(header(&recs[0], "x-idempotency-key"), Some(key(1).as_str()));
+    assert_eq!(header(&recs[1], "x-idempotency-key"), Some(key(2).as_str()));
     assert_eq!(recs[1].key.as_deref(), Some(&b"u-2"[..]));
     assert_eq!(json_of(&recs[1]), json!({"plan": "free"}));
 }
@@ -480,11 +485,10 @@ async fn outbox_crash_before_delete_is_exactly_once() {
         .iter()
         .map(|r| header(r, "x-idempotency-key").unwrap())
         .collect();
-    assert_eq!(
-        ids,
-        vec!["1", "2", "3", "4", "5", "6", "7"],
-        "exactly once, in order"
-    );
+    let want: Vec<String> = (1..=7)
+        .map(|i| format!("pgoutbox:public.{t}:{i}"))
+        .collect();
+    assert_eq!(ids, want, "exactly once, in order");
 }
 
 // ---------------------------------------------------------------------------

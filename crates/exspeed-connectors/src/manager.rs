@@ -702,6 +702,21 @@ impl ConnectorManager {
             return;
         }
         if self.registry.is_passive(&entry.config.plugin) {
+            // Passive (webhook) connectors have no runtime that would create
+            // the target stream, and every POST would otherwise fail with
+            // "stream not found" while the status says running.
+            let ensured = match StreamName::try_from(entry.config.stream.as_str()) {
+                Ok(stream) => self
+                    .log
+                    .ensure_stream(&stream)
+                    .await
+                    .map_err(|e| format!("cannot create stream '{stream}': {e}")),
+                Err(e) => Err(format!("invalid stream name: {e}")),
+            };
+            if let Err(e) = ensured {
+                entry.state.set_error(Status::Failed, e);
+                return;
+            }
             entry.webhook = self.webhook_for(&entry.config, &origin);
             entry.state.set_status(Status::Running);
             return;

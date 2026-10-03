@@ -8,9 +8,11 @@ use bytes::BytesMut;
 use exspeed_common::record_format;
 use exspeed_common::{Offset, StreamName};
 
-/// Bounds for a [`StorageEngine::read_batch`] call. A batch always contains
-/// at least one record when one is available, even if it exceeds
-/// `max_bytes`, so a single large record can't stall a reader.
+/// Bounds for a [`StorageEngine::read_batch`] call. `max_bytes` counts each
+/// record's full wire size ([`StoredRecord::wire_size`]: subject, key,
+/// value, headers and framing). A batch always contains at least one record
+/// when one is available, even if it exceeds `max_bytes`, so a single large
+/// record can't stall a reader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadLimits {
     pub max_records: usize,
@@ -287,7 +289,7 @@ pub trait StorageEngine: Send + Sync {
         let mut bytes = 0usize;
         let mut keep = 0usize;
         for r in &records {
-            let size = r.value.len() + r.subject.len() + r.key.as_ref().map_or(0, |k| k.len());
+            let size = r.wire_size();
             if keep > 0 && bytes + size > limits.max_bytes {
                 break;
             }

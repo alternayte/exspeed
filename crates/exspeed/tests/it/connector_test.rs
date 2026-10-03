@@ -104,6 +104,51 @@ async fn create_webhook_and_receive() {
     assert_eq!(offset, 0, "first record should have offset 0");
 }
 
+/// A webhook connector whose stream doesn't exist yet creates it on start
+/// (webhooks have no runtime that would), instead of answering 500 to every
+/// POST while reporting `running`.
+#[tokio::test]
+async fn webhook_creates_its_missing_stream() {
+    let (_tcp, http) = start_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/api/v1/connectors", http))
+        .json(&serde_json::json!({
+            "name": "orphan-hook",
+            "type": "source",
+            "plugin": "http_webhook",
+            "stream": "hook-created",
+            "settings": {"path": "/webhooks/orphan", "auth_type": "none"}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "{:?}", resp.text().await);
+
+    let resp = client
+        .get(format!("{}/api/v1/streams/hook-created", http))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "the stream must exist once started");
+
+    let resp = client
+        .post(format!("{}/webhooks/orphan", http))
+        .json(&serde_json::json!({"hello": "world"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+    let resp = client
+        .get(format!("{}/api/v1/connectors/orphan-hook", http))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "running", "{body}");
+}
+
 #[tokio::test]
 async fn list_and_delete_connectors() {
     let (_tcp, http) = start_server().await;

@@ -199,3 +199,71 @@ async fn http_sink_4xx_is_poison_and_goes_to_dlq() {
     assert_eq!(values(&env.read_all("in-dlq").await), vec!["bad"]);
     assert_eq!(m.received.lock().unwrap().len(), 1);
 }
+
+#[derive(Clone, Default)]
+struct EtagMock {
+    /// `If-None-Match` of every request, in order.
+    hits: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+/// First answer: 200 with an ETag and a body that isn't JSON. Afterwards:
+/// 304 when the client claims that ETag, else 200 with two items.
+async fn etag_endpoint(State(e): State<EtagMock>, headers: HeaderMap) -> Response {
+    let inm = headers
+        .get("if-none-match")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let first = {
+        let mut hits = e.hits.lock().unwrap();
+        hits.push(inm.clone());
+        hits.len() == 1
+    };
+    let tag = r#""v1""#;
+    if inm.as_deref() == Some(tag) {
+        return StatusCode::NOT_MODIFIED.into_response();
+    }
+    let body = if first {
+        "{not json".to_string()
+    } else {
+        json!({"items": [{"id": 1}, {"id": 2}]}).to_string()
+    };
+    let mut r = (StatusCode::OK, body).into_response();
+    r.headers_mut().insert("etag", tag.parse().unwrap());
+    r
+}
+
+/// N3: the ETag / Last-Modified validators are stored only once the response
+/// was read and turned into records. When the body can't be read or parsed
+/// the poll is retried, and that retry must not send `If-None-Match` for a
+/// response it never delivered (the server would answer 304 and the data
+/// would be lost).
+#[tokio::test]
+async fn http_poll_keeps_no_etag_from_an_unreadable_response() {
+    let e = EtagMock::default();
+    let router = Router::new()
+        .route("/etag", get(etag_endpoint))
+        .with_state(e.clone());
+    let base = serve(router).await;
+    let env = Env::new();
+    let mut cfg = fast_config("etagger", Source, "http_poll", "etagged");
+    cfg.settings = json!({
+        "url": format!("{base}/etag"),
+        "interval_secs": 3600,
+        "items_path": "items",
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let (h, _) = env.run(&Registry::builtin(), cfg, Arc::new(MemOffsets::default()));
+    eventually(10, "both items", || async {
+        env.read_all("etagged").await.len() >= 2
+    })
+    .await;
+    h.stop(Duration::from_secs(5)).await;
+    let hits = e.hits.lock().unwrap().clone();
+    assert_eq!(hits.len(), 2, "{hits:?}");
+    assert_eq!(
+        hits[1], None,
+        "the retry must not claim the unread response"
+    );
+}

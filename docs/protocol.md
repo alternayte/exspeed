@@ -54,6 +54,9 @@ Decoders reject truncated payloads and trailing bytes.
    should `Ping` every 15–30 seconds.
 4. A frame that can't be decoded (bad version, unknown opcode, oversize
    length) gets `Error 400` with correlation id 0, and the connection closes.
+   This applies to the very first frame too: a client speaking another
+   version gets a v2 `Error 400` "unsupported protocol version N; this server
+   speaks 2" before the close.
    A request whose *payload* is malformed gets `Error 400` with its own
    correlation id, and the connection stays open.
 5. When the connection closes, the server ends its subscriptions and deletes
@@ -173,6 +176,25 @@ Only `name` and `stream` are required.
 | 0x89 | SubscribeOk | `u32 sub_id` |
 | 0x8A | SubscriptionEnded | `u32 sub_id`, `u16 code`, `str message` (push, corr 0) |
 | 0xF1 | Pong | — |
+
+### Size limits
+
+Every frame payload is at most 16 MiB; a decoder that sees a larger length
+rejects the frame and closes the connection, and the server never sends
+one. To guarantee that, batches are budgeted by each record's full
+`WireRecord` size (headers and framing included):
+
+| What | Limit |
+|------|-------|
+| One published record | subject ≤ 1024 bytes, key ≤ 64 KiB, value ≤ 8 MiB, ≤ 256 headers with keys ≤ 1 KiB, values ≤ 32 KiB and **all header keys + values ≤ 64 KiB**, so one `WireRecord` is under ~8.2 MiB |
+| `Read` `max_bytes` | 0 = 1 MiB, capped at 8 MiB |
+| `Pull` `max_bytes` | 0 = 4 MiB, capped at 8 MiB |
+| `Deliver` | sent once a subscriber's pending records reach 4 MiB; never grown past 8 MiB |
+
+A response stops adding records before the next one would exceed its byte
+budget, except that the first record is always included (so a large record
+can't stall a reader). Records larger than the budget therefore arrive one
+per frame, which always fits.
 
 Opcodes 0x30, 0x31 and 0xA0–0xA6 are reserved. Replication between
 servers uses its own protocol on the cluster port (see

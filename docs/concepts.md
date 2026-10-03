@@ -36,8 +36,12 @@ filter on them using NATS-style wildcards:
 | `orders.>` | `orders.placed`, `orders.us.placed` | `orders` |
 | (empty) | everything | — |
 
-`>` must be the last token; a filter with a non-final `>` or an empty token
-is rejected.
+`>` must be the last token; a filter with a non-final `>`, an empty token or
+a partial wildcard (`orders.b*`) is rejected. The same rules apply to every
+filter: consumers, `tail`, sink `subject_filter` and the ExQL
+`subject_matches` function. A published subject (at most 1024 bytes) may be
+empty but may not contain empty tokens, `*`, `>`, whitespace or control
+characters.
 
 ## Consumers
 

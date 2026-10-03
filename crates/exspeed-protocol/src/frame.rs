@@ -32,13 +32,18 @@ impl Frame {
         Self::new(opcode, correlation_id, Bytes::new())
     }
 
-    pub fn encode(&self, dst: &mut BytesMut) {
+    /// Append the encoded frame to `dst`. Fails, leaving `dst` untouched,
+    /// when the payload exceeds [`MAX_PAYLOAD_SIZE`]: every decoder rejects
+    /// such a frame and drops the connection, so it must never be sent.
+    pub fn encode(&self, dst: &mut BytesMut) -> Result<(), ProtocolError> {
+        check_payload_len(self.payload.len())?;
         dst.reserve(FRAME_HEADER_SIZE + self.payload.len());
         dst.put_u8(PROTOCOL_VERSION);
         dst.put_u8(self.opcode.as_u8());
         dst.put_u32_le(self.correlation_id);
         dst.put_u32_le(self.payload.len() as u32);
         dst.extend_from_slice(&self.payload);
+        Ok(())
     }
 
     pub fn decode(src: &mut BytesMut) -> Result<Option<Self>, ProtocolError> {
@@ -59,7 +64,7 @@ impl Frame {
 
         if payload_len > MAX_PAYLOAD_SIZE {
             return Err(ProtocolError::PayloadTooLarge {
-                size: payload_len,
+                size: payload_len as u64,
                 max: MAX_PAYLOAD_SIZE,
             });
         }
@@ -108,7 +113,13 @@ impl OutFrame {
         self.head.len() + self.body.iter().map(Bytes::len).sum::<usize>()
     }
 
-    /// The 10-byte frame header.
+    /// Fails when the payload exceeds [`MAX_PAYLOAD_SIZE`] (the frame must
+    /// not be sent; see [`Frame::encode`]).
+    pub fn check_size(&self) -> Result<(), ProtocolError> {
+        check_payload_len(self.payload_len())
+    }
+
+    /// The 10-byte frame header. Check [`OutFrame::check_size`] first.
     pub fn header(&self) -> [u8; FRAME_HEADER_SIZE] {
         let mut h = [0u8; FRAME_HEADER_SIZE];
         h[0] = PROTOCOL_VERSION;
@@ -118,14 +129,17 @@ impl OutFrame {
         h
     }
 
-    /// Append the complete frame to `dst`.
-    pub fn encode(&self, dst: &mut BytesMut) {
+    /// Append the complete frame to `dst`; fails (writing nothing) when the
+    /// payload is oversize.
+    pub fn encode(&self, dst: &mut BytesMut) -> Result<(), ProtocolError> {
+        self.check_size()?;
         dst.reserve(FRAME_HEADER_SIZE + self.payload_len());
         dst.extend_from_slice(&self.header());
         dst.extend_from_slice(&self.head);
         for b in &self.body {
             dst.extend_from_slice(b);
         }
+        Ok(())
     }
 
     /// Collapse into a [`Frame`] with a contiguous payload (copies).
@@ -148,6 +162,16 @@ impl From<Frame> for OutFrame {
     }
 }
 
+fn check_payload_len(len: usize) -> Result<(), ProtocolError> {
+    if len > MAX_PAYLOAD_SIZE as usize {
+        return Err(ProtocolError::PayloadTooLarge {
+            size: len as u64,
+            max: MAX_PAYLOAD_SIZE,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,7 +180,7 @@ mod tests {
     fn encode_decode_roundtrip() {
         let frame = Frame::new(OpCode::Ping, 42, Bytes::from_static(b"hello"));
         let mut buf = BytesMut::new();
-        frame.encode(&mut buf);
+        frame.encode(&mut buf).unwrap();
         assert_eq!(buf.len(), FRAME_HEADER_SIZE + 5);
 
         let decoded = Frame::decode(&mut buf).unwrap().unwrap();
@@ -169,7 +193,7 @@ mod tests {
     fn encode_decode_empty_payload() {
         let frame = Frame::empty(OpCode::Pong, 0);
         let mut buf = BytesMut::new();
-        frame.encode(&mut buf);
+        frame.encode(&mut buf).unwrap();
         assert_eq!(buf.len(), FRAME_HEADER_SIZE);
 
         let decoded = Frame::decode(&mut buf).unwrap().unwrap();
@@ -246,13 +270,39 @@ mod tests {
             vec![Bytes::from_static(b"cd"), Bytes::from_static(b"e")],
         );
         let mut a = BytesMut::new();
-        out.encode(&mut a);
+        out.encode(&mut a).unwrap();
         let mut b = BytesMut::new();
-        out.clone().into_frame().encode(&mut b);
+        out.clone().into_frame().encode(&mut b).unwrap();
         assert_eq!(a, b);
         assert_eq!(&a[..FRAME_HEADER_SIZE], &out.header()[..]);
         let decoded = Frame::decode(&mut a).unwrap().unwrap();
         assert_eq!(decoded.payload, Bytes::from_static(b"abcde"));
+    }
+
+    #[test]
+    fn encode_rejects_oversized_payload() {
+        let big = Bytes::from(vec![0u8; MAX_PAYLOAD_SIZE as usize + 1]);
+        let mut buf = BytesMut::new();
+        let err = Frame::new(OpCode::Messages, 1, big.clone()).encode(&mut buf);
+        assert!(matches!(err, Err(ProtocolError::PayloadTooLarge { .. })));
+        assert!(buf.is_empty(), "nothing written on error");
+        // Split across head and body chunks, too.
+        let out = OutFrame::new(
+            OpCode::Messages,
+            1,
+            Bytes::from_static(b"head"),
+            vec![big.slice(..MAX_PAYLOAD_SIZE as usize - 3)],
+        );
+        assert!(out.check_size().is_err());
+        assert!(out.encode(&mut buf).is_err());
+        assert!(buf.is_empty());
+
+        // Exactly at the limit is fine.
+        let max = big.slice(..MAX_PAYLOAD_SIZE as usize);
+        Frame::new(OpCode::Messages, 1, max)
+            .encode(&mut buf)
+            .unwrap();
+        assert!(Frame::decode(&mut buf).unwrap().is_some());
     }
 
     #[test]
@@ -261,8 +311,8 @@ mod tests {
         let f2 = Frame::empty(OpCode::Pong, 2);
 
         let mut buf = BytesMut::new();
-        f1.encode(&mut buf);
-        f2.encode(&mut buf);
+        f1.encode(&mut buf).unwrap();
+        f2.encode(&mut buf).unwrap();
 
         let decoded1 = Frame::decode(&mut buf).unwrap().unwrap();
         assert_eq!(decoded1.correlation_id, 1);

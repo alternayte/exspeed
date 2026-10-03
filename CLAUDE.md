@@ -85,7 +85,7 @@ exspeed-common          Shared types (StreamName, Offset), subject filters, auth
     ↓
 exspeed-streams         StorageEngine trait, Record/StoredRecord, StreamConfig
     ↓
-exspeed-protocol        Wire protocol: Frame codec, opcodes, client protocol v2 (client.rs), replication messages
+exspeed-protocol        Wire protocol: Frame codec, opcodes, client protocol v2 (client.rs)
 exspeed-storage         FileStorage: writer thread per partition, lock-free readers, sparse indexes, retention, compaction
     ↓
 exspeed-broker          Log (single write path), dedup, consumers, leases/leadership, replication
