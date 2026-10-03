@@ -33,10 +33,18 @@ jobs:
   test:
     name: cargo test
     runs-on: ubuntu-latest
+    env:
+      # A tiny real filesystem for the disk-full tests.
+      EXSPEED_ENOSPC_DIR: /mnt/exspeed-enospc
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Mount a 16 MiB tmpfs for the disk-full tests
+        run: |
+          sudo mkdir -p "$EXSPEED_ENOSPC_DIR"
+          sudo mount -t tmpfs -o size=16m tmpfs "$EXSPEED_ENOSPC_DIR"
+          sudo chmod 777 "$EXSPEED_ENOSPC_DIR"
       - run: cargo test --workspace
 
   test-services:
