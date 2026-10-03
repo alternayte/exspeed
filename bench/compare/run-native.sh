@@ -34,6 +34,7 @@ SYSTEMS="${SYSTEMS:-exspeed kafka nats}"
 RECORDS="${RECORDS:-1000000}"
 SIZE=1024
 LATENCY_MSGS="${LATENCY_MSGS:-10000}"
+LATENCY_RATE="${LATENCY_RATE:-1000}"
 DURATION="${DURATION:-30}"
 OUT="bench/results/compare-$(date +%F)-${MODE}"
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
@@ -83,7 +84,10 @@ run_exspeed() {
     --output "$OUT/exspeed-publish.json" | tee "$OUT/exspeed-publish.log"
   "$BENCH" catchup --profile reference --catchup-records "$RECORDS" \
     --output "$OUT/exspeed-catchup.json" | tee "$OUT/exspeed-catchup.log"
-  "$BENCH" latency --profile reference --duration-secs "$DURATION" \
+  # Latency at a light load (LATENCY_RATE msg/s), like Kafka's
+  # one-at-a-time e2e tool; a rate above the publish maximum would measure
+  # queueing instead.
+  "$BENCH" latency --profile reference --duration-secs "$DURATION" --rate "$LATENCY_RATE" \
     --output "$OUT/exspeed-latency.json" | tee "$OUT/exspeed-latency.log"
   kill "$pid"
   wait "$pid" 2>/dev/null || true

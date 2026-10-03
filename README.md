@@ -76,10 +76,13 @@ disk, ext4), default durable mode (fsync before every acknowledgement):
 | Drain a 1M-record backlog | ~354k msg/s with reads, ~285k msg/s with a push consumer |
 | End-to-end latency at 5k msg/s | p50 5.3 ms, p99 11.2 ms |
 
-Machine details, all results and the exact commands are in
-[BENCHMARKS.md](BENCHMARKS.md). No Kafka or NATS numbers are published; the
-[comparison kit](bench/README.md#reproduce-a-comparison-with-kafka-and-nats-jetstream)
-runs all three on your hardware.
+On the same VM, with every broker fsyncing before it acknowledges, Exspeed
+published 51.7k msg/s against Kafka's 11.4k and drained a backlog at 411k
+msg/s against Kafka's 117k; Kafka's one-at-a-time end-to-end latency (p50
+1 ms) beat Exspeed's (p50 6 ms). The tools and their caveats (JetStream's
+numbers are for synchronous one-at-a-time publishing) are in
+[BENCHMARKS.md](BENCHMARKS.md#comparison-with-kafka-and-nats-jetstream),
+with machine details, all results and the exact commands.
 
 ## Documentation
 

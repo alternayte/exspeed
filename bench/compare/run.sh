@@ -69,7 +69,8 @@ run_exspeed() {
   done
   "$BENCH" publish --profile reference --output "$OUT/exspeed-publish.json" | tee "$OUT/exspeed-publish.log"
   "$BENCH" catchup --profile reference --output "$OUT/exspeed-catchup.json" | tee "$OUT/exspeed-catchup.log"
-  "$BENCH" latency --profile local --output "$OUT/exspeed-latency.json" | tee "$OUT/exspeed-latency.log"
+  # Light load, like the Kafka e2e tool (see run-native.sh).
+  "$BENCH" latency --profile reference --rate "${LATENCY_RATE:-1000}" --output "$OUT/exspeed-latency.json" | tee "$OUT/exspeed-latency.log"
 }
 
 run_kafka() {

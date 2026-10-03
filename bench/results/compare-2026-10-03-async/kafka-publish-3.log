@@ -1,0 +1,6 @@
+Picked up JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.net.ssl.trustStoreType=JKS -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=35591 -Dhttp.nonProxyHosts=localhost|127.0.0.1|::1|127.*|0.*|::|169.254.*|api.anthropic.com|api-staging.anthropic.com|api-pr-preview.anthropic.com|mcp-proxy.anthropic.com|mcp-proxy-staging.anthropic.com|registry.npmjs.org|jsr.io|npm.jsr.io|pypi.org|files.pythonhosted.org|index.crates.io|proxy.golang.org|host.docker.internal|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*|192.168.*|100.64.0.0/10|*.svc.cluster.local|*.svc.cluster.local -Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes=
+13486 records sent, 2695.6 records/sec (2.63 MB/sec), 2424.4 ms avg latency, 3547.0 ms max latency.
+41535 records sent, 8303.7 records/sec (8.11 MB/sec), 4212.8 ms avg latency, 5316.0 ms max latency.
+47445 records sent, 9473.8 records/sec (9.25 MB/sec), 3407.1 ms avg latency, 3593.0 ms max latency.
+64320 records sent, 12864.0 records/sec (12.56 MB/sec), 2622.4 ms avg latency, 3162.0 ms max latency.
+250000 records sent, 10274.113344 records/sec (10.03 MB/sec), 2738.04 ms avg latency, 5316.00 ms max latency, 2763 ms 50th, 4444 ms 95th, 5114 ms 99th, 5296 ms 99.9th.

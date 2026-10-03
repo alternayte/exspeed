@@ -111,30 +111,57 @@ payload set and shorter durations than `--profile reference` keep the run
 inside this VM's free disk space. See [bench/README.md](bench/README.md) for
 every scenario.
 
-## Reproduce a comparison
+## Comparison with Kafka and NATS JetStream
 
-Kafka and NATS JetStream numbers are **not published** here. A comparison is
-only meaningful on the same hardware with matching durability settings, and
-it hasn't been run on this machine yet (it has no Docker daemon). To run one
-yourself:
+_Measured **2026-10-03** on the same VM (see [Machine](#machine)), git
+`3973a40`, with [`bench/compare/run-native.sh`](bench/compare/run-native.sh):
+Kafka 3.8.1 (KRaft, OpenJDK 21, 2 GiB heap), nats-server 2.10.22 with the
+`nats` CLI 0.1.5, and Exspeed. One stream/topic, one partition, no
+replication, 1 KiB records, every system on the same disk, one system
+running at a time. Raw logs: `bench/results/compare-2026-10-03-{sync,async}/`._
+
+**Sync** = every broker fsyncs before acknowledging (Exspeed `--storage-sync
+sync` with group commit, Kafka `log.flush.interval.messages=1`, JetStream
+`sync_interval: always`). **Async** = Exspeed `--storage-sync async`, Kafka
+and JetStream defaults (page cache / timer).
+
+| Workload | Exspeed sync | Kafka sync | JetStream sync | Exspeed async | Kafka async | JetStream async |
+|---|---:|---:|---:|---:|---:|---:|
+| Publish, 4 publishers (msg/s) | **51,711** | 11,407 | 2,324 | **64,939** | 40,777 | 12,865 |
+| Consume a 1M backlog (msg/s) | **410,741** | 116,795 | 75,482 | **414,953** | 111,062 | 71,896 |
+| End-to-end latency p50 / p99 | 6.0 / 10.1 ms | 1 / 7 ms | — | 5.2 / 9.3 ms | 1 / 7 ms | — |
+
+Read the rows with the tools' differences in mind:
+
+- **Publish.** Exspeed: `exspeed-bench publish`, 4 tasks on one connection
+  with the coalescing publisher (requests pipelined) for 30 s. Kafka:
+  `kafka-producer-perf-test.sh`, 4 processes × 250,000 records, `acks=all`,
+  `linger.ms=1` (also pipelined and batched). JetStream: `nats bench --js
+  --pub 4 --syncpub`, which waits for each acknowledgement before sending
+  the next message, so it is strictly one message per round trip (and, in
+  sync mode, per fsync) per client. Its numbers are for that pattern, not
+  for JetStream's async publishing.
+- **Consume.** Exspeed: a durable push consumer from offset 0 with acks
+  batched (`exspeed-bench catchup`; stateless reads gave 396,244 msg/s).
+  Kafka: `kafka-consumer-perf-test.sh` (`nMsg.sec`, which includes the
+  ~4 s group rebalance; its fetch-only rate was 214,730 msg/s). JetStream:
+  `nats bench --sub 1 --pull`, a durable pull consumer with explicit acks.
+- **Latency.** Exspeed: publish → push delivery at a steady 1,000 msg/s for
+  30 s. Kafka: `kafka-e2e-latency.sh`, one message at a time (produce, then
+  consume it, then the next), 10,000 messages. `nats bench` has no
+  JetStream end-to-end latency workload; the core-NATS round trip was
+  0.22 ms. Kafka's median is lower than Exspeed's here. Exspeed's ~5 ms
+  median is the same in both modes, so it isn't fsync; it hasn't been
+  profiled yet (see [End-to-end latency](#end-to-end-latency)).
+
+To reproduce (no Docker needed; [`bench/compare/run.sh`](bench/compare/run.sh)
+does the same with Docker images):
 
 ```bash
 cargo build --release -p exspeed -p exspeed-bench
-BENCH_MODE=sync  bench/compare/run.sh    # every broker fsyncs before acking
-BENCH_MODE=async bench/compare/run.sh    # Kafka / JetStream defaults vs Exspeed async
+KAFKA_HOME=/opt/kafka_2.13-3.8.1 NATS_SERVER=/opt/nats-server NATS=/opt/nats \
+  BENCH_MODE=sync bench/compare/run-native.sh     # then BENCH_MODE=async
 ```
-
-[`bench/compare/run.sh`](bench/compare/run.sh) starts single-node Kafka
-(KRaft) and NATS JetStream from
-[`bench/compare/docker-compose.yml`](bench/compare/docker-compose.yml) and
-runs the same three workloads (1 KiB publish with 4 producers, backlog
-consume, end-to-end latency) with each system's standard tool:
-`exspeed-bench`, `kafka-producer-perf-test.sh` /
-`kafka-consumer-perf-test.sh` / `kafka-e2e-latency.sh`, and `nats bench`.
-In sync mode Kafka runs with `log.flush.interval.messages=1` and JetStream
-with `sync_interval: always`, so all three fsync before acknowledging. The
-tools measure latency differently (see [bench/README.md](bench/README.md)),
-so compare the raw logs, not single numbers.
 
 ## Earlier results
 
