@@ -226,7 +226,7 @@ Prometheus metrics (label `connector`):
 | `exspeed_connector_last_success_timestamp_seconds` | last committed batch |
 | `exspeed_connector_records_total{direction}` | `in` (appended by sources) or `out` (committed by sinks) |
 | `exspeed_connector_retry_attempts_total{outcome}` | in-place retries (`retried`) and exhaustions (`exhausted`) |
-| `exspeed_connector_transient_exhausted_total{action}` | `restart`, `fail` or `dlq_batch` |
+| `exspeed_connector_transient_exhausted_total{action}` | `restart`, `fail`, `dlq_batch` or `dlq_record` (a stuck record isolated under `loop_forever`) |
 | `exspeed_connector_dlq_total{reason}` | records written to the DLQ |
 | `exspeed_connector_records_skipped_total{stream,reason}` | poison records dropped (no `dlq_stream`) |
 | `exspeed_connector_dlq_failures_total` | DLQ appends that failed permanently |
@@ -250,7 +250,7 @@ checkpoint instead of skipping those changes.
 
 | Value | Behaviour |
 |-------|-----------|
-| `loop_forever` (default) | hand the error to the supervisor, which restarts the connector with bounded backoff (status `backoff`), forever |
+| `loop_forever` (default) | hand the error to the supervisor, which restarts the connector with bounded backoff (status `backoff`), forever. Sinks with a `dlq_stream`: when a write starting at the same offset exhausts its retries 3 times in a row, the runtime retries that batch one record at a time and dead-letters the first record that still fails (`retries_exhausted`), so one record behind an unclassified error can't stall the sink forever |
 | `fail` (alias `halt`) | move the connector to `failed` |
 | `dlq_batch` | sinks only: send the remaining batch to `dlq_stream` and move on (`fail` without a `dlq_stream`) |
 

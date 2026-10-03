@@ -912,6 +912,22 @@ async fn write_all(
                                 }
                                 return Ok(());
                             }
+                            // `loop_forever`: one record the sink keeps
+                            // rejecting with an unclassified error would
+                            // otherwise stall the sink forever. After
+                            // repeated exhaustions at the same offset,
+                            // isolate it and dead-letter it.
+                            let strikes = ctx.state.note_stuck(rest[0].offset);
+                            if ctx.config.on_transient_exhausted
+                                == OnTransientExhausted::LoopForever
+                                && dlq.stream().is_some()
+                                && strikes >= STUCK_EXHAUSTIONS_BEFORE_DLQ
+                            {
+                                let done = isolate_stuck(ctx, sink, rest, dlq, cancel, &e).await?;
+                                rest = &rest[done..];
+                                retry.reset();
+                                continue;
+                            }
                             return Err(exhausted(ctx, &format!("write: {e}")));
                         }
                     },
@@ -921,6 +937,66 @@ async fn write_all(
         }
     }
     Ok(())
+}
+
+/// Consecutive retry exhaustions of a sink write starting at the same
+/// offset (one per run, i.e. per supervisor restart) before the runtime
+/// assumes a poison record behind an unclassified error and isolates it.
+pub const STUCK_EXHAUSTIONS_BEFORE_DLQ: u32 = 3;
+
+/// Write `rest` one record at a time, one attempt each. The first record that
+/// still fails with a retryable error is dead-lettered (`retries_exhausted`):
+/// the batch starting here has failed every retry across several restarts.
+/// At most one record is dead-lettered this way per call, so a real outage
+/// that begins mid-isolation costs at most one record. Returns how many
+/// records of `rest` are done.
+async fn isolate_stuck(
+    ctx: &RunContext,
+    sink: &mut dyn SinkConnector,
+    rest: &[SinkRecord],
+    dlq: &DlqWriter,
+    cancel: &CancellationToken,
+    batch_error: &ConnectorError,
+) -> Result<usize, RunEnd> {
+    warn!(connector = ctx.name(), offset = rest[0].offset, error = %batch_error,
+          "sink write keeps failing at the same offset; isolating the record");
+    for (i, r) in rest.iter().enumerate() {
+        let error = match sink.write(std::slice::from_ref(r)).await {
+            Ok(WriteResult::Accepted) => continue,
+            Ok(WriteResult::Failed { accepted, .. }) if accepted >= 1 => continue,
+            Ok(WriteResult::Poison { reason, .. }) => {
+                dlq_sink_record(ctx, dlq, r, &reason, cancel).await?;
+                continue;
+            }
+            Ok(WriteResult::Failed { error, .. }) | Err(error) => error,
+        };
+        match error {
+            ConnectorError::Poison(reason) => {
+                dlq_sink_record(ctx, dlq, r, &reason, cancel).await?;
+            }
+            e @ ConnectorError::Transient { .. } => {
+                ctx.metrics.connector_transient_exhausted_total.add(
+                    1,
+                    &[
+                        opentelemetry::KeyValue::new("connector", ctx.name().to_string()),
+                        opentelemetry::KeyValue::new("action", "dlq_record"),
+                    ],
+                );
+                let reason = PoisonReason::RetriesExhausted {
+                    detail: format!(
+                        "failed every retry across {STUCK_EXHAUSTIONS_BEFORE_DLQ} restarts: {e}"
+                    ),
+                };
+                dlq_sink_record(ctx, dlq, r, &reason, cancel).await?;
+                ctx.state.clear_stuck();
+                return Ok(i + 1);
+            }
+            e => return Err(end_for(&e, "write")),
+        }
+    }
+    // Every record went through one at a time: whatever failed has cleared.
+    ctx.state.clear_stuck();
+    Ok(rest.len())
 }
 
 async fn dlq_sink_record(

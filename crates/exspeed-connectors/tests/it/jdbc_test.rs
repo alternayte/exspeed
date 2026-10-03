@@ -1,5 +1,5 @@
 //! `jdbc` sink, `jdbc_poll` and `mssql_cdc` against real MySQL and SQL
-//! Server: crash and resume.
+//! Server: crash and resume, plus SQLite cases that need no service.
 //!
 //! - MySQL: `EXSPEED_MYSQL_URL` (e.g. `mysql://exspeed:exspeed@127.0.0.1:3306/exspeed`).
 //! - SQL Server: `EXSPEED_MSSQL_URL` (e.g.
@@ -234,6 +234,79 @@ async fn sink_crash_replay(db: &Db, url: &str, mode: &str) {
     assert!(
         dlq_records.is_empty(),
         "replays are not poison: {dlq_records:?}"
+    );
+}
+
+/// A record the database keeps rejecting with an error code the sink doesn't
+/// classify (here a SQLite trigger's `RAISE(ABORT)`, extended code 1811) is
+/// treated as transient. Under the default `loop_forever` it used to stall
+/// the sink forever; after repeated exhaustions at the same offset it is now
+/// isolated and dead-lettered (`retries_exhausted`) and the sink moves on.
+/// Runs without any external service.
+#[tokio::test]
+async fn sqlite_sink_dead_letters_a_record_stuck_on_an_unclassified_error() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("stuck.db");
+    std::fs::File::create(&path).unwrap();
+    let url = format!("sqlite://{}", path.display());
+    let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+    sqlx::query("CREATE TABLE t (id BIGINT PRIMARY KEY, note TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER reject_bad BEFORE INSERT ON t WHEN NEW.note = 'bad' \
+         BEGIN SELECT RAISE(ABORT, 'rejected by trigger'); END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let name = unique("jdbc_stuck");
+    let dlq = format!("{name}_dlq");
+    let env = Env::new();
+    let vals: Vec<Value> = (0..10)
+        .map(|i| json!({"id": i, "note": if i == 6 { "bad".to_string() } else { format!("r{i}") }}))
+        .collect();
+    publish_json(&env, &name, &vals).await;
+
+    let mut cfg = fast_config(&name, Sink, "jdbc", &name);
+    cfg.batch_size = 5;
+    cfg.dlq_stream = Some(dlq.clone());
+    cfg.settings = settings(json!({
+        "connection": url,
+        "table": "t",
+        "mode": "insert",
+        "schema": "id:bigint, note:text",
+    }));
+    let mem: Arc<dyn OffsetStore> = Arc::new(MemOffsets::default());
+    let (h, state) = env.run(&Registry::builtin(), cfg, mem.clone());
+    wait_committed(&mem, &name, 10).await;
+    let restarts = state.snapshot().restart_count;
+    h.stop(Duration::from_secs(15)).await;
+
+    let ids: Vec<(i64,)> = sqlx::query_as("SELECT id FROM t ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    let ids: Vec<i64> = ids.into_iter().map(|(i,)| i).collect();
+    assert_eq!(
+        ids,
+        vec![0, 1, 2, 3, 4, 5, 7, 8, 9],
+        "everything but the poison"
+    );
+
+    let dead = env.read_all(&dlq).await;
+    assert_eq!(dead.len(), 1, "exactly the stuck record: {dead:?}");
+    assert_eq!(json_of(&dead[0])["id"], 6);
+    assert_eq!(
+        header(&dead[0], "exspeed-dlq-reason"),
+        Some("retries_exhausted")
+    );
+    assert_eq!(header(&dead[0], "exspeed-dlq-original-offset"), Some("6"));
+    assert!(
+        restarts >= (exspeed_connectors::runtime::STUCK_EXHAUSTIONS_BEFORE_DLQ - 1) as u64,
+        "isolated only after repeated exhaustions (restarts = {restarts})"
     );
 }
 
