@@ -656,10 +656,17 @@ impl Actor {
         reason.truncate(4096);
         headers.push(("exspeed-dlq-reason".into(), reason));
         // Deterministic idempotency key: a retried dead-letter write after a
-        // crash doesn't duplicate the DLQ record.
+        // crash doesn't duplicate the DLQ record. The payload hash is part of
+        // the key: after the source stream is deleted and recreated, a
+        // different record can sit at the same offset, and it must not
+        // collide with the earlier one's dedup entry in the DLQ.
         headers.push((
             crate::broker_append::IDEMPOTENCY_HEADER.into(),
-            format!("dlq:{name}:{}:{offset}", self.stream),
+            format!(
+                "dlq:{name}:{}:{offset}:{:016x}",
+                self.stream,
+                crate::broker_append::hash_body(&rec.value)
+            ),
         ));
         let record = Record {
             key: rec.key.clone(),
@@ -674,6 +681,20 @@ impl Actor {
         }
         match self.log.append(&dlq_name, record).await {
             Ok(_) => {
+                self.core.stats.dead_lettered += 1;
+                self.metrics.record_consumer_dead_letter(&name, "dlq");
+                true
+            }
+            // Retrying can never succeed: the key is taken for this window.
+            // With the payload hash in the key that means the same payload
+            // is already in the DLQ, so count it as written.
+            Err(crate::log::LogError::Storage(StorageError::KeyCollision { stored_offset })) => {
+                tracing::warn!(
+                    consumer = %name,
+                    offset,
+                    stored_offset,
+                    "DLQ already holds this dead letter's key; not retrying"
+                );
                 self.core.stats.dead_lettered += 1;
                 self.metrics.record_consumer_dead_letter(&name, "dlq");
                 true
