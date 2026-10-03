@@ -95,7 +95,7 @@ Combine with `RUST_LOG` for level/target filtering. JSON output preserves spans 
 EXSPEED_MAX_CONNS=1024   # default
 ```
 
-Caps concurrent TCP connections to the broker port. When the cap is reached, new connections are accepted-then-immediately-closed; each rejection is logged and increments the `connections_rejected_total` counter (scraped as `connections_rejected_total_total`). Tune by watching that counter alongside `connections_active`.
+Caps concurrent TCP connections to the broker port. When the cap is reached, new connections are accepted-then-immediately-closed; each rejection is logged and increments the `exspeed_connections_rejected_total` counter. Tune by watching that counter alongside `exspeed_connections_active`.
 
 ## Exclusive data-dir lock
 
@@ -143,7 +143,7 @@ logged at `error` and counted as
 
 If retention deletes records that a consumer has not reached yet, the consumer skips ahead to the earliest record still retained. It logs a warning and counts the skipped records in its stats (`stats.skipped` in consumer info). Size retention and consumer lag together so this doesn't happen.
 
-Size your retention with your slowest expected consumer in mind. Metrics of interest are `consumer_lag` and `storage_bytes`.
+Size your retention with your slowest expected consumer in mind. Metrics of interest are `exspeed_consumer_lag` and `exspeed_storage_bytes`.
 
 ## Consumer state durability
 
@@ -161,9 +161,17 @@ contract already allows.
 | Endpoint | Returns 200 when | Recommended use |
 |---|---|---|
 | `/healthz` | This pod is the cluster leader | LB traffic routing (only the leader serves traffic — see [high-availability.md](high-availability.md)) |
-| `/readyz` | Startup complete **and** `data_dir` is writable | k8s `readinessProbe` and startup gates |
+| `/readyz` | Startup complete (both listeners serving) **and** `data_dir` is writable | k8s `readinessProbe` and startup gates |
 
 Single-node deployments still benefit from `/readyz` — it stays 503 during storage recovery and connector startup, so an LB or systemd unit knows when the broker is actually serving.
+
+A stream whose partition is fenced (read-only after an IO error that couldn't
+be rolled back) does **not** make the node unready, since that would take
+every healthy stream out of service too. Instead `/readyz` answers
+`200 {"status": "degraded", "failed_streams": [{"stream", "reason"}]}`,
+`GET /api/v1/streams/{name}` shows `"status": "failed"` with the `failure`
+reason, and `exspeed_partition_failed{stream}` is 1. Alert on that gauge;
+writes to the stream fail until a restart runs recovery.
 
 ## Non-root container
 
@@ -296,26 +304,26 @@ empty data directories. They replicate everything from it.
 
 ## Metrics
 
-`GET /metrics` serves Prometheus text with no authentication.
+`GET /metrics` serves Prometheus text. It is open unless `[server]
+metrics_token` is set; then it needs `Authorization: Bearer <token>` (see
+[security.md](security.md#metrics-token)).
 
-> ⚠️ **Metric names are inconsistent today.** Some series have the
-> `exspeed_` prefix and some don't. The OTel exporter also appends `_total`
-> to counters whose names already end in `_total`. The names below are what
-> a scrape actually returns.
+Every series is named `exspeed_*`, and counters end in `_total` exactly once.
+Series that describe a stream, consumer, connector or continuous query are
+removed when it is deleted.
 
 | Area | Series |
 |------|--------|
-| Connections | `connections_active`, `connections_rejected_total_total` |
-| Throughput | `records_published_total`, `records_consumed_total` |
-| Streams | `storage_bytes{stream}` |
-| Consumers | `consumer_lag{stream,consumer}`, `subscription_queue_fill_ratio` |
-| Dedup | `exspeed_dedup_collisions_total_total`, `exspeed_dedup_map_full_total_total`, `exspeed_dedup_rebuild_duration_seconds` |
-| Leadership | `exspeed_is_leader`, `exspeed_leader_transitions_total_total`, `exspeed_lease_*` |
-| Replication | `exspeed_replication_*` (see [high-availability.md](high-availability.md#metrics)) |
-| Auth | `exspeed_auth_denied_total_total` |
+| Process | `exspeed_uptime_seconds`, `exspeed_connections_active`, `exspeed_connections_rejected_total` |
+| Streams | `exspeed_records_published_total{stream}`, `exspeed_publish_latency_seconds{stream}` (histogram), `exspeed_storage_bytes{stream}`, `exspeed_storage_write_errors_total{stream,kind}`, `exspeed_partition_failed{stream}` |
+| Consumers | `exspeed_consumer_lag{stream,consumer}` (leader only), `exspeed_consumer_dead_letters_total{consumer,outcome}` |
+| Dedup | `exspeed_dedup_writes_total{stream,result}`, `exspeed_dedup_collisions_total{stream}`, `exspeed_dedup_map_full_total{stream}`, `exspeed_dedup_map_entries{stream}`, `exspeed_dedup_window_secs{stream}`, `exspeed_dedup_rebuild_duration_seconds{stream,source}`, `exspeed_dedup_snapshot_write_duration_seconds` |
+| Leadership | `exspeed_is_leader`, `exspeed_leader_transitions_total{direction}` (`acquired`, `lost`, `stepped_down`, `resigned`), `exspeed_lease_held{name}`, `exspeed_lease_acquire_total{name,result}`, `exspeed_lease_lost_total{name}` |
+| Replication | `exspeed_replication_*` (see [high-availability.md](high-availability.md#observability)) |
+| Connectors | `exspeed_connector_*` (see [connectors.md](connectors.md)) |
+| ExQL | `exspeed_exql_late_records_total{query}` |
+| Auth | `exspeed_auth_denied_total{reason,transport,op}`: `op` is the TCP opcode or the HTTP route template (`/api/v1/streams/{name}`) |
 
-Two of these series are unreliable:
-
-- **Consumer lag** is off by one, because it counts the last acked record.
-- **`auth_denied`** is labelled with the raw request path, so its
-  cardinality is unbounded.
+`exspeed_consumer_lag` is the number of records at or after the consumer's
+ack floor: the stream's end offset minus the lowest unacknowledged offset.
+A consumer that has acknowledged everything has lag 0.

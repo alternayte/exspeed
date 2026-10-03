@@ -49,6 +49,13 @@ pub struct StreamInfo {
     pub compaction: bool,
     /// Internal streams start with `__` (consumer state, offsets, ...).
     pub internal: bool,
+    /// `healthy`, or `failed`: the partition is fenced read-only after an
+    /// IO error it could not roll back. Writes fail until a restart runs
+    /// recovery; reads keep working.
+    pub status: String,
+    /// Why the partition failed (only when `status` is `failed`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
 }
 
 fn stream_info_json(
@@ -56,8 +63,16 @@ fn stream_info_json(
     config: &StreamConfig,
     storage_bytes: u64,
     head_offset: u64,
+    failure: Option<String>,
 ) -> StreamInfo {
     StreamInfo {
+        status: if failure.is_some() {
+            "failed"
+        } else {
+            "healthy"
+        }
+        .to_string(),
+        failure,
         name: name.to_string(),
         storage_bytes,
         head_offset,
@@ -67,6 +82,13 @@ fn stream_info_json(
         dedup_max_entries: config.dedup_max_entries,
         compaction: config.compaction,
         internal: name.starts_with(exspeed_common::INTERNAL_STREAM_PREFIX),
+    }
+}
+
+fn partition_failure(state: &AppState, stream: &str) -> Option<String> {
+    match state.storage.partition_status(stream) {
+        Some(exspeed_storage::file::PartitionStatus::Failed { reason }) => Some(reason),
+        _ => None,
     }
 }
 
@@ -129,7 +151,13 @@ pub async fn list_streams(
         let stream_dir = state.storage.data_dir().join("streams").join(name);
         let config = StreamConfig::load(&stream_dir).unwrap_or_default();
 
-        streams.push(stream_info_json(name, &config, storage_bytes, head_offset));
+        streams.push(stream_info_json(
+            name,
+            &config,
+            storage_bytes,
+            head_offset,
+            partition_failure(&state, name),
+        ));
     }
 
     (StatusCode::OK, Json(streams))
@@ -346,7 +374,13 @@ pub async fn get_stream(
 
     (
         StatusCode::OK,
-        Json(stream_info_json(&name, &config, storage_bytes, head_offset)),
+        Json(stream_info_json(
+            &name,
+            &config,
+            storage_bytes,
+            head_offset,
+            partition_failure(&state, &name),
+        )),
     )
         .into_response()
 }
@@ -481,7 +515,13 @@ pub async fn patch_stream(
 
     (
         StatusCode::OK,
-        Json(stream_info_json(&name, &cfg, storage_bytes, head_offset)),
+        Json(stream_info_json(
+            &name,
+            &cfg,
+            storage_bytes,
+            head_offset,
+            partition_failure(&state, &name),
+        )),
     )
         .into_response()
 }
@@ -770,6 +810,7 @@ pub async fn delete_stream(
                 )
                     .into_response();
             }
+            state.metrics.forget_query(id);
         }
 
         let cascaded_consumers = blockers.consumers.clone();

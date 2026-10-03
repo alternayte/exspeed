@@ -65,14 +65,14 @@ exspeed-data/
 ```yaml
 # Any body-collision is a producer bug — alert immediately.
 - alert: ExspeedDedupCollision
-  expr: rate(exspeed_dedup_collisions_total_total[5m]) > 0
+  expr: rate(exspeed_dedup_collisions_total[5m]) > 0
   for: 1m
   annotations:
     summary: "Exspeed dedup key collision — same msg_id published with different body"
 
 # Sustained cap hits mean the window is too long or throughput exceeds the cap.
 - alert: ExspeedDedupMapFull
-  expr: rate(exspeed_dedup_map_full_total_total[5m]) > 0.1
+  expr: rate(exspeed_dedup_map_full_total[5m]) > 0.1
   for: 10m
   annotations:
     summary: "Exspeed dedup map full — increase dedup_max_entries or shorten dedup_window"

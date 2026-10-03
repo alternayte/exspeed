@@ -29,7 +29,7 @@ async fn consumer_lag_reported_via_metrics() {
         .unwrap();
     let line = metrics
         .lines()
-        .find(|l| l.contains("consumer_lag") && l.contains("consumer=\"slowpoke\""))
+        .find(|l| l.starts_with("exspeed_consumer_lag{") && l.contains("consumer=\"slowpoke\""))
         .unwrap_or_else(|| panic!("no consumer_lag line for slowpoke:\n{metrics}"));
     assert!(line.trim_end().ends_with(" 7"), "lag should be 7: {line}");
 }
@@ -73,7 +73,7 @@ async fn publish_latency_histogram_reported_via_metrics() {
         .unwrap();
 
     assert!(
-        metrics.contains("publish_latency_seconds"),
+        metrics.contains("exspeed_publish_latency_seconds_bucket"),
         "metrics body did not include publish_latency_seconds; got:\n{metrics}"
     );
     assert!(
@@ -134,4 +134,110 @@ async fn snapshot_refuses_when_server_holds_lock() {
         msg.contains("already in use") || msg.contains("in use"),
         "unexpected error: {msg}"
     );
+}
+
+async fn scrape(server: &TestServer) -> String {
+    reqwest::get(server.api_url("/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn consumer_lag_excludes_acked_records() {
+    let server = TestServer::start().await;
+    let c = server.client().await;
+    create_stream(&c, "lag2").await;
+    c.create_consumer(exspeed_client::ConsumerSpec::new("half", "lag2"))
+        .await
+        .unwrap();
+    publish_n(&c, "lag2", "x", 5).await;
+    let got = c.pull("half", 2, Duration::from_secs(2)).await.unwrap();
+    assert_eq!(got.len(), 2);
+    c.ack("half", got.iter().map(|r| r.offset).collect())
+        .await
+        .unwrap();
+    let want = "exspeed_consumer_lag{consumer=\"half\",stream=\"lag2\"} 3";
+    crate::common::eventually(Duration::from_secs(5), || async {
+        scrape(&server).await.contains(want).then_some(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn deleted_streams_and_consumers_leave_no_series() {
+    let server = TestServer::start().await;
+    let c = server.client().await;
+    for s in ["gone", "kept"] {
+        create_stream(&c, s).await;
+        publish_n(&c, s, "x", 2).await;
+    }
+    c.create_consumer(exspeed_client::ConsumerSpec::new("gone-c", "gone"))
+        .await
+        .unwrap();
+    c.create_consumer(exspeed_client::ConsumerSpec::new("kept-c", "kept"))
+        .await
+        .unwrap();
+    let before = scrape(&server).await;
+    assert!(
+        before.contains("exspeed_records_published_total{stream=\"gone\"} 2"),
+        "{before}"
+    );
+    assert!(
+        before.contains("exspeed_storage_bytes{stream=\"gone\"}"),
+        "{before}"
+    );
+    assert!(before.contains("consumer=\"gone-c\""), "{before}");
+
+    let r = reqwest::Client::new()
+        .delete(server.api_url("/api/v1/streams/gone?force=true"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    c.delete_consumer("kept-c").await.unwrap();
+
+    let after = scrape(&server).await;
+    assert!(!after.contains("\"gone\""), "stale stream series:\n{after}");
+    assert!(!after.contains("gone-c"), "stale consumer series:\n{after}");
+    assert!(!after.contains("kept-c"), "stale consumer series:\n{after}");
+    assert!(after.contains("exspeed_records_published_total{stream=\"kept\"} 2"));
+}
+
+#[tokio::test]
+async fn auth_denials_are_labelled_with_the_route_not_the_path() {
+    let server = TestServer::builder().auth_token("right").start().await;
+    let http = reqwest::Client::new();
+    for name in ["s1", "s2", "s3"] {
+        let r = http
+            .get(server.api_url(&format!("/api/v1/streams/{name}")))
+            .bearer_auth("wrong")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401);
+    }
+    let m = scrape(&server).await;
+    let line = m
+        .lines()
+        .find(|l| l.starts_with("exspeed_auth_denied_total{") && l.contains("transport=\"http\""))
+        .unwrap_or_else(|| panic!("no http denial series:\n{m}"));
+    assert!(line.contains("op=\"/api/v1/streams/{name}\""), "{line}");
+    assert!(line.trim_end().ends_with(" 3"), "{line}");
+    assert!(!m.contains("op=\"/api/v1/streams/s1\""), "{m}");
+}
+
+#[tokio::test]
+async fn every_scraped_series_is_prefixed() {
+    let server = TestServer::start().await;
+    let c = server.client().await;
+    create_stream(&c, "p").await;
+    publish_n(&c, "p", "x", 1).await;
+    let m = scrape(&server).await;
+    for line in m.lines().filter(|l| !l.starts_with('#') && !l.is_empty()) {
+        assert!(line.starts_with("exspeed_"), "{line}");
+        assert!(!line.contains("_total_total"), "{line}");
+    }
 }

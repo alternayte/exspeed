@@ -243,12 +243,8 @@ impl ConnectorState {
         }
     }
 
-    /// Zero the per-connector gauges (connector deleted).
+    /// Drop the connector's metric series (connector deleted).
     pub fn retire(&self) {
-        for s in Status::ALL {
-            self.metrics
-                .connector_state
-                .record(0, &[self.label(), KeyValue::new("state", s.as_str())]);
-        }
+        self.metrics.forget_connector(&self.name);
     }
 }

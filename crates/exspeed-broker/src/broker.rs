@@ -66,6 +66,8 @@ impl Broker {
         &self,
         stream: &exspeed_common::StreamName,
     ) -> Result<(), crate::log::LogError> {
-        self.log.delete_stream(stream).await
+        self.log.delete_stream(stream).await?;
+        self.metrics.forget_stream(stream.as_str());
+        Ok(())
     }
 }

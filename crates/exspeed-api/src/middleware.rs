@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{MatchedPath, State};
 use axum::http::{header::AUTHORIZATION, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -27,6 +27,15 @@ fn unauthorized() -> Response {
 
 fn forbidden() -> Response {
     (StatusCode::FORBIDDEN, Json(json!({"error": "forbidden"}))).into_response()
+}
+
+/// The route template (`/api/v1/streams/{name}`), never the raw path: a
+/// metric label must have bounded cardinality.
+fn route<B>(req: &Request<B>) -> String {
+    req.extensions()
+        .get::<MatchedPath>()
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| "unmatched".to_string())
 }
 
 /// Extract a `Bearer <token>` value from the `Authorization` header.
@@ -62,7 +71,7 @@ pub async fn require_authenticated(
     let Some(identity) = store.lookup(&digest) else {
         state
             .metrics
-            .auth_denied("unauthorized", "http", req.uri().path());
+            .auth_denied("unauthorized", "http", &route(&req));
         return unauthorized();
     };
 
@@ -95,14 +104,12 @@ pub async fn require_admin(
     let Some(identity) = store.lookup(&digest) else {
         state
             .metrics
-            .auth_denied("unauthorized", "http", req.uri().path());
+            .auth_denied("unauthorized", "http", &route(&req));
         return unauthorized();
     };
 
     if !identity.has_any_admin_permission() {
-        state
-            .metrics
-            .auth_denied("forbidden", "http", req.uri().path());
+        state.metrics.auth_denied("forbidden", "http", &route(&req));
         return forbidden();
     }
 

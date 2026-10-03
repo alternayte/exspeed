@@ -307,6 +307,9 @@ impl ConsumerManager {
             .await
             .unwrap_or_else(|_| Err(ConsumerError::Storage("consumer task ended".into())));
         self.consumers.write().await.remove(name);
+        if r.is_ok() {
+            self.metrics.forget_consumer(name);
+        }
         r
     }
 
