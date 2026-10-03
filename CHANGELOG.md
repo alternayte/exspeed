@@ -209,6 +209,67 @@ connector config and SDK API all change.
 - Jepsen-style randomized partition and restart test, and a kill -9 test
   of a real three-process cluster on a Postgres lease.
 
+### Re-audit fixes
+
+Every finding in `docs/REVIEW.md` was re-checked; §7 there lists each one
+with the test that proves it.
+
+**Breaking**
+
+- Metrics: every series is now `exspeed_`-prefixed and counters end in
+  `_total` exactly once (for example `consumer_lag` →
+  `exspeed_consumer_lag`, `exspeed_auth_denied_total_total` →
+  `exspeed_auth_denied_total`). Dead series are removed. See
+  `docs/operations.md`.
+- A record may carry at most 64 KiB of header keys and values in total, so
+  every reply fits in a 16 MiB frame. Published subjects may not contain
+  `*`, `>` or control characters.
+- ExQL `subject_matches` with an invalid pattern is a query error.
+- `postgres_outbox` idempotency keys are `pgoutbox:<schema.table>:<id>`;
+  CDC-only settings are rejected in poll mode.
+- `GET /api/v1/streams` lists only streams the caller has a permission on,
+  and internal `__` streams only with `?internal=true` for global admins.
+  HTTP writes to internal streams answer `403`.
+
+**Fixed**
+
+- Graceful shutdown keeps writes open until consumers have saved their
+  final state; the HTTP task is joined.
+- Startup fails on a port already in use, an unreadable catalog or bad TLS
+  files, and `/readyz` only reports ready after both listeners are bound. A
+  tenure whose catalog reload fails steps down for real.
+- A corrupt sealed segment fences only its partition instead of stopping
+  startup; fenced partitions show in `/readyz` (`degraded`), the
+  `exspeed_partition_failed` gauge and stream info.
+- An undecodable first frame is answered with Error 400.
+- Followers behind the leader's earliest offset re-replicate instead of
+  keeping records the leader dropped.
+- DLQ writes no longer collide after the source stream is recreated.
+- ExQL: `ORDER BY offset LIMIT n` honours the limit; continuous `FILTER`,
+  `COALESCE` and `NVL` work; out-of-range `TIMESTAMP BY` values fall back
+  to the record timestamp; `->` works in numeric contexts; big JSON
+  integers compare exactly.
+- Connectors: pgoutput errors restart from the saved LSN; webhooks create
+  their stream; a JDBC record stuck on an unclassified error is
+  dead-lettered; http_poll keeps validators only after a readable body.
+- The `examples/order-processing` configs load, and CI validates every
+  example config.
+
+**Added**
+
+- `[exql]` config section (all ExQL settings, plus
+  `max_event_time_skew_ms`), `[server] handshake_timeout_secs`,
+  `idle_timeout_secs`, `stop_timeout_secs` and `metrics_token`.
+- External Postgres tables push projection and filters into the remote
+  query, count snapshots against the memory pool and map `numeric(p, s)` to
+  decimals.
+- `GET /api/v1/streams/{name}/records?wait_ms=` long-polls; `exspeed tail`
+  uses it, works on followers and needs only subscribe permission.
+- `exspeed healthcheck` derives its URL from the server config
+  (`EXSPEED_HEALTHCHECK_URL` overrides).
+- In-process servers accept pre-bound listeners
+  (`ServerArgs::tcp_listener` / `api_listener`).
+
 ## [0.5.0] — 2026-04-24
 
 Indexing release. Queries on timestamp, key, and payload fields are now
