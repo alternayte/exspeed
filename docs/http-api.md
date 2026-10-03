@@ -25,12 +25,17 @@ requires an **admin** permission (`openapi.json` needs none):
 |------|------|
 | `GET /healthz` | none |
 | `GET /readyz` | none |
-| `GET /metrics` | none |
+| `GET /metrics` | none, or `Bearer <metrics_token>` when `[server] metrics_token` is set |
 | `GET /api/v1/openapi.json` | none |
 | `POST /webhooks/*` | none, unless the webhook connector sets its own |
 
 In multi-pod mode, standbys answer `503` on `/api/v1/*`. The exceptions are
-`/api/v1/leases`, `/api/v1/whoami` and `/api/v1/openapi.json`. See [high-availability.md](high-availability.md).
+`/api/v1/leases`, `/api/v1/cluster`, `/api/v1/whoami` and
+`/api/v1/openapi.json`. See [high-availability.md](high-availability.md).
+
+Internal streams (names starting with `__`: consumer state, catalogs,
+connector offsets) are written only by the server. Creating, updating,
+publishing to or deleting one answers `403`.
 
 ## Endpoints
 
@@ -46,7 +51,7 @@ In multi-pod mode, standbys answer `503` on `/api/v1/*`. The exceptions are
 
 | Method | Path | Body / query | Description |
 |--------|------|--------------|-------------|
-| `GET` | `/api/v1/streams` | | List streams |
+| `GET` | `/api/v1/streams` | `?internal=true` | List the streams the caller has any permission on. Internal `__` streams are included only with `internal=true`, for global admins. |
 | `POST` | `/api/v1/streams` | `{"name", "max_age_secs"?, "max_bytes"?, "dedup_window_secs"?, "dedup_max_entries"?, "compaction"?}` | Create a stream. `compaction: true` keeps only the latest record per key. |
 | `GET` | `/api/v1/streams/{name}` | | Offsets, size, retention and dedup settings |
 | `PATCH` | `/api/v1/streams/{name}` | `{"max_age_secs"?, "max_bytes"?, "dedup_window_secs"?, "dedup_max_entries"?}` | Update settings |

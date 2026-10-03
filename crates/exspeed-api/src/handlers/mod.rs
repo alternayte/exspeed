@@ -43,6 +43,23 @@ pub(crate) fn require_scoped_admin(id: &Identity, stream: &StreamName) -> Option
     }
 }
 
+/// Internal `__` streams (consumer state, catalogs, offsets) are written
+/// only by the server itself: every client write to one — create, update,
+/// publish, delete — is refused with 403, as over TCP.
+pub(crate) fn forbid_internal_write(stream: &StreamName) -> Option<Response> {
+    if stream.is_internal() {
+        Some(
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "internal streams are written only by the server"})),
+            )
+                .into_response(),
+        )
+    } else {
+        None
+    }
+}
+
 /// Verify the authenticated identity holds `Admin` with a wildcard-all
 /// glob (`streams = "*"`). Used for endpoints that span multiple streams
 /// (connectors, queries, views, connections).

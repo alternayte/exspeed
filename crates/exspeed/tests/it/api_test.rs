@@ -570,3 +570,108 @@ async fn http_records_and_consumers() {
         .unwrap();
     assert_eq!(r.status(), 404);
 }
+
+#[tokio::test]
+async fn http_writes_to_internal_streams_are_forbidden() {
+    let (_tcp, http) = start_server().await;
+    let c = reqwest::Client::new();
+    let url = |p: &str| format!("{http}{p}");
+    // A consumer makes the server create its internal `__consumers` stream.
+    let r = c
+        .post(url("/api/v1/streams"))
+        .json(&serde_json::json!({"name": "data"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let r = c
+        .post(url("/api/v1/consumers"))
+        .json(&serde_json::json!({"name": "w", "stream": "data"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    let r = c
+        .post(url("/api/v1/streams"))
+        .json(&serde_json::json!({"name": "__mine"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "create");
+    let r = c
+        .post(url("/api/v1/streams/__consumers/publish"))
+        .json(&serde_json::json!({"data": {"x": 1}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "publish");
+    let r = c
+        .patch(url("/api/v1/streams/__consumers"))
+        .json(&serde_json::json!({"max_age_secs": 60}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "patch");
+    let r = c
+        .delete(url("/api/v1/streams/__consumers?force=true"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "delete");
+    // Reading an internal stream stays possible for admins.
+    let r = c
+        .get(url("/api/v1/streams/__consumers"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "read");
+}
+
+#[tokio::test]
+async fn list_streams_hides_internal_streams_unless_asked() {
+    let (_tcp, http) = start_server().await;
+    let c = reqwest::Client::new();
+    let r = c
+        .post(format!("{http}/api/v1/streams"))
+        .json(&serde_json::json!({"name": "visible"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let r = c
+        .post(format!("{http}/api/v1/consumers"))
+        .json(&serde_json::json!({"name": "w", "stream": "visible"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let names = |v: Value| -> Vec<String> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let plain = names(
+        c.get(format!("{http}/api/v1/streams"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(plain, vec!["visible".to_string()]);
+    let all = names(
+        c.get(format!("{http}/api/v1/streams?internal=true"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap(),
+    );
+    assert!(all.contains(&"visible".to_string()));
+    assert!(all.iter().any(|n| n == "__consumers"), "{all:?}");
+}

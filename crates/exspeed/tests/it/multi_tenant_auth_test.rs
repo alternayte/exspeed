@@ -1080,3 +1080,59 @@ permissions = [{{ streams = "*", actions = ["admin", "publish", "subscribe"] }}]
         403,
     );
 }
+
+#[tokio::test]
+async fn http_list_streams_is_scoped_to_the_caller() {
+    let creds = write_creds(&format!(
+        r#"
+[[credentials]]
+name = "root"
+token_sha256 = "{}"
+permissions = [{{ streams = "*", actions = ["admin"] }}]
+
+[[credentials]]
+name = "tenant-a"
+token_sha256 = "{}"
+permissions = [{{ streams = "a-*", actions = ["admin"] }}, {{ streams = "shared", actions = ["subscribe"] }}]
+"#,
+        sha256_hex("root-token"),
+        sha256_hex("a-token"),
+    ));
+    let srv = start_server(Some(creds.path().to_path_buf()), None).await;
+    let root = try_client(&srv.tcp_addr, Some("root-token")).await.unwrap();
+    for s in ["a-1", "b-1", "shared"] {
+        root.create_stream(StreamSpec::named(s)).await.unwrap();
+    }
+    // Creates the internal `__consumers` stream.
+    root.create_consumer(ConsumerSpec::new("w", "b-1"))
+        .await
+        .unwrap();
+    let list = |token: &'static str, query: &'static str| {
+        let url = format!("http://{}/api/v1/streams{query}", srv.http_addr);
+        async move {
+            let v: serde_json::Value = reqwest::Client::new()
+                .get(url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s["name"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(list("a-token", "").await, vec!["a-1", "shared"]);
+    assert_eq!(
+        list("a-token", "?internal=true").await,
+        vec!["a-1", "shared"],
+        "internal streams are for global admins only"
+    );
+    assert_eq!(list("root-token", "").await, vec!["a-1", "b-1", "shared"]);
+    let all = list("root-token", "?internal=true").await;
+    assert!(all.iter().any(|n| n.starts_with("__")), "{all:?}");
+}

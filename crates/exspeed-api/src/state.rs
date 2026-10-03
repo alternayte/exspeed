@@ -46,4 +46,8 @@ pub struct AppState {
     /// The cluster layer (`None` in single-node mode). Backs
     /// `GET /api/v1/cluster`.
     pub cluster: Option<Arc<Cluster>>,
+    /// When set, `GET /metrics` requires `Authorization: Bearer <token>`.
+    /// Independent of the credential store (a Prometheus scraper needs no
+    /// broker identity).
+    pub metrics_token: Option<String>,
 }

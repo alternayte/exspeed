@@ -4,5 +4,6 @@
 mod common;
 mod healthz_leadership_test;
 mod leader_gate_test;
+mod metrics_test;
 mod openapi_test;
 mod readyz_test;

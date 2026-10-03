@@ -67,6 +67,10 @@ spec:
             - name: EXSPEED_AUTH_TOKEN
               valueFrom: { secretKeyRef: { name: {{ .Values.auth.tokenSecret }}, key: token } }
             {{- end }}
+            {{- if .Values.metricsTokenSecret }}
+            - name: EXSPEED_METRICS_TOKEN
+              valueFrom: { secretKeyRef: { name: {{ .Values.metricsTokenSecret }}, key: token } }
+            {{- end }}
             {{- if .Values.auth.credentialsSecret }}
             - name: EXSPEED_CREDENTIALS_FILE
               value: /etc/exspeed/credentials.toml

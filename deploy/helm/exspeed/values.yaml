@@ -94,6 +94,11 @@ serviceMonitor:
   interval: 30s
   labels: {}
 
+# Name of an existing Secret holding a /metrics bearer token under key
+# `token` (sets EXSPEED_METRICS_TOKEN; the ServiceMonitor sends it). Empty:
+# /metrics is open to anyone who can reach the HTTP port.
+metricsTokenSecret: ""
+
 podDisruptionBudget:
   enabled: false
   maxUnavailable: 1

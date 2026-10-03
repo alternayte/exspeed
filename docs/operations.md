@@ -15,6 +15,7 @@ For every flag and environment variable, see [configuration.md](configuration.md
 - [Connection cap](#connection-cap)
 - [Exclusive data-dir lock](#exclusive-data-dir-lock)
 - [Graceful shutdown](#graceful-shutdown)
+- [Startup failures](#startup-failures)
 - [Consumers vs. retention](#consumers-vs-retention)
 - [Consumer state durability](#consumer-state-durability)
 - [`/healthz` vs `/readyz`](#healthz-vs-readyz)
@@ -106,8 +107,9 @@ Do not delete the lockfile manually to "recover" — it's a TOCTOU footgun and n
 
 On `SIGTERM` or `SIGINT` the server shuts down in this order:
 
-1. Stop accepting connections and end client sessions. In-flight requests
-   get up to `server.drain_timeout_secs` (10 s).
+1. Stop accepting connections (TCP and HTTP) and end client sessions.
+   In-flight requests get up to `server.drain_timeout_secs` (10 s); the
+   HTTP server is waited for before storage closes.
 2. Stop connectors. Sinks flush and commit, and sources finish their
    batch, within 30 s.
 3. Resign leadership. This stops consumers, continuous queries and
@@ -121,6 +123,21 @@ On `SIGTERM` or `SIGINT` the server shuts down in this order:
 In Kubernetes, set `terminationGracePeriodSeconds` to at least 60 so the
 kubelet doesn't `SIGKILL` the process partway through. The Helm chart does
 this.
+
+## Startup failures
+
+`exspeed server` exits with an error, rather than running half-started, when
+either listener can't be bound (port in use, bad address), a TLS file can't
+be loaded, or the connector or ExQL catalog can't be read. `/readyz` only
+turns 200 after both listeners serve.
+
+If a node wins the leader lease but can't start the leader's work (reloading
+the ExQL or connector catalog, or starting consumers, fails), it steps down:
+writes close, the lease is released so another node can lead, and the node
+competes again after a hold-off that doubles per failed attempt (1 s up to
+32 s). A single node simply retries after the hold-off. Each step-down is
+logged at `error` and counted as
+`exspeed_leader_transitions_total{direction="stepped_down"}`.
 
 ## Consumers vs. retention
 

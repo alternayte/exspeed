@@ -78,19 +78,52 @@ pub struct StreamCreated {
     pub status: String,
 }
 
-/// List every stream the server has (internal ones included).
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ListStreamsQuery {
+    /// Also list internal `__` streams (consumer state, catalogs, offsets).
+    /// Only honoured for global admins.
+    #[serde(default)]
+    pub internal: bool,
+}
+
+/// List the streams the caller has any permission on (admin, publish or
+/// subscribe). Internal `__` streams are hidden unless `internal=true` and
+/// the caller is a global admin.
 #[utoipa::path(
     get,
     path = "/api/v1/streams",
     tag = "streams",
     security(("bearer" = [])),
-    responses((status = 200, description = "All streams", body = Vec<StreamInfo>))
+    params(ListStreamsQuery),
+    responses((status = 200, description = "The streams visible to the caller", body = Vec<StreamInfo>))
 )]
-pub async fn list_streams(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let names = state.storage.list_streams();
+pub async fn list_streams(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ListStreamsQuery>,
+    identity: Option<Extension<Arc<Identity>>>,
+) -> impl IntoResponse {
+    use exspeed_common::auth::Action;
+    let mut names = state.storage.list_streams();
+    names.sort();
     let mut streams = Vec::new();
 
     for name in &names {
+        let Ok(stream_name) = StreamName::try_from(name.as_str()) else {
+            continue;
+        };
+        let global_admin = identity.as_ref().is_none_or(|e| e.0.has_global_admin());
+        if stream_name.is_internal() && !(q.internal && global_admin) {
+            continue;
+        }
+        if let Some(Extension(id)) = identity.as_ref() {
+            if !(id.authorize(Action::Admin, &stream_name)
+                || id.authorize(Action::Publish, &stream_name)
+                || id.authorize(Action::Subscribe, &stream_name))
+            {
+                continue;
+            }
+        }
         let storage_bytes = state.storage.stream_storage_bytes(name).unwrap_or(0);
         let head_offset = state.storage.stream_head_offset(name).unwrap_or(0);
         let stream_dir = state.storage.data_dir().join("streams").join(name);
@@ -140,6 +173,9 @@ pub async fn create_stream(
         if let Some(resp) = super::require_scoped_admin(&id, &stream_name) {
             return resp;
         }
+    }
+    if let Some(resp) = super::forbid_internal_write(&stream_name) {
+        return resp;
     }
 
     // Build a full config with defaults applied for any missing dedup fields.
@@ -365,6 +401,9 @@ pub async fn patch_stream(
             return resp;
         }
     }
+    if let Some(resp) = super::forbid_internal_write(&stream_name) {
+        return resp;
+    }
 
     let stream_dir = state.storage.data_dir().join("streams").join(&name);
 
@@ -489,6 +528,7 @@ pub struct PublishResponse {
         (status = 201, description = "Stored", body = PublishResponse),
         (status = 200, description = "Duplicate of an earlier record (nothing stored)", body = PublishResponse),
         (status = 400, description = "Invalid record", body = ErrorBody),
+        (status = 403, description = "No admin permission on the stream, or an internal `__` stream", body = ErrorBody),
         (status = 404, description = "No such stream", body = ErrorBody),
         (status = 409, description = "msg_id reused with a different body", body = ErrorBody),
         (status = 503, description = "Not the leader, dedup rebuild in progress, or dedup map full (Retry-After)", body = ErrorBody),
@@ -518,6 +558,9 @@ pub async fn publish_to_stream(
         if let Some(resp) = super::require_scoped_admin(&id, &stream_name) {
             return resp;
         }
+    }
+    if let Some(resp) = super::forbid_internal_write(&stream_name) {
+        return resp;
     }
 
     let subject = if body.subject.is_empty() {
@@ -680,6 +723,9 @@ pub async fn delete_stream(
         if let Some(resp) = super::require_scoped_admin(&id, &stream_name) {
             return resp;
         }
+    }
+    if let Some(resp) = super::forbid_internal_write(&stream_name) {
+        return resp;
     }
 
     if state.storage.stream_storage_bytes(&name).is_none() {

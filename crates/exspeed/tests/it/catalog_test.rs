@@ -154,7 +154,7 @@ async fn definitions_survive_restart_from_the_log() {
     for legacy in ["exql/queries", "connectors", "connections"] {
         assert!(!dir.join(legacy).exists(), "{legacy} should not exist");
     }
-    let streams = names(&get(&server, "/api/v1/streams").await, "name");
+    let streams = names(&get(&server, "/api/v1/streams?internal=true").await, "name");
     for s in ["__exql_queries", "__exql_connections", "__connectors"] {
         assert!(streams.contains(&s.to_string()), "{s} missing: {streams:?}");
     }

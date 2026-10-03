@@ -32,7 +32,12 @@ as **file key / env var / flag**.
 | `server.api_bind` | `EXSPEED_API_BIND` | `--api-bind` | `0.0.0.0:8080` | HTTP listener |
 | `server.data_dir` | `EXSPEED_DATA_DIR` | `--data-dir` | `./exspeed-data` | Data directory. The server takes an exclusive `flock` on it. |
 | `server.max_connections` | `EXSPEED_MAX_CONNS` | `--max-connections` | `1024` | Concurrent client connections. Extra connections are refused and counted. |
-| `server.drain_timeout_secs` | `EXSPEED_DRAIN_TIMEOUT_SECS` | — | `10` | Time open connections get on shutdown |
+| `server.drain_timeout_secs` | `EXSPEED_DRAIN_TIMEOUT_SECS` | — | `10` | Time open connections and in-flight HTTP requests get on shutdown |
+| `server.metrics_token` | `EXSPEED_METRICS_TOKEN` | — | — | When set, `GET /metrics` requires `Authorization: Bearer <token>` ([security.md](security.md#metrics-token)) |
+
+Both listeners are bound before anything else starts: a port that is already
+in use (or a bad TLS file, or a connector/ExQL catalog that can't be read)
+makes `exspeed server` exit with an error instead of running half-started.
 
 ### Auth and TLS
 

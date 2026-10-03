@@ -65,6 +65,8 @@ pub struct ServerArgs {
     pub max_connections: usize,
     /// How long open connections get to finish on shutdown.
     pub drain_timeout_secs: u64,
+    /// Bearer token `/metrics` requires; `None` = `/metrics` is open.
+    pub metrics_token: Option<String>,
     /// `log` or `file`.
     pub connector_offset_store: String,
     pub cluster: ClusterArgs,
@@ -210,6 +212,7 @@ impl ServerArgs {
             dedup_window_secs: 300,
             max_connections: 1024,
             drain_timeout_secs: 10,
+            metrics_token: None,
             connector_offset_store: "log".into(),
             cluster: ClusterArgs::default(),
             log_format: None,
@@ -718,6 +721,7 @@ where
         ready: ready.clone(),
         data_dir: args.data_dir.clone(),
         cluster: cluster.clone(),
+        metrics_token: args.metrics_token.clone().filter(|t| !t.is_empty()),
     });
 
     let supervisor_handle: tokio::task::JoinHandle<()>;

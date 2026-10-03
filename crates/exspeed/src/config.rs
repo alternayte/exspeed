@@ -52,6 +52,7 @@ pub struct ServerSection {
     pub data_dir: Option<PathBuf>,
     pub max_connections: Option<usize>,
     pub drain_timeout_secs: Option<u64>,
+    pub metrics_token: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -225,6 +226,7 @@ struct Layer {
     data_dir: Option<PathBuf>,
     max_connections: Option<usize>,
     drain_timeout_secs: Option<u64>,
+    metrics_token: Option<String>,
     auth_token: Option<String>,
     credentials_file: Option<PathBuf>,
     tls_cert: Option<PathBuf>,
@@ -277,6 +279,7 @@ impl Layer {
             data_dir: f.server.data_dir,
             max_connections: f.server.max_connections,
             drain_timeout_secs: f.server.drain_timeout_secs,
+            metrics_token: f.server.metrics_token,
             auth_token: f.auth.token,
             credentials_file: f.auth.credentials_file,
             tls_cert: f.tls.cert,
@@ -335,6 +338,7 @@ impl Layer {
                 "EXSPEED_DRAIN_TIMEOUT_SECS",
                 s("EXSPEED_DRAIN_TIMEOUT_SECS"),
             )?,
+            metrics_token: s("EXSPEED_METRICS_TOKEN"),
             auth_token: s("EXSPEED_AUTH_TOKEN"),
             credentials_file: s("EXSPEED_CREDENTIALS_FILE").map(PathBuf::from),
             tls_cert: s("EXSPEED_TLS_CERT").map(PathBuf::from),
@@ -432,6 +436,9 @@ impl Layer {
         set!(data_dir => data_dir);
         set!(max_connections => max_connections);
         set!(drain_timeout_secs => drain_timeout_secs);
+        if self.metrics_token.is_some() {
+            t.metrics_token = self.metrics_token;
+        }
         if self.auth_token.is_some() {
             t.auth_token = self.auth_token;
         }
@@ -516,6 +523,7 @@ fn resolve_with(flags: &ServeArgs, env: &dyn Fn(&str) -> Option<String>) -> Resu
     Layer::from_flags(flags).apply(&mut args);
     // Normalize: empty token = unset.
     args.auth_token = args.auth_token.filter(|t| !t.is_empty());
+    args.metrics_token = args.metrics_token.filter(|t| !t.is_empty());
     Ok(args)
 }
 
@@ -640,6 +648,7 @@ api_bind = {api_bind:?}
 data_dir = {data_dir:?}
 max_connections = {maxc}
 drain_timeout_secs = {drain}
+metrics_token = {mtoken}
 
 [auth]
 token = {token}
@@ -697,6 +706,7 @@ level = {ll}
         data_dir = a.data_dir.display().to_string(),
         maxc = a.max_connections,
         drain = a.drain_timeout_secs,
+        mtoken = secret(&a.metrics_token),
         token = secret(&a.auth_token),
         creds = opt_path(&a.credentials_file),
         cert = opt_path(&a.tls_cert),
@@ -746,7 +756,8 @@ bind = "0.0.0.0:5933"            # client protocol (EXSPEED_BIND, --bind)
 api_bind = "0.0.0.0:8080"        # HTTP API, probes, metrics (EXSPEED_API_BIND, --api-bind)
 data_dir = "./exspeed-data"      # (EXSPEED_DATA_DIR, --data-dir)
 max_connections = 1024           # (EXSPEED_MAX_CONNS, --max-connections)
-drain_timeout_secs = 10          # time given to open connections on shutdown (EXSPEED_DRAIN_TIMEOUT_SECS)
+drain_timeout_secs = 10          # time given to open connections and HTTP requests on shutdown (EXSPEED_DRAIN_TIMEOUT_SECS)
+# metrics_token = "..."          # when set, GET /metrics requires `Authorization: Bearer <token>` (EXSPEED_METRICS_TOKEN)
 
 [auth]
 # credentials_file = "/etc/exspeed/credentials.toml"   # (EXSPEED_CREDENTIALS_FILE)

@@ -1,22 +1,43 @@
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use prometheus::{Encoder, TextEncoder};
 
 use crate::state::AppState;
 
-/// Prometheus metrics (text exposition format). No auth.
+/// Prometheus metrics (text exposition format). Open unless the server
+/// has a metrics token (`[server] metrics_token`), which then must be sent
+/// as `Authorization: Bearer <token>`.
 #[utoipa::path(
     get,
     path = "/metrics",
     tag = "health",
+    security((), ("bearer" = [])),
     responses(
         (status = 200, description = "Prometheus text format", content_type = "text/plain", body = String),
+        (status = 401, description = "A metrics token is configured and the request lacks it"),
     )
 )]
-pub async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn prometheus_metrics(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(expected) = state.metrics_token.as_deref() {
+        let sent = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .unwrap_or("");
+        if !constant_time_eq(sent.as_bytes(), expected.as_bytes()) {
+            return Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header("www-authenticate", "Bearer")
+                .body(axum::body::Body::from("unauthorized\n"))
+                .unwrap();
+        }
+    }
     // 1. Update uptime gauge.
     state
         .metrics
@@ -58,4 +79,15 @@ pub async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl Into
         )
         .body(axum::body::Body::from(buffer))
         .unwrap()
+}
+
+/// Compare without an early exit on the first differing byte.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    use sha2::{Digest, Sha256};
+    // Hash both sides so the comparison length doesn't depend on the input.
+    let (x, y) = (Sha256::digest(a), Sha256::digest(b));
+    x.iter()
+        .zip(y.iter())
+        .fold(0u8, |acc, (p, q)| acc | (p ^ q))
+        == 0
 }

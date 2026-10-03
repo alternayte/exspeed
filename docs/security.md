@@ -3,15 +3,20 @@
 Auth and TLS are both off by default. You turn each one on separately with
 environment variables (or the equivalent flags; see [configuration.md](configuration.md)).
 
-> ⚠️ **Known authorization gaps.** Details are in
-> [REVIEW.md §3.7](REVIEW.md#37-server-http-api-auth).
->
-> - **Scoped admins can list every tenant's streams and consumers.**
-> - **`/metrics` is unauthenticated** and exposes every stream and consumer
->   name.
->
-> SQL queries need a **global admin** credential, over both TCP and HTTP.
-> Ack and nack only apply to the consumer the connection subscribed to.
+Authorization at a glance:
+
+- Listing streams and consumers (TCP and HTTP) returns only those the caller
+  has a permission on. Internal `__` streams are listed for global admins
+  only (over HTTP only with `?internal=true`).
+- Internal `__` streams (consumer state, catalogs, connector offsets) are
+  written only by the server: client creates, updates, publishes and deletes
+  on them are refused with 403 over both TCP and HTTP.
+- SQL queries need a **global admin** credential, over both TCP and HTTP.
+- Ack, nack, term and in-progress need `subscribe` on the consumer's stream.
+  Any connection with that permission can settle that stream's consumers'
+  records, which is what lets several app instances share one consumer.
+- `/metrics` is open unless you set a metrics token (see below). It exposes
+  stream, consumer and connector names.
 
 ## Token authentication
 
@@ -28,11 +33,26 @@ they're designed to be reachable by probes, scrapers, and webhook senders:
 |---|---|
 | `GET /healthz` | Liveness probes |
 | `GET /readyz` | Readiness probes |
-| `GET /metrics` | Prometheus scrape |
+| `GET /metrics` | Prometheus scrape (see the metrics token below) |
 | `POST /webhooks/*` | External webhook senders (they carry their own per-webhook auth) |
 
-If you need to authenticate `/metrics` as well, run a reverse-proxy sidecar
-that adds Basic auth. Broker-wide bearer tokens aren't a good fit for scrapers.
+### Metrics token
+
+Broker credentials are a poor fit for scrapers, so `/metrics` has its own
+optional token:
+
+```toml
+[server]
+metrics_token = "..."   # or EXSPEED_METRICS_TOKEN
+```
+
+When it is set, `GET /metrics` answers 401 unless the request carries
+`Authorization: Bearer <metrics_token>`. In Prometheus, set
+`authorization: { credentials: <token> }` on the scrape job; the Helm
+chart sets the variable and the ServiceMonitor's credentials from the Secret
+named by `metricsTokenSecret`. Without
+the token `/metrics` is open, which is fine only when the API port is not
+reachable by untrusted clients.
 
 ## Managing credentials (multiple named identities)
 
@@ -143,9 +163,10 @@ Clients that don't trust your dev CA need to opt in:
 ## Rotation
 
 Cert and token rotation require a server restart. On a single node the
-restart is a blip of about 10 seconds. In multi-pod mode the leader doesn't
-release its lease on shutdown, so a failover waits the full lease TTL
-(30 s by default). Live SIGHUP reload is on the roadmap but not in v1.
+restart is a blip of a few seconds. In multi-pod mode a gracefully stopped
+leader releases its lease, so a follower takes over within about one
+heartbeat interval (a crashed leader is replaced once its lease TTL, 15 s by
+default, runs out). Live SIGHUP reload is on the roadmap but not in v1.
 
 ## What's not in v1
 
