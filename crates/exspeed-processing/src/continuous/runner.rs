@@ -140,6 +140,7 @@ pub struct Runner {
     forced: VecDeque<Vec<u64>>,
     seq: u64,
     dirty: bool,
+    batches_since_ckpt: u64,
     last_ckpt: Instant,
     ckpt_stream: StreamName,
     key_col: Option<usize>,
@@ -259,6 +260,7 @@ impl Runner {
             forced: VecDeque::new(),
             seq: 0,
             dirty: false,
+            batches_since_ckpt: 0,
             last_ckpt: Instant::now(),
             ckpt_stream,
             key_col,
@@ -474,6 +476,7 @@ impl Runner {
         checkpoint::save(&self.ctx.log, &self.ckpt_stream, &ck).await?;
         self.seq += 1;
         self.dirty = false;
+        self.batches_since_ckpt = 0;
         self.last_ckpt = Instant::now();
         if self.forced.is_empty() {
             self.written.clear();
@@ -639,9 +642,7 @@ impl Runner {
         let mut src_rows = Vec::with_capacity(recs.len());
         let single_stateless = matches!(self.df.input, InputOp::Single { .. }) && self.df.agg.is_none();
         let mut meta: HashMap<(u8, u64), (String, Option<Bytes>)> = HashMap::new();
-        let mut total = 0u64;
         for (i, rs) in recs.iter().enumerate() {
-            total += rs.len() as u64;
             let rows = self.source_rows(i, rs)?;
             if let Some(m) = rows.et.iter().max() {
                 self.max_et[i] = Some(self.max_et[i].map_or(*m, |x| x.max(*m)));
@@ -653,7 +654,6 @@ impl Runner {
             }
             src_rows.push(Some(rows));
         }
-        self.ctx.stats.records_in.fetch_add(total, Ordering::Relaxed);
         let wm_new = self.watermark();
         if let Some(w) = wm_new {
             self.ctx.stats.watermark.store(w, Ordering::Relaxed);
@@ -914,9 +914,12 @@ impl Runner {
                 let sig = new_pos.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
                 let items = self.process(recs, &sig)?;
                 self.write(items, &sig).await?;
+                self.ctx.stats.records_in.fetch_add(total as u64, Ordering::Relaxed);
                 self.pos = new_pos;
                 self.dirty = true;
-                if self.last_ckpt.elapsed() >= interval {
+                self.batches_since_ckpt += 1;
+                let every = self.ctx.cfg.checkpoint_every_batches;
+                if self.last_ckpt.elapsed() >= interval || (every > 0 && self.batches_since_ckpt >= every) {
                     self.checkpoint().await?;
                 }
             }

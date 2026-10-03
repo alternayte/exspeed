@@ -39,6 +39,8 @@ pub struct ExqlConfig {
     /// How often continuous queries checkpoint
     /// (`EXSPEED_EXQL_CHECKPOINT_MS`, default 5000).
     pub checkpoint_interval: Duration,
+    /// Also checkpoint after this many micro-batches (0 = time-based only).
+    pub checkpoint_every_batches: u64,
     /// Max records read per source per micro-batch.
     pub micro_batch_records: usize,
     /// Poll interval when a source has no append notifications.
@@ -58,6 +60,7 @@ impl Default for ExqlConfig {
             target_partitions: 1,
             batch_size: 8192,
             checkpoint_interval: Duration::from_secs(5),
+            checkpoint_every_batches: 0,
             micro_batch_records: 1000,
             poll_interval: Duration::from_millis(200),
             default_grace_ms: 0,

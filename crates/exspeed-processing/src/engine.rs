@@ -786,6 +786,26 @@ impl ExqlEngine {
         }
     }
 
+    /// Abort every query task without a final checkpoint (simulates a
+    /// crash; for tests).
+    #[doc(hidden)]
+    pub async fn abort_all(&self) {
+        let handles: Vec<JoinHandle<()>> = {
+            let mut q = self.queries.lock().unwrap();
+            q.values_mut()
+                .filter_map(|e| {
+                    e.generation += 1;
+                    e.cancel = None;
+                    e.handle.take()
+                })
+                .collect()
+        };
+        for h in handles {
+            h.abort();
+            let _ = h.await;
+        }
+    }
+
     fn start(self: &Arc<Self>, id: &str, tenure: &CancellationToken) {
         if tenure.is_cancelled() {
             return;

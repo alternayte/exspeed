@@ -17,6 +17,10 @@ pub mod udfs;
 
 #[cfg(test)]
 mod bounded_tests;
+#[cfg(test)]
+mod continuous_tests;
+#[cfg(test)]
+mod test_util;
 
 pub use bounded::QueryResult;
 pub use engine::{
