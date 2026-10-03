@@ -86,8 +86,16 @@ jobs:
     defaults:
       run:
         working-directory: sdks/typescript
+    env:
+      # The end-to-end tests start this server binary.
+      EXSPEED_BIN: ${{ github.workspace }}/target/debug/exspeed
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the server for the e2e tests
+        run: cargo build -p exspeed --bin exspeed
+        working-directory: .
       - uses: actions/setup-node@v4
         with:
           node-version: 22
