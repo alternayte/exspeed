@@ -9,6 +9,12 @@
   },
   "dependencies": {
     "@exspeed/sdk": "file:../../sdks/typescript",
-    "hono": "^4.0.0"
+    "@hono/node-server": "^1.19.17",
+    "hono": "^4.13.12"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
   }
 }

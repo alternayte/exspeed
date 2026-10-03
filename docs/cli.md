@@ -23,11 +23,15 @@ exspeed server [--config exspeed.toml] [--bind 0.0.0.0:5933] [--api-bind 0.0.0.0
 exspeed config print-default          # commented exspeed.toml with every setting
 exspeed config validate -c FILE       # resolve file + env + flags, check, exit non-zero on error
 exspeed config show -c FILE           # resolved settings, secrets redacted
-exspeed healthcheck [--url URL]       # exit 0 when /readyz answers 200 (Docker HEALTHCHECK)
+exspeed healthcheck [--url URL] [--timeout 3]   # exit 0 when /readyz answers 200 (Docker HEALTHCHECK)
 ```
 
 Settings come from defaults < config file < environment < flags; the full
-list is in [configuration.md](configuration.md).
+list is in [configuration.md](configuration.md), and `exspeed server --help`
+lists every flag. `healthcheck` probes `/readyz` on the `api_bind` port
+(`https` when TLS is configured), resolved from `EXSPEED_CONFIG` and the
+environment the same way `exspeed server` resolves them; `--url` or
+`EXSPEED_HEALTHCHECK_URL` overrides it.
 
 ## Streams
 
@@ -42,9 +46,13 @@ exspeed delete <name> [--force]     # --force also removes connectors/queries/co
 
 Values:
 
-- **Durations:** `30s`, `10m`, `24h`, `7d`.
-- **Sizes:** `256mb`, `10gb`.
+- **Durations:** `30s`, `10m`, `24h`, `7d`; a bare number is seconds.
+- **Sizes:** `256mb`, `10gb` (binary units: 1 GB = 1024³ bytes); a bare number is bytes.
 - **Entry counts:** `100000`, `500k`, `2M`.
+
+`create` without `--dedup-window` / `--dedup-max-entries` uses the stream
+defaults (5 minutes, 500,000 entries). Log compaction has no CLI flag:
+create a compacted stream over HTTP (`"compaction": true`) or with the SDK.
 
 ## Publish
 
@@ -52,7 +60,11 @@ Values:
 exspeed pub <stream> '<data>' [--subject order.eu.created] [--key ord-1] [--msg-id <id>]
 ```
 
-`--msg-id` turns on [idempotent publish](idempotent-publish.md).
+`pub` posts to `POST /api/v1/streams/{name}/publish`. `<data>` is sent as
+JSON when it parses as JSON, and as a JSON string otherwise. Without
+`--subject` the subject is the stream name. `--msg-id` turns on
+[idempotent publish](idempotent-publish.md); a duplicate prints
+`duplicate=true` and the original offset.
 
 ## Tail
 
@@ -93,8 +105,9 @@ exspeed query "DROP STREAM eu_orders"
 exspeed query --continuous "CREATE STREAM …"   # only accepts CREATE statements
 ```
 
-Every statement goes to `POST /api/v1/queries`. Secondary indexes
-(`CREATE INDEX`) were removed, and the server rejects them with `UNSUPPORTED`.
+Every statement goes to `POST /api/v1/queries` (`--continuous` posts to
+`/api/v1/queries/continuous`). Secondary indexes are not supported:
+`CREATE INDEX` is rejected with `UNSUPPORTED`.
 
 See [exql.md](exql.md).
 

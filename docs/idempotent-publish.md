@@ -3,10 +3,15 @@
 Exspeed supports retry-safe (idempotent) publishes. You attach an ID to a
 publish in one of these ways:
 
-- the `msg_id` field on the TCP `PUBLISH` frame
-- the `msg_id` field in the HTTP publish body
+- the `msg_id` field of a record in a TCP `Publish` or `PublishBatch`
+  request (SDK: `msgId`)
+- the `msg_id` field in the HTTP publish body, or the `x-idempotency-key`
+  request header (the body field wins when both are set)
 - the `--msg-id` CLI flag
-- the `x-idempotency-key` header, kept for compatibility with existing connectors
+- an `x-idempotency-key` record header, which is how connectors and ExQL
+  output tag their records
+
+The ID is stored on the record as its `x-idempotency-key` header.
 
 Where dedup applies:
 
@@ -16,9 +21,9 @@ Where dedup applies:
   from.
 - **During startup.** Until the startup rebuild of the dedup maps finishes,
   publishes that carry a `msg_id` are refused with a retryable error
-  (`503` over HTTP, `UNAVAILABLE` over TCP) instead of being written
-  unchecked; publishes without one are accepted. `/readyz` reports
-  `dedup_rebuild_in_progress` meanwhile.
+  (`503` over HTTP and TCP) instead of being written unchecked; publishes
+  without one are accepted. Meanwhile `/readyz` answers `503` with
+  `dedup_rebuild_in_progress`.
 - **Batches.** `PublishBatch` deduplicates within the batch as well as
   against earlier records (a repeated `msg_id` in one batch is written once,
   or rejected as a collision when the bodies differ), and it honours
@@ -32,7 +37,9 @@ Where dedup applies:
 
 ## Semantics
 
-**First-body-wins.** If a client publishes `msg_id=X` with body `A`, a retry with the same `msg_id=X` and the same body `A` receives `PublishOk { duplicate: true, offset: <original> }` — the original offset is returned and no new record is written. If the retry arrives with a *different* body `B` (a likely bug in the caller), the server responds with a `KeyCollision` error that includes the offset of the first write. When the per-stream dedup map is at capacity and an eviction cannot free a slot, the server responds with `DedupMapFull { retry_after_secs }`, which is a retryable condition (try again after the window expires). Messages published without a `msg_id` bypass the dedup engine entirely — they are always written immediately and are unaffected by a full dedup map.
+**First-body-wins.** If a client publishes `msg_id=X` with body `A`, a retry with the same `msg_id=X` and the same body `A` succeeds with `duplicate: true` and the original offset; no new record is written. The body is the record value: subject, key and headers aren't compared. If the retry arrives with a *different* body `B` (a likely bug in the caller), the server rejects it with a conflict (`409`, with `stored_offset` naming the first write). When the per-stream dedup map is at capacity (`dedup_max_entries`) and evicting expired entries cannot free a slot, the server rejects the publish as retryable: `429` over TCP and `503` with a `Retry-After` header over HTTP, both with `retry_after_secs`, the time until the oldest entry expires. Messages published without a `msg_id` bypass the dedup engine entirely: they are always written immediately and are unaffected by a full dedup map.
+
+An entry is remembered for the stream's dedup window, measured from the first write. A retry after the window has passed is written as a new record.
 
 ## CLI configuration
 
@@ -48,12 +55,17 @@ exspeed update-stream orders --dedup-window 30m
 
 | Setting | Default | Minimum |
 |---------|---------|---------|
-| `dedup_window` | `5m` (300 s) | `1 s` (must be ≤ retention) |
+| `dedup_window` | `5m` (300 s), capped at the retention age | `1 s` (must be ≤ retention) |
 | `dedup_max_entries` | `500_000` | `1` |
+
+Both are per-stream settings: `dedup_window_secs` and `dedup_max_entries`
+over HTTP (`POST`/`PATCH /api/v1/streams`) and in the SDK
+(`dedupWindowSecs`, `dedupMaxEntries`). `exspeed info <stream>` shows them,
+and `exspeed_dedup_window_secs{stream}` reports each stream's window.
 
 ## Memory and on-disk cost
 
-Each dedup entry stores a `msg_id` string (variable), an offset (8 bytes), a timestamp (8 bytes), and a body hash (8 bytes). At the default 500,000-entry cap with average 32-byte `msg_id` strings the in-memory footprint is approximately **150 MB per stream** worst case. On disk, each stream maintains a `dedup_snapshot.bin` file in its stream directory. The snapshot is written every 60 seconds and on graceful shutdown, and is included in `exspeed snapshot` offline backups. Online backups (`exspeed backup`) leave it out; after `exspeed restore` the map is rebuilt from the restored log (a full scan of the dedup window at startup).
+Each dedup entry stores a `msg_id` string (variable), an offset, an insertion time and a 64-bit body hash. At the default 500,000-entry cap with average 32-byte `msg_id` strings the in-memory footprint is approximately **150 MB per stream** worst case. On disk, each stream maintains a `dedup_snapshot.bin` file in its stream directory. The snapshot is written every 60 seconds and on graceful shutdown, and is included in `exspeed snapshot` offline backups. Online backups (`exspeed backup`) leave it out; after `exspeed restore` the map is rebuilt from the restored log (a full scan of the dedup window at startup).
 
 Storage layout with dedup:
 
@@ -94,6 +106,6 @@ exspeed-data/
     summary: "Exspeed dedup full-scan rebuild took > 30s"
 ```
 
-## Connector compatibility
+## Connectors and ExQL
 
-Connectors that already set an `x-idempotency-key` header (e.g. the Postgres outbox connector) continue to work unchanged — the same dedup engine processes both the header and the `msg_id` wire field. No connector reconfiguration is required to benefit from idempotent publish.
+Connectors that set an `x-idempotency-key` header (for example the Postgres outbox connector, or `http_poll` with `idempotent_items`) and ExQL continuous queries (deterministic keys on every output record) go through the same dedup engine as a `msg_id`. No extra configuration is needed: the stream's dedup window and cap apply.

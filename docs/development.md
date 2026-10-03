@@ -8,15 +8,19 @@ You need Rust 1.94 or newer. Node 18+ is only needed for the TypeScript SDK.
 cargo build                              # all crates
 cargo build --release -p exspeed         # just the server/CLI binary
 cargo test --workspace --lib             # fast unit tests
-cargo test -p exspeed --test exql_test   # one integration test file
-cargo clippy --workspace
+cargo test -p exspeed --test it -- exql_test              # one integration test module
+cargo test -p exspeed --test it -- consumer_test::test_name   # one test
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 Integration tests are compiled into **one binary per crate** (`tests/it/`),
-with one module per former test file. Tests that change process-wide
-environment variables still have their own binaries in `tests/*.rs`. Those
-will be merged once configuration moves into a struct; until then, don't
-add `set_var` calls to modules under `tests/it/`.
+with one module per test file. Every module in that binary shares one
+process environment, and tests run in parallel, so don't add `set_var`
+calls to modules under `crates/exspeed/tests/it/`. Two files in
+`crates/exspeed/tests/` build their own binaries: `auth_test.rs` (one of its
+tests sets `EXSPEED_AUTH_TOKEN` for the CLI client) and `lifecycle_test.rs`.
+In-process servers take their settings from `ServerArgs`, not from the
+environment.
 
 On a disk-constrained machine, build without debug info, as CI does:
 
@@ -33,16 +37,30 @@ before the server exists: a child process (`crash_test`), or a node that
 restarts on the same address (`cluster_test`'s fault-proxy nodes). Both
 work on IPv4-only hosts.
 
+These environment variables change what the tests do:
+
+| Variable | Effect |
+|----------|--------|
+| `EXSPEED_POSTGRES_URL`, `EXSPEED_MYSQL_URL`, `EXSPEED_MSSQL_URL`, `EXSPEED_RABBITMQ_URL`, `EXSPEED_S3_ENDPOINT` | Service URLs for the connector and JDBC tests (see below) |
+| `EXSPEED_LEASE_POSTGRES_URL`, `EXSPEED_LEASE_REDIS_URL` | Lease conformance tests and the three-node `crash_test` (they also accept `EXSPEED_OFFSET_STORE_POSTGRES_URL` / `EXSPEED_OFFSET_STORE_REDIS_URL`). Skipped, and reported as passing, when unset. |
+| `CI=true` | Service-backed connector and JDBC tests fail instead of skipping when their URL is missing |
+| `EXSPEED_ENOSPC_DIR` | A small, empty filesystem for the disk-full tests (CI mounts a 16 MiB tmpfs). Skipped when unset. |
+| `EXSPEED_CRASH_ROUNDS` | Rounds of the single-node `kill -9` test (default 5) |
+| `EXSPEED_PROPTEST_CASES` | Cases for the storage property tests (default 16) |
+| `EXSPEED_BIN` | Server binary for the TypeScript SDK's end-to-end tests |
+
 ## CI
 
-`.github/workflows/ci.yml` runs on every PR. It has four jobs:
+`.github/workflows/ci.yml` runs on every pull request and every push to
+`main`. It has five jobs:
 
 | Job | What it runs |
 |-----|--------------|
-| `lint` | `cargo fmt --check` and `cargo clippy -D warnings` |
-| `test` | `cargo test --workspace` |
-| `test-services` | Postgres (with `wal_level=logical`), Redis and MySQL in Docker, then the gated tests with `--include-ignored` |
-| `sdk` | SDK typecheck, test and build |
+| `lint` | `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` |
+| `test` | Builds the binary, validates every example `connectors.d/*.toml` with `exspeed connector validate`, mounts a 16 MiB tmpfs for the disk-full tests, then `cargo test --workspace` |
+| `test-services` | Postgres (with `wal_level=logical`), Redis, MySQL, RabbitMQ, an S3-compatible store (moto) and SQL Server (with its Agent) in Docker, then the library, binary, `it`, `leadership_test`, `postgres_lease_test` and `redis_lease_test` test targets with `--include-ignored` |
+| `sdk` | Builds the server for the end-to-end tests, then SDK typecheck, test and build |
+| `helm` | `helm lint` and rendering of the single-node and multi-pod values |
 
 ## TypeScript SDK
 
@@ -50,60 +68,93 @@ work on IPv4-only hosts.
 cd sdks/typescript
 npm ci
 npm run typecheck
-npm test            # vitest, against mock sockets
+npm test            # vitest: unit tests against a scriptable fake server,
+                    # e2e tests against target/debug/exspeed or $EXSPEED_BIN
 npm run build       # tsup → ESM + CJS
 ```
+
+The end-to-end tests (`test/e2e/`) are skipped when neither binary exists,
+so build the server first (`cargo build -p exspeed --bin exspeed`).
 
 ## Infrastructure for connector tests
 
 ```bash
-docker compose up -d postgres rabbitmq minio mysql mssql
+docker compose up -d postgres rabbitmq s3 mysql mssql
+docker run -d --name redis -p 6379:6379 redis:7    # lease tests only
 ```
 
 | Service | Ports | Credentials |
 |---------|-------|-------------|
 | postgres (`wal_level=logical`) | 5432 | `testuser` / `testpass`, db `testdb` |
 | rabbitmq | 5672, 15672 | `guest` / `guest` |
-| minio | 9000, 9001 | `minioadmin` / `minioadmin` |
-| mysql | 3306 | `exspeed` / `exspeed` |
-| mssql (amd64 only) | 1433 | `sa` / `Exspeed_Test!1` |
+| s3 (moto, S3-compatible) | 9000 | any; the tests default to `minioadmin` / `minioadmin` |
+| mysql | 3306 | `exspeed` / `exspeed`, db `exspeed` |
+| mssql (amd64 only, Agent enabled) | 1433 | `sa` / `Exspeed_Test!1` |
+
+The compose file has no Redis service; the `docker run` line above starts
+one for the Redis lease tests.
 
 **Connector framework and plugin tests** live in
 `crates/exspeed-connectors/tests/it/`: fake sources and sinks drive the
 checkpoint protocol and the supervisor (crashes between append and ack,
-flush failures, restarts, panics), an in-process HTTP server drives
-`http_poll`/`http_sink`, and `postgres_test` runs `postgres_cdc`,
-`postgres_outbox` and `postgres_poll` against a real Postgres. The Postgres
-tests are `#[ignore]`d; they skip without `EXSPEED_POSTGRES_URL`, and
-**fail** when `CI=true` is set without it:
+flush failures, restarts, panics), and an in-process HTTP server drives
+`http_poll`/`http_sink`. The service-backed modules run real plugins:
+`postgres_test` (`postgres_cdc`, `postgres_outbox`, `postgres_poll`),
+`rabbitmq_test`, `s3_test` and `jdbc_test` (the `jdbc` sink and `jdbc_poll`
+on MySQL and SQL Server, and `mssql_cdc`). These tests are `#[ignore]`d;
+with `--include-ignored` they skip when their URL is unset, and **fail**
+when `CI=true` is set without it:
 
 ```bash
 EXSPEED_POSTGRES_URL="postgres://testuser:testpass@localhost:5432/testdb" \
+EXSPEED_RABBITMQ_URL="amqp://guest:guest@localhost:5672/%2f" \
+EXSPEED_S3_ENDPOINT="http://localhost:9000" \
+EXSPEED_MYSQL_URL="mysql://exspeed:exspeed@localhost:3306/exspeed" \
+EXSPEED_MSSQL_URL="mssql://sa:Exspeed_Test!1@localhost:1433/exspeed?trust_server_certificate=true" \
   cargo test -p exspeed-connectors --test it -- --include-ignored
 ```
 
-The JDBC end-to-end tests in `crates/exspeed/tests/it/` still **skip
-silently, and report as passing,** when their env var isn't set:
+CDC can't be enabled on SQL Server's `master` database, so create the
+`exspeed` database once:
+
+```bash
+docker exec exspeed-mssql /opt/mssql-tools18/bin/sqlcmd -C -S localhost \
+  -U sa -P 'Exspeed_Test!1' -Q "IF DB_ID('exspeed') IS NULL CREATE DATABASE exspeed"
+```
+
+The JDBC end-to-end tests in `crates/exspeed/tests/it/` follow the same
+rules (`#[ignore]`d, skip without their URL, fail under `CI=true`):
 
 ```bash
 EXSPEED_POSTGRES_URL="postgres://testuser:testpass@localhost:5432/testdb" \
-  cargo test -p exspeed --test jdbc_sink_postgres_test
+  cargo test -p exspeed --test it -- jdbc_sink_postgres_test --include-ignored
 
 EXSPEED_MYSQL_URL="mysql://exspeed:exspeed@localhost:3306/exspeed" \
-  cargo test -p exspeed --test jdbc_sink_mysql_test
+  cargo test -p exspeed --test it -- jdbc_sink_mysql_test --include-ignored
 
-EXSPEED_MSSQL_URL="mssql://sa:Exspeed_Test!1@localhost:1433/master?trust_server_certificate=true" \
-  cargo test -p exspeed --test jdbc_sink_mssql_test
+EXSPEED_MSSQL_URL="mssql://sa:Exspeed_Test!1@localhost:1433/exspeed?trust_server_certificate=true" \
+  cargo test -p exspeed --test it -- jdbc_sink_mssql_test jdbc_poll_test --include-ignored
 ```
 
-The replication and multi-pod tests are `#[ignore]` because they need
-Postgres. They are currently known to fail, and Phase 6 of the plan replaces
-them:
+**Replication and multi-pod tests.** `cluster_test` (in-process nodes
+replicating over real TCP on the in-memory lease, including the randomized
+partition test) and `exspeed-broker`'s `replication_test` and
+`leadership_test` run in a plain `cargo test`. The lease conformance tests
+and the three-node `kill -9` test need a real lease backend:
 
 ```bash
-EXSPEED_OFFSET_STORE_POSTGRES_URL=postgres://testuser:testpass@localhost:5432/testdb \
-  cargo test -p exspeed -- --ignored --nocapture
+EXSPEED_LEASE_POSTGRES_URL=postgres://testuser:testpass@localhost:5432/testdb \
+EXSPEED_LEASE_REDIS_URL=redis://localhost:6379 \
+  cargo test -p exspeed-broker --test postgres_lease_test --test redis_lease_test
+
+EXSPEED_LEASE_POSTGRES_URL=postgres://testuser:testpass@localhost:5432/testdb \
+  cargo test -p exspeed --test it -- crash_test::kill_9_in_a_three_node_cluster --nocapture
 ```
+
+The `kill -9` tests run the server binary that Cargo builds for the test
+target as separate processes. See
+[high-availability.md](high-availability.md#how-it-is-tested) for what each
+test proves.
 
 Microsoft doesn't publish an arm64 SQL Server image. The compose file pins
 `platform: linux/amd64`, so on Apple Silicon it runs under emulation and the
@@ -116,29 +167,31 @@ See [BENCHMARKS.md](../BENCHMARKS.md) and [bench/README.md](../bench/README.md).
 ```bash
 cargo build --release -p exspeed -p exspeed-bench
 ./target/release/exspeed server --data-dir /tmp/exspeed-bench &
-./target/release/exspeed-bench all --server localhost:5933 --api http://localhost:8080 --profile local
+./target/release/exspeed-bench all --server localhost:5933 --api http://localhost:8080 \
+  --profile local --output bench/results/all.json
 ```
 
-> The published numbers are from v0.2.0 on macOS. Driver and broker ran on
-> the same host. Re-run them on Linux before you quote them.
+> The published numbers come from a 4-vCPU Linux cloud VM with the driver
+> and the broker on the same host, and BENCHMARKS.md compares them with
+> Kafka and NATS JetStream measured on the same machine. Treat them as an
+> order of magnitude for that hardware.
 
 ## Releasing
 
-Releases are driven by cargo-dist. See the "Releasing" section of
-[CLAUDE.md](../CLAUDE.md) for the full checklist:
-
-1. Bump versions.
-2. Update `CHANGELOG.md`.
-3. Tag `vX.Y.Z` and push. This alone creates the GitHub Release.
-4. Build the multi-arch Docker image.
-5. Run `npm publish`.
+Pushing a `vX.Y.Z` tag runs the Release workflow (cargo-dist): it builds
+the binaries and installers, creates the GitHub Release with the matching
+`CHANGELOG.md` section as its notes, and publishes the multi-arch image
+`ghcr.io/alternayte/exspeed` from those binaries. The checklist (version
+bump, changelog, tag, npm publish) is in the "Releasing" section of
+[CLAUDE.md](../CLAUDE.md).
 
 ## Repository layout
 
 ```
 crates/              Rust workspace (see docs/architecture.md)
 sdks/typescript/     @exspeed/sdk
+deploy/helm/         Helm chart
 examples/            getting-started (Bun) and order-processing demos
-bench/               comparison kit (Kafka) and stored results
+bench/               comparison kit (Kafka, NATS JetStream) and stored results
 docs/                this documentation
 ```

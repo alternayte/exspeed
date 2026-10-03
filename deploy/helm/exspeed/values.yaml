@@ -1,7 +1,7 @@
 # Default: a single-node Exspeed with a persistent volume.
 
 image:
-  repository: docker.io/nayth/exspeed
+  repository: ghcr.io/alternayte/exspeed
   tag: ""            # defaults to .Chart.AppVersion
   pullPolicy: IfNotPresent
 

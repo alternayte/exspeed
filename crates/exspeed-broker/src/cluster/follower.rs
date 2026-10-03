@@ -223,7 +223,7 @@ async fn positions(cluster: &Cluster) -> Result<Vec<FetchPos>, String> {
         .map_err(|e| format!("list streams: {e}"))?;
     let mut out = Vec::with_capacity(streams.len());
     for s in streams {
-        let Ok((earliest, next)) = cluster.storage.stream_bounds(&s).await else {
+        let Ok((earliest, next)) = cluster.storage.committed_bounds(&s).await else {
             continue;
         };
         let h = cluster.epochs.get(s.as_str());
@@ -233,6 +233,7 @@ async fn positions(cluster: &Cluster) -> Result<Vec<FetchPos>, String> {
             next: next.0,
             last_epoch: h.as_ref().map_or(0, |h| h.last_epoch(next.0)),
             earliest: earliest.0,
+            hw: cluster.storage.read_floor(&s).unwrap_or(0),
         });
     }
     Ok(out)
@@ -255,7 +256,7 @@ async fn apply(
     let mut lag = 0u64;
     for sd in resp.streams {
         let stream = name(&sd.stream)?;
-        let (earliest, mut next) = match storage.stream_bounds(&stream).await {
+        let (earliest, mut next) = match storage.committed_bounds(&stream).await {
             Ok(b) => b,
             Err(StorageError::StreamNotFound(_)) => continue, // metadata comes next round
             Err(e) => return Err(format!("bounds of {stream}: {e}")),
@@ -302,7 +303,7 @@ async fn apply(
             StreamAction::Trim => {}
         }
         let (earliest, next) = storage
-            .stream_bounds(&stream)
+            .committed_bounds(&stream)
             .await
             .map_err(|e| format!("bounds of {stream}: {e}"))?;
         if earliest.0 < sd.earliest && sd.earliest <= next.0 {
@@ -316,6 +317,15 @@ async fn apply(
             .update(stream.as_str(), |h| h.adopt(&sd.epochs, next.0))
             .map_err(|e| format!("epoch history of {stream}: {e}"))?;
         lag += sd.high_watermark.saturating_sub(next.0);
+    }
+    // Hold this node's readers to what the leader's readers see: records
+    // above it could still be lost in a failover.
+    for (s, hw) in &resp.high_watermarks {
+        if let Ok(name) = StreamName::try_from(s.as_str()) {
+            if !name.is_internal() {
+                storage.set_read_floor(&name, Some(*hw));
+            }
+        }
     }
     cluster.follower_info.lock().lag_records = lag;
     cluster.metrics.replication_lag_records.record(

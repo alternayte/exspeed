@@ -226,11 +226,17 @@ impl PartitionShared {
         &self,
         mut read: impl FnMut() -> Result<T, StorageError>,
         hwm_of: impl Fn(&T) -> u64,
+        committed: bool,
     ) -> Result<T, StorageError> {
         for _ in 0..8 {
             let epoch = self.truncation_epoch();
             let r = read()?;
-            if self.truncation_epoch() == epoch && self.high_watermark() >= hwm_of(&r) {
+            let bound = if committed {
+                self.committed()
+            } else {
+                self.high_watermark()
+            };
+            if self.truncation_epoch() == epoch && bound >= hwm_of(&r) {
                 return Ok(r);
             }
         }
@@ -251,9 +257,34 @@ impl PartitionShared {
         strict: bool,
     ) -> Result<ReadBatch, StorageError> {
         self.read_consistent(
-            || self.read_once(from, max_records, max_bytes, strict),
+            || self.read_once(from, max_records, max_bytes, strict, false),
             |b| b.high_watermark.0,
+            false,
         )
+    }
+
+    /// Like [`read`](Self::read), but up to the committed end of the log,
+    /// ignoring the replication floor (for replication and for rebuilding
+    /// state that must include unreplicated records).
+    pub fn read_committed(
+        &self,
+        from: u64,
+        max_records: usize,
+        max_bytes: usize,
+    ) -> Result<ReadBatch, StorageError> {
+        self.read_consistent(
+            || self.read_once(from, max_records, max_bytes, false, true),
+            |b| b.high_watermark.0,
+            true,
+        )
+    }
+
+    /// The configured replication floor, if any.
+    pub fn floor(&self) -> Option<u64> {
+        match self.floor.load(Ordering::Acquire) {
+            u64::MAX => None,
+            f => Some(f),
+        }
     }
 
     fn read_once(
@@ -262,8 +293,13 @@ impl PartitionShared {
         max_records: usize,
         max_bytes: usize,
         strict: bool,
+        committed: bool,
     ) -> Result<ReadBatch, StorageError> {
-        let hwm = self.high_watermark();
+        let hwm = if committed {
+            self.committed()
+        } else {
+            self.high_watermark()
+        };
         let list = self.segments();
         let earliest = list.first().map_or(hwm, |s| s.base_offset).min(hwm);
         let mut from = from;
@@ -363,6 +399,7 @@ impl PartitionShared {
         self.read_consistent(
             || self.read_raw_once(from, max_records, max_bytes),
             |b| b.high_watermark.0,
+            false,
         )
     }
 
@@ -916,6 +953,7 @@ mod tests {
                     Ok(hwm)
                 },
                 |hwm| *hwm,
+                false,
             )
             .unwrap();
         assert_eq!(calls.get(), 2, "the raced read is retried");
@@ -940,6 +978,7 @@ mod tests {
                     Ok(hwm)
                 },
                 |hwm| *hwm,
+                false,
             )
             .unwrap();
         assert_eq!((calls.get(), got), (2, 10));
@@ -955,10 +994,25 @@ mod tests {
                     Ok(0u64)
                 },
                 |_| 0,
+                false,
             )
             .unwrap_err();
         assert!(
             matches!(err, StorageError::Io(ref e) if e.kind() == std::io::ErrorKind::Interrupted)
         );
+    }
+
+    /// The replication floor hides records from readers but not from
+    /// committed reads (replication, state rebuilds).
+    #[test]
+    fn floor_hides_records_from_readers_but_not_committed_reads() {
+        let s = shared(100);
+        assert_eq!(s.high_watermark(), 100);
+        s.set_floor(Some(40));
+        assert_eq!(s.floor(), Some(40));
+        assert_eq!(s.high_watermark(), 40);
+        assert_eq!(s.committed(), 100);
+        s.set_floor(None);
+        assert_eq!(s.high_watermark(), 100);
     }
 }

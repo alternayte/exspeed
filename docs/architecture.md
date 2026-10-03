@@ -1,23 +1,24 @@
 # Architecture
 
-This page describes the system **as it is today**. The proposed target
-architecture is in [REVIEW.md §5](REVIEW.md#5-proposed-target-architecture).
+This page describes how Exspeed is built: its crates, the write and read
+paths, the on-disk format, and the order in which the server starts.
 
 ## Crates
 
-Arrows point from a crate to the crates it depends on.
+Arrows point from a crate to the crates it depends on. Indirect
+dependencies are left out (most crates also use `exspeed-common` directly,
+for example).
 
 ```mermaid
 graph BT
   streams[exspeed-streams] --> common[exspeed-common]
-  protocol[exspeed-protocol] --> streams
+  protocol[exspeed-protocol] --> common
   storage[exspeed-storage] --> streams
   broker[exspeed-broker] --> protocol
   broker --> storage
-  connectors[exspeed-connectors] --> broker
   processing[exspeed-processing] --> broker
+  connectors[exspeed-connectors] --> processing
   api[exspeed-api] --> connectors
-  api --> processing
   bin[exspeed] --> api
   client[exspeed-client] --> protocol
   bench[exspeed-bench] --> client
@@ -30,8 +31,8 @@ graph BT
 | `exspeed-protocol` | Wire protocol: frame codec, opcodes, client protocol v2 (`client.rs`) |
 | `exspeed-storage` | `FileStorage` (segments, sparse indexes, retention, compaction), `MemoryStorage` |
 | `exspeed-broker` | `Log` (the single write path), `BrokerAppend` (dedup), consumers, leases and leadership, cluster replication (`cluster/`) |
-| `exspeed-connectors` | Connector manager, per-connector supervisor, retry/DLQ, offset stores, built-in plugins |
-| `exspeed-processing` | ExQL: parser, planner, bounded and continuous runtimes |
+| `exspeed-connectors` | Connector manager, per-connector supervisor, retry/DLQ, offset stores, built-in plugins (record transforms come from `exspeed-processing`) |
+| `exspeed-processing` | ExQL: parser, planner, bounded queries on DataFusion, continuous runtime |
 | `exspeed-api` | Axum HTTP API, auth and leader-gate middleware, webhooks |
 | `exspeed` | Binary: CLI, server bootstrap (`cli/server.rs`), TCP sessions (`session.rs`) |
 | `exspeed-client` | Async Rust client for protocol v2 (also used by the benchmarks and tests) |
@@ -48,6 +49,8 @@ flowchart LR
     src["Source connectors"]
     exqlout["ExQL continuous output"]
     cstate["Consumer state (__consumers)"]
+    dlq["Dead letters (consumers, connectors)"]
+    cat["Catalogs (__connectors, __exql_*)"]
   end
   log["Log<br/>leader gate, validation, dedup,<br/>acks=all wait, metrics"]
   fs[("FileStorage")]
@@ -56,6 +59,8 @@ flowchart LR
   src --> log
   exqlout --> log
   cstate --> log
+  dlq --> log
+  cat --> log
   log --> fs
   fs --> actors["Consumer actors<br/>(leader only)"] -->|"push / pull over TCP"| apps["Applications"]
   fs --> reads["Stateless reads<br/>(TCP Read, HTTP /records)"]
@@ -70,7 +75,8 @@ It enforces the leader gate, validates records, applies `msg_id` dedup,
 appends to storage, waits for the in-sync replicas in a cluster with
 `acks = all`, and records metrics. The one other writer is the replication
 follower, which applies the leader's records with `StorageEngine::append_at`
-while the node is not the leader (see [high-availability.md](high-availability.md)).
+(and mirrors trims and truncations) while the node is not the leader (see
+[high-availability.md](high-availability.md)).
 
 ## Consumers
 
@@ -103,12 +109,17 @@ Each TCP connection is served by `crates/exspeed/src/session.rs`:
 
 - a reader loop decodes and dispatches requests;
 - one writer task owns the socket;
-- requests that wait (pull, long-poll read, query) run concurrently, so
-  replies can arrive out of order;
+- `Publish` and `PublishBatch` go through the connection's publish
+  pipeline, a task that applies them in arrival order while the reader
+  keeps going. Requests already queued for the same stream are appended
+  together (one `Log` batch, so one fsync), up to 4,096 records or 8 MiB,
+  and each request gets its own reply;
+- requests that wait (pull, long-poll read, query) run concurrently, at
+  most 64 per connection, so replies can arrive out of order;
 - each subscription has a forwarder task that turns consumer events into
   `Deliver` pushes (correlation id 0).
 
-Frames are capped at 16 MB.
+Frame payloads are capped at 16 MiB.
 
 ## Storage layout
 
@@ -116,12 +127,14 @@ Frames are capped at 16 MB.
 <data-dir>/
   .exspeed.lock                      exclusive flock held by the running server
   credentials.toml                   optional, auto-detected
+  node_id                            this node's id, generated on first start
   .trash/                            streams being deleted (cleared on startup)
+  cluster/epochs/<stream>.json       per-stream leader-epoch history (cluster mode)
   streams/<stream>/
     stream.json                      retention, dedup and compaction config
-    dedup_snapshot.bin               periodic dedup-map snapshot
+    dedup_snapshot.bin               periodic dedup-map snapshot (single node)
     partitions/0/
-      00000000000000000000.seg       append-only segment (wire-encoded records), rolls at 256 MB
+      00000000000000000000.seg       append-only segment (wire-encoded records), rolls at 256 MiB
       00000000000000000000.idx       sparse offset + time index, one entry about every 4 KiB
       00000000000000000000.meta      sealed-segment metadata (offsets, timestamps, length)
       truncate.json                  only while a truncation is in progress
@@ -136,9 +149,9 @@ Frames are capped at 16 MB.
   connections.d/*.toml               ExQL connections (operator-managed)
   connector-offsets/                 connector offsets (EXSPEED_CONNECTOR_OFFSET_STORE=file only;
                                      the default stores them in the __connector_offsets stream)
-  connectors.migrated/               legacy files, kept after their one-time import
-  connections.migrated/                (older versions kept API definitions under
-  exql/queries.migrated/               connectors/, connections/ and exql/queries/)
+  connectors.migrated/               JSON definitions from connectors/, connections/
+  connections.migrated/              and exql/queries/, kept after the server imported
+  exql/queries.migrated/             them into the internal streams above
 ```
 
 **Cluster metadata lives in the log.** Everything created through the API
@@ -152,9 +165,10 @@ the old leader had. Files under `connectors.d/` and `connections.d/` stay
 node-local on purpose: operators ship the same files to every pod. Dedup
 snapshots are node-local caches that can be rebuilt from the log.
 
-Segment files are named after their base offset and start with a 16-byte
-header (magic `EXSG`, format version 3). Older segment files are refused;
-there is no migration because nobody runs Exspeed in production yet.
+Segment files are named after their base offset (20 digits, zero-padded)
+and start with a 16-byte header: magic `EXSG`, format version 3, base
+offset. The server refuses a segment with any other version and names the
+file in the error.
 
 **Record format.** After the header, a segment holds records back to back
 in exactly the encoding the client protocol uses for a `WireRecord`
@@ -177,8 +191,8 @@ little-endian:
 
 A record is 35 bytes plus its subject, key, value and headers, and at most
 64 MiB. The per-record length and CRC are what recovery, compaction and
-backup use to walk and validate a segment, so torn writes are detected as
-before: the scan stops at the first record whose length runs past the end
+backup use to walk and validate a segment, and how torn writes are
+detected: the scan stops at the first record whose length runs past the end
 of the file or whose CRC doesn't match.
 
 Why this shape: the length prefix lets the server find record boundaries
@@ -200,9 +214,12 @@ timestamp, so it is monotonic even when producer timestamps are not.
 
 **High watermark.** Readers see records only below the high watermark. In
 `sync` mode it advances after the fsync; in `async` mode after the write.
-`watch_appends` wakes subscribers when it moves. A replication floor hook
-(`FileStorage::set_replication_floor`) can hold it back further; nothing
-sets it yet.
+`watch_appends` wakes subscribers when it moves. In a cluster a **read
+floor** holds it back further on user streams: readers see a record only
+once every in-sync replica has it (see
+[high-availability.md](high-availability.md#what-readers-see)). Replication
+and state rebuilds read the committed log above the floor
+(`committed_bounds`, `read_batch_committed`).
 
 **Reads.** Readers never take the writer's lock and never fsync. They load
 the segment list (swapped atomically by the writer), binary-search it, look
@@ -270,10 +287,12 @@ writes, retention and compaction with `PartitionFailed`, and listed by
 `failed_streams`. The damaged files are left untouched; restore or remove them
 and restart.
 
-**Retention** runs every 60 s on the writer thread. It deletes whole sealed
-segments from the front of the log, by age (the newest record is older than
-`max_age_secs`) or by size (total size above `max_bytes`). The active
-segment is never deleted.
+**Retention** runs every 60 s on the leader; each pass executes on the
+partition's writer thread. It deletes whole sealed segments from the front
+of the log, by age (the newest record is older than `max_age_secs`) or by
+size (total size above `max_bytes`). The active segment is never deleted.
+Followers don't run retention: they trim up to the leader's earliest
+offset.
 
 **Compaction.** A stream with `compaction = true` in its config is visited
 by a background compactor every 60 s. It rewrites sealed segments to keep
@@ -285,9 +304,10 @@ is itself removed once it is older than `tombstone_retention_secs`
 gaps, and every read path skips them. A rewrite goes to `*.compacting`
 files, is fsynced, renamed over the original, and the segment list is then
 swapped atomically; a crash at any point leaves either the old or the new
-segment. Compaction can only be turned on through `StreamConfig` (for the
-internal metadata streams planned in REVIEW.md §6); the HTTP API and CLI do
-not expose it yet.
+segment. The internal metadata streams are compacted. For other streams,
+set `compaction` in the HTTP create request (`POST /api/v1/streams`) or in
+the `StreamSpec` of the protocol's `CreateStream` / `UpdateStream`. The
+HTTP `PATCH` and the CLI don't change it.
 
 **Replication.** `StorageEngine::append_at` appends records that already
 carry their offsets, timestamps and keys. Offsets must be strictly
@@ -299,38 +319,64 @@ replicated records (`exspeed_broker::cluster::follower`).
 
 `crates/exspeed/src/cli/server.rs` starts the server in this order:
 
-1. Take the data-dir `flock`.
-2. Load credentials and TLS.
-3. Open `FileStorage`. This recovers each stream's active segment with a
+1. Load the credentials store (from `credentials.toml` and/or the shared
+   token) and resolve the TLS certificate paths.
+2. Take the data-dir `flock`.
+3. Bind the client (TCP) and HTTP listeners, so a port conflict fails
+   startup. Connections wait in the backlog until the server serves them.
+4. Open `FileStorage`. This recovers each stream's active segment with a
    tail scan and starts one writer thread per stream and the compactor.
-4. Build `BrokerAppend`, then rebuild the dedup maps in the background.
-   These come from the snapshot when one exists, otherwise from a scan.
-5. Build the lease backend, bind the cluster port (cluster mode), and build
-   the `Broker`, which contains the `Log` and the `ConsumerManager`.
-6. In cluster mode build `cluster::Cluster` (epoch store, write-path hooks,
-   follower, fetch server). Start `ClusterLeadership` with it as the role
-   hooks, and gate writes on leadership. A node starts as a follower;
-   on acquiring the lease it stops following, stamps the new epoch on every
-   stream and rebuilds dedup state before writes open.
-7. Build the `ConnectorManager` and `ExqlEngine`, and load their configs and
-   queries.
-8. Spawn the background tasks: the dedup snapshot task and the leader
-   supervisor. When this pod becomes leader, the supervisor starts the
-   consumers (restored from `__consumers`), connectors, continuous queries
-   and retention.
-9. Spawn the HTTP API.
-10. Enter the TCP accept loop, which spawns one task per connection.
+5. Build `BrokerAppend`. On a single node, apply each stream's dedup
+   settings and rebuild the dedup maps in the background: from the
+   snapshot plus a scan of what follows it, or with a scan of the dedup
+   window when there is no usable snapshot. A cluster node skips this and
+   rebuilds from the replicated log when it is promoted.
+6. Build the lease backend (a no-op that always grants on a single node),
+   read or create `node_id`, bind the cluster port (cluster mode), and
+   build the `Broker`, which contains the `Log` and the `ConsumerManager`.
+7. In cluster mode build `cluster::Cluster` (epoch store, write-path hooks,
+   follower, fetch server). Start `ClusterLeadership`, with the cluster as
+   its role hooks, gate writes on leadership, and serve the cluster port.
+   A cluster node starts as a follower; on acquiring the lease it stops
+   following, stamps the new epoch on every stream and starts the dedup
+   rebuild before writes open. The server then waits briefly (at most 2 s)
+   for leadership and logs its role.
+8. On a single node, spawn the dedup snapshot task (every 60 s, and once
+   more at shutdown).
+9. Build the connector offset store and the `ConnectorManager`, load the
+   connector configs and start the `connectors.d/` watcher. Build the
+   `ExqlEngine` and load its catalog. Failing to read either catalog stops
+   startup with an error.
+10. Spawn the leader supervisor. Each time this node becomes leader it
+    reloads the ExQL catalog and the API-created connector configs, starts
+    the consumers (restored from `__consumers`), then runs connectors,
+    continuous queries and retention until the tenure ends. If that work
+    can't start, the node steps down (see
+    [operations.md](operations.md#startup-failures)).
+11. Spawn the dedup eviction task (every 60 s).
+12. Load the TLS configs, start serving the HTTP API, and mark the server
+    ready (`/readyz`).
+13. Enter the TCP accept loop, which spawns one task per connection.
+
+Shutdown runs the other way; the steps are in
+[operations.md](operations.md#graceful-shutdown).
 
 ## Concurrency model
 
 - **One tokio runtime.**
 - **Storage:** one writer OS thread per partition does group commit and all
-  file IO, off the tokio runtime. Readers take no lock.
+  file IO, off the tokio runtime. Readers take no lock. One more thread runs
+  the compactor.
 - **Consumers:** one actor task per consumer (leader only), woken by
   `watch_appends`, timers and client commands.
-- **Connections:** a reader, a writer and one forwarder per subscription.
+- **Connections:** a reader, a writer, a publish pipeline (started on the
+  first publish), one task per waiting request, and one forwarder per
+  subscription.
 - **Connectors:** one supervisor task each, under the leader's cancellation
   token. The supervisor runs the plugin, catches panics and restarts it with
   backoff (see [connectors.md](connectors.md#status-restarts-and-metrics)).
 - **Continuous queries:** one task each, under the leader's cancellation
   token.
+- **Cluster:** a leadership task (lease heartbeat or polling), the follower
+  task while following, and one task per follower connection on the
+  leader's fetch server.

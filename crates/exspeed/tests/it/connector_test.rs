@@ -369,7 +369,7 @@ async fn connector_names(client: &reqwest::Client, http: &str) -> Vec<String> {
     names
 }
 
-/// Regression (REVIEW blocker 15): the connectors.d watcher used to delete
+/// Regression (2026-10 review, blocker 15): the connectors.d watcher used to delete
 /// every connector without a matching `<name>.toml`, i.e. all API-created
 /// connectors, on the first filesystem event.
 #[tokio::test]

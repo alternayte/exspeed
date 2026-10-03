@@ -9,7 +9,7 @@ A full-featured demo showing Exspeed as the backbone of an event-driven order pr
 - **Postgres outbox pattern** — a `postgres_outbox` source in CDC mode streams rows inserted into an outbox table through logical replication
 - **Continuous queries** — an ExQL `CREATE STREAM … AS SELECT` filters high-value orders into their own stream
 - **Sink connectors** — those high-value orders are forwarded to an HTTP endpoint
-- **ExQL queries** — ad-hoc SQL queries and materialized views over streaming data
+- **ExQL queries** — ad-hoc SQL queries and a materialized table (`CREATE MATERIALIZED VIEW`, an alias of `CREATE TABLE … AS SELECT`) over streaming data
 
 ## Architecture
 
@@ -27,7 +27,8 @@ flowchart LR
 ## Prerequisites
 
 - **Docker** and **Docker Compose**
-- **Bun** (https://bun.sh)
+- **Bun** (https://bun.sh), or Node.js 18 or later
+- The SDK built, since the example uses it from this repository: `npm ci && npm run build` in `sdks/typescript`
 
 ## Running
 
@@ -37,13 +38,24 @@ flowchart LR
 docker compose up -d
 ```
 
-This starts the Exspeed server and Postgres with the order schema pre-loaded.
+This starts the Exspeed server (the published `ghcr.io/alternayte/exspeed` image) and
+Postgres with the order schema pre-loaded and logical replication enabled.
+The server's `connectors.d/` and `connections.d/` directories are mounted
+from `exspeed/`, so the two connectors below start with it, and the database
+is registered as the ExQL connection `app-db`, which bounded queries can read
+([external databases](../../docs/exql.md#external-databases)).
 
 ### 2. Install dependencies
 
 ```bash
 bun install
 ```
+
+With Node.js, run `npm install` here, and below replace `bun run start`,
+`bun run consumer` and `bun run dashboard` with `npx tsx src/app.ts`,
+`npx tsx src/consumer.ts` and `npx tsx src/dashboard.ts`. The scripts connect to
+`localhost:5933` and `http://localhost:8080`; set `EXSPEED_HOST`, `EXSPEED_PORT`
+and `EXSPEED_URL` to change that, and `PORT` to move the API off port 3000.
 
 ### 3. Start the API server
 
@@ -98,11 +110,15 @@ deterministic idempotency key) and posted to httpbin.org by the sink.
 bun run dashboard
 ```
 
-This creates a materialized view and queries order stats grouped by region.
+This creates the materialized table `order_stats` (order count and revenue
+per region) through `POST /api/v1/views` unless it already exists, reads it
+back with `GET /api/v1/views/order_stats`, and runs an ad-hoc ExQL query that
+counts orders by region through the SDK's `query()`.
 
 ## Connectors
 
-Both connector configs are checked in CI with `exspeed connector validate`.
+CI runs `exspeed connector validate` on every connector config under
+`examples/`, including both of these.
 
 ### pg-outbox (source)
 

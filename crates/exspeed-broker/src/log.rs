@@ -372,12 +372,26 @@ impl Log {
         Ok(())
     }
 
+    /// The dedup window a new stream gets when it doesn't set one
+    /// (`storage.dedup_window_secs`).
+    pub fn default_dedup_window_secs(&self) -> u64 {
+        self.dedup.default_window_secs()
+    }
+
+    /// Default settings for a new stream, with this server's dedup window.
+    pub fn default_stream_config(&self) -> StreamConfig {
+        StreamConfig::from_request_with_window(0, 0, 0, 0, self.default_dedup_window_secs())
+    }
+
     /// Create `stream` with default settings if it doesn't exist yet.
     pub async fn ensure_stream(&self, stream: &StreamName) -> Result<(), LogError> {
         match self.storage.stream_bounds(stream).await {
             Ok(_) => Ok(()),
             Err(StorageError::StreamNotFound(_)) => {
-                match self.create_stream(stream, &StreamConfig::default()).await {
+                match self
+                    .create_stream(stream, &self.default_stream_config())
+                    .await
+                {
                     Ok(()) | Err(LogError::Storage(StorageError::StreamAlreadyExists(_))) => Ok(()),
                     Err(e) => Err(e),
                 }
@@ -468,7 +482,13 @@ impl StorageEngine for LogBackedStorage {
         max_age_secs: u64,
         max_bytes: u64,
     ) -> Result<(), StorageError> {
-        let config = StreamConfig::from_request(max_age_secs, max_bytes, 0, 0);
+        let config = StreamConfig::from_request_with_window(
+            max_age_secs,
+            max_bytes,
+            0,
+            0,
+            self.log.default_dedup_window_secs(),
+        );
         self.log
             .create_stream(stream, &config)
             .await
@@ -585,6 +605,37 @@ impl StorageEngine for LogBackedStorage {
             .delete_stream(stream)
             .await
             .map_err(into_storage_error)
+    }
+
+    async fn committed_bounds(
+        &self,
+        stream: &StreamName,
+    ) -> Result<(exspeed_common::Offset, exspeed_common::Offset), StorageError> {
+        self.log.storage.committed_bounds(stream).await
+    }
+
+    async fn read_batch_committed(
+        &self,
+        stream: &StreamName,
+        from: exspeed_common::Offset,
+        limits: exspeed_streams::ReadLimits,
+    ) -> Result<exspeed_streams::ReadBatch, StorageError> {
+        self.log
+            .storage
+            .read_batch_committed(stream, from, limits)
+            .await
+    }
+
+    fn set_read_floor(&self, stream: &StreamName, floor: Option<u64>) {
+        self.log.storage.set_read_floor(stream, floor)
+    }
+
+    fn read_floor(&self, stream: &StreamName) -> Option<u64> {
+        self.log.storage.read_floor(stream)
+    }
+
+    fn visible_end(&self, stream: &StreamName) -> Option<u64> {
+        self.log.storage.visible_end(stream)
     }
 
     async fn stream_bounds(

@@ -42,6 +42,7 @@ impl Node {
         let mut cfg = ClusterConfig::new(id);
         cfg.acks_all = false;
         cfg.fetch_max_wait = Duration::from_millis(200);
+        cfg.replica_lag_max = Duration::from_millis(1500);
         let cluster = Cluster::new(
             cfg,
             dir,
@@ -226,11 +227,17 @@ async fn follower_behind_the_leaders_earliest_offset_recovers() {
     })
     .await;
 
-    // b goes away; the leader moves on and trims past b's position.
+    // b goes away; once it has left the ISR (the leader never trims above
+    // what every in-sync replica has), the leader moves on and trims past
+    // b's position.
     b.stop().await;
     for i in 20..100 {
         a.append("s", i..i + 1).await;
     }
+    wait_until("b leaves the ISR", || async {
+        a.storage.read_floor(&sn("s")).is_none()
+    })
+    .await;
     a.storage.trim_up_to(&sn("s"), Offset(60)).await.unwrap();
     let (leader_earliest, _) = a.bounds("s").await.unwrap();
     assert!(leader_earliest > 20, "{leader_earliest}");

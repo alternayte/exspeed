@@ -679,3 +679,36 @@ async fn list_streams_hides_internal_streams_unless_asked() {
     assert!(all.contains(&"visible".to_string()));
     assert!(all.iter().any(|n| n == "__consumers"), "{all:?}");
 }
+
+/// `storage.dedup_window_secs` is the window of every new stream that
+/// doesn't set one, over HTTP and TCP alike.
+#[tokio::test]
+async fn server_dedup_window_is_the_default_for_new_streams() {
+    let server = crate::common::TestServer::builder()
+        .with(|a| a.dedup_window_secs = 60)
+        .start()
+        .await;
+    let http = format!("http://{}", server.api_addr);
+    reqwest::Client::new()
+        .post(format!("{http}/api/v1/streams"))
+        .json(&serde_json::json!({ "name": "via-http" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let client = server.client().await;
+    client
+        .create_stream(exspeed_client::StreamSpec::named("via-tcp"))
+        .await
+        .unwrap();
+    for name in ["via-http", "via-tcp"] {
+        let info: Value = reqwest::get(format!("{http}/api/v1/streams/{name}"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(info["dedup_window_secs"], 60, "{name}: {info}");
+    }
+}

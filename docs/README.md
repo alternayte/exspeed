@@ -12,9 +12,9 @@
 | Page | What it covers |
 |------|----------------|
 | [CLI reference](cli.md) | Every `exspeed` command and flag |
-| [HTTP API reference](http-api.md) | Every endpoint, plus auth and the TCP frame format |
-| [ExQL](exql.md) | SQL over streams: bounded and continuous queries, views, windows, joins, indexes |
-| [Connectors](connectors.md) | Source and sink plugins, config format, retry and DLQ |
+| [HTTP API reference](http-api.md) | Every endpoint and the permission it needs |
+| [ExQL](exql.md) | SQL over streams: bounded and continuous queries, windows, joins, materialized tables, external Postgres tables |
+| [Connectors](connectors.md) | Source and sink plugins, config format, delivery guarantees, retry and DLQ |
 | [Idempotent publish](idempotent-publish.md) | `msg_id` dedup semantics, sizing, alerts |
 | [TypeScript SDK](../sdks/typescript/README.md) | `@exspeed/sdk`: publishing, push and pull consumers, reconnection, TLS and auth |
 | [Rust client](../crates/exspeed-client) | `exspeed-client` crate |
@@ -24,8 +24,8 @@
 
 | Page | What it covers |
 |------|----------------|
-| [Configuration](configuration.md) | Server flags and every environment variable |
-| [Operations](operations.md) | Docker, logging, probes, shutdown, backups, metrics |
+| [Configuration](configuration.md) | `exspeed.toml`, environment variables and flags: every server setting |
+| [Operations](operations.md) | Docker, Kubernetes, logging, probes, shutdown, backups, metrics |
 | [Security](security.md) | Tokens, scoped credentials, TLS |
 | [High availability](high-availability.md) | Clusters: leader election, replication, failover, `acks` |
 
@@ -35,6 +35,6 @@
 |------|----------------|
 | [Architecture](architecture.md) | Crates, data flow, storage layout, startup sequence |
 | [Development](development.md) | Building, testing, connector test infra, benchmarks, releasing |
-| [**Review and roadmap**](REVIEW.md) | October 2026 deep review: what's broken, the target architecture, and the phased plan |
 | [Benchmarks](../BENCHMARKS.md) | Published numbers and methodology |
-| [Changelog](../CHANGELOG.md) | Release history |
+| [Changelog](../CHANGELOG.md) | Release history and upgrade notes |
+| [2026-10 design review](history/2026-10-review.md) | Historical record: the October 2026 deep review, the design it proposed, and the test behind each fix |

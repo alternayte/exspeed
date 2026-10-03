@@ -207,11 +207,12 @@ pub async fn create_stream(
     }
 
     // Build a full config with defaults applied for any missing dedup fields.
-    let mut cfg = StreamConfig::from_request(
+    let mut cfg = StreamConfig::from_request_with_window(
         body.max_age_secs,
         body.max_bytes,
         body.dedup_window_secs.unwrap_or(0),
         body.dedup_max_entries.unwrap_or(0),
+        state.broker.log.default_dedup_window_secs(),
     );
     cfg.compaction = body.compaction;
 

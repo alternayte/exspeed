@@ -1,8 +1,10 @@
 # Exspeed Benchmarks
 
-_Measured **2026-10-03** on exspeed 0.5.0 (unreleased rebuild), git `d8bb597`
-/ `89202d9` (same server binary; the second commit only added the bench's
-override flags)._
+_Single-node results measured **2026-10-03** at git `d8bb597` / `89202d9`
+(same server binary; the second commit only added the bench's override
+flags). The [comparison with Kafka and NATS
+JetStream](#comparison-with-kafka-and-nats-jetstream) was measured the same
+day at git `3973a40`._
 
 These are single-node numbers from one run on a small cloud VM, with the
 broker and the benchmark driver on the same machine. Treat them as an order
@@ -162,10 +164,3 @@ cargo build --release -p exspeed -p exspeed-bench
 KAFKA_HOME=/opt/kafka_2.13-3.8.1 NATS_SERVER=/opt/nats-server NATS=/opt/nats \
   BENCH_MODE=sync bench/compare/run-native.sh     # then BENCH_MODE=async
 ```
-
-## Earlier results
-
-The v0.2.0 numbers measured on a macOS laptop (April 2026) and the
-pre-DataFusion ExQL scan numbers are in this file's git history. They came
-from a different storage engine, protocol and query engine and are not
-comparable with the results above.

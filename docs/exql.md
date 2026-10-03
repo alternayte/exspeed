@@ -65,18 +65,24 @@ curl -X POST localhost:8080/api/v1/queries -H 'Content-Type: application/json' \
 | `SELECT …`, `WITH …`, `EXPLAIN …` | Rows (200) |
 | `CREATE [OR REPLACE] STREAM\|VIEW [IF NOT EXISTS] <name> AS SELECT …` | The new query (201) |
 | `CREATE [OR REPLACE] TABLE\|MATERIALIZED VIEW [IF NOT EXISTS] <name> AS SELECT …` | The new query (201) |
-| `DROP STREAM\|VIEW [IF EXISTS] <name>` | Drops the query writing it, then deletes the stream |
-| `DROP TABLE\|MATERIALIZED VIEW [IF EXISTS] <name>` | Drops the table's query, the table and its changelog |
-| `DROP QUERY <id>` / `TERMINATE <id>` | Drops the query and keeps its output |
+| `DROP STREAM\|VIEW [IF EXISTS] <name>` | Drops the query writing it (if any), then deletes the stream. `CONFLICT` while another query reads the stream, or if `<name>` is a table |
+| `DROP TABLE\|MATERIALIZED VIEW [IF EXISTS] <name>` | Drops the table's query, the table and its changelog. `CONFLICT` while another query reads the table |
+| `DROP QUERY <id>` / `TERMINATE [QUERY] <id>` | Drops the query and its checkpoint stream, and keeps its output |
 | `PAUSE QUERY <id>` / `RESUME QUERY <id>` | The query's new state |
-| `CREATE INDEX` / `DROP INDEX` | Error `UNSUPPORTED`. Secondary indexes were removed |
+| `CREATE INDEX` / `DROP INDEX` | Error `UNSUPPORTED`. Secondary indexes are not supported; offset and timestamp predicates are pushed down to storage instead ([pushdown](#bounded-queries)) |
+
+`CREATE` for a name another query already writes is a `CONFLICT`, unless
+`IF NOT EXISTS` (returns the existing query) or `OR REPLACE` (replaces it)
+is given. `CREATE TABLE` also needs a name that isn't an existing stream,
+because the table's changelog gets that name. `CREATE STREAM` may target an
+existing stream; the query appends to it.
 
 Only one statement per request is accepted. Errors are structured, and the
 HTTP status follows the code:
 
 ```json
 {"error": "parse error: Expected: …, found: FORM at Line: 1, Column: 10", "code": "PARSE_ERROR", "line": 1, "column": 10}
-{"error": "not supported: CREATE INDEX / DROP INDEX", "code": "UNSUPPORTED", "hint": "secondary indexes were removed; …"}
+{"error": "not supported: SESSION windows", "code": "UNSUPPORTED", "hint": "use WINDOW TUMBLING or WINDOW HOPPING"}
 ```
 
 | Code | HTTP |
@@ -86,16 +92,32 @@ HTTP status follows the code:
 | `TIMEOUT` | 408 |
 | `CONFLICT` | 409 |
 | `RESOURCES_EXHAUSTED` | 422 |
+| `CANCELLED` | 499 |
+| `STORAGE_ERROR`, `INTERNAL_ERROR` | 500 |
 | `NOT_LEADER`, `TRANSIENT_ERROR` | 503 |
 
-A misspelled stream, column or function is a `PLAN_ERROR`. It never gives
-an empty result or NULL.
+A misspelled stream or column is a `PLAN_ERROR`, and an unknown function is
+rejected as well. A misspelling never gives an empty result or NULL.
 
 Bounded queries also run over TCP (`OpCode::Query`; SDK `client.query(sql)`),
 and the result JSON is the same.
 
 > 🔒 Every ExQL endpoint requires a global admin credential over both HTTP
-> and TCP, and runs on the leader.
+> and TCP. The HTTP endpoints are served by the leader (`503` on other
+> nodes); a bounded query over TCP runs on the node that receives it.
+> Continuous queries run only on the leader.
+
+Besides `POST /api/v1/queries`, the HTTP API has:
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /api/v1/queries/continuous` | `CREATE STREAM\|TABLE` only (`exspeed query --continuous`) |
+| `GET /api/v1/queries`, `GET /api/v1/queries/<id>` | Continuous queries with status and `stats` |
+| `DELETE /api/v1/queries/<id>` | `DROP QUERY` |
+| `POST /api/v1/queries/<id>/pause`, `/resume` | `PAUSE QUERY`, `RESUME QUERY` |
+| `GET /api/v1/views`, `GET /api/v1/views/<name>[?key=<k>]` | Materialized tables and their rows ([tables](#materialized-tables)) |
+| `POST /api/v1/views` | `CREATE TABLE` |
+| `GET\|POST /api/v1/connections`, `DELETE /api/v1/connections/<name>` | [External database](#external-databases) connections |
 
 ## Bounded queries
 
@@ -103,7 +125,7 @@ Everything DataFusion supports works. That includes `WHERE`, `GROUP BY`
 (ordinals, aliases and expressions), `HAVING`, `DISTINCT`, every join type,
 window functions (`OVER`), scalar, `IN` and `EXISTS` subqueries, CTEs,
 `UNION`, `ORDER BY` on columns that aren't projected, `INTERVAL` arithmetic
-and `now()`.
+and `now()`. DDL and DML (`INSERT`, `UPDATE`, …) are rejected.
 
 ```sql
 SELECT payload->>'region' AS region, COUNT(*) AS n, SUM(payload->>'total') AS revenue
@@ -180,19 +202,19 @@ CREATE TABLE revenue_by_region AS
 ```
 
 A continuous query is a micro-batch dataflow. It wakes on appends to its
-source streams (falling back to polling every 200 ms), reads up to
+source streams (and re-checks at least once a second), reads up to
 1,000 records per source per micro-batch, runs them through the operators,
 writes the output through the broker's write path (the same `Log` producers
 use) and advances its positions. **Queries start from the beginning of their
 sources**, so creating a query over history replays that history.
 
-Supported shape (anything else is rejected with `UNSUPPORTED` before
-anything is created):
+Supported shape (anything else is rejected with `UNSUPPORTED` or
+`PLAN_ERROR` before anything is created):
 
 ```text
 SELECT <expressions>                       -- any scalar expressions, CASE, functions, JSON
 FROM <stream> [[AS] a] [TIMESTAMP BY <expr>]
-  [ [LEFT] JOIN <stream|table> [[AS] b] [TIMESTAMP BY <expr>] [WITHIN <interval>] ON <cond> [WITHIN <interval>] ]
+  [ [INNER | LEFT] JOIN <stream|table> [[AS] b] [TIMESTAMP BY <expr>] [WITHIN <interval>] ON <cond> [WITHIN <interval>] ]
 [WHERE <predicate>]
 [WINDOW TUMBLING (SIZE <interval> [, GRACE PERIOD <interval>])
  | WINDOW HOPPING (SIZE <interval>, ADVANCE BY <interval> [, GRACE PERIOD <interval>])]
@@ -208,16 +230,22 @@ FROM <stream> [[AS] a] [TIMESTAMP BY <expr>]
   `COUNT(DISTINCT …)`, `SUM`, `AVG`, `MIN`, `MAX`, `STDDEV`, `MEDIAN`,
   `LAST_VALUE`, `ARRAY_AGG`, `agg(x) FILTER (WHERE …)`, …), as do
   expressions over aggregates (`SUM(a)/COUNT(*)`, `ROUND(AVG(x), 1)`).
+  `ORDER BY` inside an aggregate (`ARRAY_AGG(x ORDER BY y)`) is not
+  supported.
 - **Intervals** can be written `INTERVAL '5 minutes'`, `'5 minutes'`,
   `5 MINUTES`, `INTERVAL '10' SECOND`, `'1h30m'` or `'500ms'`. Units go from
   ms to weeks.
 - **EMIT CHANGES** (the default) emits one updated row per changed group
   per micro-batch. **EMIT FINAL** emits a window's row exactly once, when
-  the window closes. It requires a `WINDOW`.
+  the window closes. It requires a `WINDOW`. `EMIT` must be the last
+  clause.
 - Without GROUP BY, an aggregate is **global**: one row, which for tables
   exists (e.g. `COUNT(*) = 0`) before any input arrives.
 - `HAVING` filters groups. For tables, a group that stops matching is
   deleted.
+- `TIMESTAMP BY`, `WINDOW`, `WITHIN`, `GRACE PERIOD` and `EMIT` belong to
+  continuous queries; a bounded query that uses them is rejected with
+  `UNSUPPORTED`.
 
 ## Event time, watermarks and late data
 
@@ -226,13 +254,14 @@ FROM <stream> [[AS] a] [TIMESTAMP BY <expr>]
   milliseconds (number or numeric text), or RFC 3339 /
   `YYYY-MM-DD HH:MM:SS[.fff]` text (taken as UTC). If it is NULL or can't be
   parsed, the record timestamp is used. So is an **out-of-range** value: one
-  before 1970 or more than `EXSPEED_EXQL_MAX_EVENT_TIME_SKEW_MS` (default
-  1 day) ahead of the record's own timestamp. One bad record therefore
-  can't push the watermark years ahead and make everything after it late.
-  Replacements are counted in the query's `stats.invalid_event_times`.
+  before 1970 or more than `max_event_time_skew_ms` (default 1 day, see
+  [configuration](#limits-and-configuration)) ahead of the record's own
+  timestamp. One bad record therefore can't push the watermark years ahead
+  and make everything after it late. Replacements are counted in the
+  query's `stats.invalid_event_times`.
 - **Watermark** = min over sources of (max event time seen in that source)
   − `GRACE PERIOD`. The grace period defaults to **0**
-  (`EXSPEED_EXQL_DEFAULT_GRACE_MS`). A source that has produced no records
+  (`default_grace_ms`). A source that has produced no records
   yet doesn't hold the watermark back. An idle source does hold it back,
   because there is no wall-clock timeout.
 - **Windows close and join buffers are evicted on the watermark, never on
@@ -261,17 +290,19 @@ CREATE TABLE sliding_counts AS
 ```
 
 - Windows are `[start, end)`, aligned to the epoch. A hopping window places
-  each record in `SIZE / ADVANCE` windows (at most 1,000).
+  each record in `SIZE / ADVANCE` windows. `ADVANCE BY` must be at most
+  `SIZE`, and `SIZE / ADVANCE BY` at most 1,000.
+- A `WINDOW` needs an aggregation (GROUP BY or aggregate functions).
 - `window_start` and `window_end` (`Timestamp(ms, UTC)`) can be used in the
   SELECT list and in HAVING. The window is implicitly part of the GROUP BY.
 - A window closes when the watermark reaches its end. Its state is freed
   then, for both emit modes. A windowed **table** keeps one row per window
   and group.
-- Session windows aren't supported.
+- Session windows aren't supported; use tumbling or hopping windows.
 
 ## Joins in continuous queries
 
-**Stream-stream join** (INNER or LEFT) with `WITHIN`:
+**Stream-stream join** (INNER or LEFT), which requires `WITHIN`:
 
 ```sql
 CREATE STREAM paid_orders AS
@@ -291,12 +322,13 @@ CREATE STREAM paid_orders AS
 - LEFT JOIN emits a left row with NULLs once the watermark passes
   `t_left + WITHIN` with no match. A windowed aggregate after a join holds
   its windows open for an extra `WITHIN`, so these rows aren't late.
-- Two inputs per query. RIGHT and FULL joins aren't supported; swap the
-  sides.
+- Two inputs per query. For a RIGHT join, swap the sides and use LEFT
+  JOIN. FULL and CROSS joins aren't supported.
 
-**Stream-table join** (INNER, or `stream LEFT JOIN table`) looks each record
-up in a materialized table. The table's current contents are used, and
-updates are seen live:
+**Stream-table join** (INNER in either order, or `stream LEFT JOIN table`)
+looks each record up in a materialized table. The table's current contents
+are used, and updates are seen live. `WITHIN` doesn't apply, and
+`table LEFT JOIN stream` is rejected:
 
 ```sql
 CREATE TABLE customer_names AS
@@ -317,14 +349,19 @@ VIEW`) requires an aggregation:
 
 - The current rows live in memory, one per group, keyed by the group value.
 - Every change is written to the **changelog stream `<name>`**. The record
-  key is the group key and the payload is the row as JSON. A deleted group
-  (dropped by HAVING) is written as an empty record with header
-  `x-exql-op: delete`.
+  key is the group key and the payload is the row as JSON, with header
+  `x-exql-op: upsert`. A deleted group (dropped by HAVING) is written as an
+  empty record with header `x-exql-op: delete`.
 - You can query it with `SELECT … FROM <name>` (any SQL, including joins with
-  streams) and read it over HTTP with `GET /api/v1/views/<name>`. Add
-  `?key=<k>` to get one group. The key is the group value; for several
-  GROUP BY columns it is a JSON array (`["eu",3]`), and empty for a global
-  aggregate.
+  streams) and read it over HTTP with `GET /api/v1/views/<name>`
+  (`{columns, rows, row_count}`). Add `?key=<k>` to get one group
+  (`{columns, row}`). The key is the group value; for several GROUP BY
+  columns it is a JSON array (`["eu",3]`), and empty for a global
+  aggregate. In a windowed table the key also starts with the window's
+  start and end. `GET /api/v1/views` lists the tables with their query,
+  columns and row count.
+- A table on its own can't be the input of a continuous query; join it with
+  a stream, or query it with a bounded `SELECT`.
 - Tables survive restarts. On boot a table is filled from its changelog,
   and once its query resumes it is rebuilt from the query's checkpointed
   state.
@@ -336,18 +373,18 @@ Each output row becomes one record:
 | Field | Value |
 |-------|-------|
 | payload | A JSON object of the output columns. JSON columns (`payload`, `headers`) are embedded as JSON, timestamps as RFC 3339 |
-| key | Column `key` if selected. Otherwise the group key (aggregates), or the source record's key (filter/project over one stream) |
+| key | Column `key` if selected. Otherwise the group key (aggregates; none for a global aggregate), or the source record's key (filter/project over one stream) |
 | subject | Column `subject` if selected and valid. Otherwise the source record's subject (filter/project over one stream), else empty |
-| headers | `x-idempotency-key`, `x-exql-query` (query id), `x-exql-pos` (micro-batch boundary) |
+| headers | `x-idempotency-key`, `x-exql-query` (query id), `x-exql-pos` (micro-batch boundary); `x-exql-op` on table changelogs |
 
 Output columns need distinct names. ExQL names `a.payload->>'id'`
 `a.payload ->> 'id'`, so two qualified JSON columns don't collide.
 
 ## State, recovery and delivery guarantees
 
-What is implemented and tested:
+These guarantees are implemented and covered by tests:
 
-- **Checkpoints.** Every 5 s (`EXSPEED_EXQL_CHECKPOINT_MS`) when there is
+- **Checkpoints.** Every 5 s (`checkpoint_ms`) when there is
   progress, and when a query is paused, dropped or shut down, a query writes
   a checkpoint to the internal stream `__exql_ckpt_<query_id>` through the
   `Log`. The checkpoint holds its source positions, per-source max event
@@ -361,12 +398,13 @@ What is implemented and tested:
   the original micro-batch boundaries (the `x-exql-pos` headers) are
   replayed, so EMIT CHANGES output is reproduced exactly.
 - **Effectively-once output.** Each output record has a deterministic
-  idempotency key (`<query_id>:<source/offset or group>:<n>`). The skip
-  above makes this hold independently of the broker's dedup window. The
-  `Log` dedup (`x-idempotency-key`) is a second layer. **Tested:** a query
-  killed mid-stream (aggregates, EMIT FINAL windows, a table, INNER and
-  LEFT joins) and restarted produces output identical to an uninterrupted
-  run, with no duplicate records.
+  idempotency key, built from the query id and the row's origin (source
+  offset, or group and window). The skip above makes this hold
+  independently of the broker's dedup window. The `Log` dedup
+  (`x-idempotency-key`) is a second layer. **Tested:** a query killed
+  mid-stream (aggregates, EMIT FINAL windows, a table, INNER and LEFT
+  joins) and restarted produces output identical to an uninterrupted run,
+  with no duplicate records.
 - Stream-table joins are as-of processing time (see above). A replay can
   therefore differ if the table changed meanwhile, which is why such
   queries aren't covered by the identical-output guarantee.
@@ -378,25 +416,31 @@ What is implemented and tested:
 
 - A query is validated (parsed, planned, names checked) before anything is
   persisted. Names follow stream-name rules (`[A-Za-z0-9_-]`); names that
-  start with `__` are reserved. A query may not read its own output.
+  start with `__` are reserved. A query may not read its own output. Query
+  ids are `<name>_<8 hex digits>`.
 - Definitions and desired state are stored in the compacted internal
   stream `__exql_queries` (key = query id, value = the definition as JSON;
   `DROP` writes a tombstone). They replicate with the log, and every leader
   tenure starts by reloading them, so a promoted follower resumes the same
   queries. Creating, pausing, resuming or dropping a query needs the leader.
-  Desired state is `running`, `paused` or `stopped`. Older versions kept
-  definitions in `{data_dir}/exql/queries/<id>.json`; the first leader to
-  start imports them and renames the directory to `exql/queries.migrated/`.
+  Desired state is `running`, `paused` or `stopped`. An
+  `exql/queries.migrated/` directory in the data directory holds definition
+  files that were imported into `__exql_queries`; the server doesn't read
+  it.
 - Status is `running`, `paused`, `pending` (wants to run but this node
   isn't the leader, or it is starting), or `failed` with the error. A
   failure (including a panic, which is caught) sets the desired state to
   `stopped`. **Paused and stopped queries don't restart on boot or leader
   promotion.** `RESUME QUERY` restarts either from the last checkpoint.
-- Transient errors (not yet leader, dedup state loading, I/O) restart the
-  query from its checkpoint with backoff. They don't mark it failed.
+- Transient errors (this node not being the leader, dedup state still
+  loading, I/O) restart the query from its checkpoint with backoff (0.5 s,
+  doubling up to 30 s). They don't mark it failed.
 - Queries run only on the leader, and stop when leadership is lost.
-- `GET /api/v1/queries/<id>` reports `stats`: `records_in`, `records_out`,
-  `late_records_dropped`, `invalid_event_times`, `checkpoints`, `watermark`, `last_checkpoint`.
+- `GET /api/v1/queries/<id>` reports `id`, `sql`, `kind` (`stream` or
+  `table`), `name`, `target_stream`, `status`, `desired_state`, `error`,
+  `created_at` and `stats`: `records_in`, `records_out`,
+  `late_records_dropped`, `invalid_event_times`, `checkpoints`,
+  `watermark`, `last_checkpoint`.
 
 ## External databases
 
@@ -414,35 +458,43 @@ FROM orders o JOIN warehouse.customers c ON o.payload->>'customer_id' = c.id;  -
 SELECT * FROM warehouse.sales.targets;                                          -- schema sales
 ```
 
+- `driver` is `postgres` (or `postgresql`). Connection names are 1–64
+  characters of `[A-Za-z0-9_-]`.
 - The column list comes from `information_schema` through a parameterized
   query. Identifiers are quoted, so names are never interpolated raw.
 - Each scan fetches **only the columns the query uses**, and simple filters
-  on the table's columns (`col = literal`, `<>`, numeric `<`/`<=`/`>`/`>=`,
-  `IN (…)`, `IS [NOT] NULL`, combined with `AND`) are pushed into the
-  remote `WHERE` as bind parameters. ExQL re-applies every filter, so
-  pushdown only narrows the fetch. Joins and other predicates are evaluated
-  locally.
+  on the table's columns are pushed into the remote `WHERE` as bind
+  parameters: `col = literal` and `<>` on integer, float, boolean and text
+  columns, `<`/`<=`/`>`/`>=` on integer and float columns, `IN (…)` with up
+  to 1,000 values, and `IS [NOT] NULL`, combined with `AND`. ExQL re-applies
+  every filter, so pushdown only narrows the fetch. Joins and other
+  predicates are evaluated locally.
 - Fetches are cached per (table, columns, filters) for 30 s in an LRU of 64
-  entries, and pools are reused per connection. A fetch of more than
-  1,000,000 rows is an error, and each fetched snapshot is counted against
-  the query memory pool while the query runs (`RESOURCES_EXHAUSTED` when it
-  doesn't fit).
-- Postgres column types map to Int64, Float64, `Decimal128(p, s)` (for
+  entries, column lists are cached for 30 s, and pools are reused per
+  connection. A fetch times out after 30 s, a fetch of more than 1,000,000
+  rows is an error, and each fetched snapshot is counted against the query
+  memory pool while the query runs (`RESOURCES_EXHAUSTED` when it doesn't
+  fit).
+- Postgres column types map to Int64 (`smallint`, `integer`, `bigint`),
+  Float64 (`real`, `double precision`), `Decimal128(p, s)` (for
   `numeric(p, s)` with `p <= 38`; unconstrained `numeric` is Float64),
-  Boolean, text, JSON text, `Timestamp(ms, UTC)` and Date32.
+  Boolean, JSON text (`json`, `jsonb`), `Timestamp(ms, UTC)` (`timestamp`
+  with or without time zone), Date32 (`date`) and text (everything else).
 - **Bounded queries only**: continuous queries can't read external tables.
-  The inline `postgres('url', 'table')` form has been removed.
 - Connections created through the API are stored in the compacted internal
   stream `__exql_connections` (key = name), so they replicate with the log.
   The URL is stored as written: use `${VAR}` references (resolved from the
-  server's environment) to keep passwords out of the log. Older versions
-  kept them under `{data_dir}/connections/`; that directory is imported once
-  and renamed to `connections.migrated/`.
+  server's environment; an unset variable resolves to an empty string) to
+  keep passwords out of the log. A `connections.migrated/` directory in the
+  data directory holds connection files that were imported into
+  `__exql_connections`; the server doesn't read it.
 - Connections can also be declared in `{data_dir}/connections.d/*.toml`
   (`[connection]` with `name`, `driver`, `url`) or with
-  `EXSPEED_CONNECTION_<NAME>_DRIVER` and `EXSPEED_CONNECTION_<NAME>_URL`.
-  Environment variables override files, which override API connections.
-  These can't be deleted through the API (`409`).
+  `EXSPEED_CONNECTION_<NAME>_DRIVER` and `EXSPEED_CONNECTION_<NAME>_URL`
+  (`<NAME>` is lower-cased and `_` becomes `-`, so
+  `EXSPEED_CONNECTION_MY_DB_URL` defines `my-db`). Environment variables
+  override files, which override API connections. These can't be deleted
+  through the API (`409`).
 
 ## Functions
 
@@ -454,22 +506,25 @@ math, dates and times (`date_trunc`, `date_bin`, `to_timestamp`,
 
 | Function | Notes |
 |----------|-------|
-| `subject_part(subject, n)` | n-th dot-delimited token (1-based; negative counts from the end) |
-| `subject_matches(subject, 'orders.>')` | NATS-style wildcard match (`*` one token, `>` the rest), same rules as consumer filters; an invalid pattern is an error |
+| `subject_part(subject, n)` | n-th dot-delimited token (1-based; negative counts from the end; NULL when out of range) |
+| `subject_matches(subject, 'orders.>')` | NATS-style wildcard match (`*` one token, `>` the rest), same rules as consumer filters; an invalid pattern is an `EXECUTION_ERROR` |
 | `json_get_*`, `->`, `->>`, `json_contains`, … | From `datafusion-functions-json` |
 | `window_start`, `window_end` | In windowed continuous queries |
 
 ## Limits and configuration
 
-| Setting | Default | Env var |
-|---------|---------|---------|
-| Bounded query timeout | 30 s | `EXSPEED_QUERY_TIMEOUT_SECS` |
-| Max rows returned (more rows → `"truncated": true`) | 10,000 | `EXSPEED_QUERY_MAX_ROWS` |
-| Memory pool for query execution (exceeding it → `RESOURCES_EXHAUSTED`; no spilling) | 512 MB | `EXSPEED_QUERY_MEMORY_MB` |
-| DataFusion partitions | 1 | `EXSPEED_QUERY_PARTITIONS` |
-| Continuous checkpoint interval | 5 s | `EXSPEED_EXQL_CHECKPOINT_MS` |
-| Default grace period | 0 | `EXSPEED_EXQL_DEFAULT_GRACE_MS` |
-| Max `TIMESTAMP BY` value ahead of the record timestamp | 1 day | `EXSPEED_EXQL_MAX_EVENT_TIME_SKEW_MS` |
+Each setting can be set in the `[exql]` section of `exspeed.toml` or with
+its environment variable (see [configuration](configuration.md)).
+
+| Setting | Default | `[exql]` key | Env var |
+|---------|---------|--------------|---------|
+| Bounded query timeout | 30 s | `query_timeout_secs` | `EXSPEED_QUERY_TIMEOUT_SECS` |
+| Max rows returned (more rows → `"truncated": true`) | 10,000 | `query_max_rows` | `EXSPEED_QUERY_MAX_ROWS` |
+| Memory pool shared by bounded queries (exceeding it → `RESOURCES_EXHAUSTED`; no spilling; min 16 MB) | 512 MB | `query_memory_mb` | `EXSPEED_QUERY_MEMORY_MB` |
+| DataFusion partitions (1–64) | 1 | `query_partitions` | `EXSPEED_QUERY_PARTITIONS` |
+| Continuous checkpoint interval (min 100 ms) | 5 s | `checkpoint_ms` | `EXSPEED_EXQL_CHECKPOINT_MS` |
+| Default grace period | 0 | `default_grace_ms` | `EXSPEED_EXQL_DEFAULT_GRACE_MS` |
+| Max `TIMESTAMP BY` value ahead of the record timestamp | 1 day | `max_event_time_skew_ms` | `EXSPEED_EXQL_MAX_EVENT_TIME_SKEW_MS` |
 
 When a client disconnects, its bounded query is cancelled: over HTTP the
 request future is dropped, and over TCP the session cancels every waiting
@@ -483,10 +538,10 @@ with your key cardinality in mind.
 
 | Feature | Status |
 |---------|--------|
-| Secondary indexes (`CREATE INDEX`) | Removed. Rejected with `UNSUPPORTED` |
+| Secondary indexes (`CREATE INDEX`) | Rejected with `UNSUPPORTED`; offset and timestamp predicates are pushed down instead |
 | `INSERT`/`UPDATE`/DDL other than the statements above | Rejected |
-| Continuous: ORDER BY, LIMIT, DISTINCT, window functions, UNION, subqueries, nested aggregation | Rejected (`UNSUPPORTED`) |
-| Continuous: RIGHT/FULL/CROSS joins, joins of 3+ relations, table-table joins | Rejected |
+| Continuous: ORDER BY, LIMIT/OFFSET, DISTINCT, window functions (`OVER`), UNION, subqueries, UNNEST, nested aggregation, GROUPING SETS/ROLLUP/CUBE, ORDER BY inside an aggregate | Rejected (`UNSUPPORTED`) |
+| Continuous: RIGHT/FULL/CROSS joins, joins of 3+ relations, table-table joins, `table LEFT JOIN stream`, a table as the only input | Rejected |
 | Continuous: external databases | Rejected (bounded-only) |
 | Session windows | Rejected |
-| Idle-source watermark advancement | Not implemented. An idle source holds the watermark |
+| Idle-source watermark advancement | An idle source holds the watermark; there is no wall-clock timeout |

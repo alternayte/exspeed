@@ -68,8 +68,8 @@ pub enum OnTransientExhausted {
     /// through the API or its config changes.
     #[serde(alias = "halt")]
     Fail,
-    /// Sinks only: write the batch to `dlq_stream` and move on. Falls back
-    /// to `fail` without a `dlq_stream`.
+    /// Sinks only: write the batch to `dlq_stream` and move on. Without a
+    /// `dlq_stream` it restarts and retries, like `loop_forever`.
     DlqBatch,
 }
 
@@ -214,6 +214,12 @@ impl ConnectorConfig {
         if !self.transform_sql.is_empty() {
             if self.connector_type == ConnectorType::Sink {
                 return Err("transforms are only supported on sources".into());
+            }
+            if self.plugin == "http_webhook" {
+                return Err(
+                    "transforms are not applied to webhook connectors; transform the stream with a continuous query instead"
+                        .into(),
+                );
             }
             crate::transform::Transform::compile(&self.transform_sql)
                 .map_err(|e| format!("transform SQL error: {e}"))?;
@@ -445,6 +451,16 @@ mod tests {
         config.save_json(&path).unwrap();
         let loaded = ConnectorConfig::load_json(&path).unwrap();
         assert_eq!(loaded, config);
+    }
+
+    /// Webhooks don't run transforms, so a webhook config with one is
+    /// rejected instead of silently ignoring it.
+    #[test]
+    fn webhook_transform_is_rejected() {
+        let mut c = ConnectorConfig::new("w", ConnectorType::Source, "http_webhook", "events");
+        c.transform_sql = "SELECT * FROM input".into();
+        let err = c.validate_common().unwrap_err();
+        assert!(err.contains("webhook"), "{err}");
     }
 
     /// A sink's `subject_filter` is validated with the same parser the

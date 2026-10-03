@@ -749,7 +749,13 @@ impl Writer {
         max_bytes: u64,
     ) -> Result<RetentionStats, StorageError> {
         let list = self.shared.segments();
-        let sealed = list.len() - 1;
+        // Never remove records readers can't see yet (above the replication
+        // read floor): only segments entirely below the high watermark go,
+        // like Kafka never deletes past its high watermark.
+        let hwm = self.shared.high_watermark();
+        let sealed = (0..list.len() - 1)
+            .take_while(|&i| list[i + 1].base_offset <= hwm)
+            .count();
         let cutoff = now_nanos().saturating_sub(max_age_secs.saturating_mul(1_000_000_000));
         let mut doomed: Vec<usize> = Vec::new();
         // Age: a sealed segment goes once its newest record is older than
@@ -784,6 +790,8 @@ impl Writer {
 
     fn trim(&mut self, keep_from: u64) -> Result<RetentionStats, StorageError> {
         let list = self.shared.segments();
+        // As in `retention`: nothing at or above the high watermark goes.
+        let keep_from = keep_from.min(self.shared.high_watermark());
         // Segment i holds only offsets below segment i+1's base.
         let doomed: Vec<usize> = (0..list.len() - 1)
             .take_while(|&i| list[i + 1].base_offset <= keep_from)
