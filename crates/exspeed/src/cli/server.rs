@@ -215,8 +215,8 @@ pub struct ServerArgs {
     #[arg(long, default_value_t = 10, env = "EXSPEED_SYNC_INTERVAL_MS")]
     pub storage_sync_interval_ms: u64,
 
-    /// Unflushed-bytes threshold to trigger an early fsync in async sync mode.
-    /// Currently reserved for future use — timer-only in this release.
+    /// Unflushed-bytes threshold to trigger an early fsync in async sync mode
+    /// (0 = timer only). Only relevant when `--storage-sync=async`.
     #[arg(long, default_value_t = 4 * 1024 * 1024, env = "EXSPEED_SYNC_BYTES")]
     pub storage_sync_bytes: usize,
 
@@ -363,7 +363,7 @@ where
     }
 
     // Build appender config from CLI args.
-    let appender_config = exspeed_storage::file::segment_appender::AppenderConfig {
+    let appender_config = exspeed_storage::file::AppenderConfig {
         flush_window: std::time::Duration::from_micros(args.storage_flush_window_us),
         flush_threshold_records: args.storage_flush_threshold_records,
         flush_threshold_bytes: args.storage_flush_threshold_bytes,
@@ -383,28 +383,7 @@ where
         storage_sync_mode,
         appender_config,
     )?);
-    // Check for S3 tiered storage
-    let storage: Arc<dyn StorageEngine> = match exspeed_storage::s3::config::S3Config::from_env() {
-        Ok(Some(s3_config)) => {
-            info!("S3 tiered storage enabled");
-            let s3_storage = exspeed_storage::s3::S3TieredStorage::new(
-                (*file_storage).clone(),
-                s3_config.bucket,
-                s3_config.prefix,
-                s3_config.local_max_bytes,
-            )
-            .await
-            .expect("failed to initialize S3 tiered storage");
-            Arc::new(s3_storage)
-        }
-        Ok(None) => {
-            info!("using local file storage");
-            file_storage.clone()
-        }
-        Err(e) => {
-            panic!("S3 storage configuration error: {e}");
-        }
-    };
+    let storage: Arc<dyn StorageEngine> = file_storage.clone();
 
     // Create metrics
     let (metrics, prometheus_registry) = exspeed_common::Metrics::new();

@@ -16,6 +16,7 @@ struct StreamState {
     records: Vec<StoredRecord>,
     next_offset: u64,
     config: StreamConfig,
+    watch: tokio::sync::watch::Sender<u64>,
 }
 
 impl StreamState {
@@ -24,7 +25,13 @@ impl StreamState {
             records: Vec::new(),
             next_offset: 0,
             config: StreamConfig::default(),
+            watch: tokio::sync::watch::channel(0).0,
         }
+    }
+
+    fn set_next(&mut self, next: u64) {
+        self.next_offset = next;
+        self.watch.send_replace(next);
     }
 }
 
@@ -125,8 +132,41 @@ impl StorageEngine for MemoryStorage {
             headers: record.headers.clone(),
         };
         state.records.push(stored);
-        state.next_offset += 1;
+        let next = state.next_offset + 1;
+        state.set_next(next);
         Ok((offset, timestamp))
+    }
+
+    async fn append_at(
+        &self,
+        stream: &StreamName,
+        records: Vec<StoredRecord>,
+    ) -> Result<(), StorageError> {
+        let mut map = self.streams.write().unwrap();
+        let state = map
+            .get_mut(stream.as_str())
+            .ok_or_else(|| StorageError::StreamNotFound(stream.clone()))?;
+        let mut min = state.next_offset;
+        for r in &records {
+            if r.offset.0 < min {
+                return Err(StorageError::OffsetConflict {
+                    offset: r.offset.0,
+                    min_allowed: min,
+                });
+            }
+            min = r.offset.0 + 1;
+        }
+        if let Some(last) = records.last() {
+            let next = last.offset.0 + 1;
+            state.records.extend(records);
+            state.set_next(next);
+        }
+        Ok(())
+    }
+
+    fn watch_appends(&self, stream: &StreamName) -> Option<tokio::sync::watch::Receiver<u64>> {
+        let map = self.streams.read().unwrap();
+        map.get(stream.as_str()).map(|s| s.watch.subscribe())
     }
 
     async fn read(
@@ -242,7 +282,7 @@ impl StorageEngine for MemoryStorage {
             return Ok(());
         }
         state.records.retain(|r| r.offset.0 < drop_from.0);
-        state.next_offset = drop_from.0;
+        state.set_next(drop_from.0);
         Ok(())
     }
 }

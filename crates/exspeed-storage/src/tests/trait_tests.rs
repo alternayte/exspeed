@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use exspeed_common::{Offset, StreamName};
-use exspeed_streams::{Record, StorageEngine, StorageError};
+use exspeed_streams::{Record, StorageEngine, StorageError, StoredRecord};
 
 // -- Helpers ------------------------------------------------------------------
 
@@ -530,4 +530,97 @@ pub async fn test_append_honors_timestamp_override(engine: &impl StorageEngine) 
         results[1].timestamp, PINNED_NS,
         "second record (no override) should be freshly stamped, not reuse the pinned value"
     );
+}
+
+fn stored(offset: u64, ts: u64, key: Option<&str>, value: &str) -> StoredRecord {
+    StoredRecord {
+        offset: Offset(offset),
+        timestamp: ts,
+        subject: "repl".into(),
+        key: key.map(|k| Bytes::copy_from_slice(k.as_bytes())),
+        value: Bytes::copy_from_slice(value.as_bytes()),
+        headers: vec![("h".into(), format!("{offset}"))],
+    }
+}
+
+/// `append_at` keeps offsets, timestamps, keys and headers; allows gaps;
+/// rejects overlap and non-increasing offsets without writing anything.
+pub async fn test_append_at(engine: &impl StorageEngine) {
+    let s = stream("test-append-at");
+    engine.create_stream(&s, 0, 0).await.unwrap();
+    let mut first = record("a", b"x");
+    first.timestamp_ns = Some(50);
+    engine.append(&s, &first).await.unwrap();
+    let recs = vec![
+        stored(1, 111, Some("k1"), "one"),
+        stored(5, 99, Some("k5"), "five"),
+        stored(6, 500, None, "six"),
+    ];
+    engine.append_at(&s, recs.clone()).await.unwrap();
+    assert_eq!(engine.stream_bounds(&s).await.unwrap().1, Offset(7));
+    let got = engine.read(&s, Offset(1), 100).await.unwrap();
+    assert_eq!(got.len(), 3);
+    for (g, w) in got.iter().zip(&recs) {
+        assert_eq!(g.offset, w.offset);
+        assert_eq!(g.timestamp, w.timestamp);
+        assert_eq!(g.key, w.key);
+        assert_eq!(g.value, w.value);
+        assert_eq!(g.subject, w.subject);
+        assert_eq!(g.headers, w.headers);
+    }
+
+    // Overlap with existing data.
+    let err = engine
+        .append_at(&s, vec![stored(6, 1, None, "dup")])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StorageError::OffsetConflict {
+                offset: 6,
+                min_allowed: 7
+            }
+        ),
+        "{err:?}"
+    );
+    // Not strictly increasing within the call: nothing is written.
+    for bad in [
+        vec![stored(8, 1, None, "a"), stored(8, 1, None, "b")],
+        vec![stored(9, 1, None, "a"), stored(7, 1, None, "b")],
+    ] {
+        assert!(matches!(
+            engine.append_at(&s, bad).await,
+            Err(StorageError::OffsetConflict { .. })
+        ));
+        assert_eq!(engine.stream_bounds(&s).await.unwrap().1, Offset(7));
+    }
+    engine.append_at(&s, vec![]).await.unwrap();
+
+    // Regular appends continue after the last explicit offset.
+    let (o, _) = engine.append(&s, &record("a", b"y")).await.unwrap();
+    assert_eq!(o, Offset(7));
+
+    // Reads starting inside a gap land on the next record.
+    let got = engine.read(&s, Offset(2), 1).await.unwrap();
+    assert_eq!(got[0].offset, Offset(5));
+    let b = engine
+        .read_batch(&s, Offset(2), exspeed_streams::ReadLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(b.records[0].offset, Offset(5));
+    assert_eq!(engine.seek_by_time(&s, 100).await.unwrap(), Offset(1));
+}
+
+/// `watch_appends` is bumped by every append.
+pub async fn test_watch_appends(engine: &impl StorageEngine) {
+    let s = stream("test-watch");
+    engine.create_stream(&s, 0, 0).await.unwrap();
+    let mut rx = engine.watch_appends(&s).expect("watch supported");
+    engine.append(&s, &record("a", b"x")).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), rx.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(*rx.borrow(), 1);
 }
