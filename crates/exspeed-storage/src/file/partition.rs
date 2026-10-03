@@ -424,11 +424,9 @@ fn read_raw_segment(
     // Size the read: the records asked for at the segment's average size,
     // plus the index gap we may have to skip, capped by the byte limit.
     let stats = seg.stats();
-    let avg = if stats.records > 0 {
-        ((stats.len - SEGMENT_HEADER_LEN) / stats.records) as usize
-    } else {
-        256
-    };
+    let avg = (stats.len - SEGMENT_HEADER_LEN)
+        .checked_div(stats.records)
+        .map_or(256, |a| a as usize);
     let want = avg
         .saturating_mul(max_records)
         .min(max_bytes)
