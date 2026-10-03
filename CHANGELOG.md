@@ -49,6 +49,39 @@ connector config and SDK API all change.
 - New Rust client crate `exspeed-client`, with a coalescing publisher.
   `exspeed tail` no longer goes through SQL.
 
+### Operations (Phase 3)
+
+- Online backup: `GET /api/v1/backup` (global admin, leader) streams a tar
+  archive while writes continue. Each stream is a point-in-time copy of
+  every record below its high watermark at snapshot start: sealed segments
+  whole, the active segment cut after its last complete record, indexes and
+  metadata regenerated to match. A manifest (`exspeed-backup.json`) lists
+  each stream's `[earliest_offset, next_offset)`. Connector, connection and
+  ExQL directories are included; credentials are not. Consistency is per
+  stream, not across streams; internal progress streams are snapshotted
+  first so a restore replays rather than skips.
+- `exspeed backup --url … [--token …] --output backup.tar` downloads and
+  verifies a backup; `exspeed restore --input backup.tar --data-dir DIR
+  [--force]` restores it offline (takes the data-dir lock, refuses a
+  non-empty dir, validates the manifest, paths and every stream's offsets
+  before moving anything into place). See
+  [docs/operations.md](docs/operations.md#backup-and-restore).
+- OpenAPI 3.1 document for the HTTP API at `GET /api/v1/openapi.json`
+  (no auth), generated with utoipa from annotations on the handlers. Tests
+  keep it in sync with the router in both directions.
+- HTTP responses for streams, publish and record browsing are now typed
+  structs (same JSON).
+- `exspeed-bench catchup`: backlog-drain throughput with stateless reads and
+  with a push consumer; part of `exspeed-bench all`. Single-scenario
+  commands take `--duration-secs`, `--payload-sizes`, `--rate` and
+  `--catchup-records` overrides.
+- BENCHMARKS.md and the README numbers re-measured on Linux (4-vCPU cloud
+  VM, virtio disk; ~62k msg/s durable 1 KiB publish), with the exact
+  commands and raw results in `bench/results/2026-10-03-linux-*.json`. `bench/compare/` has a docker-compose file (Kafka in
+  KRaft mode, NATS JetStream) and `run.sh` to run equivalent workloads with
+  each system's own perf tools; no comparison numbers are published until
+  they are run on the same hardware.
+
 ### Connectors v2 (Phase 5)
 
 - A supervisor per connector (starting/running/backoff/failed/stopped):
