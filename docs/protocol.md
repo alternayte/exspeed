@@ -41,24 +41,29 @@ Decoders reject truncated payloads and trailing bytes.
 - `Publish` and `PublishBatch` requests on one connection are applied **in the
   order they were sent**, and the connection keeps reading while they are
   written. Publishes already queued for the same stream are appended
-  together (one storage batch, one fsync), so a client that pipelines
-  publishes without waiting for each reply shares fsyncs instead of paying
-  one per record. Each request still gets its own reply. A request that
-  depends on a publish (a read of it, say) should wait for its reply.
+  together (one storage batch, one fsync; up to 4,096 records or 8 MiB per
+  group), so a client that pipelines publishes without waiting for each
+  reply shares fsyncs instead of paying one per record. Each request still
+  gets its own reply, and a request whose records are invalid fails alone.
+  Other requests don't wait for queued publishes, so a request that depends
+  on a publish (a read of it, say) should wait for its reply.
 - The server sends pushes (`Deliver`, `SubscriptionEnded`) with correlation id
   `0`.
-- A request sent with correlation id `0` is **fire-and-forget**: no reply on
-  success. If it fails, the server sends an `Error` with correlation id `0`.
-  Use it for `Ack` and `Credit` on hot paths.
+- `Ack`, `Nack`, `Term`, `InProgress`, `Credit` and `Unsubscribe` sent with
+  correlation id `0` are **fire-and-forget**: no reply on success. If one
+  fails, the server sends an `Error` with correlation id `0`. Use this for
+  `Ack` and `Credit` on hot paths. Other requests are always answered, with
+  whatever correlation id they carried, so give them a non-zero one.
 
 ## Connection lifecycle
 
-1. The first frame must be `Connect`, sent within 10 seconds. Any other first
-   frame gets `Error 401`, and the connection closes.
+1. The first frame must be `Connect`, sent within 10 seconds
+   (`server.handshake_timeout_secs`, which also bounds the TLS handshake). Any
+   other first frame gets `Error 401`, and the connection closes.
 2. On success the server replies `ConnectOk`. With auth enabled, an unknown or
    missing token gets `Error 401`, and the connection closes.
-3. The server closes connections that send nothing for 120 seconds. Clients
-   should `Ping` every 15–30 seconds.
+3. The server closes connections that send nothing for 120 seconds
+   (`server.idle_timeout_secs`). Clients should `Ping` every 15–30 seconds.
 4. A frame that can't be decoded (bad version, unknown opcode, oversize
    length) gets `Error 400` with correlation id 0, and the connection closes.
    This applies to the very first frame too: a client speaking another
@@ -97,12 +102,6 @@ contains. Clients should verify the CRC (the Rust client does; the
 TypeScript SDK exposes `verifyRecordCrc` but doesn't call it by default,
 since a JavaScript CRC costs more than the rest of decoding). Records in a
 `vec<WireRecord>` follow each other with no padding.
-
-> **Changed during the rebuild, without a version bump.** Earlier builds of
-> protocol v2 encoded a `WireRecord` as `u64 offset, u64 timestamp_ms,
-> u16 delivery_count, …` with no length or CRC. The version byte stays `2`
-> because nothing is deployed yet, so there is no negotiation: clients and
-> servers from before and after this change can't talk to each other.
 
 **StreamSpec**
 : `str name`, `u64 max_age_secs`, `u64 max_bytes`, `u64 dedup_window_secs`,
@@ -150,7 +149,7 @@ Only `name` and `stream` are required.
 | 0x1A | DeleteStream | `str name` | `Ok` (409 while consumers exist) |
 | 0x1B | StreamInfo | `str name` | `Json` |
 | 0x1C | ListStreams | — | `Json` array |
-| 0x20 | Query | `lstr sql` | `Json {columns, rows, row_count, execution_time_ms}` |
+| 0x20 | Query | `lstr sql` | `Json {columns, rows, row_count, execution_time_ms, truncated}` |
 | 0x40 | CreateConsumer | `bytes` (ConsumerSpec JSON) | `Json` consumer info (idempotent; 409 if the spec differs) |
 | 0x41 | DeleteConsumer | `str name` | `Ok` |
 | 0x42 | ConsumerInfo | `str name` | `Json` |
@@ -162,7 +161,7 @@ Only `name` and `stream` are required.
 | 0x53 | Pull | `str consumer`, `u32 max_messages`, `u32 max_bytes`, `u32 expires_ms` | `Messages` (empty on timeout) |
 | 0x54 | Ack | `str consumer`, `vec<u64> offsets` | `Ok` |
 | 0x55 | Nack | `str consumer`, `u64 offset`, `u32 delay_ms` (0 = consumer backoff) | `Ok` |
-| 0x56 | Term | `str consumer`, `u64 offset`, `str reason` | `Ok` (dead-letters now) |
+| 0x56 | Term | `str consumer`, `u64 offset`, `str reason` | `Ok` (dead-letters immediately) |
 | 0x57 | InProgress | `str consumer`, `vec<u64> offsets` | `Ok` (resets the ack timers) |
 | 0x60 | Read | `str stream`, `u64 from`, `u32 max_records`, `u32 max_bytes`, `u32 wait_ms`, `str filter` | `ReadResult` |
 | 0xF0 | Ping | — | `Pong` |
@@ -195,7 +194,9 @@ one. To guarantee that, batches are budgeted by each record's full
 |------|-------|
 | One published record | subject ≤ 1024 bytes, key ≤ 64 KiB, value ≤ 8 MiB, ≤ 256 headers with keys ≤ 1 KiB, values ≤ 32 KiB and **all header keys + values ≤ 64 KiB**, so one `WireRecord` is under ~8.2 MiB |
 | `Read` `max_bytes` | 0 = 1 MiB, capped at 8 MiB |
+| `Read` `max_records`, `wait_ms` | clamped to 1–10,000 records; waits at most 300 s |
 | `Pull` `max_bytes` | 0 = 4 MiB, capped at 8 MiB |
+| `Pull` `max_messages`, `expires_ms` | clamped to 1–10,000 records; waits at most 300 s |
 | `Deliver` | sent once a subscriber's pending records reach 4 MiB; never grown past 8 MiB |
 
 A response stops adding records before the next one would exceed its byte
@@ -284,12 +285,13 @@ per-stream actions:
 | Operation | Needs |
 |-----------|-------|
 | Publish, PublishBatch | `publish` on the stream |
-| Read, Subscribe, Pull, Ack, Nack, Term, InProgress | `subscribe` on the consumer's stream |
+| Read | `subscribe` on the stream |
+| Subscribe, Pull, Ack, Nack, Term, InProgress | `subscribe` on the consumer's stream |
 | ConsumerInfo, SeekConsumer, CreateConsumer | `subscribe` or `admin` on the stream. Creating a consumer with `dlq_stream` also needs `publish` on that stream. |
 | DeleteConsumer, CreateStream, UpdateStream, DeleteStream | `admin` on the stream |
 | StreamInfo | `admin` or `subscribe` |
-| ListStreams, ListConsumers | Return only the streams and consumers the credential can see. |
+| ListStreams, ListConsumers | Return only the streams and consumers the credential can see (internal streams only to a global admin). |
 | Query | Global admin (`streams = "*"`), since SQL can read any stream. |
 
 Streams whose names start with `__` are internal. Clients can't create,
-publish to or delete them.
+update, publish to or delete them.

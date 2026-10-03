@@ -17,8 +17,9 @@ consumers, connectors, continuous queries and retention. The others are
   leader that loses the lease stops before anyone else can take it, and any
   writes it accepted but never replicated are truncated when it rejoins.
 - **Clients follow the leader.** Followers reject writes with `503` and
-  name the leader. The SDKs find the leader from a list of seed addresses
-  and find the new one after a failover.
+  name the leader. The SDKs find the leader from a list of seed addresses;
+  the TypeScript SDK also finds the new one when it reconnects after a
+  failover.
 
 ```mermaid
 flowchart LR
@@ -51,7 +52,8 @@ The lease is one record in the backend:
 | `replication_endpoint` / `client_endpoint` | where followers and clients reach the holder |
 | `isr` | the in-sync replicas the holder last published |
 
-The holder refreshes the lease every `lease_heartbeat_secs`. It considers the
+The holder refreshes the lease every `lease_heartbeat_secs` (at most a third
+of `lease_ttl_secs`). It considers the
 lease lost on the first refresh that finds another holder, or when two
 thirds of `lease_ttl_secs` pass without a successful refresh. So it stops
 acting as leader well before the backend lets anyone else in. Followers poll
@@ -61,6 +63,7 @@ Redis), so node clocks don't matter.
 
 Node ids are generated once and kept in `{data_dir}/node_id` (override with
 `cluster.node_id`). A restarted node can take its own unexpired lease back.
+Each stream's epoch history is kept in `{data_dir}/cluster/epochs/`.
 
 ### Promotion
 
@@ -233,6 +236,11 @@ The Helm chart (`deploy/helm/exspeed`) sets this up with `replicas: 3`:
   either use `/healthz` to pick the leader, or retry against the `leader`
   named in a follower's `503`.
 
+The chart sets `cluster.size` to `replicas`, so `cluster.acks=quorum` works
+without more settings, and turns on TLS for the cluster port whenever
+`tls.secretName` is set (`cluster.tlsCaKey` names a CA key in the same
+Secret for per-pod certificates).
+
 ```bash
 helm install exspeed deploy/helm/exspeed \
   --set replicas=3 \
@@ -253,11 +261,13 @@ helm install exspeed deploy/helm/exspeed \
   ([protocol.md](protocol.md)). Behind a load balancer, route to the node
   whose `/healthz` returns 200.
 
-Client-protocol reads (`Read`, `StreamInfo`, `ListStreams`, `Query`) work on
-followers and return replicated data. Writes and consumers need the leader.
-The HTTP API answers only on the leader (503 with the leader's address
-elsewhere), except the probes, `/metrics`, `/api/v1/cluster`,
-`/api/v1/leases` and `/api/v1/whoami`.
+Client-protocol reads (`Read`, `StreamInfo`, `ListStreams`, bounded `Query`)
+work on followers and return replicated data. Writes, consumers and
+continuous queries need the leader. The HTTP API answers only on the leader
+(503 with the leader's address elsewhere), except the probes, `/metrics`,
+`/api/v1/openapi.json`, `/api/v1/cluster`, `/api/v1/leases`,
+`/api/v1/whoami` and record reads (`GET /api/v1/streams/{name}/records`).
+Webhooks are writes, so a follower answers them with 503.
 
 ### Failover timing
 
@@ -299,17 +309,18 @@ traffic and less tolerance for slow backends.
 
 | Test | What it proves |
 |------|----------------|
-| `cluster_test` (in-process, real TCP replication) | Replication of records, configs, deletes, consumer state, queries and connectors. Failover without losing acknowledged writes. Divergent-leader truncation, follower restart, `min_insync_replicas`. TLS replication, and refusal of an untrusted peer. |
+| `cluster_test` (in-process, real TCP replication) | Replication of records, configs, deletes, consumer state, queries and connectors. Failover without losing acknowledged writes or consumer progress, and a deleted consumer staying deleted. Divergent-leader truncation, follower restart, `min_insync_replicas`. Reads and long polls on followers, continuous queries refused there. TLS replication, and refusal of an untrusted peer. |
 | `cluster_test::randomized_partitions_and_restarts_lose_no_acknowledged_write` | Jepsen-style. Random lease partitions, replication links cut by a fault-injecting proxy, and node restarts run under a writer that retries with the same `msg_id`. Afterwards every acknowledged write is present exactly once, every value in the log was written by the client, and all nodes hold identical logs. |
 | `crash_test::kill_9_in_a_three_node_cluster_loses_no_acknowledged_write` | Three real processes on a Postgres lease with `acks = "quorum"`, while the leader (usually) or a follower is SIGKILLed and restarted. Same checks. Runs in CI with Postgres. |
-| `postgres_lease_test`, `redis_lease_test`, lease unit tests | One conformance suite for every lease backend: epochs, fencing, ISR-gated election, expiry, release. |
+| `replication_test` (`exspeed-broker`) | Two nodes on the in-memory lease: retention reaching followers, and a follower that is behind the leader's earliest offset. |
+| `postgres_lease_test`, `redis_lease_test`, lease unit tests | One conformance suite for every lease backend: epochs, fencing, ISR-gated election, expiry, release. The Postgres and Redis runs need `EXSPEED_LEASE_POSTGRES_URL` / `EXSPEED_LEASE_REDIS_URL` and run in CI. |
 
 ## Limits
 
 - **Every node has every stream, by design.** One leader serves every
   stream, so the node that takes over must already hold all of them. A
   per-stream replication factor would leave a promoted node missing streams,
-  so it is not planned. To scale writes, partition data across separate
+  so Exspeed has none. To scale writes, partition data across separate
   clusters. A cluster scales reads and availability, not write throughput.
 - **Followers apply compaction themselves.** Compacted streams converge on
   the same contents, but a follower may keep superseded records slightly
