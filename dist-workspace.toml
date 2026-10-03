@@ -13,3 +13,11 @@ installers = ["shell", "powershell"]
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Where to host releases
 hosting = "github"
+# Publish the Docker image to ghcr.io from the release's Linux binaries
+# (.github/workflows/publish-docker.yml), prereleases included (their image
+# gets only the X.Y.Z tag).
+publish-jobs = ["./publish-docker"]
+publish-prereleases = true
+
+[dist.github-custom-job-permissions]
+"publish-docker" = { contents = "read", packages = "write" }

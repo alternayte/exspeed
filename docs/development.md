@@ -178,14 +178,12 @@ cargo build --release -p exspeed -p exspeed-bench
 
 ## Releasing
 
-Releases are driven by cargo-dist. See the "Releasing" section of
-[CLAUDE.md](../CLAUDE.md) for the full checklist:
-
-1. Bump versions.
-2. Update `CHANGELOG.md`.
-3. Tag `vX.Y.Z` and push. This alone creates the GitHub Release.
-4. Build the multi-arch Docker image.
-5. Run `npm publish`.
+Pushing a `vX.Y.Z` tag runs the Release workflow (cargo-dist): it builds
+the binaries and installers, creates the GitHub Release with the matching
+`CHANGELOG.md` section as its notes, and publishes the multi-arch image
+`ghcr.io/alternayte/exspeed` from those binaries. The checklist (version
+bump, changelog, tag, npm publish) is in the "Releasing" section of
+[CLAUDE.md](../CLAUDE.md).
 
 ## Repository layout
 

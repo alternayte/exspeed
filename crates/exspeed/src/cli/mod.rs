@@ -17,7 +17,11 @@ pub mod view;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "exspeed", about = "Lightweight stream processing platform")]
+#[command(
+    name = "exspeed",
+    version,
+    about = "A streaming platform in one binary: durable log, subjects, SQL over streams and connectors"
+)]
 pub struct Cli {
     /// URL of the exspeed server
     #[arg(

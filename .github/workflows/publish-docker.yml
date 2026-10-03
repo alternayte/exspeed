@@ -1,0 +1,115 @@
+# Publishes the multi-arch (amd64 + arm64) Docker image to
+# ghcr.io/<owner>/exspeed from a release's Linux binaries.
+#
+# Called by the Release workflow (cargo-dist `publish-jobs`) once the
+# GitHub Release and its artifacts exist. It can also be run by hand for an
+# existing release (Actions -> Publish Docker image -> Run workflow).
+#
+# Tags: X.Y.Z for every release; X.Y and latest only for non-prereleases.
+name: Publish Docker image
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish (for example v0.6.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PLAN: ${{ inputs.plan }}
+      DISPATCH_TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the release
+        id: release
+        run: |
+          set -euo pipefail
+          if [ -n "${PLAN:-}" ]; then
+            tag=$(jq -r '.announcement_tag' <<<"$PLAN")
+            pre=$(jq -r '.announcement_is_prerelease' <<<"$PLAN")
+          else
+            tag="$DISPATCH_TAG"
+            pre=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isPrerelease -q .isPrerelease)
+          fi
+          version="${tag#v}"
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/exspeed"
+          tags="$image:$version"
+          if [ "$pre" != "true" ]; then
+            minor="${version%.*}"
+            tags="$tags,$image:$minor,$image:latest"
+          fi
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "image=$image"
+            echo "tags=$tags"
+          } >> "$GITHUB_OUTPUT"
+          echo "Publishing $tags (prerelease: $pre)"
+
+      - name: Download the Linux binaries from the release
+        run: |
+          set -euo pipefail
+          tag='${{ steps.release.outputs.tag }}'
+          mkdir -p dl ctx/bin/amd64 ctx/bin/arm64
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir dl \
+            --pattern 'exspeed-x86_64-unknown-linux-gnu.tar.xz*' \
+            --pattern 'exspeed-aarch64-unknown-linux-gnu.tar.xz*'
+          (cd dl && sha256sum -c exspeed-x86_64-unknown-linux-gnu.tar.xz.sha256 \
+                 && sha256sum -c exspeed-aarch64-unknown-linux-gnu.tar.xz.sha256)
+          tar -xJf dl/exspeed-x86_64-unknown-linux-gnu.tar.xz -C dl
+          tar -xJf dl/exspeed-aarch64-unknown-linux-gnu.tar.xz -C dl
+          cp dl/exspeed-x86_64-unknown-linux-gnu/exspeed ctx/bin/amd64/exspeed
+          cp dl/exspeed-aarch64-unknown-linux-gnu/exspeed ctx/bin/arm64/exspeed
+          cp Dockerfile.release ctx/Dockerfile
+          ctx/bin/amd64/exspeed --version
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ctx
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.release.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=exspeed
+            org.opencontainers.image.description=A streaming platform in one binary: durable log, subjects, SQL over streams and connectors
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.url=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.release.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT
+          annotations: |
+            index:org.opencontainers.image.description=A streaming platform in one binary: durable log, subjects, SQL over streams and connectors
+            index:org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            index:org.opencontainers.image.licenses=MIT
+
+      - name: Check the published image
+        run: |
+          set -euo pipefail
+          ref='${{ steps.release.outputs.image }}:${{ steps.release.outputs.version }}'
+          docker buildx imagetools inspect "$ref"
+          docker run --rm --platform linux/amd64 "$ref" --version
+          docker run --rm --platform linux/arm64 "$ref" --version
