@@ -150,10 +150,8 @@ async fn poison_record_routes_to_dlq_stream() {
             "type": "sink",
             "plugin": "http_sink",
             "stream": "dlq-src-1",
-            "settings": {
-                "url": mock_url,
-                "dlq_stream": "dlq-out-1"
-            }
+            "dlq_stream": "dlq-out-1",
+            "settings": { "url": mock_url }
         }))
         .send()
         .await
@@ -315,7 +313,8 @@ async fn dlq_batch_on_transient_exhausted() {
             "stream": "dlq-src-5",
             "on_transient_exhausted": "dlq_batch",
             "retry": { "max_retries": 2, "initial_backoff_ms": 10, "max_backoff_ms": 100, "jitter": false },
-            "settings": { "url": mock_url, "dlq_stream": "dlq-out-5" }
+            "dlq_stream": "dlq-out-5",
+            "settings": { "url": mock_url }
         }))
         .send()
         .await
@@ -337,13 +336,16 @@ async fn dlq_batch_on_transient_exhausted() {
         "all 3 records should have been routed to dlq_batch"
     );
 
-    // Each DLQ record carries reason=sink_rejected (transient exhaustion).
+    // Each DLQ record carries reason=retries_exhausted.
     for (_, _, headers) in &recs {
         let reason = headers
             .iter()
             .find(|(k, _)| k == "exspeed-dlq-reason")
             .map(|(_, v)| v.as_str())
             .unwrap_or("");
-        assert_eq!(reason, "sink_rejected", "unexpected reason: {headers:?}");
+        assert_eq!(
+            reason, "retries_exhausted",
+            "unexpected reason: {headers:?}"
+        );
     }
 }

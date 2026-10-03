@@ -17,12 +17,12 @@ impl TiberiusBackend {
     pub(super) async fn connect(raw_url: &str) -> Result<Self, BackendError> {
         let config = parse_url(raw_url)?;
         let mgr = ConnectionManager::build(config)
-            .map_err(|e| BackendError::Pool(format!("bb8-tiberius build: {e}")))?;
+            .map_err(|e| BackendError::Config(format!("bb8-tiberius build: {e}")))?;
         let pool = Pool::builder()
             .max_size(8)
             .build(mgr)
             .await
-            .map_err(|e| BackendError::Pool(format!("bb8 pool build: {e}")))?;
+            .map_err(|e| BackendError::Connection(format!("bb8 pool build: {e}")))?;
         Ok(Self { pool })
     }
 }
@@ -36,7 +36,7 @@ fn parse_url(raw: &str) -> Result<Config, BackendError> {
     } else {
         raw.to_string()
     };
-    let u = Url::parse(&normalized).map_err(|e| BackendError::Pool(format!("url parse: {e}")))?;
+    let u = Url::parse(&normalized).map_err(|e| BackendError::Config(format!("url parse: {e}")))?;
 
     let mut cfg = Config::new();
     if let Some(host) = u.host_str() {
@@ -82,7 +82,7 @@ impl SinkBackend for TiberiusBackend {
             .pool
             .get()
             .await
-            .map_err(|e| BackendError::Pool(format!("pool get: {e}")))?;
+            .map_err(|e| BackendError::Connection(format!("pool get: {e}")))?;
         conn.simple_query(sql)
             .await
             .map_err(map_tiberius_err)?
@@ -97,7 +97,7 @@ impl SinkBackend for TiberiusBackend {
             .pool
             .get()
             .await
-            .map_err(|e| BackendError::Pool(format!("pool get: {e}")))?;
+            .map_err(|e| BackendError::Connection(format!("pool get: {e}")))?;
         let mut q = Query::new(sql);
         for p in params {
             bind_param(&mut q, p);
@@ -124,18 +124,7 @@ fn bind_param(q: &mut Query<'_>, p: &Param) {
 }
 
 fn map_tiberius_err(e: tiberius::error::Error) -> BackendError {
-    use tiberius::error::Error as E;
-    match &e {
-        E::Server(t) => BackendError::Sql {
-            sqlstate: t.code().to_string(),
-            message: t.message().to_string(),
-        },
-        E::Io { kind, message } => BackendError::Io(format!("{kind:?}: {message}")),
-        _ => BackendError::Sql {
-            sqlstate: String::new(),
-            message: e.to_string(),
-        },
-    }
+    super::errors::from_tiberius(e)
 }
 
 #[cfg(test)]

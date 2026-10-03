@@ -94,9 +94,9 @@ exspeed view <name>           # rows
 ## Connectors
 
 ```bash
-exspeed connectors                                   # list running connectors
-exspeed connector validate <file.toml>               # syntax, plugin, stream, transform
-exspeed connector dry-run  <file.toml>               # + connect and fetch a sample
+exspeed connectors                                   # list connectors and their status
+exspeed connector validate <file.toml>               # syntax, names, transform and every plugin setting
+exspeed connector dry-run  <file.toml> [--max 3]     # + connect and print samples, without side effects
 ```
 
 See [connectors.md](connectors.md).

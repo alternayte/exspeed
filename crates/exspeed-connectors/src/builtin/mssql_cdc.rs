@@ -1,510 +1,529 @@
-//! SQL Server Change Data Capture (CDC) source.
+//! `mssql_cdc`: SQL Server Change Data Capture.
 //!
-//! Reads from SQL Server's built-in CDC change tables (`cdc.<capture_instance>_CT`)
-//! via the `[cdc].[fn_cdc_get_all_changes_<capture_instance>]` function.
-//! Emits each insert/update/delete as a JSON record with a metadata op type.
+//! Reads `[cdc].[fn_cdc_get_all_changes_<capture_instance>]` and emits one
+//! record per change with the same envelope as `postgres_cdc`:
 //!
-//! Prerequisites on the target SQL Server:
+//! ```json
+//! {"op": "c" | "u" | "d",
+//!  "before": null | {...},          // the deleted row for "d"
+//!  "after":  {...} | null,
+//!  "source": {"connector": "...", "capture_instance": "dbo_orders",
+//!             "lsn": "0000002A000007F80003", "seqval": "..."}}
+//! ```
+//!
+//! Prerequisites on the server:
 //! ```sql
 //! EXEC sys.sp_cdc_enable_db;
-//! EXEC sys.sp_cdc_enable_table
-//!     @source_schema = 'dbo', @source_name = 'mytable', @role_name = NULL;
+//! EXEC sys.sp_cdc_enable_table @source_schema = 'dbo', @source_name = 'orders', @role_name = NULL;
 //! ```
-//! SQL Server Agent must be running; the CDC capture job populates the
-//! change tables asynchronously from the transaction log.
 //!
-//! LSN tracking: we store the last-processed Log Sequence Number as a
-//! hex-encoded string (20 hex chars for a 10-byte LSN). On restart we
-//! resume from just past that LSN.
+//! **Cursor.** The checkpoint is the `(__$start_lsn, __$seqval)` of the last
+//! emitted change (`"<lsn>:<seqval>"`, hex). The next poll reads from that
+//! LSN and skips rows at or before the pair, so a transaction larger than
+//! `batch_size` is paged through instead of re-read forever. Once a poll
+//! catches up (fewer rows than requested), the cursor moves to
+//! `sys.fn_cdc_increment_lsn(<lsn>)` (stored as `"<lsn>"`) so the finished
+//! transaction is not scanned again.
 //!
-//! Required config (`settings`):
-//! - `connection`: `mssql://` or `sqlserver://` URL.
-//! - `capture_instance`: the CDC capture instance name (typically
-//!   `<schema>_<table>` — e.g. `dbo_orders`).
-//! - `schema`: column-type DSL (same format as the JDBC sink) describing
-//!   the business columns to extract. Do NOT include CDC metadata
-//!   columns (`__$start_lsn`, `__$operation`, etc.); we handle those.
+//! Columns are cast in SQL according to the `schema` DSL; NULL becomes JSON
+//! null. Each record carries `x-idempotency-key = mssqlcdc:<ci>:<lsn>:<seqval>`,
+//! so replays inside the stream's dedup window are dropped.
+//!
+//! Guarantee: at-least-once (effectively-once inside the dedup window). If
+//! the CDC cleanup job removed changes past the stored cursor, the connector
+//! fails instead of silently skipping them.
 
 use async_trait::async_trait;
 use bb8::Pool;
 use bb8_tiberius::ConnectionManager;
 use bytes::Bytes;
-use tiberius::{ColumnData, Query};
-use tracing::{info, warn};
-use url::Url;
+use serde::Deserialize;
+use serde_json::{json, Map, Value};
+use tiberius::Query;
+use tracing::info;
 
-use crate::builtin::jdbc::dialect::{ColumnSpec, JsonType};
+use crate::builtin::jdbc::dialect::{ColumnSpec, DialectKind, JsonType};
+use crate::builtin::jdbc::errors;
 use crate::builtin::jdbc::schema::{is_valid_ident, parse_schema};
-use crate::config::ConnectorConfig;
-use crate::traits::{ConnectorError, HealthStatus, SourceBatch, SourceConnector, SourceRecord};
+use crate::builtin::jdbc_poll::parse_mssql_url;
+use crate::registry::PluginInit;
+use crate::settings::{self, de};
+use crate::traits::{ConnectorError, SourceBatch, SourceConnector, SourceRecord};
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MssqlCdcSettings {
+    pub connection: String,
+    pub capture_instance: String,
+    /// Column DSL for the business columns: `"id:bigint, name:text"`.
+    pub schema: String,
+    /// Columns that form the record key (default: none).
+    #[serde(default, deserialize_with = "de::string_list")]
+    pub key_columns: Vec<String>,
+}
+
+/// Position in the change table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Cursor {
+    /// Read from this LSN (inclusive); nothing at it was emitted yet.
+    From(Vec<u8>),
+    /// The last emitted change; skip everything up to and including it.
+    After { lsn: Vec<u8>, seqval: Vec<u8> },
+}
+
+impl Cursor {
+    fn parse(s: &str) -> Option<Self> {
+        match s.split_once(':') {
+            Some((l, q)) => Some(Self::After {
+                lsn: hex_to_bytes(l)?,
+                seqval: hex_to_bytes(q)?,
+            }),
+            None => Some(Self::From(hex_to_bytes(s)?)),
+        }
+    }
+
+    fn encode(&self) -> String {
+        match self {
+            Self::From(l) => to_hex(l),
+            Self::After { lsn, seqval } => format!("{}:{}", to_hex(lsn), to_hex(seqval)),
+        }
+    }
+
+    fn lsn(&self) -> &[u8] {
+        match self {
+            Self::From(l) => l,
+            Self::After { lsn, .. } => lsn,
+        }
+    }
+}
 
 pub struct MssqlCdcSource {
-    connection_string: String,
-    capture_instance: String,
+    connector: String,
+    settings: MssqlCdcSettings,
     schema_cols: Vec<ColumnSpec>,
-    pool: Option<Pool<ConnectionManager>>,
-    last_lsn: Option<Vec<u8>>, // 10-byte LSN, stored/resumed as hex string
     subject_template: String,
+    pool: Option<Pool<ConnectionManager>>,
+    cursor: Option<Cursor>,
 }
 
 impl MssqlCdcSource {
-    pub fn new(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
-        let connection_string = config
-            .setting("connection")
-            .map_err(ConnectorError::Config)?
-            .to_string();
-
-        let lower = connection_string.to_ascii_lowercase();
+    pub fn new(init: &PluginInit) -> Result<Self, ConnectorError> {
+        let s: MssqlCdcSettings = settings::parse("mssql_cdc", &init.settings)?;
+        let lower = s.connection.to_ascii_lowercase();
         if !(lower.starts_with("mssql://") || lower.starts_with("sqlserver://")) {
-            return Err(ConnectorError::Config(
-                "mssql_cdc: connection URL must start with mssql:// or sqlserver://".into(),
+            return Err(ConnectorError::config(
+                "mssql_cdc: connection URL must start with mssql:// or sqlserver://",
             ));
         }
-
-        let capture_instance = config
-            .setting("capture_instance")
-            .map_err(ConnectorError::Config)?
-            .to_string();
-        if !is_valid_ident(&capture_instance) {
-            return Err(ConnectorError::Config(format!(
-                "mssql_cdc: invalid capture_instance '{capture_instance}' (must match [A-Za-z_][A-Za-z0-9_]*)"
+        if !is_valid_ident(&s.capture_instance) {
+            return Err(ConnectorError::config(format!(
+                "mssql_cdc: invalid capture_instance '{}' (must match [A-Za-z_][A-Za-z0-9_]*)",
+                s.capture_instance
             )));
         }
-
-        let schema_raw = config.setting_or("schema", "");
-        if schema_raw.trim().is_empty() {
-            return Err(ConnectorError::Config(
-                "mssql_cdc: 'schema' setting required — declares business columns to extract"
-                    .into(),
+        if s.schema.trim().is_empty() {
+            return Err(ConnectorError::config(
+                "mssql_cdc: 'schema' is required — declares the business columns to extract",
             ));
         }
-        let schema_cols = parse_schema(&schema_raw)
-            .map_err(|e| ConnectorError::Config(format!("mssql_cdc: schema DSL error: {e}")))?;
-
+        let schema_cols = parse_schema(&s.schema)
+            .map_err(|e| ConnectorError::config(format!("mssql_cdc: schema DSL error: {e}")))?;
+        for k in &s.key_columns {
+            if !schema_cols.iter().any(|c| &c.name == k) {
+                return Err(ConnectorError::config(format!(
+                    "mssql_cdc: key column '{k}' is not in the schema"
+                )));
+            }
+        }
         Ok(Self {
-            connection_string,
-            capture_instance,
+            connector: init.config.name.clone(),
+            settings: s,
             schema_cols,
+            subject_template: if init.config.subject_template.is_empty() {
+                "mssql_cdc.{capture_instance}.{op}".into()
+            } else {
+                init.config.subject_template.clone()
+            },
             pool: None,
-            last_lsn: None,
-            subject_template: config.subject_template.clone(),
+            cursor: None,
         })
     }
-}
 
-fn parse_url_to_config(raw: &str) -> Result<tiberius::Config, ConnectorError> {
-    let normalized = if raw.to_ascii_lowercase().starts_with("mssql://") {
-        format!("sqlserver://{}", &raw[8..])
-    } else {
-        raw.to_string()
-    };
-    let u = Url::parse(&normalized)
-        .map_err(|e| ConnectorError::Config(format!("mssql_cdc url parse: {e}")))?;
-
-    let mut cfg = tiberius::Config::new();
-    if let Some(h) = u.host_str() {
-        cfg.host(h);
-    }
-    cfg.port(u.port().unwrap_or(1433));
-    if !u.username().is_empty() {
-        let user = percent_encoding::percent_decode_str(u.username())
-            .decode_utf8_lossy()
-            .into_owned();
-        let pass = u
-            .password()
-            .map(|p| {
-                percent_encoding::percent_decode_str(p)
-                    .decode_utf8_lossy()
-                    .into_owned()
+    fn fetch_sql(&self, limit: usize, filtered: bool) -> String {
+        let cols: Vec<String> = self
+            .schema_cols
+            .iter()
+            .map(|c| {
+                let q = format!("[{}]", c.name);
+                let expr = match c.json_type {
+                    JsonType::Bigint => format!("CAST({q} AS BIGINT)"),
+                    JsonType::Double => format!("CAST({q} AS FLOAT)"),
+                    JsonType::Boolean => format!("CAST({q} AS BIT)"),
+                    JsonType::Timestamptz => format!("CONVERT(NVARCHAR(40), {q}, 127)"),
+                    JsonType::Text | JsonType::Jsonb => format!("CAST({q} AS NVARCHAR(MAX))"),
+                };
+                format!("{expr} AS {q}")
             })
-            .unwrap_or_default();
-        cfg.authentication(tiberius::AuthMethod::sql_server(&user, &pass));
+            .collect();
+        let filter = if filtered {
+            " WHERE [__$start_lsn] > @P3 OR ([__$start_lsn] = @P3 AND [__$seqval] > @P4)"
+        } else {
+            ""
+        };
+        format!(
+            "SELECT TOP ({limit}) [__$start_lsn], [__$seqval], [__$operation], {cols} \
+             FROM [cdc].[fn_cdc_get_all_changes_{ci}](@P1, @P2, N'all'){filter} \
+             ORDER BY [__$start_lsn], [__$seqval]",
+            limit = limit.max(1),
+            cols = cols.join(", "),
+            ci = self.settings.capture_instance,
+        )
     }
-    let db = u.path().trim_start_matches('/');
-    if !db.is_empty() {
-        cfg.database(db);
-    }
-    for (k, v) in u.query_pairs() {
-        if k.eq_ignore_ascii_case("trust_server_certificate") && v.eq_ignore_ascii_case("true") {
-            cfg.trust_cert();
+
+    fn record(&self, row: &tiberius::Row) -> Option<(SourceRecord, Vec<u8>, Vec<u8>)> {
+        let lsn = row.get::<&[u8], _>("__$start_lsn")?.to_vec();
+        let seqval = row.get::<&[u8], _>("__$seqval")?.to_vec();
+        let operation: i32 = row.get::<i32, _>("__$operation").unwrap_or(0);
+        let (op, op_name) = match operation {
+            1 => ("d", "delete"),
+            2 => ("c", "insert"),
+            4 => ("u", "update"),
+            _ => return None, // 3 = update before-image, not requested with N'all'
+        };
+        let mut obj = Map::with_capacity(self.schema_cols.len());
+        for col in &self.schema_cols {
+            obj.insert(col.name.clone(), decode_cell(row, &col.name, col.json_type));
         }
+        let key = if self.settings.key_columns.is_empty() {
+            None
+        } else if self.settings.key_columns.len() == 1 {
+            Some(match obj.get(&self.settings.key_columns[0]) {
+                Some(Value::String(s)) => s.clone(),
+                Some(v) => v.to_string(),
+                None => String::new(),
+            })
+        } else {
+            let parts: Vec<Value> = self
+                .settings
+                .key_columns
+                .iter()
+                .map(|k| obj.get(k).cloned().unwrap_or(Value::Null))
+                .collect();
+            Some(Value::Array(parts).to_string())
+        };
+        let row_value = Value::Object(obj);
+        let (before, after) = if op == "d" {
+            (row_value, Value::Null)
+        } else {
+            (Value::Null, row_value)
+        };
+        let lsn_hex = to_hex(&lsn);
+        let seq_hex = to_hex(&seqval);
+        let envelope = json!({
+            "op": op,
+            "before": before,
+            "after": after,
+            "source": {
+                "connector": self.connector,
+                "capture_instance": self.settings.capture_instance,
+                "lsn": lsn_hex,
+                "seqval": seq_hex,
+            }
+        });
+        let subject = crate::subject::render(
+            &self.subject_template,
+            &[
+                ("capture_instance", &self.settings.capture_instance),
+                ("op", op_name),
+            ],
+            Some(&envelope),
+        );
+        let rec = SourceRecord {
+            key: key.map(|k| Bytes::from(k.into_bytes())),
+            value: Bytes::from(envelope.to_string().into_bytes()),
+            subject,
+            headers: vec![
+                (
+                    "x-idempotency-key".into(),
+                    format!(
+                        "mssqlcdc:{}:{lsn_hex}:{seq_hex}",
+                        self.settings.capture_instance
+                    ),
+                ),
+                ("exspeed-mssql-op".into(), op_name.into()),
+            ],
+        };
+        Some((rec, lsn, seqval))
     }
-    Ok(cfg)
 }
 
-fn lsn_to_hex(lsn: &[u8]) -> String {
-    lsn.iter().map(|b| format!("{b:02X}")).collect()
+fn decode_cell(row: &tiberius::Row, col: &str, ty: JsonType) -> Value {
+    let v = match ty {
+        JsonType::Bigint => row.try_get::<i64, _>(col).ok().flatten().map(Value::from),
+        JsonType::Double => row
+            .try_get::<f64, _>(col)
+            .ok()
+            .flatten()
+            .and_then(serde_json::Number::from_f64)
+            .map(Value::Number),
+        JsonType::Boolean => row.try_get::<bool, _>(col).ok().flatten().map(Value::Bool),
+        JsonType::Text | JsonType::Timestamptz => row
+            .try_get::<&str, _>(col)
+            .ok()
+            .flatten()
+            .map(|s| Value::String(s.to_string())),
+        JsonType::Jsonb => row
+            .try_get::<&str, _>(col)
+            .ok()
+            .flatten()
+            .map(|s| serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.to_string()))),
+    };
+    v.unwrap_or(Value::Null)
 }
 
-fn hex_to_lsn(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
+fn tib_err(e: tiberius::error::Error, what: &str) -> ConnectorError {
+    match errors::to_connector_error(DialectKind::Mssql, &errors::from_tiberius(e), what) {
+        // A source's own query can't be "poison".
+        ConnectorError::Poison(r) => ConnectorError::fatal(r.detail()),
+        other => other,
+    }
+}
+
+fn to_hex(b: &[u8]) -> String {
+    b.iter().map(|b| format!("{b:02X}")).collect()
+}
+
+fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
+    if s.is_empty() || !s.len().is_multiple_of(2) {
         return None;
     }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    for i in (0..s.len()).step_by(2) {
-        let byte = u8::from_str_radix(&s[i..i + 2], 16).ok()?;
-        out.push(byte);
-    }
-    Some(out)
-}
-
-/// Map a CDC `__$operation` code to a human-readable op string.
-/// 1=delete, 2=insert, 3=update (before), 4=update (after).
-fn op_label(code: i32) -> &'static str {
-    match code {
-        1 => "delete",
-        2 => "insert",
-        3 => "update_before",
-        4 => "update_after",
-        _ => "unknown",
-    }
-}
-
-fn column_data_to_json(cd: &ColumnData, ty: JsonType) -> serde_json::Value {
-    use serde_json::Value;
-    match cd {
-        ColumnData::Bit(Some(b)) => Value::Bool(*b),
-        ColumnData::I16(Some(v)) => Value::Number((*v as i64).into()),
-        ColumnData::I32(Some(v)) => Value::Number((*v as i64).into()),
-        ColumnData::I64(Some(v)) => Value::Number((*v).into()),
-        ColumnData::U8(Some(v)) => Value::Number((*v as u64).into()),
-        ColumnData::F32(Some(v)) => serde_json::Number::from_f64(*v as f64)
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
-        ColumnData::F64(Some(v)) => serde_json::Number::from_f64(*v)
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
-        ColumnData::String(Some(s)) => Value::String(s.to_string()),
-        _ => match ty {
-            JsonType::Text | JsonType::Jsonb | JsonType::Timestamptz => {
-                // Best-effort stringification for complex types or NULL.
-                Value::String(format!("{cd:?}"))
-            }
-            _ => Value::Null,
-        },
-    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
 }
 
 #[async_trait]
 impl SourceConnector for MssqlCdcSource {
-    async fn start(&mut self, last_position: Option<String>) -> Result<(), ConnectorError> {
-        let cfg = parse_url_to_config(&self.connection_string)?;
+    async fn start(&mut self, checkpoint: Option<String>) -> Result<(), ConnectorError> {
+        self.cursor = match &checkpoint {
+            Some(s) => Some(Cursor::parse(s).ok_or_else(|| {
+                ConnectorError::fatal(format!(
+                    "mssql_cdc: stored checkpoint '{s}' is not a valid LSN cursor"
+                ))
+            })?),
+            None => None,
+        };
+        let cfg = parse_mssql_url(&self.settings.connection)?;
         let mgr = ConnectionManager::build(cfg)
-            .map_err(|e| ConnectorError::Connection(format!("mssql_cdc bb8 build: {e}")))?;
+            .map_err(|e| ConnectorError::config(format!("mssql_cdc: {e}")))?;
         let pool = Pool::builder()
-            .max_size(4)
+            .max_size(2)
             .build(mgr)
             .await
-            .map_err(|e| ConnectorError::Connection(format!("mssql_cdc pool: {e}")))?;
-
-        if let Some(s) = last_position {
-            match hex_to_lsn(&s) {
-                Some(lsn) => self.last_lsn = Some(lsn),
-                None => {
-                    warn!(last_position = %s, "mssql_cdc: invalid LSN hex; starting from beginning")
-                }
-            }
-        }
-
+            .map_err(|e| ConnectorError::connection(format!("mssql_cdc pool: {e}")))?;
         info!(
-            capture_instance = %self.capture_instance,
-            resume_lsn = self.last_lsn.as_deref().map(lsn_to_hex).as_deref().unwrap_or("<none>"),
+            capture_instance = %self.settings.capture_instance,
+            cursor = ?checkpoint,
             "mssql_cdc source started"
         );
-
         self.pool = Some(pool);
         Ok(())
     }
 
     async fn poll(&mut self, max_batch: usize) -> Result<SourceBatch, ConnectorError> {
-        let pool = match &self.pool {
-            Some(p) => p,
-            None => return Err(ConnectorError::Connection("mssql_cdc: not started".into())),
-        };
+        let pool = self
+            .pool
+            .as_ref()
+            .ok_or_else(|| ConnectorError::connection("mssql_cdc: not started"))?;
         let mut conn = pool
             .get()
             .await
-            .map_err(|e| ConnectorError::Connection(format!("mssql_cdc pool get: {e}")))?;
+            .map_err(|e| ConnectorError::connection(format!("mssql_cdc pool get: {e}")))?;
 
-        // Determine `from_lsn` and `to_lsn`.
-        //   from_lsn = last_lsn + 1 (via sys.fn_cdc_increment_lsn), or min_lsn if first run.
-        //   to_lsn   = sys.fn_cdc_get_max_lsn()
         let bounds_sql = format!(
-            "SELECT \
-                sys.fn_cdc_get_max_lsn() AS max_lsn, \
-                sys.fn_cdc_get_min_lsn(N'{}') AS min_lsn",
-            self.capture_instance.replace('\'', "''")
+            "SELECT sys.fn_cdc_get_max_lsn() AS max_lsn, sys.fn_cdc_get_min_lsn(N'{}') AS min_lsn",
+            self.settings.capture_instance
         );
-        let stream = conn
+        let rows = conn
             .simple_query(bounds_sql)
             .await
-            .map_err(|e| ConnectorError::Connection(format!("mssql_cdc bounds query: {e}")))?;
-        let rows = stream
+            .map_err(|e| tib_err(e, "mssql_cdc bounds"))?
             .into_first_result()
             .await
-            .map_err(|e| ConnectorError::Connection(format!("mssql_cdc bounds result: {e}")))?;
-        let bounds = match rows.first() {
-            Some(r) => r,
-            None => {
-                return Ok(SourceBatch {
-                    records: Vec::new(),
-                    position: None,
-                })
-            }
+            .map_err(|e| tib_err(e, "mssql_cdc bounds"))?;
+        let (max_lsn, min_lsn) = match rows.first() {
+            Some(r) => (
+                r.get::<&[u8], _>(0).map(<[u8]>::to_vec),
+                r.get::<&[u8], _>(1).map(<[u8]>::to_vec),
+            ),
+            None => (None, None),
         };
-        let max_lsn: Option<&[u8]> = bounds.get::<&[u8], _>(0);
-        let min_lsn: Option<&[u8]> = bounds.get::<&[u8], _>(1);
-        let Some(max_lsn) = max_lsn else {
-            return Ok(SourceBatch {
-                records: Vec::new(),
-                position: None,
-            });
+        let (Some(max_lsn), Some(min_lsn)) = (max_lsn, min_lsn) else {
+            return Ok(SourceBatch::empty());
         };
-        let Some(min_lsn) = min_lsn else {
-            return Ok(SourceBatch {
-                records: Vec::new(),
-                position: None,
-            });
-        };
-        let max_lsn_vec = max_lsn.to_vec();
-        let min_lsn_vec = min_lsn.to_vec();
-
-        let from_lsn = match &self.last_lsn {
-            Some(v) => v.clone(),
-            None => min_lsn_vec.clone(),
-        };
-
-        // If from_lsn > max_lsn nothing new.
-        if from_lsn > max_lsn_vec {
-            return Ok(SourceBatch {
-                records: Vec::new(),
-                position: None,
-            });
+        // An all-zero min LSN means the capture instance has no data yet.
+        if min_lsn.iter().all(|b| *b == 0) {
+            return Ok(SourceBatch::empty());
         }
 
-        let fetch_sql = format!(
-            "SELECT TOP ({limit}) * FROM [cdc].[fn_cdc_get_all_changes_{ci}](@P1, @P2, N'all') ORDER BY [__$start_lsn], [__$seqval]",
-            limit = max_batch.max(1),
-            ci = self.capture_instance,
-        );
-
-        let mut q = Query::new(fetch_sql);
-        q.bind(from_lsn.clone());
-        q.bind(max_lsn_vec.clone());
-        let stream = q
-            .query(&mut *conn)
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("mssql_cdc change fetch: {e}")))?;
-        let rows = stream
-            .into_first_result()
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("mssql_cdc change result: {e}")))?;
-
-        let mut out: Vec<SourceRecord> = Vec::with_capacity(rows.len());
-        let mut highest_lsn = self.last_lsn.clone().unwrap_or_default();
-
-        for row in &rows {
-            // CDC metadata columns (always first 5):
-            //   __$start_lsn (binary(10)), __$end_lsn (binary(10)),
-            //   __$seqval (binary(10)), __$operation (int),
-            //   __$update_mask (varbinary).
-            let start_lsn: Option<&[u8]> = row.get::<&[u8], _>("__$start_lsn");
-            let operation: Option<i32> = row.get::<i32, _>("__$operation");
-
-            let op = operation.map(op_label).unwrap_or("unknown");
-
-            let mut obj = serde_json::Map::with_capacity(self.schema_cols.len() + 1);
-            obj.insert("__op".into(), serde_json::Value::String(op.to_string()));
-
-            for col in &self.schema_cols {
-                // Look up the business column by name.
-                let cd_opt: Option<ColumnData> = row_get_column_data(row, &col.name);
-                let v = cd_opt
-                    .map(|cd| column_data_to_json(&cd, col.json_type))
-                    .unwrap_or(serde_json::Value::Null);
-                obj.insert(col.name.clone(), v);
-            }
-
-            if let Some(lsn) = start_lsn {
-                if lsn.to_vec() > highest_lsn {
-                    highest_lsn = lsn.to_vec();
+        let (from, filter) = match &self.cursor {
+            None => (min_lsn.clone(), None),
+            Some(c) => {
+                if c.lsn() < min_lsn.as_slice() {
+                    return Err(ConnectorError::fatal(format!(
+                        "mssql_cdc: changes after the stored cursor {} were removed by CDC cleanup \
+                         (min LSN is now {}); reset the connector's offset to continue",
+                        c.encode(),
+                        to_hex(&min_lsn)
+                    )));
+                }
+                match c {
+                    Cursor::From(l) => (l.clone(), None),
+                    Cursor::After { lsn, seqval } => {
+                        (lsn.clone(), Some((lsn.clone(), seqval.clone())))
+                    }
                 }
             }
-
-            let value = Bytes::from(serde_json::to_vec(&obj).unwrap_or_else(|_| b"null".to_vec()));
-            let subject = if self.subject_template.is_empty() {
-                format!("mssql_cdc.{}.{}", self.capture_instance, op)
-            } else {
-                self.subject_template.clone()
-            };
-            out.push(SourceRecord {
-                key: None,
-                value,
-                subject,
-                headers: vec![
-                    ("exspeed-mssql-op".into(), op.to_string()),
-                    (
-                        "exspeed-mssql-capture".into(),
-                        self.capture_instance.clone(),
-                    ),
-                ],
-            });
+        };
+        if from > max_lsn {
+            return Ok(SourceBatch::empty());
         }
 
-        let position = if !highest_lsn.is_empty() && Some(&highest_lsn) != self.last_lsn.as_ref() {
-            self.last_lsn = Some(highest_lsn.clone());
-            Some(lsn_to_hex(&highest_lsn))
-        } else {
-            None
+        let limit = max_batch.max(1);
+        let mut q = Query::new(self.fetch_sql(limit, filter.is_some()));
+        q.bind(from);
+        q.bind(max_lsn);
+        if let Some((l, s)) = &filter {
+            q.bind(l.clone());
+            q.bind(s.clone());
+        }
+        let rows = q
+            .query(&mut *conn)
+            .await
+            .map_err(|e| tib_err(e, "mssql_cdc fetch"))?
+            .into_first_result()
+            .await
+            .map_err(|e| tib_err(e, "mssql_cdc fetch"))?;
+
+        let mut records = Vec::with_capacity(rows.len());
+        let mut last: Option<(Vec<u8>, Vec<u8>)> = None;
+        for row in &rows {
+            if let Some((rec, lsn, seq)) = self.record(row) {
+                records.push(rec);
+                last = Some((lsn, seq));
+            } else if let (Some(l), Some(s)) = (row.get::<&[u8], _>(0), row.get::<&[u8], _>(1)) {
+                last = Some((l.to_vec(), s.to_vec()));
+            }
+        }
+        let Some((lsn, seqval)) = last else {
+            return Ok(SourceBatch::empty());
         };
 
+        let next = if rows.len() < limit {
+            // Caught up: the transaction at `lsn` is complete.
+            let mut q = Query::new("SELECT sys.fn_cdc_increment_lsn(@P1)");
+            q.bind(lsn.clone());
+            let inc = q
+                .query(&mut *conn)
+                .await
+                .map_err(|e| tib_err(e, "mssql_cdc increment_lsn"))?
+                .into_row()
+                .await
+                .map_err(|e| tib_err(e, "mssql_cdc increment_lsn"))?
+                .and_then(|r| r.get::<&[u8], _>(0).map(<[u8]>::to_vec));
+            match inc {
+                Some(l) => Cursor::From(l),
+                None => Cursor::After { lsn, seqval },
+            }
+        } else {
+            Cursor::After { lsn, seqval }
+        };
+        let checkpoint = next.encode();
+        self.cursor = Some(next);
         Ok(SourceBatch {
-            records: out,
-            position,
+            records,
+            checkpoint: Some(checkpoint),
         })
     }
 
-    async fn commit(&mut self, _position: String) -> Result<(), ConnectorError> {
-        // LSN is advanced on successful poll; nothing server-side to ack.
+    async fn ack(&mut self, _checkpoint: Option<&str>) -> Result<(), ConnectorError> {
+        // Nothing to acknowledge server-side; the cursor is the checkpoint.
         Ok(())
     }
 
     async fn stop(&mut self) -> Result<(), ConnectorError> {
-        self.pool = None; // bb8 drops connections when pool is dropped.
+        self.pool = None;
         Ok(())
     }
-
-    async fn health(&self) -> HealthStatus {
-        if self.pool.is_some() {
-            HealthStatus::Healthy
-        } else {
-            HealthStatus::Unhealthy("mssql_cdc: not started".into())
-        }
-    }
-}
-
-/// Best-effort extract a `ColumnData` owned-value from a row by column name.
-/// tiberius gives typed accessors; we probe the common types.
-fn row_get_column_data(row: &tiberius::Row, col: &str) -> Option<ColumnData<'static>> {
-    // Note: tiberius::Row doesn't expose ColumnData directly. We re-materialize
-    // the value into an owned ColumnData by probing the typed accessors in
-    // the same order used by column_data_to_json.
-    if let Ok(Some(v)) =
-        std::panic::catch_unwind(|| row.try_get::<&str, _>(col)).unwrap_or(Ok(None))
-    {
-        return Some(ColumnData::String(Some(v.to_string().into())));
-    }
-    if let Ok(Some(v)) = std::panic::catch_unwind(|| row.try_get::<i64, _>(col)).unwrap_or(Ok(None))
-    {
-        return Some(ColumnData::I64(Some(v)));
-    }
-    if let Ok(Some(v)) = std::panic::catch_unwind(|| row.try_get::<i32, _>(col)).unwrap_or(Ok(None))
-    {
-        return Some(ColumnData::I32(Some(v)));
-    }
-    if let Ok(Some(v)) =
-        std::panic::catch_unwind(|| row.try_get::<bool, _>(col)).unwrap_or(Ok(None))
-    {
-        return Some(ColumnData::Bit(Some(v)));
-    }
-    if let Ok(Some(v)) = std::panic::catch_unwind(|| row.try_get::<f64, _>(col)).unwrap_or(Ok(None))
-    {
-        return Some(ColumnData::F64(Some(v)));
-    }
-    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use crate::config::{ConnectorConfig, ConnectorType};
 
-    fn make_config(settings: HashMap<String, String>) -> ConnectorConfig {
-        ConnectorConfig {
-            name: "test-cdc".into(),
-            connector_type: "source".into(),
-            plugin: "mssql_cdc".into(),
-            stream: "cdc-events".into(),
-            subject_template: String::new(),
-            subject_filter: String::new(),
-            settings,
-            batch_size: 100,
-            poll_interval_ms: 50,
-            dedup_enabled: false,
-            dedup_key: String::new(),
-            dedup_window_secs: 86400,
-            transform_sql: String::new(),
-            key_field: String::new(),
-            on_transient_exhausted: crate::config::OnTransientExhausted::default(),
-            retry: crate::retry::RetryPolicy::default_transient(),
+    fn init(settings: serde_json::Value) -> PluginInit {
+        let (m, _) = exspeed_common::Metrics::new();
+        PluginInit {
+            config: ConnectorConfig::new(
+                "test-cdc",
+                ConnectorType::Source,
+                "mssql_cdc",
+                "cdc-events",
+            ),
+            settings: settings.as_object().unwrap().clone(),
+            metrics: std::sync::Arc::new(m),
         }
     }
 
     #[test]
-    fn new_rejects_non_mssql_url() {
-        let cfg = make_config(HashMap::from([
-            ("connection".into(), "postgres://x/y".into()),
-            ("capture_instance".into(), "dbo_orders".into()),
-            ("schema".into(), "id:bigint".into()),
-        ]));
-        assert!(MssqlCdcSource::new(&cfg).is_err());
+    fn settings_validation() {
+        let ok = json!({"connection": "mssql://sa:pw@h/db", "capture_instance": "dbo_orders",
+                        "schema": "id:bigint, name:text", "key_columns": ["id"]});
+        assert!(MssqlCdcSource::new(&init(ok)).is_ok());
+        for bad in [
+            json!({"connection": "postgres://x/y", "capture_instance": "dbo_orders", "schema": "id:bigint"}),
+            json!({"connection": "mssql://sa:pw@h/db"}),
+            json!({"connection": "mssql://sa:pw@h/db", "capture_instance": "dbo_orders"}),
+            json!({"connection": "mssql://sa:pw@h/db", "capture_instance": "dbo; DROP TABLE x", "schema": "id:bigint"}),
+            json!({"connection": "mssql://sa:pw@h/db", "capture_instance": "c", "schema": "id:bigint", "key_columns": "nope"}),
+            json!({"connection": "mssql://sa:pw@h/db", "capture_instance": "c", "schema": "id:bigint", "tabel": "x"}),
+        ] {
+            assert!(MssqlCdcSource::new(&init(bad.clone())).is_err(), "{bad}");
+        }
     }
 
     #[test]
-    fn new_requires_capture_instance_and_schema() {
-        let cfg = make_config(HashMap::from([(
-            "connection".into(),
-            "mssql://sa:pw@h/db".into(),
-        )]));
-        assert!(MssqlCdcSource::new(&cfg).is_err());
-
-        let cfg = make_config(HashMap::from([
-            ("connection".into(), "mssql://sa:pw@h/db".into()),
-            ("capture_instance".into(), "dbo_orders".into()),
-        ]));
-        assert!(MssqlCdcSource::new(&cfg).is_err());
-    }
-
-    #[test]
-    fn new_accepts_valid() {
-        let cfg = make_config(HashMap::from([
-            ("connection".into(), "mssql://sa:pw@h/db".into()),
-            ("capture_instance".into(), "dbo_orders".into()),
-            ("schema".into(), "id:bigint, name:text".into()),
-        ]));
-        assert!(MssqlCdcSource::new(&cfg).is_ok());
-    }
-
-    #[test]
-    fn new_rejects_injection_in_capture_instance() {
-        let cfg = make_config(HashMap::from([
-            ("connection".into(), "mssql://sa:pw@h/db".into()),
-            ("capture_instance".into(), "dbo; DROP TABLE x".into()),
-            ("schema".into(), "id:bigint".into()),
-        ]));
-        assert!(MssqlCdcSource::new(&cfg).is_err());
-    }
-
-    #[test]
-    fn lsn_hex_roundtrip() {
+    fn cursor_roundtrip() {
         let lsn = vec![0x00, 0x00, 0x00, 0x2A, 0x00, 0x00, 0x07, 0xF8, 0x00, 0x03];
-        let hex = lsn_to_hex(&lsn);
-        assert_eq!(hex, "0000002A000007F80003");
-        assert_eq!(hex_to_lsn(&hex).unwrap(), lsn);
+        let from = Cursor::From(lsn.clone());
+        assert_eq!(from.encode(), "0000002A000007F80003");
+        assert_eq!(Cursor::parse(&from.encode()), Some(from));
+        let after = Cursor::After {
+            lsn: lsn.clone(),
+            seqval: vec![0, 1],
+        };
+        assert_eq!(after.encode(), "0000002A000007F80003:0001");
+        assert_eq!(Cursor::parse(&after.encode()), Some(after));
+        assert_eq!(Cursor::parse("ABC"), None);
+        assert_eq!(Cursor::parse("GG"), None);
+        assert_eq!(Cursor::parse(""), None);
     }
 
     #[test]
-    fn hex_to_lsn_rejects_bad_input() {
-        assert!(hex_to_lsn("ABC").is_none()); // odd length
-        assert!(hex_to_lsn("GG").is_none()); // non-hex
-    }
-
-    #[test]
-    fn op_label_cases() {
-        assert_eq!(op_label(1), "delete");
-        assert_eq!(op_label(2), "insert");
-        assert_eq!(op_label(3), "update_before");
-        assert_eq!(op_label(4), "update_after");
-        assert_eq!(op_label(99), "unknown");
+    fn fetch_sql_pages_with_seqval() {
+        let src = MssqlCdcSource::new(&init(json!({
+            "connection": "mssql://sa:pw@h/db", "capture_instance": "dbo_orders",
+            "schema": "id:bigint, at:timestamptz, doc:jsonb"
+        })))
+        .unwrap();
+        let sql = src.fetch_sql(10, true);
+        assert!(sql.starts_with("SELECT TOP (10) [__$start_lsn], [__$seqval], [__$operation]"));
+        assert!(sql.contains("CAST([id] AS BIGINT) AS [id]"));
+        assert!(sql.contains("CONVERT(NVARCHAR(40), [at], 127) AS [at]"));
+        assert!(sql.contains("fn_cdc_get_all_changes_dbo_orders](@P1, @P2, N'all')"));
+        assert!(sql.contains("[__$start_lsn] = @P3 AND [__$seqval] > @P4"));
+        assert!(!src.fetch_sql(10, false).contains("@P3"));
     }
 }

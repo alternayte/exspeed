@@ -66,15 +66,29 @@ pub struct Metrics {
     /// its DLQ stream). Labels: `connector`.
     pub connector_dlq_failures_total: Counter<u64>,
     /// Counts retry attempt outcomes on transient sink/source failures.
-    /// Labels: `connector`, `outcome` (`succeeded` | `exhausted`).
+    /// Labels: `connector`, `outcome` (`retried` | `exhausted`).
     pub connector_retry_attempts_total: Counter<u64>,
     /// Counts transient-exhaustion events and the action the manager took.
-    /// Labels: `connector`, `action` (`halt` | `halt_no_dlq` | `dlq_batch` |
-    /// `loop_forever` | `source_loop_forever`).
+    /// Labels: `connector`, `action` (`restart` | `fail` | `dlq_batch`).
     pub connector_transient_exhausted_total: Counter<u64>,
     /// Records a consumer gave up on after `max_deliver` attempts or a term.
     /// Labels: `consumer`, `outcome` (`dlq` | `dropped`).
     pub consumer_dead_letters_total: Counter<u64>,
+    /// Supervisor state per connector: 1 for the current state, 0 for the
+    /// others. Labels: `connector`, `state` (`starting` | `running` |
+    /// `backoff` | `failed` | `stopped`).
+    pub connector_state: Gauge<i64>,
+    /// Supervisor restarts (stop + start after a failure). Labels: `connector`.
+    pub connector_restarts_total: Counter<u64>,
+    /// Connector lag. Labels: `connector`, `unit` (`records` for sinks:
+    /// stream high watermark minus committed offset; `bytes` for Postgres
+    /// CDC/outbox: server WAL end minus the confirmed LSN).
+    pub connector_lag: Gauge<i64>,
+    /// Unix time (seconds) of the last successful batch. Labels: `connector`.
+    pub connector_last_success_timestamp_seconds: Gauge<f64>,
+    /// Records moved by a connector. Labels: `connector`, `direction`
+    /// (`in` = appended by a source, `out` = committed by a sink).
+    pub connector_records_total: Counter<u64>,
     /// Fill ratio (0.0–1.0) of the per-subscription delivery mpsc channel.
     /// Labeled by `consumer` and `subscriber`.
     pub subscription_queue_fill_ratio: Gauge<f64>,
@@ -343,6 +357,28 @@ impl Metrics {
             .with_description("Transient-exhaustion events and action taken")
             .build();
 
+        let connector_state = meter
+            .i64_gauge("exspeed_connector_state")
+            .with_description("Connector supervisor state (1 = current)")
+            .build();
+        let connector_restarts_total = meter
+            .u64_counter("exspeed_connector_restarts_total")
+            .with_description("Connector restarts by the supervisor")
+            .build();
+        let connector_lag = meter
+            .i64_gauge("exspeed_connector_lag")
+            .with_description("Connector lag (unit label: records, bytes or rows)")
+            .build();
+        let connector_last_success_timestamp_seconds = meter
+            .f64_gauge("exspeed_connector_last_success_timestamp_seconds")
+            .with_description("Unix time of the connector's last successful batch")
+            .build();
+        let connector_records_total = meter
+            .u64_counter("exspeed_connector_records_total")
+            .with_description("Records appended by sources (in) or committed by sinks (out)")
+            .build();
+        connector_restarts_total.add(0, &[KeyValue::new("connector", "__init__")]);
+
         connector_records_skipped_total.add(
             0,
             &[
@@ -378,7 +414,7 @@ impl Metrics {
             0,
             &[
                 KeyValue::new("connector", "__init__"),
-                KeyValue::new("outcome", "succeeded"),
+                KeyValue::new("outcome", "retried"),
             ],
         );
         connector_transient_exhausted_total.add(
@@ -416,6 +452,11 @@ impl Metrics {
             connector_retry_attempts_total,
             connector_transient_exhausted_total,
             consumer_dead_letters_total,
+            connector_state,
+            connector_restarts_total,
+            connector_lag,
+            connector_last_success_timestamp_seconds,
+            connector_records_total,
             subscription_queue_fill_ratio,
             dedup_map_entries,
             dedup_writes_total,

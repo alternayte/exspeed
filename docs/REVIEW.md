@@ -16,7 +16,7 @@
 | 2. Consumers + protocol v2 | 🚧 Done: protocol v2 ([protocol.md](protocol.md)) with a new session layer (handshake/idle timeouts, out-of-order replies, bounded waits, cleanup on every exit path); JetStream-style consumers in the broker (push with credits + pull, ack/nack/term/in-progress, ack timeout, backoff, max_deliver, DLQ, `max_ack_pending`, work sharing across connections and instances, immediate redelivery when a subscriber leaves), state in the compacted `__consumers` stream; old consumer stores and work coordinators removed; HTTP consumer CRUD + seek and `/records` browsing; `exspeed-client` Rust crate with a coalescing publisher; integration tests and the bench rewritten on it. In progress: TypeScript SDK v2. |
 | 3. Ops | — |
 | 4. ExQL v2 | — |
-| 5. Connectors v2 | — |
+| 5. Connectors v2 | ✅ checkpoint protocol, supervisor, typed settings, error taxonomy, log-backed offsets, plugin fixes; PG CDC/outbox/poll tested against Postgres in CI. RabbitMQ/S3/MySQL/MSSQL service tests still to do |
 | 6. HA | — |
 
 ## Contents
@@ -267,6 +267,10 @@ Severity: **C** critical · **H** high · **M** medium · **L** low.
 | Restart and state recovery | ❌ offsets only; state is lost |
 
 ### 3.6 Connectors (`exspeed-connectors`)
+
+> **Status (Phase 5):** every finding below is addressed; the current
+> per-connector guarantees and their tests are in
+> [connectors.md](connectors.md#delivery-guarantees).
 
 | Sev | Finding | Where |
 |-----|---------|-------|

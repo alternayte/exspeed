@@ -87,9 +87,7 @@ pub async fn make_state_with_leader(leader: bool) -> Arc<exspeed_api::AppState> 
         .dedup_ready
         .store(true, std::sync::atomic::Ordering::Release);
 
-    let oss = offset_store::from_env(tmp.path(), storage_dyn.clone())
-        .await
-        .expect("offset store");
+    let oss = offset_store::from_env(tmp.path(), broker.log.clone()).expect("offset store");
     let cm = Arc::new(ConnectorManager::new(
         storage_dyn.clone(),
         broker.log.clone(),

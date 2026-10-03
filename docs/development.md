@@ -62,8 +62,22 @@ docker compose up -d postgres rabbitmq minio mysql mssql
 | mysql | 3306 | `exspeed` / `exspeed` |
 | mssql (amd64 only) | 1433 | `sa` / `Exspeed_Test!1` |
 
-The database-backed tests **skip silently, and report as passing,** when
-their env var isn't set:
+**Connector framework and plugin tests** live in
+`crates/exspeed-connectors/tests/it/`: fake sources and sinks drive the
+checkpoint protocol and the supervisor (crashes between append and ack,
+flush failures, restarts, panics), an in-process HTTP server drives
+`http_poll`/`http_sink`, and `postgres_test` runs `postgres_cdc`,
+`postgres_outbox` and `postgres_poll` against a real Postgres. The Postgres
+tests are `#[ignore]`d; they skip without `EXSPEED_POSTGRES_URL`, and
+**fail** when `CI=true` is set without it:
+
+```bash
+EXSPEED_POSTGRES_URL="postgres://testuser:testpass@localhost:5432/testdb" \
+  cargo test -p exspeed-connectors --test it -- --include-ignored
+```
+
+The JDBC end-to-end tests in `crates/exspeed/tests/it/` still **skip
+silently, and report as passing,** when their env var isn't set:
 
 ```bash
 EXSPEED_POSTGRES_URL="postgres://testuser:testpass@localhost:5432/testdb" \

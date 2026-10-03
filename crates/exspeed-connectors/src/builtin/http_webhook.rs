@@ -1,174 +1,256 @@
-// HTTP webhook source is implemented as an axum handler, not a SourceConnector.
-// See exspeed-api/src/handlers/webhooks.rs for the handler.
-// This module provides the handle_webhook_post() function.
+//! `http_webhook`: a passive source served at `POST /webhooks/<path>` by the
+//! HTTP API. There is no task loop; each request is appended through the
+//! broker `Log` before the response is sent, so a 200 means the record is
+//! stored (at-least-once from the sender's point of view; effectively-once
+//! when the sender sets `Idempotency-Key`).
 
 use bytes::Bytes;
+use hmac::{Hmac, Mac};
+use serde::Deserialize;
+use sha2::Sha256;
 
-use crate::config::ConnectorConfig;
+use crate::registry::PluginInit;
+use crate::settings;
 use exspeed_broker::broker_append::{AppendResult, IDEMPOTENCY_HEADER};
 use exspeed_broker::log::{Log, LogError};
 use exspeed_common::StreamName;
 use exspeed_streams::record::Record;
 
+use crate::traits::ConnectorError;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookAuth {
+    /// No authentication. Must be chosen explicitly.
+    None,
+    /// `Authorization: Bearer <secret>` (constant-time compare).
+    Bearer,
+    /// HMAC-SHA256 of the raw body, hex-encoded, in `signature_header`
+    /// (optionally after `signature_prefix`, e.g. `sha256=`).
+    HmacSha256,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookSettings {
+    /// Served at `POST /webhooks/<path>`.
+    pub path: String,
+    /// Required: `none`, `bearer` or `hmac_sha256`.
+    pub auth_type: WebhookAuth,
+    #[serde(default)]
+    pub auth_secret: Option<String>,
+    #[serde(default = "default_signature_header")]
+    pub signature_header: String,
+    #[serde(default)]
+    pub signature_prefix: String,
+}
+
+fn default_signature_header() -> String {
+    "X-Signature-256".into()
+}
+
+/// A configured webhook, ready to serve requests.
+#[derive(Debug, Clone)]
+pub struct WebhookEndpoint {
+    pub connector: String,
+    pub stream: StreamName,
+    pub subject_template: String,
+    path: String,
+    settings: WebhookSettings,
+}
+
 /// Why a webhook POST was rejected.
 #[derive(Debug, thiserror::Error)]
 pub enum WebhookError {
-    #[error("unauthorized: invalid or missing bearer token")]
+    #[error("unauthorized: invalid or missing credentials")]
     Unauthorized,
-    #[error("webhook misconfigured: {0}")]
-    Config(String),
     #[error(transparent)]
     Log(#[from] LogError),
 }
 
-/// Handle an incoming HTTP webhook POST request.
-///
-/// Validates auth, extracts the subject from the request body using the
-/// connector's subject template, and appends the body through the broker
-/// write path. `idempotency_key` (from the sender's `Idempotency-Key`
-/// header) makes sender retries safe.
-///
-/// Returns the record's offset (the original offset for a duplicate).
-pub async fn handle_webhook_post(
-    log: &Log,
-    config: &ConnectorConfig,
-    body: Bytes,
-    auth_header: Option<&str>,
-    idempotency_key: Option<&str>,
-) -> Result<u64, WebhookError> {
-    // 1. Validate auth
-    let auth_type = config.setting_or("auth_type", "none");
-    match auth_type.as_str() {
-        "none" => {}
-        "bearer" => {
-            let secret = config
-                .setting("auth_secret")
-                .map_err(WebhookError::Config)?;
-            let expected = format!("Bearer {secret}");
-            let ok = auth_header.is_some_and(|v| {
-                constant_time_eq::constant_time_eq(v.as_bytes(), expected.as_bytes())
-            });
-            if !ok {
-                return Err(WebhookError::Unauthorized);
-            }
+impl WebhookEndpoint {
+    pub fn from_init(init: &PluginInit) -> Result<Self, ConnectorError> {
+        let s: WebhookSettings = settings::parse("http_webhook", &init.settings)?;
+        let path = normalize_path(&s.path);
+        if path.is_empty() {
+            return Err(ConnectorError::config(
+                "http_webhook: 'path' must not be empty",
+            ));
         }
-        other => {
-            return Err(WebhookError::Config(format!(
-                "unsupported auth_type: {other}"
+        if path.split('/').any(|seg| seg == ".." || seg.is_empty()) {
+            return Err(ConnectorError::config(format!(
+                "http_webhook: invalid path '{}'",
+                s.path
             )));
         }
+        match s.auth_type {
+            WebhookAuth::None => {}
+            WebhookAuth::Bearer | WebhookAuth::HmacSha256 => {
+                if s.auth_secret.as_deref().unwrap_or("").is_empty() {
+                    return Err(ConnectorError::config(
+                        "http_webhook: auth_secret is required for bearer and hmac_sha256",
+                    ));
+                }
+            }
+        }
+        let stream = StreamName::try_from(init.config.stream.as_str())
+            .map_err(|e| ConnectorError::config(format!("invalid stream name: {e}")))?;
+        Ok(Self {
+            connector: init.config.name.clone(),
+            stream,
+            subject_template: init.config.subject_template.clone(),
+            path,
+            settings: s,
+        })
     }
 
-    // 2. Extract subject from body using the template
-    let subject = extract_subject(&config.subject_template, &body);
-
-    // 3. Build the record
-    let mut headers = vec![
-        ("x-exspeed-source".to_string(), "http_webhook".to_string()),
-        ("x-exspeed-connector".to_string(), config.name.clone()),
-    ];
-    if let Some(key) = idempotency_key.filter(|k| !k.is_empty()) {
-        headers.push((IDEMPOTENCY_HEADER.to_string(), key.to_string()));
-    }
-    let record = Record {
-        key: None,
-        value: body,
-        subject,
-        headers,
-        timestamp_ns: None,
-    };
-
-    // 4. Resolve stream name and append
-    let stream = StreamName::try_from(config.stream.as_str())
-        .map_err(|e| WebhookError::Config(format!("invalid stream name: {e}")))?;
-
-    Ok(match log.append(&stream, record).await? {
-        AppendResult::Written(offset, _) | AppendResult::Duplicate(offset) => offset.0,
-    })
-}
-
-/// Interpolate `{$.field}` references in `template` from the top-level fields of a JSON object.
-///
-/// - If the template contains no `{$` sequences it is returned unchanged.
-/// - If the body is not valid JSON, the template is returned unchanged.
-/// - If a referenced field is absent the placeholder is replaced with `"unknown"`.
-fn extract_subject(template: &str, body: &Bytes) -> String {
-    // Fast path: no template variables present
-    if !template.contains("{$") {
-        return template.to_string();
+    /// Normalised path (no leading `/` or `webhooks/` prefix).
+    pub fn path(&self) -> &str {
+        &self.path
     }
 
-    // Try to parse the body as a JSON object
-    let json: serde_json::Value = match serde_json::from_slice(body) {
-        Ok(v) => v,
-        Err(_) => return template.to_string(),
-    };
-
-    let obj = match json.as_object() {
-        Some(o) => o,
-        None => return template.to_string(),
-    };
-
-    // Replace every `{$.field}` occurrence
-    let mut result = template.to_string();
-    // Collect all placeholders first to avoid mutating while iterating
-    let mut placeholders: Vec<(String, String)> = Vec::new();
-
-    let mut search_from = 0usize;
-    while let Some(rel_start) = result[search_from..].find("{$.") {
-        let start = search_from + rel_start;
-        if let Some(rel_end) = result[start..].find('}') {
-            let end = start + rel_end;
-            let placeholder = result[start..=end].to_string(); // e.g. "{$.type}"
-            let field_name = &result[start + 3..end]; // e.g. "type"
-            let value = obj
-                .get(field_name)
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            placeholders.push((placeholder, value));
-            search_from = end + 1;
-        } else {
-            break;
+    fn authorize(&self, body: &[u8], header: &(dyn Fn(&str) -> Option<String> + Sync)) -> bool {
+        let secret = self.settings.auth_secret.as_deref().unwrap_or("");
+        match self.settings.auth_type {
+            WebhookAuth::None => true,
+            WebhookAuth::Bearer => {
+                let expected = format!("Bearer {secret}");
+                header("authorization").is_some_and(|v| {
+                    constant_time_eq::constant_time_eq(v.as_bytes(), expected.as_bytes())
+                })
+            }
+            WebhookAuth::HmacSha256 => {
+                let Some(sig) = header(&self.settings.signature_header) else {
+                    return false;
+                };
+                let sig = sig.trim();
+                let Some(hex) = sig.strip_prefix(self.settings.signature_prefix.as_str()) else {
+                    return false;
+                };
+                let Some(given) = decode_hex(hex.trim()) else {
+                    return false;
+                };
+                let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+                    .expect("HMAC accepts any key length");
+                mac.update(body);
+                mac.verify_slice(&given).is_ok()
+            }
         }
     }
 
-    for (placeholder, value) in placeholders {
-        result = result.replacen(&placeholder, &value, 1);
+    /// Authenticate and append one request body. `header` looks up a
+    /// request header by (case-insensitive) name. Returns the record's
+    /// offset (the original offset for a duplicate `Idempotency-Key`).
+    pub async fn handle(
+        &self,
+        log: &Log,
+        body: Bytes,
+        header: &(dyn Fn(&str) -> Option<String> + Sync),
+    ) -> Result<u64, WebhookError> {
+        if !self.authorize(&body, header) {
+            return Err(WebhookError::Unauthorized);
+        }
+        let json: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
+        let subject = crate::subject::render(&self.subject_template, &[], json.as_ref());
+        let mut headers = vec![
+            ("x-exspeed-source".to_string(), "http_webhook".to_string()),
+            ("x-exspeed-connector".to_string(), self.connector.clone()),
+        ];
+        let idem = header("idempotency-key").or_else(|| header(IDEMPOTENCY_HEADER));
+        if let Some(key) = idem.filter(|k| !k.is_empty()) {
+            headers.push((IDEMPOTENCY_HEADER.to_string(), key));
+        }
+        let record = Record {
+            key: None,
+            value: body,
+            subject,
+            headers,
+            timestamp_ns: None,
+        };
+        Ok(match log.append(&self.stream, record).await? {
+            AppendResult::Written(offset, _) | AppendResult::Duplicate(offset) => offset.0,
+        })
     }
+}
 
-    result
+fn normalize_path(p: &str) -> String {
+    let p = p.trim().trim_matches('/');
+    p.strip_prefix("webhooks/")
+        .unwrap_or(p)
+        .trim_matches('/')
+        .to_string()
+}
+
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{ConnectorConfig, ConnectorType};
+    use serde_json::json;
 
-    fn body(s: &str) -> Bytes {
-        Bytes::from(s.to_string())
+    fn endpoint(settings: serde_json::Value) -> Result<WebhookEndpoint, ConnectorError> {
+        let (m, _) = exspeed_common::Metrics::new();
+        WebhookEndpoint::from_init(&PluginInit {
+            config: ConnectorConfig::new("w", ConnectorType::Source, "http_webhook", "events"),
+            settings: settings.as_object().unwrap().clone(),
+            metrics: std::sync::Arc::new(m),
+        })
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
     #[test]
-    fn extract_subject_literal() {
-        let result = extract_subject("webhook.received", &body(r#"{"type":"order"}"#));
-        assert_eq!(result, "webhook.received");
+    fn settings_validation() {
+        assert!(
+            endpoint(json!({"path": "x"})).is_err(),
+            "auth_type is required"
+        );
+        assert!(endpoint(json!({"path": "x", "auth_type": "bearer"})).is_err());
+        assert!(endpoint(json!({"path": "../x", "auth_type": "none"})).is_err());
+        assert!(endpoint(json!({"path": "x", "auth_type": "none", "auth": "x"})).is_err());
+        let e = endpoint(json!({"path": "/webhooks/stripe", "auth_type": "none"})).unwrap();
+        assert_eq!(e.path(), "stripe");
     }
 
     #[test]
-    fn extract_subject_from_json() {
-        let result = extract_subject("webhook.{$.type}", &body(r#"{"type":"order_created"}"#));
-        assert_eq!(result, "webhook.order_created");
+    fn bearer_auth() {
+        let e = endpoint(json!({"path": "x", "auth_type": "bearer", "auth_secret": "s3"})).unwrap();
+        assert!(e.authorize(b"{}", &|h| (h == "authorization")
+            .then(|| "Bearer s3".to_string())));
+        assert!(!e.authorize(b"{}", &|h| (h == "authorization")
+            .then(|| "Bearer no".to_string())));
+        assert!(!e.authorize(b"{}", &|_| None));
     }
 
     #[test]
-    fn extract_subject_missing_field() {
-        let result = extract_subject("webhook.{$.kind}", &body(r#"{"type":"order_created"}"#));
-        assert_eq!(result, "webhook.unknown");
-    }
-
-    #[test]
-    fn extract_subject_invalid_json() {
-        let result = extract_subject("webhook.{$.type}", &body("not json at all"));
-        assert_eq!(result, "webhook.{$.type}");
+    fn hmac_auth() {
+        let e = endpoint(json!({
+            "path": "x", "auth_type": "hmac_sha256", "auth_secret": "key",
+            "signature_header": "X-Hub-Signature-256", "signature_prefix": "sha256="
+        }))
+        .unwrap();
+        let body = br#"{"a":1}"#;
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"key").unwrap();
+        mac.update(body);
+        let good = format!("sha256={}", hex(&mac.finalize().into_bytes()));
+        let lookup = |v: String| move |h: &str| (h == "X-Hub-Signature-256").then(|| v.clone());
+        assert!(e.authorize(body, &lookup(good.clone())));
+        assert!(!e.authorize(b"tampered", &lookup(good.clone())));
+        assert!(!e.authorize(
+            body,
+            &lookup(good.trim_start_matches("sha256=").to_string())
+        ));
+        assert!(!e.authorize(body, &lookup("sha256=zz".into())));
     }
 }

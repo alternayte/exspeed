@@ -1,61 +1,43 @@
+//! Connector lifecycle: registration, provenance (file vs API), leadership,
+//! and one supervisor per connector (see [`crate::runtime`]).
+
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use tokio::sync::{oneshot, RwLock};
+use serde::Serialize;
+use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use exspeed_broker::leadership::ClusterLeadership;
-use exspeed_broker::log::{Log, LogError};
+use exspeed_broker::log::Log;
 use exspeed_common::metrics::Metrics;
-use exspeed_common::{Offset, StreamName};
-use exspeed_streams::record::Record;
+use exspeed_common::StreamName;
 use exspeed_streams::traits::StorageEngine;
-use exspeed_streams::StorageError;
 
-use crate::builtin;
-use crate::config::{ConnectorConfig, OnTransientExhausted};
-use crate::dlq::DlqWriter;
-use crate::retry::RetryPolicy;
-use crate::traits::{PoisonReason, SinkBatch, SinkRecord, WriteResult};
+use crate::builtin::http_webhook::WebhookEndpoint;
+use crate::config::{sanitized_name, ConnectorConfig, ConnectorType};
+use crate::offset_store::OffsetStore;
+use crate::registry::Registry;
+use crate::runtime::{self, RunContext, RunHandle};
+use crate::status::{ConnectorState, Status, StatusSnapshot};
 
-// ---------------------------------------------------------------------------
-// Status types
-// ---------------------------------------------------------------------------
+/// How long `stop` waits for a connector (final flush included).
+const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone)]
-pub enum ConnectorStatus {
-    Running,
-    Failed(String),
-    Stopped,
+/// Where a connector's definition lives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    /// Created through the HTTP API; persisted as JSON under
+    /// `{data_dir}/connectors/`.
+    Api,
+    /// Defined by `{data_dir}/connectors.d/<file>`; the file is the source
+    /// of truth and nothing is persisted.
+    File(String),
 }
-
-impl std::fmt::Display for ConnectorStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ConnectorStatus::Running => write!(f, "running"),
-            ConnectorStatus::Failed(msg) => write!(f, "failed: {msg}"),
-            ConnectorStatus::Stopped => write!(f, "stopped"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ConnectorInfo {
-    pub name: String,
-    pub connector_type: String,
-    pub plugin: String,
-    pub stream: String,
-    pub status: String,
-    pub uptime_secs: u64,
-}
-
-// ---------------------------------------------------------------------------
-// RunningConnector
-// ---------------------------------------------------------------------------
 
 /// A connector config file in `connectors.d/` and what it currently defines.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,33 +48,62 @@ pub struct TomlFile {
     pub hash: u64,
 }
 
-pub struct RunningConnector {
-    pub config: ConnectorConfig,
-    pub status: ConnectorStatus,
-    pub cancel_tx: Option<oneshot::Sender<()>>,
-    pub started_at: Instant,
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectorInfo {
+    pub name: String,
+    pub connector_type: String,
+    pub plugin: String,
+    pub stream: String,
+    /// `api` or `file`.
+    pub origin: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(flatten)]
+    pub state: StatusSnapshot,
 }
 
-// ---------------------------------------------------------------------------
-// ConnectorManager
-// ---------------------------------------------------------------------------
+#[derive(Debug, thiserror::Error)]
+pub enum ManagerError {
+    #[error("connector '{0}' not found")]
+    NotFound(String),
+    #[error("connector '{0}' already exists")]
+    AlreadyExists(String),
+    #[error("{0}")]
+    Invalid(String),
+    #[error("not the leader; connectors run on the leader")]
+    NotLeader,
+    #[error("connector '{name}' is defined by connectors.d/{file}; edit the file instead")]
+    FileManaged { name: String, file: String },
+    #[error("{0}")]
+    Internal(String),
+}
+
+struct Entry {
+    config: ConnectorConfig,
+    origin: Origin,
+    state: Arc<ConnectorState>,
+    handle: Option<RunHandle>,
+    /// Passive sources (webhooks): the parsed endpoint.
+    webhook: Option<Arc<WebhookEndpoint>>,
+}
 
 pub struct ConnectorManager {
     pub storage: Arc<dyn StorageEngine>,
-    /// The broker write path; every source record and DLQ write goes here.
+    /// The broker write path; every source record, DLQ write and offset goes here.
     pub log: Arc<Log>,
-    pub connectors: RwLock<HashMap<String, RunningConnector>>,
     pub data_dir: PathBuf,
     pub metrics: Arc<Metrics>,
-    pub offset_store: Arc<dyn crate::offset_store::OffsetStore>,
+    pub offset_store: Arc<dyn OffsetStore>,
     /// Connectors that came from `connectors.d/*.toml`, keyed by file name.
-    /// The file watcher only ever reconciles these; connectors created via
-    /// the HTTP API are never touched by it.
+    /// The file watcher only ever reconciles these.
     pub toml_files: RwLock<HashMap<String, TomlFile>>,
-    /// Cluster-leader lease wrapper. Used to check whether this pod is
-    /// currently the leader before starting connector tasks, and to obtain
-    /// the current leader `CancellationToken` for the spawned tasks.
     pub leadership: Arc<ClusterLeadership>,
+    registry: Registry,
+    entries: RwLock<HashMap<String, Entry>>,
+    /// Serialises lifecycle operations (create/update/delete/restart).
+    lifecycle: Mutex<()>,
+    /// Token of the current leader tenure while `run_all` is active.
+    tenure: std::sync::Mutex<Option<CancellationToken>>,
 }
 
 impl ConnectorManager {
@@ -101,19 +112,32 @@ impl ConnectorManager {
         log: Arc<Log>,
         data_dir: PathBuf,
         metrics: Arc<Metrics>,
-        offset_store: Arc<dyn crate::offset_store::OffsetStore>,
+        offset_store: Arc<dyn OffsetStore>,
         leadership: Arc<ClusterLeadership>,
     ) -> Self {
         Self {
             storage,
             log,
-            connectors: RwLock::new(HashMap::new()),
             data_dir,
             metrics,
             offset_store,
             toml_files: RwLock::new(HashMap::new()),
             leadership,
+            registry: Registry::builtin(),
+            entries: RwLock::new(HashMap::new()),
+            lifecycle: Mutex::new(()),
+            tenure: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Replace the plugin registry (tests register fake plugins).
+    pub fn with_registry(mut self, registry: Registry) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    pub fn registry(&self) -> &Registry {
+        &self.registry
     }
 
     /// Hash the contents of a file for change detection.
@@ -123,8 +147,6 @@ impl ConnectorManager {
         content.hash(&mut hasher);
         Some(hasher.finish())
     }
-
-    // -- path helpers -------------------------------------------------------
 
     fn configs_dir(&self) -> PathBuf {
         self.data_dir.join("connectors")
@@ -138,1171 +160,510 @@ impl ConnectorManager {
         self.data_dir.join("connectors.d")
     }
 
-    // -- public API ---------------------------------------------------------
+    // -- validation -----------------------------------------------------------
 
-    /// Create and start a new connector. Persists config to disk.
-    pub async fn create(&self, config: ConnectorConfig) -> Result<(), String> {
-        self.create_inner(config, true).await
+    /// Full validation with the plugin registry (typed settings included).
+    pub fn validate(&self, config: &ConnectorConfig, origin: &Origin) -> Result<(), ManagerError> {
+        self.registry
+            .validate(config, Self::resolves_env(origin), self.metrics.clone())
+            .map_err(|e| ManagerError::Invalid(e.to_string()))
     }
 
-    /// Create a connector defined by a `connectors.d/` file. The file stays
-    /// the source of truth, so nothing is persisted (in particular, secrets
-    /// resolved from `${VAR}` are never written to disk).
-    pub async fn create_from_file(&self, config: ConnectorConfig) -> Result<(), String> {
-        self.create_inner(config, false).await
+    /// `${VAR}` substitution applies only to file-defined connectors; API
+    /// callers can't read the server's environment.
+    fn resolves_env(origin: &Origin) -> bool {
+        matches!(origin, Origin::File(_))
+    }
+
+    fn check_collision(entries: &HashMap<String, Entry>, name: &str) -> Result<(), ManagerError> {
+        let sanitized = sanitized_name(name);
+        if let Some(other) = entries
+            .keys()
+            .find(|k| k.as_str() != name && sanitized_name(k) == sanitized)
+        {
+            return Err(ManagerError::Invalid(format!(
+                "connector name '{name}' collides with existing connector '{other}' \
+                 (both map to '{sanitized}' in external identifiers)"
+            )));
+        }
+        Ok(())
+    }
+
+    // -- public API -------------------------------------------------------------
+
+    /// Create a connector through the API: validate, persist, start.
+    pub async fn create(&self, config: ConnectorConfig) -> Result<(), ManagerError> {
+        let _g = self.lifecycle.lock().await;
+        self.validate(&config, &Origin::Api)?;
+        {
+            let entries = self.entries.read().await;
+            if entries.contains_key(&config.name) {
+                return Err(ManagerError::AlreadyExists(config.name.clone()));
+            }
+            Self::check_collision(&entries, &config.name)?;
+        }
+        config
+            .save_json(&self.config_path(&config.name))
+            .map_err(|e| ManagerError::Internal(format!("failed to save config: {e}")))?;
+        self.insert_and_start(config, Origin::Api).await;
+        Ok(())
+    }
+
+    /// Register (and start, on the leader) a connector defined by a
+    /// `connectors.d/` file. Nothing is persisted; secrets resolved from
+    /// `${VAR}` never reach disk. An invalid config is still registered, in
+    /// `failed` status with the validation error, so it is visible.
+    pub async fn create_from_file(
+        &self,
+        config: ConnectorConfig,
+        file_name: &str,
+    ) -> Result<(), ManagerError> {
+        let _g = self.lifecycle.lock().await;
+        {
+            let entries = self.entries.read().await;
+            if entries.contains_key(&config.name) {
+                return Err(ManagerError::AlreadyExists(config.name.clone()));
+            }
+            Self::check_collision(&entries, &config.name)?;
+        }
+        let origin = Origin::File(file_name.to_string());
+        let invalid = self.validate(&config, &origin).err();
+        self.insert_and_start(config, origin).await;
+        invalid.map_or(Ok(()), Err)
+    }
+
+    /// Replace an API-created connector's config (`PUT`), keeping its
+    /// offsets. File-defined connectors are read-only through the API.
+    pub async fn update(&self, config: ConnectorConfig) -> Result<(), ManagerError> {
+        {
+            let entries = self.entries.read().await;
+            match entries.get(&config.name) {
+                None => return Err(ManagerError::NotFound(config.name.clone())),
+                Some(Entry {
+                    origin: Origin::File(file),
+                    ..
+                }) => {
+                    return Err(ManagerError::FileManaged {
+                        name: config.name.clone(),
+                        file: file.clone(),
+                    })
+                }
+                Some(_) => {}
+            }
+        }
+        self.validate(&config, &Origin::Api)?;
+        self.update_config(config, Origin::Api).await
     }
 
     /// Replace a connector's config and restart it, keeping its offsets.
-    pub async fn update_config(&self, config: ConnectorConfig) -> Result<(), String> {
+    /// Creates it if it doesn't exist.
+    pub async fn update_config(
+        &self,
+        config: ConnectorConfig,
+        origin: Origin,
+    ) -> Result<(), ManagerError> {
+        let _g = self.lifecycle.lock().await;
         let name = config.name.clone();
-        let exists = self.connectors.read().await.contains_key(&name);
-        if !exists {
-            return self.create_from_file(config).await;
+        let old = self.take_handle(&name).await;
+        if let Some(h) = old {
+            h.stop(STOP_TIMEOUT).await;
         }
-        self.stop_connector(&name).await?;
-        self.connectors.write().await.remove(&name);
-        // Keep a REST-persisted copy in sync if one exists.
-        let json = self.config_path(&name);
-        if json.exists() {
-            config
-                .save_json(&json)
-                .map_err(|e| format!("failed to save config: {e}"))?;
-        }
-        if self.leadership.is_currently_leader() {
-            self.start_connector(config).await
-        } else {
-            self.register_stopped(config).await;
-            Ok(())
-        }
-    }
-
-    /// Record a config without starting it (followers, or before leadership).
-    async fn register_stopped(&self, config: ConnectorConfig) {
-        let mut map = self.connectors.write().await;
-        map.insert(
-            config.name.clone(),
-            RunningConnector {
-                config,
-                status: ConnectorStatus::Stopped,
-                cancel_tx: None,
-                started_at: Instant::now(),
-            },
-        );
-    }
-
-    async fn create_inner(&self, config: ConnectorConfig, persist: bool) -> Result<(), String> {
-        // Validate name
-        if config.name.is_empty() {
-            return Err("connector name cannot be empty".into());
-        }
-
-        // Check for duplicates
         {
-            let map = self.connectors.read().await;
-            if map.contains_key(&config.name) {
-                return Err(format!("connector '{}' already exists", config.name));
+            let entries = self.entries.read().await;
+            Self::check_collision(&entries, &name)?;
+        }
+        let invalid = self.validate(&config, &origin).err();
+        match &origin {
+            Origin::Api => {
+                if invalid.is_none() {
+                    config.save_json(&self.config_path(&name)).map_err(|e| {
+                        ManagerError::Internal(format!("failed to save config: {e}"))
+                    })?;
+                }
+            }
+            Origin::File(_) => {
+                // The file is now the definition; drop any API copy.
+                let _ = std::fs::remove_file(self.config_path(&name));
             }
         }
-
-        // Validate connector_type
-        if config.connector_type != "source" && config.connector_type != "sink" {
-            return Err(format!(
-                "invalid connector type '{}': must be 'source' or 'sink'",
-                config.connector_type
-            ));
-        }
-
-        // Validate stream name
-        let stream_name = StreamName::try_from(config.stream.as_str())
-            .map_err(|e| format!("invalid stream name: {e}"))?;
-
-        // Auto-create stream if it doesn't exist
-        self.ensure_stream_exists(&stream_name).await?;
-
-        // Persist config
-        if persist {
-            let dir = self.configs_dir();
-            std::fs::create_dir_all(&dir)
-                .map_err(|e| format!("failed to create configs dir: {e}"))?;
-            config
-                .save_json(&self.config_path(&config.name))
-                .map_err(|e| format!("failed to save config: {e}"))?;
-        }
-
-        // Start the connector (followers only register it; the leader
-        // supervisor starts everything on promotion).
-        if self.leadership.is_currently_leader() {
-            self.start_connector(config).await
-        } else {
-            self.register_stopped(config).await;
-            Ok(())
-        }
+        self.insert_and_start(config, origin).await;
+        invalid.map_or(Ok(()), Err)
     }
 
-    /// Stop and delete a connector, removing config and offset files.
-    pub async fn delete(&self, name: &str) -> Result<(), String> {
-        self.stop_connector(name).await?;
-
-        {
-            let mut map = self.connectors.write().await;
-            map.remove(name);
+    /// Stop and delete a connector, its persisted config and its offsets.
+    /// Plugin cleanup (e.g. `drop_slot_on_delete`) runs on the leader.
+    pub async fn delete(&self, name: &str) -> Result<(), ManagerError> {
+        let _g = self.lifecycle.lock().await;
+        let entry = {
+            let mut entries = self.entries.write().await;
+            entries
+                .remove(name)
+                .ok_or_else(|| ManagerError::NotFound(name.to_string()))?
+        };
+        if let Some(h) = &entry.handle {
+            h.stop(STOP_TIMEOUT).await;
         }
+        entry.state.set_status(Status::Stopped);
+        entry.state.retire();
 
-        // Remove config file
-        let config_path = self.config_path(name);
-        if config_path.exists() {
-            std::fs::remove_file(&config_path)
-                .map_err(|e| format!("failed to remove config file: {e}"))?;
+        let path = self.config_path(name);
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| {
+                ManagerError::Internal(format!("failed to remove config file: {e}"))
+            })?;
         }
-
-        // Remove offset
-        if let Err(e) = self.offset_store.delete(name).await {
-            warn!(connector = name, error = %e, "failed to delete offset");
+        if self.log.can_write() {
+            if let Err(e) = self.offset_store.delete(name).await {
+                warn!(connector = name, error = %e, "failed to delete offset");
+            }
+            self.cleanup_plugin(&entry).await;
         }
-
         info!(connector = name, "connector deleted");
         Ok(())
     }
 
-    /// Restart a connector: stop it, then start it again with the same config.
-    pub async fn restart(&self, name: &str) -> Result<(), String> {
-        let config = {
-            let map = self.connectors.read().await;
-            match map.get(name) {
-                Some(rc) => rc.config.clone(),
-                None => return Err(format!("connector '{name}' not found")),
-            }
-        };
-
-        self.stop_connector(name).await?;
-
+    async fn cleanup_plugin(&self, entry: &Entry) {
+        if entry.config.connector_type != ConnectorType::Source
+            || self.registry.is_passive(&entry.config.plugin)
         {
-            let mut map = self.connectors.write().await;
-            map.remove(name);
+            return;
         }
-
-        self.start_connector(config).await
+        let init = match self.registry.init(
+            &entry.config,
+            Self::resolves_env(&entry.origin),
+            self.metrics.clone(),
+        ) {
+            Ok(i) => i,
+            Err(_) => return,
+        };
+        if let Ok(mut source) = self.registry.create_source(&init) {
+            match tokio::time::timeout(Duration::from_secs(30), source.cleanup()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!(connector = %entry.config.name, error = %e, "connector cleanup failed")
+                }
+                Err(_) => warn!(connector = %entry.config.name, "connector cleanup timed out"),
+            }
+        }
     }
 
-    /// Get status info for a single connector.
+    /// Restart a connector (also brings a `failed` connector back).
+    pub async fn restart(&self, name: &str) -> Result<(), ManagerError> {
+        let _g = self.lifecycle.lock().await;
+        if !self.entries.read().await.contains_key(name) {
+            return Err(ManagerError::NotFound(name.to_string()));
+        }
+        if !self.leadership.is_currently_leader() {
+            return Err(ManagerError::NotLeader);
+        }
+        if let Some(h) = self.take_handle(name).await {
+            h.stop(STOP_TIMEOUT).await;
+        }
+        let token = self.leader_token().await;
+        self.start_entry(name, &token).await;
+        Ok(())
+    }
+
     pub async fn get_status(&self, name: &str) -> Option<ConnectorInfo> {
-        let map = self.connectors.read().await;
-        map.get(name).map(|rc| ConnectorInfo {
-            name: rc.config.name.clone(),
-            connector_type: rc.config.connector_type.clone(),
-            plugin: rc.config.plugin.clone(),
-            stream: rc.config.stream.clone(),
-            status: rc.status.to_string(),
-            uptime_secs: rc.started_at.elapsed().as_secs(),
-        })
+        let entries = self.entries.read().await;
+        entries.get(name).map(Self::info)
     }
 
-    /// List all connectors.
     pub async fn list(&self) -> Vec<ConnectorInfo> {
-        let map = self.connectors.read().await;
-        map.values()
-            .map(|rc| ConnectorInfo {
-                name: rc.config.name.clone(),
-                connector_type: rc.config.connector_type.clone(),
-                plugin: rc.config.plugin.clone(),
-                stream: rc.config.stream.clone(),
-                status: rc.status.to_string(),
-                uptime_secs: rc.started_at.elapsed().as_secs(),
-            })
-            .collect()
+        let entries = self.entries.read().await;
+        let mut v: Vec<_> = entries.values().map(Self::info).collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        v
     }
 
-    /// Load all persisted connector configs (REST JSON + TOML from connectors.d/).
-    /// Only parses and registers configs — does NOT start connector tasks.
-    /// Starting is handled by the leader supervisor via `run_all(token)`.
+    /// The config of a connector, as defined (unresolved).
+    pub async fn get_config(&self, name: &str) -> Option<ConnectorConfig> {
+        self.entries
+            .read()
+            .await
+            .get(name)
+            .map(|e| e.config.clone())
+    }
+
+    fn info(e: &Entry) -> ConnectorInfo {
+        ConnectorInfo {
+            name: e.config.name.clone(),
+            connector_type: e.config.connector_type.to_string(),
+            plugin: e.config.plugin.clone(),
+            stream: e.config.stream.clone(),
+            origin: match e.origin {
+                Origin::Api => "api",
+                Origin::File(_) => "file",
+            },
+            file: match &e.origin {
+                Origin::File(f) => Some(f.clone()),
+                Origin::Api => None,
+            },
+            state: e.state.snapshot(),
+        }
+    }
+
+    /// The webhook connector serving `path` (`/webhooks/<path>`), if any.
+    pub async fn find_webhook(&self, path: &str) -> Option<Arc<WebhookEndpoint>> {
+        let wanted = path.trim_matches('/');
+        let entries = self.entries.read().await;
+        entries
+            .values()
+            .filter_map(|e| e.webhook.clone())
+            .find(|w| w.path() == wanted)
+    }
+
+    /// Record a problem with a connector's definition file (e.g. the edited
+    /// file no longer parses; the previous config stays active).
+    pub async fn note_config_error(&self, name: &str, error: &str) {
+        if let Some(e) = self.entries.read().await.get(name) {
+            e.state.note_error(format!("config file: {error}"));
+        }
+    }
+
+    // -- startup / leadership -------------------------------------------------------
+
+    /// Load persisted API configs and `connectors.d/*.toml`. Registers
+    /// only; `run_all` starts them on the leader.
     pub async fn load_all(&self) -> Result<(), String> {
         self.load_json_configs().await?;
         self.load_toml_configs().await?;
         Ok(())
     }
 
-    /// Load TOML configs from connectors.d/ directory (config-only, no starting).
+    /// Load TOML configs from `connectors.d/` (register only).
     pub async fn load_toml_configs(&self) -> Result<(), String> {
         let dir = self.connectors_d_dir();
         if !dir.exists() {
             return Ok(());
         }
-
         let entries =
             std::fs::read_dir(&dir).map_err(|e| format!("failed to read connectors.d: {e}"))?;
-
-        for entry in entries {
-            let entry = entry.map_err(|e| format!("failed to read dir entry: {e}"))?;
+        for entry in entries.flatten() {
             let path = entry.path();
-
             if path.extension().and_then(|e| e.to_str()) != Some("toml") {
                 continue;
             }
-
+            let Some(file_name) = path.file_name().and_then(|n| n.to_str()).map(String::from)
+            else {
+                continue;
+            };
             match ConnectorConfig::load_toml(&path) {
-                Ok(mut config) => {
-                    config.resolve_env_vars();
-                    let connector_name = config.name.clone();
-                    info!(
-                        connector = config.name.as_str(),
-                        file = ?path,
-                        "loaded TOML connector config"
-                    );
-                    // The file is the source of truth: it replaces any
-                    // stale REST/JSON copy (older versions persisted TOML
-                    // configs, secrets included, to connectors/*.json).
-                    let stale_json = self.config_path(&connector_name);
-                    if stale_json.exists() {
-                        let _ = std::fs::remove_file(&stale_json);
+                Ok(config) => {
+                    let name = config.name.clone();
+                    // The file is the source of truth: it replaces any stale
+                    // API copy.
+                    let _ = std::fs::remove_file(self.config_path(&name));
+                    self.entries.write().await.remove(&name);
+                    if let Err(e) = self.register(config, Origin::File(file_name.clone())).await {
+                        warn!(file = ?path, error = %e, "connector config registered as failed");
                     }
-                    // Register config without starting (leader supervisor handles startup).
-                    self.register_stopped(config).await;
-                    // Record file hash for change detection.
-                    if let (Some(hash), Some(file_name)) = (
-                        Self::hash_file(&path),
-                        path.file_name().and_then(|n| n.to_str()),
-                    ) {
+                    if let Some(hash) = Self::hash_file(&path) {
                         self.toml_files.write().await.insert(
-                            file_name.to_string(),
+                            file_name,
                             TomlFile {
-                                connector_name,
+                                connector_name: name,
                                 hash,
                             },
                         );
                     }
                 }
-                Err(e) => {
-                    warn!(file = ?path, error = %e, "failed to parse TOML connector config");
-                }
+                Err(e) => warn!(file = ?path, error = %e, "failed to parse TOML connector config"),
             }
         }
-
         Ok(())
     }
 
-    // -- internal -----------------------------------------------------------
-
-    /// Load JSON configs from the connectors/ directory (configs created via REST).
-    /// Only registers configs — does NOT start connector tasks.
     async fn load_json_configs(&self) -> Result<(), String> {
         let dir = self.configs_dir();
         if !dir.exists() {
             return Ok(());
         }
-
         let entries =
             std::fs::read_dir(&dir).map_err(|e| format!("failed to read connectors dir: {e}"))?;
-
-        for entry in entries {
-            let entry = entry.map_err(|e| format!("failed to read dir entry: {e}"))?;
+        for entry in entries.flatten() {
             let path = entry.path();
-
-            // Skip non-JSON files
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-
-            // Skip offset files
-            let filename = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default();
-            if filename.ends_with(".offset.json") {
-                continue;
-            }
-
             match ConnectorConfig::load_json(&path) {
                 Ok(config) => {
-                    info!(
-                        connector = config.name.as_str(),
-                        file = ?path,
-                        "loaded JSON connector config"
-                    );
-                    // Register config without starting (leader supervisor handles startup).
-                    let name = config.name.clone();
-                    let mut map = self.connectors.write().await;
-                    map.entry(name).or_insert_with(|| RunningConnector {
-                        config,
-                        status: ConnectorStatus::Stopped,
-                        cancel_tx: None,
-                        started_at: Instant::now(),
-                    });
+                    if let Err(e) = self.register(config, Origin::Api).await {
+                        warn!(file = ?path, error = %e, "connector config registered as failed");
+                    }
                 }
-                Err(e) => {
-                    warn!(file = ?path, error = %e, "failed to parse connector config");
-                }
+                Err(e) => warn!(file = ?path, error = %e, "failed to parse connector config"),
             }
         }
-
         Ok(())
     }
 
-    /// Ensure a stream exists, creating it if necessary. Followers skip this:
-    /// only the leader writes, and the stream reaches followers by replication.
-    async fn ensure_stream_exists(&self, stream: &StreamName) -> Result<(), String> {
-        if !self.log.can_write() {
-            return Ok(());
+    /// Register without starting. Invalid configs are registered `failed`.
+    async fn register(&self, config: ConnectorConfig, origin: Origin) -> Result<(), ManagerError> {
+        let invalid = self.validate(&config, &origin).err();
+        let webhook = if invalid.is_none() {
+            self.webhook_for(&config, &origin)
+        } else {
+            None
+        };
+        let mut entries = self.entries.write().await;
+        // Keep an existing status object (restart count, history).
+        let state = entries
+            .get(&config.name)
+            .map(|e| e.state.clone())
+            .unwrap_or_else(|| ConnectorState::new(&config.name, self.metrics.clone()));
+        match &invalid {
+            Some(e) => state.set_error(Status::Failed, e.to_string()),
+            None => state.set_status(Status::Stopped),
         }
-        self.log
-            .ensure_stream(stream)
+        entries.insert(
+            config.name.clone(),
+            Entry {
+                config,
+                origin,
+                state,
+                handle: None,
+                webhook,
+            },
+        );
+        invalid.map_or(Ok(()), Err)
+    }
+
+    fn webhook_for(
+        &self,
+        config: &ConnectorConfig,
+        origin: &Origin,
+    ) -> Option<Arc<WebhookEndpoint>> {
+        if config.connector_type != ConnectorType::Source || config.plugin != "http_webhook" {
+            return None;
+        }
+        let init = self
+            .registry
+            .init(config, Self::resolves_env(origin), self.metrics.clone())
+            .ok()?;
+        WebhookEndpoint::from_init(&init).ok().map(Arc::new)
+    }
+
+    async fn insert_and_start(&self, config: ConnectorConfig, origin: Origin) {
+        let name = config.name.clone();
+        let valid = self.register(config, origin).await.is_ok();
+        if valid && self.leadership.is_currently_leader() {
+            let token = self.leader_token().await;
+            self.start_entry(&name, &token).await;
+        }
+    }
+
+    async fn leader_token(&self) -> CancellationToken {
+        let tenure = self.tenure.lock().unwrap().clone();
+        match tenure {
+            Some(t) => t,
+            None => self.leadership.current_child_token().await,
+        }
+    }
+
+    async fn take_handle(&self, name: &str) -> Option<RunHandle> {
+        self.entries
+            .write()
             .await
-            .map_err(|e| format!("failed to create stream: {e}"))
+            .get_mut(name)
+            .and_then(|e| e.handle.take())
     }
 
-    /// Start a connector based on its type (source or sink). Called from REST
-    /// API endpoints (POST /api/v1/connectors, restart, etc.) and the
-    /// file-watcher hot-reload path.
-    ///
-    /// If this pod is not the leader the call returns an error immediately —
-    /// the `leader_gate` middleware should have already returned 503 for REST
-    /// callers, but we check here as defence-in-depth.
-    pub async fn start_connector(&self, config: ConnectorConfig) -> Result<(), String> {
-        if !self.leadership.is_currently_leader() {
-            return Err("not leader; connector creation is handled by the leader".to_string());
+    /// Start one registered connector under `token`. A still-running
+    /// previous instance is stopped (and awaited) first.
+    async fn start_entry(&self, name: &str, token: &CancellationToken) {
+        if let Some(old) = self.take_handle(name).await {
+            old.stop(STOP_TIMEOUT).await;
         }
-        let token = self.leadership.current_child_token().await;
-        self.start_connector_under_token(config, token).await
-    }
-
-    /// Internal: dispatch by type but spawn under the provided token.
-    async fn start_connector_under_token(
-        &self,
-        config: ConnectorConfig,
-        token: CancellationToken,
-    ) -> Result<(), String> {
-        match config.connector_type.as_str() {
-            "source" => self.start_source_under_token(config, token).await,
-            "sink" => self.start_sink_under_token(config, token).await,
-            other => Err(format!("unknown connector type: {other}")),
+        let mut entries = self.entries.write().await;
+        let Some(entry) = entries.get_mut(name) else {
+            return;
+        };
+        let origin = entry.origin.clone();
+        if let Err(e) = self.validate(&entry.config, &origin) {
+            entry.state.set_error(Status::Failed, e.to_string());
+            return;
         }
+        if self.registry.is_passive(&entry.config.plugin) {
+            entry.webhook = self.webhook_for(&entry.config, &origin);
+            entry.state.set_status(Status::Running);
+            return;
+        }
+        let settings = match self.registry.init(
+            &entry.config,
+            Self::resolves_env(&origin),
+            self.metrics.clone(),
+        ) {
+            Ok(i) => i.settings,
+            Err(e) => {
+                entry.state.set_error(Status::Failed, e.to_string());
+                return;
+            }
+        };
+        if StreamName::try_from(entry.config.stream.as_str()).is_err() {
+            entry
+                .state
+                .set_error(Status::Failed, "invalid stream name".to_string());
+            return;
+        }
+        let ctx = Arc::new(RunContext {
+            config: entry.config.clone(),
+            settings,
+            log: self.log.clone(),
+            storage: self.storage.clone(),
+            offsets: self.offset_store.clone(),
+            metrics: self.metrics.clone(),
+            state: entry.state.clone(),
+            registry: self.registry.clone(),
+        });
+        entry.handle = Some(runtime::spawn(ctx, token));
+        info!(connector = name, "connector supervisor started");
     }
 
-    /// Start every loaded source + sink connector under `token`. Called
-    /// exactly once per leadership tenure by the leader supervisor in
-    /// `crates/exspeed/src/cli/server.rs`. Returns when `token.cancelled()`
-    /// fires — on demotion or shutdown.
-    ///
-    /// Callers should NOT call this method outside the leader supervisor;
-    /// if you need to start a single connector at create-time (e.g., the
-    /// `/api/v1/connectors` POST handler), use `start_connector` which
-    /// checks the current leadership state.
+    /// Start every registered connector under `token` (one leader tenure).
+    /// Returns after `token` is cancelled and every connector has stopped
+    /// (final sink flushes included).
     pub async fn run_all(&self, token: CancellationToken) {
-        // Snapshot the config list under read-lock so we don't hold it
-        // across await points that might try to take the write lock.
-        let configs: Vec<ConnectorConfig> = {
-            let conns = self.connectors.read().await;
-            conns.values().map(|rc| rc.config.clone()).collect()
-        };
-
-        for cfg in configs {
-            if let Err(e) = self.start_connector_under_token(cfg, token.clone()).await {
-                warn!(error = %e, "failed to start connector under leader supervisor");
-            }
+        *self.tenure.lock().unwrap() = Some(token.clone());
+        let names: Vec<String> = self.entries.read().await.keys().cloned().collect();
+        for name in names {
+            self.start_entry(&name, &token).await;
         }
-
         token.cancelled().await;
-        info!("connector manager leader tenure ended; connector tasks will drain");
+        info!("connector manager: leader tenure ended; stopping connectors");
+        *self.tenure.lock().unwrap() = None;
+        self.stop_all().await;
     }
 
-    /// Start a source connector under the given cancellation token.
-    async fn start_source_under_token(
-        &self,
-        config: ConnectorConfig,
-        token: CancellationToken,
-    ) -> Result<(), String> {
-        let name = config.name.clone();
+    /// Stop every connector and wait for them (graceful shutdown).
+    pub async fn shutdown(&self) {
+        *self.tenure.lock().unwrap() = None;
+        self.stop_all().await;
+    }
 
-        // HTTP webhook sources don't have a task loop — they're axum handlers
-        // driven by inbound HTTP requests.
-        if config.plugin == "http_webhook" {
-            let mut map = self.connectors.write().await;
-            map.insert(
-                name.clone(),
-                RunningConnector {
-                    config,
-                    status: ConnectorStatus::Running,
-                    cancel_tx: None,
-                    started_at: Instant::now(),
-                },
-            );
-            info!(
-                connector = name.as_str(),
-                "registered http_webhook source (no task loop)"
-            );
-            return Ok(());
-        }
-
-        // Create the source connector via plugin registry
-        let mut source = match builtin::create_source(&config.plugin, &config) {
-            Ok(s) => s,
-            Err(e) => {
-                return Err(format!("failed to create source: {e}"));
-            }
+    async fn stop_all(&self) {
+        let handles: Vec<(String, RunHandle, Arc<ConnectorState>)> = {
+            let mut entries = self.entries.write().await;
+            entries
+                .iter_mut()
+                .filter_map(|(n, e)| {
+                    if e.handle.is_none() && e.webhook.is_some() {
+                        e.state.set_status(Status::Stopped);
+                    }
+                    e.handle.take().map(|h| (n.clone(), h, e.state.clone()))
+                })
+                .collect()
         };
-
-        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-
-        // Derive a child token so that dropping cancel_tx (for manual stop /
-        // restart) doesn't disturb sibling connector tasks that share the
-        // parent token.
-        let child_token = token.child_token();
-
-        let log = self.log.clone();
-        let metrics = self.metrics.clone();
-        let offset_store = self.offset_store.clone();
-        let stream_str = config.stream.clone();
-        let batch_size = config.batch_size as usize;
-        let poll_interval = std::time::Duration::from_millis(config.poll_interval_ms);
-        let dedup_enabled = config.dedup_enabled;
-        let dedup_window_secs = config.dedup_window_secs;
-        let dedup_key_header = config.dedup_key.clone();
-        let transform_sql = config.transform_sql.clone();
-        let key_field = config.key_field.clone();
-        let task_name = name.clone();
-        let name_for_select = name.clone();
-        let source_retry_policy: RetryPolicy = config.retry.clone();
-        let source_cfg_for_dlq = config.clone();
-        let log_for_source_dlq = self.log.clone();
-
-        // Insert into map before spawning
-        {
-            let mut map = self.connectors.write().await;
-            map.insert(
-                name.clone(),
-                RunningConnector {
-                    config,
-                    status: ConnectorStatus::Running,
-                    cancel_tx: Some(cancel_tx),
-                    started_at: Instant::now(),
-                },
-            );
-        }
-
-        let log_name = name.clone();
-
-        // Spawn source task
-        tokio::spawn(async move {
-            let name = name_for_select;
-            let work = async move {
-                // Load last position
-                let last_pos = match offset_store.load_source_offset(&task_name).await {
-                    Ok(pos) => pos,
-                    Err(e) => {
-                        error!(connector = task_name.as_str(), error = %e, "failed to load offset");
-                        None
-                    }
-                };
-
-                // Start the source
-                if let Err(e) = source.start(last_pos).await {
-                    error!(connector = task_name.as_str(), error = %e, "source start failed");
-                    return;
-                }
-
-                // Build the DLQ writer (None if dlq_stream unset).
-                let source_dlq =
-                    match DlqWriter::from_config(log_for_source_dlq.clone(), &source_cfg_for_dlq) {
-                        Ok(w) => w,
-                        Err(e) => {
-                            error!(connector = task_name.as_str(), error = %e,
-                           "source DLQ writer init failed");
-                            None
-                        }
-                    };
-                if let Some(w) = &source_dlq {
-                    if let Err(e) = log_for_source_dlq.ensure_stream(w.stream()).await {
-                        error!(connector = task_name.as_str(), error = %e,
-                           "source DLQ stream auto-create failed");
-                    }
-                }
-
-                let stream_name = match StreamName::try_from(stream_str.as_str()) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!(connector = task_name.as_str(), error = %e, "invalid stream name");
-                        return;
-                    }
-                };
-
-                let mut dedup_cache = if dedup_enabled {
-                    Some(crate::dedup::DedupCache::new(dedup_window_secs))
-                } else {
-                    None
-                };
-                let mut dedup_counter = 0u64;
-
-                // Compile transform once before the loop
-                let transform = if !transform_sql.is_empty() {
-                    match crate::transform::Transform::compile(&transform_sql) {
-                        Ok(t) => Some(t),
-                        Err(e) => {
-                            error!(
-                                connector = task_name.as_str(),
-                                "transform compile failed: {e}"
-                            );
-                            return;
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                loop {
-                    // Poll for records with RetryPolicy for transient errors.
-                    let mut poll_attempt: u32 = 0;
-                    let batch = loop {
-                        match source.poll(batch_size).await {
-                            Ok(b) => break b,
-                            Err(e) => match source_retry_policy.delay_for(poll_attempt) {
-                                Some(d) => {
-                                    warn!(connector = task_name.as_str(),
-                                          attempt = poll_attempt, error = %e,
-                                          "source poll error; retrying");
-                                    tokio::time::sleep(d).await;
-                                    poll_attempt += 1;
-                                }
-                                None => {
-                                    error!(connector = task_name.as_str(), error = %e,
-                                           "source poll retries exhausted; looping with poll_interval");
-                                    metrics.connector_transient_exhausted_total.add(
-                                        1,
-                                        &[
-                                            opentelemetry::KeyValue::new(
-                                                "connector",
-                                                task_name.to_string(),
-                                            ),
-                                            opentelemetry::KeyValue::new(
-                                                "action",
-                                                "source_loop_forever",
-                                            ),
-                                        ],
-                                    );
-                                    tokio::time::sleep(poll_interval).await;
-                                    poll_attempt = 0;
-                                }
-                            },
-                        }
-                    };
-
-                    if batch.records.is_empty() {
-                        tokio::time::sleep(poll_interval).await;
-                        continue;
-                    }
-
-                    // Append each record to storage
-                    for record in &batch.records {
-                        // Dedup check
-                        if let Some(ref mut cache) = dedup_cache {
-                            let key = if !dedup_key_header.is_empty() {
-                                // Look up named header
-                                record
-                                    .headers
-                                    .iter()
-                                    .find(|(k, _)| k == &dedup_key_header)
-                                    .map(|(_, v)| v.clone())
-                            } else {
-                                // Use record key, or content hash fallback
-                                record
-                                    .key
-                                    .as_ref()
-                                    .map(|k| String::from_utf8_lossy(k).to_string())
-                            }
-                            .unwrap_or_else(|| {
-                                crate::dedup::DedupCache::content_hash(&record.value)
-                            });
-
-                            if !cache.check_and_insert(&key) {
-                                continue; // skip duplicate
-                            }
-
-                            // Periodic cleanup
-                            dedup_counter += 1;
-                            if dedup_counter.is_multiple_of(1000) {
-                                cache.cleanup();
-                            }
-                        }
-
-                        // Apply transform (filter + projection)
-                        let record = if let Some(ref t) = transform {
-                            match t.apply(record) {
-                                Some(r) => r,
-                                None => continue, // filtered out
-                            }
-                        } else {
-                            record.clone()
-                        };
-
-                        let extracted_key = if !key_field.is_empty() && record.key.is_none() {
-                            if let Ok(json) =
-                                serde_json::from_slice::<serde_json::Value>(&record.value)
-                            {
-                                json.get(&key_field).map(|v| match v {
-                                    serde_json::Value::String(s) => {
-                                        bytes::Bytes::from(s.clone().into_bytes())
-                                    }
-                                    other => bytes::Bytes::from(other.to_string().into_bytes()),
-                                })
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
-
-                        let storage_record = Record {
-                            key: record.key.clone().or(extracted_key),
-                            value: record.value.clone(),
-                            subject: record.subject.clone(),
-                            headers: record.headers.clone(),
-                            timestamp_ns: None,
-                        };
-
-                        // Transient append failures (disk full, dedup map full,
-                        // stream briefly missing) are retried: committing the
-                        // source position past a record that was never stored
-                        // would lose it. Only a key collision (same idempotency
-                        // key, different body) is treated as poison.
-                        let mut append_attempt: u32 = 0;
-                        let result = loop {
-                            match log.append(&stream_name, storage_record.clone()).await {
-                                Err(e)
-                                    if !matches!(
-                                        e,
-                                        LogError::InvalidRecord(_)
-                                            | LogError::Storage(StorageError::KeyCollision { .. })
-                                    ) =>
-                                {
-                                    let delay = source_retry_policy
-                                        .delay_for(append_attempt)
-                                        .unwrap_or(poll_interval.max(Duration::from_secs(1)));
-                                    warn!(connector = task_name.as_str(), attempt = append_attempt,
-                                          error = %e, "source append failed; retrying");
-                                    tokio::time::sleep(delay).await;
-                                    append_attempt = append_attempt.saturating_add(1);
-                                }
-                                other => break other,
-                            }
-                        };
-
-                        match result {
-                            Ok(exspeed_broker::broker_append::AppendResult::Written(..)) => {
-                                metrics.record_publish(stream_str.as_str());
-                            }
-                            Ok(exspeed_broker::broker_append::AppendResult::Duplicate(_)) => {
-                                // Silently skip — broker dedup caught it
-                            }
-                            Err(e) => {
-                                error!(
-                                    connector = task_name.as_str(),
-                                    error = %e,
-                                    "failed to append source record"
-                                );
-                                if let Some(dlq) = &source_dlq {
-                                    let reason = PoisonReason::SinkRejected {
-                                        detail: format!("source broker append failed: {e}"),
-                                    };
-                                    let sink_rec = SinkRecord {
-                                        offset: 0,
-                                        timestamp: 0,
-                                        subject: record.subject.clone(),
-                                        key: record.key.clone(),
-                                        value: record.value.clone(),
-                                        headers: record.headers.clone(),
-                                    };
-                                    if let Err(dlqerr) = dlq.write(&sink_rec, &reason).await {
-                                        error!(connector = task_name.as_str(),
-                                           error = %dlqerr,
-                                           "source DLQ write failed");
-                                        metrics.connector_dlq_failures_total.add(
-                                            1,
-                                            &[opentelemetry::KeyValue::new(
-                                                "connector",
-                                                task_name.to_string(),
-                                            )],
-                                        );
-                                    } else {
-                                        metrics.connector_dlq_total.add(
-                                            1,
-                                            &[
-                                                opentelemetry::KeyValue::new(
-                                                    "connector",
-                                                    task_name.to_string(),
-                                                ),
-                                                opentelemetry::KeyValue::new(
-                                                    "reason",
-                                                    reason.label(),
-                                                ),
-                                            ],
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Save offset and commit
-                    if let Some(ref pos) = batch.position {
-                        if let Err(e) = offset_store.save_source_offset(&task_name, pos).await {
-                            error!(connector = task_name.as_str(), error = %e, "failed to save offset");
-                        }
-                        if let Err(e) = source.commit(pos.clone()).await {
-                            error!(connector = task_name.as_str(), error = %e, "source commit failed");
-                        }
-                    }
-                }
-            }; // end of `work` async block
-
-            tokio::select! {
-                _ = work => {}
-                _ = child_token.cancelled() => {
-                    info!(connector = %name, "stopping source (leader token fired)");
-                }
-                _ = cancel_rx => {
-                    info!(connector = %name, "stopping source (manual cancel)");
-                }
+        let stops = handles.iter().map(|(name, h, _)| async move {
+            if !h.stop(STOP_TIMEOUT).await {
+                error!(connector = %name, "connector did not stop in time; aborted");
             }
         });
-
-        info!(connector = log_name.as_str(), "source connector started");
-        Ok(())
-    }
-
-    /// Start a sink connector under the given cancellation token.
-    async fn start_sink_under_token(
-        &self,
-        config: ConnectorConfig,
-        token: CancellationToken,
-    ) -> Result<(), String> {
-        let name = config.name.clone();
-
-        // Create the sink connector via plugin registry
-        let mut sink = match builtin::create_sink(&config.plugin, &config, self.metrics.clone()) {
-            Ok(s) => s,
-            Err(e) => {
-                return Err(format!("failed to create sink: {e}"));
+        futures_util::future::join_all(stops).await;
+        for (_, _, state) in handles {
+            if state.status() != Status::Failed {
+                state.set_status(Status::Stopped);
             }
-        };
-
-        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-
-        // Derive a child token so that dropping cancel_tx (for manual stop /
-        // restart) doesn't disturb sibling connector tasks that share the
-        // parent token.
-        let child_token = token.child_token();
-
-        let storage = self.storage.clone();
-        let metrics = self.metrics.clone();
-        let offset_store = self.offset_store.clone();
-        let stream_str = config.stream.clone();
-        let subject_filter = config.subject_filter.clone();
-        let batch_size = config.batch_size as usize;
-        let poll_interval = std::time::Duration::from_millis(config.poll_interval_ms);
-        let task_name = name.clone();
-        let name_for_select = name.clone();
-        let retry_policy: RetryPolicy = config.retry.clone();
-        let on_transient_exhausted: OnTransientExhausted = config.on_transient_exhausted;
-        let log_for_dlq = self.log.clone();
-        let cfg_for_dlq = config.clone();
-
-        // Insert into map before spawning
-        {
-            let mut map = self.connectors.write().await;
-            map.insert(
-                name.clone(),
-                RunningConnector {
-                    config,
-                    status: ConnectorStatus::Running,
-                    cancel_tx: Some(cancel_tx),
-                    started_at: Instant::now(),
-                },
-            );
-        }
-
-        let log_name = name.clone();
-
-        // Spawn sink task
-        tokio::spawn(async move {
-            let name = name_for_select;
-            let work = async move {
-                // Start the sink
-                if let Err(e) = sink.start().await {
-                    error!(connector = task_name.as_str(), error = %e, "sink start failed");
-                    return;
-                }
-
-                // Build the DLQ writer (None if dlq_stream unset).
-                let dlq_writer = match DlqWriter::from_config(log_for_dlq.clone(), &cfg_for_dlq) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        error!(connector = task_name.as_str(), error = %e,
-                           "DLQ writer init failed");
-                        return;
-                    }
-                };
-                if let Some(w) = &dlq_writer {
-                    if let Err(e) = log_for_dlq.ensure_stream(w.stream()).await {
-                        error!(connector = task_name.as_str(), error = %e,
-                           "DLQ stream auto-create failed");
-                        return;
-                    }
-                }
-
-                // Load last sink offset
-                let mut current_offset = match offset_store.load_sink_offset(&task_name).await {
-                    Ok(o) => o,
-                    Err(e) => {
-                        error!(connector = task_name.as_str(), error = %e, "failed to load sink offset");
-                        0
-                    }
-                };
-
-                let stream_name = match StreamName::try_from(stream_str.as_str()) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!(connector = task_name.as_str(), error = %e, "invalid stream name");
-                        return;
-                    }
-                };
-
-                loop {
-                    // Read records from storage
-                    let stored_records = match storage
-                        .read(&stream_name, Offset(current_offset), batch_size)
-                        .await
-                    {
-                        Ok(recs) => recs,
-                        Err(e) => {
-                            error!(connector = task_name.as_str(), error = %e, "failed to read from storage");
-                            tokio::time::sleep(poll_interval).await;
-                            continue;
-                        }
-                    };
-
-                    if stored_records.is_empty() {
-                        tokio::time::sleep(poll_interval).await;
-                        continue;
-                    }
-
-                    // Compute the offset to advance to: past all records we read,
-                    // regardless of subject filtering.
-                    let new_offset = stored_records
-                        .last()
-                        .map(|r| r.offset.0 + 1)
-                        .unwrap_or(current_offset);
-
-                    // Filter by subject if pattern is set
-                    let filtered: Vec<_> = stored_records
-                        .into_iter()
-                        .filter(|r| {
-                            exspeed_common::subject::subject_matches(&r.subject, &subject_filter)
-                        })
-                        .collect();
-
-                    if filtered.is_empty() {
-                        current_offset = new_offset;
-                        if let Err(e) = offset_store
-                            .save_sink_offset(&task_name, current_offset)
-                            .await
-                        {
-                            error!(connector = task_name.as_str(), error = %e, "failed to save sink offset");
-                        }
-                        continue;
-                    }
-
-                    // Convert to SinkRecords
-                    let sink_records: Vec<SinkRecord> = filtered
-                        .iter()
-                        .map(|r| SinkRecord {
-                            offset: r.offset.0,
-                            timestamp: r.timestamp,
-                            subject: r.subject.clone(),
-                            key: r.key.clone(),
-                            value: r.value.clone(),
-                            headers: r.headers.clone(),
-                        })
-                        .collect();
-
-                    // Inner retry loop. Rebuilds the batch each attempt.
-                    let mut attempt: u32 = 0;
-                    'retry: loop {
-                        let batch = SinkBatch {
-                            records: sink_records.clone(),
-                        };
-                        match sink.write(batch).await {
-                            Ok(WriteResult::AllSuccess) => {
-                                metrics.record_consume(&stream_str, &task_name);
-                                current_offset = new_offset;
-                                break 'retry;
-                            }
-                            Ok(WriteResult::PartialSuccess {
-                                last_successful_offset,
-                            }) => {
-                                warn!(
-                                    connector = task_name.as_str(),
-                                    last_offset = last_successful_offset,
-                                    "partial write success"
-                                );
-                                current_offset = last_successful_offset + 1;
-                                break 'retry;
-                            }
-                            Ok(WriteResult::Poison {
-                                poison_offset,
-                                reason,
-                                record,
-                                ..
-                            }) => {
-                                match &dlq_writer {
-                                    Some(dlq) => match dlq.write(&record, &reason).await {
-                                        Ok(()) => {
-                                            metrics.connector_dlq_total.add(
-                                                1,
-                                                &[
-                                                    opentelemetry::KeyValue::new(
-                                                        "connector",
-                                                        task_name.to_string(),
-                                                    ),
-                                                    opentelemetry::KeyValue::new(
-                                                        "reason",
-                                                        reason.label(),
-                                                    ),
-                                                ],
-                                            );
-                                        }
-                                        Err(e) => {
-                                            error!(connector = task_name.as_str(),
-                                                   error = %e,
-                                                   "DLQ write failed; advancing anyway");
-                                            metrics.connector_dlq_failures_total.add(
-                                                1,
-                                                &[opentelemetry::KeyValue::new(
-                                                    "connector",
-                                                    task_name.to_string(),
-                                                )],
-                                            );
-                                        }
-                                    },
-                                    None => {
-                                        metrics.connector_records_skipped_total.add(
-                                            1,
-                                            &[
-                                                opentelemetry::KeyValue::new(
-                                                    "connector",
-                                                    task_name.to_string(),
-                                                ),
-                                                opentelemetry::KeyValue::new(
-                                                    "stream",
-                                                    stream_str.clone(),
-                                                ),
-                                                opentelemetry::KeyValue::new(
-                                                    "reason",
-                                                    reason.label(),
-                                                ),
-                                            ],
-                                        );
-                                    }
-                                }
-                                current_offset = poison_offset + 1;
-                                break 'retry;
-                            }
-                            Ok(WriteResult::TransientFailure { error, .. }) => {
-                                match retry_policy.delay_for(attempt) {
-                                    Some(d) => {
-                                        warn!(connector = task_name.as_str(),
-                                          attempt, backoff_ms = d.as_millis() as u64,
-                                          error = %error,
-                                          "transient failure; retrying");
-                                        tokio::time::sleep(d).await;
-                                        attempt += 1;
-                                        continue 'retry;
-                                    }
-                                    None => {
-                                        metrics.connector_retry_attempts_total.add(
-                                            1,
-                                            &[
-                                                opentelemetry::KeyValue::new(
-                                                    "connector",
-                                                    task_name.to_string(),
-                                                ),
-                                                opentelemetry::KeyValue::new(
-                                                    "outcome",
-                                                    "exhausted",
-                                                ),
-                                            ],
-                                        );
-                                        match on_transient_exhausted {
-                                            OnTransientExhausted::Halt => {
-                                                error!(connector = task_name.as_str(),
-                                                   error = %error,
-                                                   "transient retries exhausted; halting");
-                                                metrics.connector_transient_exhausted_total.add(
-                                                    1,
-                                                    &[
-                                                        opentelemetry::KeyValue::new(
-                                                            "connector",
-                                                            task_name.to_string(),
-                                                        ),
-                                                        opentelemetry::KeyValue::new(
-                                                            "action", "halt",
-                                                        ),
-                                                    ],
-                                                );
-                                                return;
-                                            }
-                                            OnTransientExhausted::DlqBatch
-                                                if dlq_writer.is_some() =>
-                                            {
-                                                let dlq = dlq_writer.as_ref().unwrap();
-                                                for rec in &sink_records {
-                                                    let reason = PoisonReason::SinkRejected {
-                                                        detail: format!(
-                                                            "transient-retry-exhausted: {error}"
-                                                        ),
-                                                    };
-                                                    if let Err(e) = dlq.write(rec, &reason).await {
-                                                        error!(connector = task_name.as_str(),
-                                                           error = %e,
-                                                           "dlq_batch write failed");
-                                                        metrics.connector_dlq_failures_total.add(
-                                                            1,
-                                                            &[opentelemetry::KeyValue::new(
-                                                                "connector",
-                                                                task_name.to_string(),
-                                                            )],
-                                                        );
-                                                    } else {
-                                                        metrics.connector_dlq_total.add(
-                                                            1,
-                                                            &[
-                                                                opentelemetry::KeyValue::new(
-                                                                    "connector",
-                                                                    task_name.to_string(),
-                                                                ),
-                                                                opentelemetry::KeyValue::new(
-                                                                    "reason",
-                                                                    "sink_rejected",
-                                                                ),
-                                                            ],
-                                                        );
-                                                    }
-                                                }
-                                                metrics.connector_transient_exhausted_total.add(
-                                                    1,
-                                                    &[
-                                                        opentelemetry::KeyValue::new(
-                                                            "connector",
-                                                            task_name.to_string(),
-                                                        ),
-                                                        opentelemetry::KeyValue::new(
-                                                            "action",
-                                                            "dlq_batch",
-                                                        ),
-                                                    ],
-                                                );
-                                                current_offset = new_offset;
-                                                break 'retry;
-                                            }
-                                            OnTransientExhausted::DlqBatch => {
-                                                error!(connector = task_name.as_str(),
-                                                   "dlq_batch requested but dlq_stream unset; halting");
-                                                metrics.connector_transient_exhausted_total.add(
-                                                    1,
-                                                    &[
-                                                        opentelemetry::KeyValue::new(
-                                                            "connector",
-                                                            task_name.to_string(),
-                                                        ),
-                                                        opentelemetry::KeyValue::new(
-                                                            "action",
-                                                            "halt_no_dlq",
-                                                        ),
-                                                    ],
-                                                );
-                                                return;
-                                            }
-                                            OnTransientExhausted::LoopForever => {
-                                                warn!(connector = task_name.as_str(),
-                                                  error = %error,
-                                                  "transient retries exhausted; looping");
-                                                metrics.connector_transient_exhausted_total.add(
-                                                    1,
-                                                    &[
-                                                        opentelemetry::KeyValue::new(
-                                                            "connector",
-                                                            task_name.to_string(),
-                                                        ),
-                                                        opentelemetry::KeyValue::new(
-                                                            "action",
-                                                            "loop_forever",
-                                                        ),
-                                                    ],
-                                                );
-                                                tokio::time::sleep(poll_interval).await;
-                                                attempt = 0;
-                                                continue 'retry;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!(connector = task_name.as_str(),
-                                   error = %e, "sink write ConnectorError");
-                                match retry_policy.delay_for(attempt) {
-                                    Some(d) => {
-                                        tokio::time::sleep(d).await;
-                                        attempt += 1;
-                                        continue 'retry;
-                                    }
-                                    None => {
-                                        error!(connector = task_name.as_str(),
-                                           error = %e,
-                                           "ConnectorError retries exhausted; halting");
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                    } // end 'retry
-
-                    // Persist sink offset after each successful inner-loop exit.
-                    if let Err(e) = offset_store
-                        .save_sink_offset(&task_name, current_offset)
-                        .await
-                    {
-                        error!(connector = task_name.as_str(), error = %e,
-                           "failed to save sink offset");
-                    }
-                }
-            }; // end of `work` async block
-
-            tokio::select! {
-                _ = work => {}
-                _ = child_token.cancelled() => {
-                    info!(connector = %name, "stopping sink (leader token fired)");
-                }
-                _ = cancel_rx => {
-                    info!(connector = %name, "stopping sink (manual cancel)");
-                }
-            }
-        });
-
-        info!(connector = log_name.as_str(), "sink connector started");
-        Ok(())
-    }
-
-    /// Stop a connector by sending a cancel signal.
-    async fn stop_connector(&self, name: &str) -> Result<(), String> {
-        let mut map = self.connectors.write().await;
-        match map.get_mut(name) {
-            Some(rc) => {
-                if let Some(tx) = rc.cancel_tx.take() {
-                    let _ = tx.send(());
-                }
-                rc.status = ConnectorStatus::Stopped;
-                info!(connector = name, "connector stopped");
-                Ok(())
-            }
-            None => Err(format!("connector '{name}' not found")),
         }
     }
 }

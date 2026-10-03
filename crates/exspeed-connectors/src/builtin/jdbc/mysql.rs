@@ -9,6 +9,9 @@ impl Dialect for MysqlDialect {
     fn placeholder(&self, _n: usize) -> String {
         "?".to_string()
     }
+    fn max_params(&self) -> usize {
+        32767
+    }
     fn json_blob_type(&self) -> &'static str {
         "JSON"
     }

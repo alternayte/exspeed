@@ -108,11 +108,12 @@ Errors are returned in this form:
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/v1/connectors` | List connectors and their status |
-| `POST` | `/api/v1/connectors` | Create a connector (JSON form of the TOML config; see [connectors.md](connectors.md#http-api)) |
-| `GET` | `/api/v1/connectors/{name}` | Status of one connector |
-| `DELETE` | `/api/v1/connectors/{name}` | Stop the connector and delete it, including its offsets |
-| `POST` | `/api/v1/connectors/{name}/restart` | Restart a connector |
+| `GET` | `/api/v1/connectors` | List connectors with `status`, `last_error`, `restart_count`, `lag`, `last_success_ms`, `checkpoint` ([fields](connectors.md#status-restarts-and-metrics)) |
+| `POST` | `/api/v1/connectors` | Create a connector (JSON form of the TOML config; see [connectors.md](connectors.md#http-api)). `400` invalid, `409` exists or collides |
+| `GET` | `/api/v1/connectors/{name}` | Status of one connector, plus its `config` (`${VAR}` unresolved) |
+| `PUT` | `/api/v1/connectors/{name}` | Replace an API-created connector's config and restart it; offsets are kept. `409` for file-defined connectors |
+| `DELETE` | `/api/v1/connectors/{name}` | Stop the connector and delete it, including its offsets (and its replication slot with `drop_slot_on_delete`) |
+| `POST` | `/api/v1/connectors/{name}/restart` | Restart a connector; also revives a `failed` one. `503` on a non-leader |
 
 ### External database connections
 
@@ -134,7 +135,7 @@ Errors are returned in this form:
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/webhooks/{path}` | Ingest the request body through a matching `http_webhook` connector. Returns `{"offset": N}`. |
+| `POST` | `/webhooks/{path}` | Ingest the request body through a matching `http_webhook` connector. Returns `{"offset": N}` once stored; `401`, `409` (idempotency key reused with another body), `503` (not leader). |
 
 ## TCP protocol
 

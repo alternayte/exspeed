@@ -54,44 +54,31 @@ marks the stream failed (read-only until restart).
 
 ### Multi-pod coordination
 
-Single-node defaults are file-based. See [high-availability.md](high-availability.md).
+Single node needs none of these. See [high-availability.md](high-availability.md).
 
 **Backend selection:**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `EXSPEED_LEASE_BACKEND` | none | `postgres` or `redis` turns on multi-pod mode: one pod holds the cluster lease and serves writes, the others follow. Unset = single node. (`EXSPEED_CONSUMER_STORE` is accepted as a deprecated alias.) |
-| `EXSPEED_OFFSET_STORE` | `file` | Where connector offsets are stored (`file`, `postgres`, `redis`, `s3`, `stream`) |
+| `EXSPEED_CONNECTOR_OFFSET_STORE` | `log` | Where connector offsets are stored: `log` (the internal `__connector_offsets` stream; replicates with the data) or `file` (`<data-dir>/connector-offsets/`). See [connectors.md](connectors.md#offsets). |
 
-Consumer state needs no backend: it lives in the internal `__consumers`
-stream.
+Consumer state needs no backend either: it lives in the internal
+`__consumers` stream.
 
 **Postgres:**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `EXSPEED_OFFSET_STORE_POSTGRES_URL` | — | Postgres URL, used by the Postgres lease and offset store |
+| `EXSPEED_OFFSET_STORE_POSTGRES_URL` | — | Postgres URL for the Postgres lease backend |
 | `EXSPEED_OFFSET_STORE_POSTGRES_SCHEMA` | `public` | |
-| `EXSPEED_OFFSET_STORE_POSTGRES_TABLE` | `exspeed_offsets` | Connector offset table |
 
 **Redis:**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `EXSPEED_OFFSET_STORE_REDIS_URL` | — | Redis URL, used by the Redis lease and offset store |
-| `EXSPEED_OFFSET_STORE_REDIS_KEY_PREFIX` | `exspeed:offsets:` | |
+| `EXSPEED_OFFSET_STORE_REDIS_URL` | — | Redis URL for the Redis lease backend |
 | `EXSPEED_LEASE_REDIS_KEY_PREFIX` | `exspeed:lease:` | |
-
-**S3 (connector offsets):**
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `EXSPEED_OFFSET_STORE_S3_BUCKET` | — | |
-| `EXSPEED_OFFSET_STORE_S3_REGION` | `us-east-1` | |
-| `EXSPEED_OFFSET_STORE_S3_ENDPOINT` | — | |
-| `EXSPEED_OFFSET_STORE_S3_ACCESS_KEY` | — | |
-| `EXSPEED_OFFSET_STORE_S3_SECRET_KEY` | — | |
-| `EXSPEED_OFFSET_STORE_S3_PREFIX` | `exspeed/offsets/` | |
 
 **Lease and replication:**
 

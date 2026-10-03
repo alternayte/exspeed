@@ -30,7 +30,7 @@ impl DialectKind {
         } else if lower.starts_with("sqlite:") {
             Ok(Self::Sqlite)
         } else {
-            Err(ConnectorError::Config(format!(
+            Err(ConnectorError::config(format!(
                 "jdbc sink: unsupported connection URL scheme; expected postgres://, mysql://, mssql://, or sqlite:, got: {}",
                 url.split("://").next().unwrap_or(url)
             )))
@@ -95,6 +95,50 @@ pub trait Dialect: Send + Sync {
     /// TIMESTAMPTZ, …). `types[i]` is the column type for placeholder `i+1`.
     fn cast_placeholders(&self, sql: String, _types: &[JsonType]) -> String {
         sql
+    }
+
+    /// Most bind parameters one statement may carry.
+    fn max_params(&self) -> usize;
+
+    /// `(p1, ..., pn), (pn+1, ..., p2n), ...` for `rows` rows of `ncols`.
+    fn row_placeholders(&self, ncols: usize, rows: usize) -> String {
+        (0..rows)
+            .map(|r| {
+                let ps: Vec<String> = (0..ncols)
+                    .map(|c| self.placeholder(r * ncols + c + 1))
+                    .collect();
+                format!("({})", ps.join(", "))
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Multi-row form of [`Dialect::insert_sql`].
+    fn insert_rows_sql(&self, table: &str, cols: &[&str], rows: usize) -> String {
+        splice_rows(self, self.insert_sql(table, cols), cols.len(), rows)
+    }
+
+    /// Multi-row form of [`Dialect::upsert_sql`]. Callers must not repeat a
+    /// key within one statement.
+    fn upsert_rows_sql(&self, table: &str, cols: &[&str], keys: &[&str], rows: usize) -> String {
+        splice_rows(self, self.upsert_sql(table, cols, keys), cols.len(), rows)
+    }
+}
+
+/// Replace the single-row `VALUES` placeholder group with `rows` groups.
+fn splice_rows<D: Dialect + ?Sized>(d: &D, sql: String, ncols: usize, rows: usize) -> String {
+    if rows <= 1 {
+        return sql;
+    }
+    let single = d.row_placeholders(ncols, 1);
+    match sql.find(&single) {
+        Some(pos) => format!(
+            "{}{}{}",
+            &sql[..pos],
+            d.row_placeholders(ncols, rows),
+            &sql[pos + single.len()..]
+        ),
+        None => sql,
     }
 }
 
@@ -162,6 +206,28 @@ mod tests {
             DialectKind::from_url("MSSQL://u:p@h/d").unwrap(),
             DialectKind::Mssql
         );
+    }
+
+    #[test]
+    fn multi_row_sql_per_dialect() {
+        let pg = dialect_for(DialectKind::Postgres);
+        let sql = pg.upsert_rows_sql("t", &["id", "v"], &["id"], 3);
+        assert!(
+            sql.contains("VALUES ($1, $2), ($3, $4), ($5, $6) ON CONFLICT"),
+            "{sql}"
+        );
+        let my = dialect_for(DialectKind::MySql);
+        let sql = my.insert_rows_sql("t", &["a"], 2);
+        assert_eq!(sql, "INSERT INTO `t` (`a`) VALUES (?), (?)");
+        let ms = dialect_for(DialectKind::Mssql);
+        let sql = ms.upsert_rows_sql("t", &["id", "v"], &["id"], 2);
+        assert!(
+            sql.contains("USING (VALUES (@P1, @P2), (@P3, @P4)) AS s"),
+            "{sql}"
+        );
+        let lite = dialect_for(DialectKind::Sqlite);
+        let sql = lite.upsert_rows_sql("t", &["id", "v"], &["id"], 2);
+        assert!(sql.contains("VALUES (?, ?), (?, ?) ON CONFLICT"), "{sql}");
     }
 
     #[test]
