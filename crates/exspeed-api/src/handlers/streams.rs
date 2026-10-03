@@ -537,7 +537,7 @@ pub async fn delete_stream(
 
         let cascaded_queries = blockers.queries.clone();
         for id in &cascaded_queries {
-            if let Err(e) = state.exql.remove_query(id) {
+            if let Err(e) = state.exql.drop_query(id).await {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({"error": format!("cascade: failed to remove query '{id}': {e}")})),
@@ -634,11 +634,7 @@ async fn collect_blockers(state: &Arc<AppState>, stream: &str) -> Blockers {
         }
     }
 
-    for q in state.exql.list_queries() {
-        if q.target_stream == stream {
-            b.queries.push(q.id);
-        }
-    }
+    b.queries.extend(state.exql.queries_referencing(stream));
 
     b
 }

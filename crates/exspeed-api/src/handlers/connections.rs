@@ -38,13 +38,13 @@ pub async fn create_connection(
         url: body.url,
     };
 
-    match state.exql.connection_registry.add(config) {
+    match state.exql.add_connection(config) {
         Ok(()) => (
             StatusCode::CREATED,
             Json(json!({"name": body.name, "driver": body.driver, "status": "created"})),
         )
             .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+        Err(e) => super::queries::exql_error(&e),
     }
 }
 
@@ -62,8 +62,7 @@ pub async fn list_connections(
     }
     let connections: Vec<serde_json::Value> = state
         .exql
-        .connection_registry
-        .list()
+        .list_connections()
         .into_iter()
         .map(|(name, driver)| json!({"name": name, "driver": driver}))
         .collect();
@@ -84,12 +83,12 @@ pub async fn delete_connection(
             return resp;
         }
     }
-    match state.exql.connection_registry.remove(&name) {
+    match state.exql.remove_connection(&name) {
         Ok(()) => (
             StatusCode::OK,
             Json(json!({"status": "removed", "name": name})),
         )
             .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+        Err(e) => super::queries::exql_error(&e),
     }
 }

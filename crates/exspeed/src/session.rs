@@ -96,10 +96,14 @@ struct ConnState {
     ctx: Arc<SessionContext>,
     subs: HashMap<u32, SubEntry>,
     ephemeral: Vec<String>,
+    /// Cancelled when the connection ends, so waiting requests (queries,
+    /// pulls, long-poll reads) stop instead of running on for nobody.
+    closed: CancellationToken,
 }
 
 impl Drop for ConnState {
     fn drop(&mut self) {
+        self.closed.cancel();
         let consumers = self.ctx.broker.consumers.clone();
         let subs: Vec<(u32, SubEntry)> = self.subs.drain().collect();
         let ephemeral = std::mem::take(&mut self.ephemeral);
@@ -210,6 +214,7 @@ where
         ctx: ctx.clone(),
         subs: HashMap::new(),
         ephemeral: Vec::new(),
+        closed: cancel.child_token(),
     };
     let waits = Arc::new(Semaphore::new(MAX_CONCURRENT_WAITS));
     let result = loop {
@@ -586,10 +591,14 @@ async fn dispatch(
             };
             let out = out.clone();
             let ctx = ctx.clone();
+            let closed = state.closed.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                let resp = run_query(&ctx, &sql).await;
-                out.send(corr, resp).await;
+                // Dropping the query future on disconnect cancels execution.
+                tokio::select! {
+                    resp = run_query(&ctx, &sql) => out.send(corr, resp).await,
+                    _ = closed.cancelled() => {}
+                }
             });
         }
 
@@ -744,21 +753,25 @@ async fn dispatch(
             };
             let out = out.clone();
             let ctx = ctx.clone();
+            let closed = state.closed.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                let resp = match ctx
-                    .broker
-                    .consumers
-                    .pull(
-                        &consumer,
-                        max_messages,
-                        max_bytes,
-                        Duration::from_millis(expires_ms as u64),
-                    )
-                    .await
-                {
-                    Ok(records) => Response::Messages { records },
-                    Err(e) => consumer_error_response(&ctx, e),
+                let pull = ctx.broker.consumers.pull(
+                    &consumer,
+                    max_messages,
+                    max_bytes,
+                    Duration::from_millis(expires_ms as u64),
+                );
+                // On disconnect, dropping the pull drops its waiter; the
+                // consumer skips waiters whose caller is gone, so no records
+                // are stranded (any already handed out come back after
+                // ack_wait).
+                let resp = tokio::select! {
+                    r = pull => match r {
+                        Ok(records) => Response::Messages { records },
+                        Err(e) => consumer_error_response(&ctx, e),
+                    },
+                    _ = closed.cancelled() => return,
                 };
                 out.send(corr, resp).await;
             });
@@ -846,6 +859,7 @@ async fn dispatch(
             };
             let out = out.clone();
             let ctx = ctx.clone();
+            let closed = state.closed.clone();
             tokio::spawn(async move {
                 let _permit = permit;
                 let resp = read(
@@ -856,9 +870,11 @@ async fn dispatch(
                     max_bytes,
                     Duration::from_millis(wait_ms as u64),
                     &filter,
-                )
-                .await;
-                out.send(corr, resp).await;
+                );
+                tokio::select! {
+                    resp = resp => out.send(corr, resp).await,
+                    _ = closed.cancelled() => {}
+                }
             });
         }
     }
@@ -924,29 +940,13 @@ async fn stream_info(
 }
 
 async fn run_query(ctx: &SessionContext, sql: &str) -> Response {
-    use exspeed_processing::types::value_to_json;
     match ctx.exql.execute_bounded(sql).await {
-        Ok(rs) => {
-            let rows: Vec<Vec<serde_json::Value>> = rs
-                .rows
-                .iter()
-                .map(|row| row.values.iter().map(value_to_json).collect())
-                .collect();
-            Response::json(&serde_json::json!({
-                "columns": rs.columns,
-                "row_count": rows.len(),
-                "rows": rows,
-                "execution_time_ms": rs.execution_time_ms,
-            }))
-        }
-        Err(e) => {
-            let detail = e.to_json();
-            Response::Error {
-                code: code::BAD_REQUEST,
-                message: e.to_string(),
-                detail: Some(Bytes::from(detail.to_string())),
-            }
-        }
+        Ok(rs) => Response::json(&rs.to_json()),
+        Err(e) => Response::Error {
+            code: e.http_status(),
+            message: e.to_string(),
+            detail: Some(Bytes::from(e.to_json().to_string())),
+        },
     }
 }
 

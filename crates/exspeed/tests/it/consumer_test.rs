@@ -632,3 +632,33 @@ async fn consumer_throughput() {
         n as f64 / secs
     );
 }
+
+/// A pull waiting when its connection closes must not swallow records:
+/// they go to the next puller straight away, not after `ack_wait`.
+#[tokio::test]
+async fn abandoned_pull_does_not_strand_records() {
+    let server = TestServer::start().await;
+    let c = server.client().await;
+    create_stream(&c, "s").await;
+    c.create_consumer(ConsumerSpec {
+        ack_wait_ms: 60_000,
+        ..ConsumerSpec::new("p", "s")
+    })
+    .await
+    .unwrap();
+
+    let gone = server.client().await;
+    let waiting = {
+        let gone = gone.clone();
+        tokio::spawn(async move { gone.pull("p", 10, Duration::from_secs(30)).await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    gone.close();
+    let _ = waiting.await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    publish_n(&c, "s", "x", 3).await;
+    let got = c.pull("p", 10, Duration::from_secs(2)).await.unwrap();
+    assert_eq!(got.len(), 3, "records must not be held by the dead pull");
+    assert!(got.iter().all(|r| r.delivery_count == 1));
+}

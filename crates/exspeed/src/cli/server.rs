@@ -553,16 +553,19 @@ where
 
     // Create ExQL engine. Reads hit storage directly; query output is written
     // through the broker's write path.
-    let exql_storage: Arc<dyn StorageEngine> = Arc::new(
-        exspeed_broker::log::LogBackedStorage::new(broker.log.clone()),
+    let exql = Arc::new(
+        ExqlEngine::new(
+            broker.log.clone(),
+            args.data_dir.clone(),
+            leadership.clone(),
+            metrics.clone(),
+            exspeed_processing::ExqlConfig::from_env(),
+        )
+        .map_err(|e| anyhow::anyhow!("ExQL engine: {e}"))?,
     );
-    let exql = Arc::new(ExqlEngine::new(
-        exql_storage,
-        args.data_dir.clone(),
-        leadership.clone(),
-        metrics.clone(),
-    ));
-    exql.load().unwrap_or_else(|e| warn!("ExQL load: {e}"));
+    if let Err(e) = exql.load().await {
+        warn!("ExQL load: {e}");
+    }
     // resume_all_and_run(token) is called by the leader supervisor (Task 9).
 
     // Clone before moving into AppState so the leader supervisor can capture them.
@@ -570,6 +573,7 @@ where
     let connector_manager_for_shutdown = connector_manager.clone();
     let exql_for_supervisor = exql.clone();
     let exql_for_tcp = exql.clone();
+    let exql_for_shutdown = exql.clone();
 
     // Readiness flag, flipped to true after the HTTP API server is spawned.
     // Until then, /readyz returns 503 with {"status":"starting"}.
@@ -1027,6 +1031,17 @@ where
     .is_err()
     {
         warn!("connectors did not stop within 30s");
+    }
+
+    // Stop continuous queries; each writes a final checkpoint.
+    if tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        exql_for_shutdown.shutdown(),
+    )
+    .await
+    .is_err()
+    {
+        warn!("continuous queries did not stop within 10s");
     }
 
     // Step down: cancels the leader token, stopping consumers, continuous

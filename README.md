@@ -20,8 +20,9 @@ exspeed server        # that's the whole deployment
   `order.*.created` or `order.>`.
 - **Replayable and retained.** Records are kept by time and size. You can
   seek by offset or timestamp and replay from anywhere.
-- **SQL built in.** Run one-shot queries, continuous queries into new streams,
-  materialized views, tumbling windows and stream-stream joins.
+- **SQL built in.** Run one-shot queries (on Apache DataFusion), continuous
+  queries into new streams, materialized tables, event-time windows and
+  stream joins.
 - **Connectors built in.** Postgres CDC and outbox, webhooks, JDBC, S3,
   RabbitMQ and HTTP, configured with TOML files that hot-reload.
 - **Simple to operate.** It is a single static binary with a Docker image,
@@ -55,8 +56,8 @@ or the Rust [`exspeed-client`](crates/exspeed-client) on TCP port 5933
 | Work sharing across app instances (one consumer, many subscribers) | ✅ |
 | Idempotent publish (`msg_id`) | ✅ single node · ⚠️ gaps in batches and on failover |
 | Auth (scoped tokens) and TLS | ✅ |
-| ExQL bounded queries | ✅ filter/project · ⚠️ joins, JSON numerics, many clauses ([§3.5](docs/REVIEW.md#35-exql-exspeed-processing)) |
-| ExQL continuous queries, windows, joins, views | ⚠️ partial; state is not durable |
+| ExQL bounded queries | ✅ full SQL on DataFusion (joins, HAVING, window functions, subqueries), JSON numerics, pushdown, timeouts/limits ([exql.md](docs/exql.md)) |
+| ExQL continuous queries, windows, joins, tables | ✅ event-time windows, stream-stream/stream-table joins, durable tables, checkpointed state, effectively-once output · ⚠️ query registry not replicated ([exql.md](docs/exql.md#state-recovery-and-delivery-guarantees)) |
 | Connectors: framework (checkpoint protocol, supervisor, typed settings, DLQ, replicated offsets) | ✅ tested with fault injection |
 | Connectors: Postgres CDC, outbox, poll; JDBC sink; HTTP poll/sink/webhook | ✅ at-least-once or effectively-once, tested against real services ([guarantees](docs/connectors.md#delivery-guarantees)) |
 | Connectors: RabbitMQ, S3, SQL Server CDC | ⚠️ implemented to the same protocol; unit-tested only, no service tests in CI yet |

@@ -1,412 +1,316 @@
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 
-use exspeed_client::PublishRecord;
-
-use crate::common::TestServer;
+use exspeed_client::{Client, ConnectOptions, PublishRecord};
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Helpers (same pattern as exql_test.rs)
 // ---------------------------------------------------------------------------
 
-/// Returns the server (keep it alive) and its HTTP base URL.
-async fn start_server() -> (TestServer, String) {
-    let server = TestServer::start().await;
-    let http = format!("http://{}", server.api_addr);
-    (server, http)
+async fn start_server() -> (String, String) {
+    let tcp_port = exspeed_testkit::pick_unused_port().unwrap();
+    let http_port = exspeed_testkit::pick_unused_port().unwrap();
+    let tcp_addr = format!("127.0.0.1:{}", tcp_port);
+    let http_addr = format!("127.0.0.1:{}", http_port);
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let args = exspeed::cli::server::ServerArgs {
+        bind: tcp_addr.clone(),
+        data_dir: dir.path().to_path_buf(),
+        api_bind: http_addr.clone(),
+        ..Default::default()
+    };
+
+    tokio::spawn(async move {
+        let _keep = dir;
+        exspeed::cli::server::run(args).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    (tcp_addr, format!("http://{}", http_addr))
 }
 
-async fn http_create_stream(http_url: &str, stream_name: &str) {
+async fn post_sql(http_url: &str, sql: &str) -> (u16, Value) {
     let resp = reqwest::Client::new()
-        .post(format!("{}/api/v1/streams", http_url))
-        .json(&serde_json::json!({"name": stream_name}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        201,
-        "failed to create stream '{stream_name}'"
-    );
-}
-
-/// Create a stream via HTTP, then publish `(subject, json)` records via TCP.
-async fn setup_stream(
-    stream_name: &str,
-    records: &[(&str, &str)],
-    server: &TestServer,
-    http_url: &str,
-) {
-    http_create_stream(http_url, stream_name).await;
-    let c = server.client().await;
-    for (subject, payload) in records {
-        c.publish(
-            stream_name,
-            PublishRecord::new(*subject, payload.to_string()),
-        )
-        .await
-        .unwrap();
-    }
-}
-
-/// Execute a bounded SQL query via the HTTP API and return the JSON response body.
-async fn query(http_url: &str, sql: &str) -> Value {
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("{}/api/v1/queries", http_url))
+        .post(format!("{http_url}/api/v1/queries"))
         .json(&serde_json::json!({"sql": sql}))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "query failed for SQL: {}", sql);
-    resp.json().await.unwrap()
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(Value::Null))
 }
 
-/// Extract a field from the payload column of an output stream row.
-///
-/// Output stream records have standard columns (offset, timestamp, key,
-/// subject, payload, headers).  The continuous executor serialises the
-/// operator output into the payload as a JSON object.
-fn payload_field(row: &[Value], columns: &[Value], field: &str) -> Value {
-    let idx = columns
+async fn create(http_url: &str, sql: &str) -> String {
+    let (status, body) = post_sql(http_url, sql).await;
+    assert_eq!(status, 201, "{sql}: {body}");
+    body["query_id"].as_str().unwrap().to_string()
+}
+
+/// Poll a bounded query until `pred` holds (10 s max).
+async fn query_until(http_url: &str, sql: &str, pred: impl Fn(&Value) -> bool) -> Value {
+    let mut last = Value::Null;
+    for _ in 0..100 {
+        let (status, body) = post_sql(http_url, sql).await;
+        if status == 200 && pred(&body) {
+            return body;
+        }
+        last = body;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("condition not met for {sql}: last result {last}");
+}
+
+/// The `payload` column of every row of `stream`, in offset order.
+async fn payloads(http_url: &str, stream: &str) -> Vec<Value> {
+    let (status, body) = post_sql(
+        http_url,
+        &format!("SELECT payload FROM {stream} ORDER BY offset"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    body["rows"]
+        .as_array()
+        .unwrap()
         .iter()
-        .position(|c| c.as_str() == Some("payload"))
-        .expect("output should have 'payload' column");
-    let payload = &row[idx];
-    // The payload is a JSON object (serde_json::Value::Object) or a string.
-    let obj = if let Some(s) = payload.as_str() {
-        serde_json::from_str::<Value>(s).unwrap_or(Value::Null)
-    } else {
-        payload.clone()
-    };
-    obj.get(field).cloned().unwrap_or(Value::Null)
+        .map(|r| r[0].clone())
+        .collect()
+}
+
+const T0: i64 = 1_700_000_000_000;
+
+fn ts(d: i64) -> String {
+    exspeed_processing::convert::format_ts_millis(T0 + d)
+}
+
+async fn publish_json(tcp: &str, stream: &str, payloads: &[Value]) {
+    let c = Client::connect(tcp, ConnectOptions::default())
+        .await
+        .expect("connect");
+    for p in payloads {
+        c.publish(stream, PublishRecord::new("e", p.to_string()))
+            .await
+            .unwrap();
+    }
+}
+
+async fn create_stream(http: &str, name: &str) {
+    let resp = reqwest::Client::new()
+        .post(format!("{http}/api/v1/streams"))
+        .json(&serde_json::json!({"name": name}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Test 1: Tumbling window via continuous query (EMIT CHANGES).
-///
-/// Bounded execution does not support WindowedAggregate, so we create a
-/// continuous query with a tumbling window that writes to an output stream.
-/// All 10 records are published within the same second, so they all fall into
-/// a single 1-hour window.  With EMIT CHANGES, every record produces an
-/// updated aggregate row in the output stream.  The last row should have
-/// cnt = 10.
+/// Event-time tumbling windows over replayed history: EMIT FINAL emits each
+/// closed window exactly once, with every aggregate correct.
 #[tokio::test]
-async fn tumbling_window_continuous_query() {
+async fn tumbling_window_emit_final_on_event_time() {
     let (tcp, http) = start_server().await;
-    let client = reqwest::Client::new();
-
-    // 1. Create source stream and publish 10 records.
-    let records: Vec<(&str, &str)> = vec![
-        ("event.created", r#"{"region": "eu", "val": 1}"#),
-        ("event.created", r#"{"region": "us", "val": 1}"#),
-        ("event.created", r#"{"region": "eu", "val": 1}"#),
-        ("event.created", r#"{"region": "us", "val": 1}"#),
-        ("event.created", r#"{"region": "eu", "val": 1}"#),
-        ("event.created", r#"{"region": "us", "val": 1}"#),
-        ("event.created", r#"{"region": "eu", "val": 1}"#),
-        ("event.created", r#"{"region": "us", "val": 1}"#),
-        ("event.created", r#"{"region": "eu", "val": 1}"#),
-        ("event.created", r#"{"region": "us", "val": 1}"#),
+    create_stream(&http, "wclicks").await;
+    let events: Vec<Value> = [
+        ("a", 1_000, 5),
+        ("b", 2_000, 7),
+        ("a", 3_000, 1),
+        ("a", 12_000, 2),
+        ("b", 21_000, 10),
+        ("a", 35_000, 1),
+    ]
+    .iter()
+    .map(|(u, d, a)| serde_json::json!({"user": u, "ts": T0 + d, "amount": a}))
+    .collect();
+    publish_json(&tcp, "wclicks", &events).await;
+    create(
+        &http,
+        "CREATE STREAM wout AS SELECT payload->>'user' AS usr, window_start, COUNT(*) AS n, \
+         SUM(payload->>'amount') AS total, AVG(payload->>'amount') AS avg FROM wclicks \
+         TIMESTAMP BY payload->>'ts' WINDOW TUMBLING (SIZE 10 SECONDS) GROUP BY payload->>'user' EMIT FINAL",
+    )
+    .await;
+    let expected = vec![
+        serde_json::json!({"usr": "a", "window_start": ts(0), "n": 2, "total": 6.0, "avg": 3.0}),
+        serde_json::json!({"usr": "b", "window_start": ts(0), "n": 1, "total": 7.0, "avg": 7.0}),
+        serde_json::json!({"usr": "a", "window_start": ts(10_000), "n": 1, "total": 2.0, "avg": 2.0}),
+        serde_json::json!({"usr": "b", "window_start": ts(20_000), "n": 1, "total": 10.0, "avg": 10.0}),
     ];
-    setup_stream("windowed-test", &records, &tcp, &http).await;
+    query_until(&http, "SELECT COUNT(*) FROM wout", |b| b["rows"][0][0] == 4).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(payloads(&http, "wout").await, expected);
+}
 
-    // 2. Create continuous query with a tumbling window (no extra group-by
-    //    key, so all records go into a single group within each window).
-    let resp = client
-        .post(format!("{}/api/v1/queries/continuous", http))
-        .json(&serde_json::json!({
-            "sql": r#"CREATE VIEW windowed_output AS SELECT tumbling(timestamp, '1 hour') AS window_start, COUNT(*) AS cnt FROM "windowed-test" GROUP BY tumbling(timestamp, '1 hour') EMIT CHANGES"#
-        }))
-        .send()
-        .await
-        .unwrap();
+/// Stream-stream LEFT JOIN with WITHIN, through the server.
+#[tokio::test]
+async fn stream_stream_left_join_within() {
+    let (tcp, http) = start_server().await;
+    create_stream(&http, "jorders").await;
+    create_stream(&http, "jpay").await;
+    publish_json(
+        &tcp,
+        "jorders",
+        &[
+            serde_json::json!({"id": "o1", "ts": T0 + 1_000}),
+            serde_json::json!({"id": "o2", "ts": T0 + 2_000}),
+            serde_json::json!({"id": "o3", "ts": T0 + 30_000}),
+        ],
+    )
+    .await;
+    publish_json(
+        &tcp,
+        "jpay",
+        &[
+            serde_json::json!({"order_id": "o1", "ts": T0 + 3_000, "amt": 10}),
+            serde_json::json!({"order_id": "o2", "ts": T0 + 20_000, "amt": 20}),
+            serde_json::json!({"order_id": "x", "ts": T0 + 31_000, "amt": 1}),
+        ],
+    )
+    .await;
+    create(
+        &http,
+        "CREATE STREAM jout AS SELECT o.payload->>'id' AS oid, p.payload->>'amt' AS amt \
+         FROM jorders o TIMESTAMP BY o.payload->>'ts' LEFT JOIN jpay p TIMESTAMP BY p.payload->>'ts' \
+         WITHIN 5 SECONDS ON o.payload->>'id' = p.payload->>'order_id'",
+    )
+    .await;
+    // Watermark = min(30, 31) s: o1 matched, o2's payment is 18 s away so o2
+    // is emitted unmatched; o3 stays open.
+    query_until(&http, "SELECT COUNT(*) FROM jout", |b| b["rows"][0][0] == 2).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut got = payloads(&http, "jout").await;
+    got.sort_by_key(|v| v.to_string());
     assert_eq!(
-        resp.status(),
-        201,
-        "create continuous query should return 201"
-    );
-
-    let cq_body: Value = resp.json().await.unwrap();
-    assert!(
-        cq_body.get("query_id").is_some(),
-        "response should include query_id"
-    );
-    assert_eq!(cq_body["status"], "running");
-
-    // 3. Wait for the continuous query to process existing records.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // 4. Query the output stream.
-    let body = query(&http, r#"SELECT * FROM "windowed_output""#).await;
-
-    let row_count = body["row_count"].as_u64().unwrap();
-    assert!(
-        row_count >= 1,
-        "expected at least 1 row in windowed output, got: {}",
-        row_count
-    );
-
-    // With EMIT CHANGES and 10 records in the same window (single group),
-    // we get 10 output records with running counts 1..10.
-    let rows = body["rows"].as_array().expect("rows should be array");
-    let columns = body["columns"].as_array().expect("columns should be array");
-
-    // The output stream stores windowed aggregate results serialised as
-    // JSON in the payload column.  Extract cnt from the last row.
-    let last_row = rows.last().unwrap().as_array().unwrap();
-    let last_cnt = payload_field(last_row, columns, "cnt");
-    assert_eq!(
-        last_cnt.as_i64().unwrap(),
-        10,
-        "last running count should be 10, got: {}",
-        last_cnt
+        got,
+        vec![
+            serde_json::json!({"oid": "o1", "amt": "10"}),
+            serde_json::json!({"oid": "o2", "amt": null}),
+        ]
     );
 }
 
-/// Test 2: Create a materialized view (filter/project) and query via
-/// bounded SQL.
-///
-/// MVs in simple mode (no windowed aggregate) work as a per-record
-/// filter/project pipeline.  This test creates an MV that filters for
-/// EU records and verifies that `SELECT * FROM <mv>` returns only EU rows.
+async fn start_server_at(data_dir: PathBuf) -> (String, String, CancellationToken) {
+    let tcp_port = exspeed_testkit::pick_unused_port().unwrap();
+    let http_port = exspeed_testkit::pick_unused_port().unwrap();
+    let tcp_addr = format!("127.0.0.1:{}", tcp_port);
+    let http_addr = format!("127.0.0.1:{}", http_port);
+    let cancel = CancellationToken::new();
+    let args = exspeed::cli::server::ServerArgs {
+        bind: tcp_addr.clone(),
+        api_bind: http_addr.clone(),
+        data_dir,
+        ..Default::default()
+    };
+    let c = cancel.clone();
+    tokio::spawn(async move {
+        let shutdown = async move { c.cancelled().await };
+        exspeed::cli::server::run_with_shutdown(args, shutdown)
+            .await
+            .ok();
+    });
+    let http = format!("http://{http_addr}");
+    for _ in 0..100 {
+        if let Ok(r) = reqwest::get(format!("{http}/readyz")).await {
+            if r.status().is_success() {
+                // queries resume once the leader supervisor starts
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                return (tcp_addr, http, cancel);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("server did not become ready");
+}
+
+async fn stop_server(cancel: CancellationToken, data_dir: &Path) {
+    cancel.cancel();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let _ = std::fs::remove_file(data_dir.join(".exspeed.lock"));
+}
+
+/// Tables, windows and paused queries survive a server restart; output has
+/// no duplicates.
 #[tokio::test]
-async fn materialized_view_creation_and_query() {
-    let (tcp, http) = start_server().await;
-    let client = reqwest::Client::new();
+async fn queries_and_tables_survive_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (tcp, http, cancel) = start_server_at(dir.path().to_path_buf()).await;
+    create_stream(&http, "rsrc").await;
+    let batch1: Vec<Value> = (0..6)
+        .map(|i| serde_json::json!({"k": if i % 2 == 0 { "x" } else { "y" }, "v": i, "ts": T0 + i * 4_000}))
+        .collect();
+    publish_json(&tcp, "rsrc", &batch1).await;
+    create(&http, "CREATE TABLE rtab AS SELECT payload->>'k' AS k, COUNT(*) AS n, SUM(payload->>'v') AS s FROM rsrc GROUP BY payload->>'k'").await;
+    create(
+        &http,
+        "CREATE STREAM rwin AS SELECT payload->>'k' AS k, window_start, COUNT(*) AS n FROM rsrc \
+         TIMESTAMP BY payload->>'ts' WINDOW TUMBLING (SIZE 10 SECONDS) GROUP BY payload->>'k' EMIT FINAL",
+    )
+    .await;
+    let paused = create(
+        &http,
+        "CREATE STREAM rcopy AS SELECT payload->>'v' AS v FROM rsrc",
+    )
+    .await;
+    query_until(&http, "SELECT k, n, s FROM rtab ORDER BY k", |b| {
+        b["rows"] == serde_json::json!([["x", 3, 6.0], ["y", 3, 9.0]])
+    })
+    .await;
+    query_until(&http, "SELECT COUNT(*) FROM rcopy", |b| {
+        b["rows"][0][0] == 6
+    })
+    .await;
+    // windows [0,10) and [10,20) closed by the record at 20 s
+    query_until(&http, "SELECT COUNT(*) FROM rwin", |b| b["rows"][0][0] == 4).await;
+    let (status, _) = post_sql(&http, &format!("PAUSE QUERY {paused}")).await;
+    assert_eq!(status, 200);
+    stop_server(cancel, dir.path()).await;
 
-    // 1. Create stream and publish records.
-    let records: Vec<(&str, &str)> = vec![
-        ("order.created", r#"{"region": "eu", "amount": 100}"#),
-        ("order.created", r#"{"region": "us", "amount": 200}"#),
-        ("order.created", r#"{"region": "eu", "amount": 300}"#),
-        ("order.created", r#"{"region": "us", "amount": 400}"#),
-        ("order.created", r#"{"region": "eu", "amount": 500}"#),
-    ];
-    setup_stream("mv-test", &records, &tcp, &http).await;
-
-    // 2. Create materialized view that selects EU records.
-    let resp = client
-        .post(format!("{}/api/v1/views", http))
-        .json(&serde_json::json!({
-            "sql": r#"CREATE MATERIALIZED VIEW eu_orders AS SELECT payload->>'region' AS region, payload->>'amount' AS amount FROM "mv-test" WHERE payload->>'region' = 'eu'"#
-        }))
-        .send()
+    let (tcp, http, cancel) = start_server_at(dir.path().to_path_buf()).await;
+    let res = post_sql(&http, "SELECT k, n, s FROM rtab ORDER BY k")
+        .await
+        .1;
+    assert_eq!(
+        res["rows"],
+        serde_json::json!([["x", 3, 6.0], ["y", 3, 9.0]])
+    );
+    let (_, info) = post_sql(&http, "SELECT 1").await;
+    assert_eq!(info["rows"], serde_json::json!([[1]]));
+    let q: Value = reqwest::get(format!("{http}/api/v1/queries/{paused}"))
+        .await
+        .unwrap()
+        .json()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 201, "create MV should return 201");
+    assert_eq!(q["status"], "paused");
 
-    let mv_body: Value = resp.json().await.unwrap();
-    assert!(
-        mv_body.get("query_id").is_some(),
-        "response should include query_id"
-    );
-
-    // 3. Wait for the MV to catch up.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // 4. Query the MV via bounded SQL.
-    let body = query(&http, "SELECT * FROM eu_orders").await;
-
-    let row_count = body["row_count"].as_u64().unwrap();
-    assert!(
-        row_count >= 1,
-        "expected at least 1 row in MV, got: {}. body: {}",
-        row_count,
-        body
-    );
-
-    // Verify all rows have region = "eu".
-    let rows = body["rows"].as_array().expect("rows should be array");
-    let columns = body["columns"].as_array().expect("columns should be array");
-    let region_idx = columns
+    let batch2: Vec<Value> = (6..10)
+        .map(|i| serde_json::json!({"k": if i % 2 == 0 { "x" } else { "y" }, "v": i, "ts": T0 + i * 4_000}))
+        .collect();
+    publish_json(&tcp, "rsrc", &batch2).await;
+    query_until(&http, "SELECT k, n, s FROM rtab ORDER BY k", |b| {
+        b["rows"] == serde_json::json!([["x", 5, 20.0], ["y", 5, 25.0]])
+    })
+    .await;
+    // + windows [20,30) x/y closed by the record at 36 s
+    query_until(&http, "SELECT COUNT(*) FROM rwin", |b| b["rows"][0][0] == 6).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let wins = payloads(&http, "rwin").await;
+    let n: Vec<i64> = wins.iter().map(|w| w["n"].as_i64().unwrap()).collect();
+    assert_eq!(n, vec![2, 1, 1, 1, 1, 2]);
+    let starts: std::collections::HashSet<String> = wins
         .iter()
-        .position(|c| c.as_str() == Some("region"))
-        .expect("should have 'region' column");
-
-    for (i, row) in rows.iter().enumerate() {
-        let row = row.as_array().unwrap();
-        let region = row[region_idx].as_str().unwrap_or("?");
-        assert_eq!(
-            region, "eu",
-            "row {} should have region 'eu', got '{}'",
-            i, region
-        );
-    }
-}
-
-/// Test 3: Query a materialized view via REST API endpoints.
-///
-/// Verifies `GET /api/v1/views` lists the view, and
-/// `GET /api/v1/views/{name}` returns the expected rows.
-#[tokio::test]
-async fn materialized_view_via_rest() {
-    let (tcp, http) = start_server().await;
-    let client = reqwest::Client::new();
-
-    // 1. Setup: create stream, publish records, create MV.
-    let records: Vec<(&str, &str)> = vec![
-        ("order.created", r#"{"region": "eu", "amount": 50}"#),
-        ("order.created", r#"{"region": "us", "amount": 75}"#),
-        ("order.created", r#"{"region": "eu", "amount": 60}"#),
-        ("order.created", r#"{"region": "us", "amount": 80}"#),
-    ];
-    setup_stream("mv-rest-test", &records, &tcp, &http).await;
-
-    let resp = client
-        .post(format!("{}/api/v1/views", http))
-        .json(&serde_json::json!({
-            "sql": r#"CREATE MATERIALIZED VIEW rest_eu_orders AS SELECT payload->>'region' AS region, payload->>'amount' AS amount FROM "mv-rest-test" WHERE payload->>'region' = 'eu'"#
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 201, "create MV should return 201");
-
-    // 2. Wait for the MV to catch up.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // 3. GET /api/v1/views — list should contain our MV.
-    let resp = client
-        .get(format!("{}/api/v1/views", http))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let views_body: Value = resp.json().await.unwrap();
-    let views = views_body.as_array().expect("views list should be array");
-    let found = views
-        .iter()
-        .any(|v| v["name"].as_str() == Some("rest_eu_orders"));
-    assert!(
-        found,
-        "views list should contain 'rest_eu_orders', got: {:?}",
-        views
-    );
-
-    // 4. GET /api/v1/views/rest_eu_orders — should have rows.
-    let resp = client
-        .get(format!("{}/api/v1/views/rest_eu_orders", http))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let view_body: Value = resp.json().await.unwrap();
-
-    let row_count = view_body["row_count"].as_u64().unwrap();
-    assert!(
-        row_count >= 1,
-        "expected at least 1 row from REST view endpoint, got: {}",
-        row_count
-    );
-
-    let columns = view_body["columns"]
-        .as_array()
-        .expect("should have columns");
-    let col_names: Vec<&str> = columns.iter().filter_map(|c| c.as_str()).collect();
-    assert!(
-        col_names.contains(&"region"),
-        "columns should include 'region', got: {:?}",
-        col_names
-    );
-    assert!(
-        col_names.contains(&"amount"),
-        "columns should include 'amount', got: {:?}",
-        col_names
-    );
-
-    // Verify all rows have region = "eu".
-    let rows = view_body["rows"].as_array().expect("should have rows");
-    let region_idx = col_names.iter().position(|&c| c == "region").unwrap();
-    for (i, row) in rows.iter().enumerate() {
-        let row = row.as_array().unwrap();
-        let region = row[region_idx].as_str().unwrap_or("?");
-        assert_eq!(
-            region, "eu",
-            "REST view row {} should have region 'eu', got '{}'",
-            i, region
-        );
-    }
-}
-
-/// Test 4: Continuous query with tumbling window and multiple input records.
-///
-/// Creates a continuous query that counts all records in 1-hour tumbling
-/// windows (EMIT CHANGES).  Publishes a second batch of records after the
-/// query is running to verify that the continuous executor picks up new
-/// data and emits updated counts.
-#[tokio::test]
-async fn continuous_query_tumbling_picks_up_new_records() {
-    let (tcp, http) = start_server().await;
-    let client = reqwest::Client::new();
-
-    // 1. Create source stream and publish an initial batch of 3 records.
-    let records: Vec<(&str, &str)> = vec![
-        ("event.created", r#"{"val": 1}"#),
-        ("event.created", r#"{"val": 2}"#),
-        ("event.created", r#"{"val": 3}"#),
-    ];
-    setup_stream("cq-tumble-live", &records, &tcp, &http).await;
-
-    // 2. Create continuous query with tumbling window.
-    let resp = client
-        .post(format!("{}/api/v1/queries/continuous", http))
-        .json(&serde_json::json!({
-            "sql": r#"CREATE VIEW tumble_live AS SELECT tumbling(timestamp, '1 hour') AS window_start, COUNT(*) AS cnt FROM "cq-tumble-live" GROUP BY tumbling(timestamp, '1 hour') EMIT CHANGES"#
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
-
-    // 3. Wait for the initial batch to be processed.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Verify initial output — should have at least 3 rows (running count 1,2,3).
-    let body = query(&http, r#"SELECT * FROM "tumble_live""#).await;
-    let initial_count = body["row_count"].as_u64().unwrap();
-    assert!(
-        initial_count >= 3,
-        "expected at least 3 output rows after initial batch, got: {}",
-        initial_count
-    );
-
-    // 4. Publish 2 more records while the query is already running.
-    let c = tcp.client().await;
-    for _ in 0..2 {
-        c.publish(
-            "cq-tumble-live",
-            PublishRecord::new("event.created", r#"{"val": 99}"#),
-        )
-        .await
-        .unwrap();
-    }
-
-    // 5. Wait for the new records to be processed.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // 6. Query again — should have more output rows, and the last row
-    //    should have cnt = 5 (total of 3 + 2 records, all in one window).
-    let body = query(&http, r#"SELECT * FROM "tumble_live""#).await;
-    let final_count = body["row_count"].as_u64().unwrap();
-    assert!(
-        final_count > initial_count,
-        "output row count should increase after new records (was {}, now {})",
-        initial_count,
-        final_count
-    );
-
-    let rows = body["rows"].as_array().unwrap();
-    let columns = body["columns"].as_array().unwrap();
-    let last_row = rows.last().unwrap().as_array().unwrap();
-    let last_cnt = payload_field(last_row, columns, "cnt");
+        .map(|w| format!("{}{}", w["k"], w["window_start"]))
+        .collect();
+    assert_eq!(starts.len(), 6, "duplicate window rows: {wins:?}");
+    // The paused query stayed paused.
     assert_eq!(
-        last_cnt.as_i64().unwrap(),
-        5,
-        "last running count should be 5 (3 initial + 2 new), got: {}",
-        last_cnt
+        post_sql(&http, "SELECT COUNT(*) FROM rcopy").await.1["rows"][0][0],
+        6
     );
+    stop_server(cancel, dir.path()).await;
 }

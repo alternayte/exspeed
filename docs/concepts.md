@@ -98,14 +98,20 @@ with the same `msg_id` and the same body returns the original offset. The
 same `msg_id` with a different body is rejected. See
 [idempotent-publish.md](idempotent-publish.md).
 
-## Continuous queries and materialized views
+## Continuous queries and materialized tables
 
-ExQL can run a `SELECT` once (a **bounded** query) or continuously:
+ExQL (SQL on Apache DataFusion) can run a `SELECT` once (a **bounded**
+query) or continuously:
 
-- **`CREATE VIEW <out> AS SELECT …`** starts a long-running query. It writes
-  its results as records to a new stream named `<out>`.
-- **`CREATE MATERIALIZED VIEW <v> AS SELECT …`** keeps a keyed in-memory
-  table. It is readable via `/api/v1/views/<v>` and `SELECT * FROM <v>`.
+- **`CREATE STREAM <out> AS SELECT …`** (alias `CREATE VIEW`) starts a
+  long-running query. It writes its results as records to the stream
+  `<out>`.
+- **`CREATE TABLE <t> AS SELECT … GROUP BY …`** (alias `CREATE MATERIALIZED
+  VIEW`) keeps the current aggregate per key, backed by the changelog stream
+  `<t>`. It is readable via `/api/v1/views/<t>` and `SELECT * FROM <t>`.
+
+Continuous queries run on event time with watermarks, checkpoint their
+state, and survive restarts without duplicating output.
 
 See [exql.md](exql.md).
 

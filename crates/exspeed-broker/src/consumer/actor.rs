@@ -437,6 +437,8 @@ impl Actor {
     async fn pump(&mut self) {
         let now = Instant::now();
         self.subs.retain(|s| !s.tx.is_closed());
+        // Pullers that gave up (connection closed) must not be handed records.
+        self.pulls.retain(|p| !p.reply.is_closed());
         self.core.expire(now);
         let mut batches: Vec<Vec<WireRecord>> = vec![Vec::new(); self.subs.len()];
 

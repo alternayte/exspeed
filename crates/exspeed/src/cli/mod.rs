@@ -133,19 +133,20 @@ pub enum Command {
         /// Consumer name
         name: String,
     },
-    /// Run a SQL query
+    /// Run an ExQL statement: SELECT, CREATE STREAM/TABLE … AS SELECT,
+    /// DROP STREAM/TABLE/QUERY, PAUSE/RESUME QUERY
     Query {
-        /// SQL query string
+        /// SQL statement
         sql: String,
-        /// Run as continuous query
+        /// Only accept CREATE STREAM/TABLE (posts to /api/v1/queries/continuous)
         #[arg(long)]
         continuous: bool,
     },
-    /// List all views
+    /// List materialized tables (CREATE TABLE … AS SELECT)
     Views,
-    /// Show view details
+    /// Show the rows of a materialized table
     View {
-        /// View name
+        /// Table name
         name: String,
     },
     /// List all connectors

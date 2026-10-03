@@ -8,7 +8,7 @@ When auth is enabled, every `/api/v1/*` request must carry
 `Authorization: Bearer <token>`. Every `/api/v1/*` route except `whoami`
 requires an **admin** permission:
 
-- **Global admin** for queries, connectors, connections, indexes, leases
+- **Global admin** for queries, tables, connectors, connections, leases
   and cluster routes.
 - **Admin on the stream** for stream routes.
 
@@ -70,39 +70,51 @@ consumers. See [concepts.md](concepts.md#consumers) for the model.
 
 | Method | Path | Body | Description |
 |--------|------|------|-------------|
-| `POST` | `/api/v1/queries` | `{"sql"}` | Run a bounded query. Also accepts `CREATE INDEX` / `DROP INDEX`. |
+| `POST` | `/api/v1/queries` | `{"sql"}` | Run any ExQL statement: a bounded `SELECT` (200), `CREATE STREAM/TABLE … AS SELECT` (201, returns the query), `DROP STREAM/TABLE/QUERY`, `PAUSE/RESUME QUERY` |
+| `POST` | `/api/v1/queries/continuous` | `{"sql": "CREATE STREAM out AS SELECT …"}` | Create a continuous query (`CREATE` statements only) |
 | `GET` | `/api/v1/queries` | | List continuous queries |
-| `POST` | `/api/v1/queries/continuous` | `{"sql": "CREATE VIEW out AS SELECT …"}` | Start a continuous query |
-| `GET` | `/api/v1/queries/{id}` | | Query details and status |
-| `DELETE` | `/api/v1/queries/{id}` | | Stop and remove a query |
+| `GET` | `/api/v1/queries/{id}` | | Definition, `status` (`running`/`paused`/`pending`/`failed`), `desired_state`, `error`, `stats` |
+| `POST` | `/api/v1/queries/{id}/pause` | | Pause (state and position are kept) |
+| `POST` | `/api/v1/queries/{id}/resume` | | Resume a paused or failed query from its checkpoint |
+| `DELETE` | `/api/v1/queries/{id}` | | `DROP QUERY`: stop and remove the query; its output stream is kept |
 
-A bounded query returns:
+A bounded query returns the rows below. `truncated` is true when more than
+`EXSPEED_QUERY_MAX_ROWS` rows matched:
 
 ```json
-{"columns": ["region", "n"], "rows": [["eu", 42]], "row_count": 1, "execution_time_ms": 12}
+{"columns": ["region", "n"], "rows": [["eu", 42]], "row_count": 1, "execution_time_ms": 12, "truncated": false}
 ```
 
-Errors are returned in this form:
+A query, as returned by `CREATE` and `GET /api/v1/queries/{id}`:
+
+```json
+{"id": "big_orders_1a2b3c4d", "query_id": "big_orders_1a2b3c4d", "kind": "stream", "name": "big_orders",
+ "target_stream": "big_orders", "status": "running", "desired_state": "running", "error": null,
+ "sql": "CREATE STREAM big_orders AS …", "created_at": "…",
+ "stats": {"records_in": 10, "records_out": 4, "late_records_dropped": 0, "checkpoints": 1,
+           "watermark": "…", "last_checkpoint": "…"}}
+```
+
+Errors are returned in this form, and the HTTP status follows the code
+(400 parse/plan/unsupported, 404 not found, 408 timeout, 409 conflict, 422
+memory limit, 503 not leader):
 
 ```json
 {"error": "parse error: …", "code": "PARSE_ERROR", "line": 1, "column": 25}
 ```
 
-### Materialized views
+`CREATE INDEX` returns `UNSUPPORTED`; the `/api/v1/indexes` endpoints have
+been removed.
+
+### Materialized tables
+
+`CREATE TABLE … AS SELECT … GROUP BY …` (alias `CREATE MATERIALIZED VIEW`):
 
 | Method | Path | Body / query | Description |
 |--------|------|--------------|-------------|
-| `GET` | `/api/v1/views` | | List views |
-| `POST` | `/api/v1/views` | `{"sql": "CREATE MATERIALIZED VIEW v AS SELECT …"}` | Create a view |
-| `GET` | `/api/v1/views/{name}` | `?key=<k>` | Return all rows, or one row by key |
-
-### Indexes
-
-| Method | Path | Body | Description |
-|--------|------|------|-------------|
-| `GET` | `/api/v1/indexes` | | List secondary indexes |
-| `POST` | `/api/v1/indexes` | `{"sql": "CREATE INDEX name ON stream(payload->>'field')"}` | Create an index |
-| `DELETE` | `/api/v1/indexes/{name}` | | Drop an index (definition only; see [exql.md](exql.md#indexes)) |
+| `GET` | `/api/v1/views` | | List tables: `[{name, query_id, columns, row_count}]` |
+| `POST` | `/api/v1/views` | `{"sql": "CREATE TABLE t AS SELECT …"}` | Create a table (201) |
+| `GET` | `/api/v1/views/{name}` | `?key=<k>` | All rows (`{columns, rows, row_count}`), or one group's row (`{columns, row}`, 404 if absent). For several GROUP BY columns the key is a JSON array, e.g. `?key=["eu",3]` |
 
 ### Connectors
 
@@ -120,7 +132,7 @@ Errors are returned in this form:
 | Method | Path | Body | Description |
 |--------|------|------|-------------|
 | `GET` | `/api/v1/connections` | | List connections |
-| `POST` | `/api/v1/connections` | `{"name", "driver", "url"}` | Register a connection (`postgres`, `mysql`, `sqlite` or `mssql`) |
+| `POST` | `/api/v1/connections` | `{"name", "driver", "url"}` | Register a connection (driver `postgres`). Bounded queries read its tables as `<name>.<table>` or `<name>.<schema>.<table>` |
 | `DELETE` | `/api/v1/connections/{name}` | | Remove a connection |
 
 ### Identity and cluster

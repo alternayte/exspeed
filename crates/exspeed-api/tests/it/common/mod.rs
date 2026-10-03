@@ -97,12 +97,16 @@ pub async fn make_state_with_leader(leader: bool) -> Arc<exspeed_api::AppState> 
         leadership.clone(),
     ));
 
-    let exql = Arc::new(ExqlEngine::new(
-        storage_dyn.clone(),
-        tmp.path().to_path_buf(),
-        leadership.clone(),
-        metrics.clone(),
-    ));
+    let exql = Arc::new(
+        ExqlEngine::new(
+            broker.log.clone(),
+            tmp.path().to_path_buf(),
+            leadership.clone(),
+            metrics.clone(),
+            exspeed_processing::ExqlConfig::default(),
+        )
+        .expect("exql engine"),
+    );
 
     let data_dir = tmp.path().to_path_buf();
 

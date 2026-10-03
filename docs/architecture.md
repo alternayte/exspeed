@@ -35,7 +35,7 @@ exspeed-testkit      test helpers
  FileStorage ──► consumer actors (one per consumer, leader only) ──► subscriptions / pulls ──TCP──► apps
             ──► stateless reads (TCP Read, HTTP /records)
             ──► sink connectors ──► external systems
-            ──► continuous queries / materialized views
+            ──► continuous queries / materialized tables
             ──► replication server (leader) ──TCP 5934──► followers
 ```
 
@@ -102,8 +102,8 @@ Frames are capped at 16 MB.
   connectors/                        API-created connector configs (JSON)
   connector-offsets/                 connector offsets (EXSPEED_CONNECTOR_OFFSET_STORE=file only;
                                      the default stores them in the __connector_offsets stream)
-  queries/                           continuous query registry + checkpoints
-  indexes/<name>.json                ExQL index definitions (storage builds no index files)
+  exql/queries/<id>.json             continuous query definitions + desired state
+                                     (checkpoints live in the stream __exql_ckpt_<id>)
 ```
 
 Segment files are named after their base offset and start with a 16-byte
