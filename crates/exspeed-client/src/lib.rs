@@ -301,7 +301,8 @@ impl Client {
                     client_id: opts.client_id.clone(),
                     token: opts.token.clone(),
                 }
-                .into_frame(1),
+                .try_into_frame(1)
+                .map_err(proto)?,
             )
             .await
             .map_err(proto)?;
@@ -422,6 +423,9 @@ impl Client {
     /// while preserving their order on the wire.
     async fn send_request(&self, req: Request) -> Result<(u32, oneshot::Receiver<Response>)> {
         let corr = self.inner.next_corr();
+        // An unencodable request (e.g. a subject over 64 KiB) fails here
+        // instead of being sent truncated.
+        let frame = req.try_into_frame(corr).map_err(proto)?;
         let (tx, rx) = oneshot::channel();
         {
             let mut routes = self.inner.routes.lock().unwrap();
@@ -430,7 +434,7 @@ impl Client {
             }
             routes.pending.insert(corr, tx);
         }
-        if self.inner.out.send(req.into_frame(corr)).await.is_err() {
+        if self.inner.out.send(frame).await.is_err() {
             self.inner.routes.lock().unwrap().pending.remove(&corr);
             return Err(Error::Closed);
         }
@@ -492,11 +496,8 @@ impl Client {
     /// Send without waiting for a reply (correlation id 0). The server only
     /// answers if the request fails, and that error is logged.
     async fn send_nowait(&self, req: Request) -> Result<()> {
-        self.inner
-            .out
-            .send(req.into_frame(0))
-            .await
-            .map_err(|_| Error::Closed)
+        let frame = req.try_into_frame(0).map_err(proto)?;
+        self.inner.out.send(frame).await.map_err(|_| Error::Closed)
     }
 
     // ---- basics -----------------------------------------------------------
