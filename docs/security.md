@@ -1,7 +1,9 @@
 # Security
 
 Auth and TLS are both off by default. You turn each one on separately with
-environment variables (or the equivalent flags; see [configuration.md](configuration.md)).
+environment variables, the `[auth]` and `[tls]` sections of `exspeed.toml`,
+or the equivalent flags (see [configuration.md](configuration.md)). Auth is
+also on whenever `{data_dir}/credentials.toml` exists.
 
 Authorization at a glance:
 
@@ -15,6 +17,10 @@ Authorization at a glance:
 - Ack, nack, term and in-progress need `subscribe` on the consumer's stream.
   Any connection with that permission can settle that stream's consumers'
   records, which is what lets several app instances share one consumer.
+- HTTP management routes need an `admin` permission; see
+  [http-api.md](http-api.md#authentication) for the per-route rules. The
+  HTTP record browser (`GET /api/v1/streams/{name}/records`) needs
+  `subscribe` or `admin` on the stream.
 - `/metrics` is open unless you set a metrics token (see below). It exposes
   stream, consumer and connector names.
 
@@ -24,17 +30,21 @@ Authorization at a glance:
 export EXSPEED_AUTH_TOKEN=$(openssl rand -hex 32)
 ```
 
-When set, every TCP client must include this token in the `Connect` handshake
-(`AuthType::Token`) and every HTTP request to `/api/v1/*` must include
-`Authorization: Bearer <token>`. The following paths always bypass auth —
-they're designed to be reachable by probes, scrapers, and webhook senders:
+When the token is set (`EXSPEED_AUTH_TOKEN`, `auth.token` in `exspeed.toml`,
+or `--auth-token`), every TCP client must send this token in the `token` field of the `Connect` handshake,
+and every HTTP request to `/api/v1/*` must include
+`Authorization: Bearer <token>`. A missing or wrong token fails the TCP
+handshake and gets `401` over HTTP. The token is a full admin on every
+stream. The following paths always bypass auth; they're meant to be
+reachable by probes, scrapers, API tooling and webhook senders:
 
 | Path | Who uses it |
 |---|---|
 | `GET /healthz` | Liveness probes |
 | `GET /readyz` | Readiness probes |
 | `GET /metrics` | Prometheus scrape (see the metrics token below) |
-| `POST /webhooks/*` | External webhook senders (they carry their own per-webhook auth) |
+| `GET /api/v1/openapi.json` | API tooling (it describes the API, not its data) |
+| `POST /webhooks/*` | External webhook senders (each `http_webhook` connector can carry its own auth) |
 
 ### Metrics token
 
@@ -58,9 +68,20 @@ reachable by untrusted clients.
 
 `EXSPEED_AUTH_TOKEN` gives one shared admin token. For more than one app
 sharing the broker, point `EXSPEED_CREDENTIALS_FILE` at a TOML file with
-one entry per app. Each entry stores `sha256(token)` — never the token
-itself — and a list of per-stream permissions (`publish`, `subscribe`,
-`admin`).
+one entry per app (or put it at `{data_dir}/credentials.toml`). Each entry
+stores `sha256(token)`, never the token itself, and a list of permissions.
+Each permission pairs a stream glob with actions:
+
+- `streams`: a stream-name pattern with `*` as the only wildcard (zero or
+  more characters), for example `orders-*` or `*`. Patterns may contain
+  letters, digits, `_`, `-` and `*`. A permission on `*` with `admin` is a
+  **global admin**.
+- `actions`: any of `publish`, `subscribe`, `admin`, and `replicate` (the
+  cluster port; followers need it, see
+  [high-availability.md](high-availability.md)).
+
+Names and token hashes must be unique; an unknown action or an invalid
+pattern stops the server from starting.
 
 **Generate a credential:**
 
@@ -97,17 +118,16 @@ EXSPEED_TLS_KEY=/etc/exspeed/key.pem \
   exspeed server
 ```
 
-**Migration from single `EXSPEED_AUTH_TOKEN`:** the env var keeps working
-as a synthetic `legacy-admin` identity (full global admin). Add scoped
-credentials to the file; migrate one app at a time; unset the env var
-when done. You can set both at once — the server registers `legacy-admin`
-from the env var plus every entry in the TOML. (Reserved: an entry named
-`legacy-admin` while the env var is set refuses to start; rename the
-entry or unset the env var.)
+**Shared token and credentials file together:** you can set both. The
+server registers every entry in the file plus a `legacy-admin` identity
+(full global admin) for `EXSPEED_AUTH_TOKEN`. This lets you move apps to
+scoped credentials one at a time and unset the shared token afterwards.
+The name `legacy-admin` is reserved while the token is set: a file entry
+with that name stops the server from starting.
 
 **Rotation:** add a new credential, point the client at its new token,
-remove the old entry, restart the server. Restart is required —
-credentials are loaded once at boot (v1).
+remove the old entry, restart the server. Credentials are loaded once at
+startup, so changes take effect on restart.
 
 **Multi-pod:** each pod reads its own `EXSPEED_CREDENTIALS_FILE`.
 Distribute the same file to every pod via a k8s Secret mount, Coolify
@@ -128,11 +148,14 @@ export EXSPEED_TLS_KEY=/etc/exspeed/tls/privkey.pem
 ```
 
 Both variables must be set together, or neither. When set, **both** the TCP
-(5933) and HTTP (8080) listeners serve TLS using the same cert/key pair — one
+(5933) and HTTP (8080) listeners serve TLS using the same cert/key pair: one
 cert, two ports. Make sure the cert's SAN list covers every hostname clients
-will use.
+will use. In a cluster, `cluster.tls = true` serves the same certificate on
+the replication port and makes followers verify it; see
+[high-availability.md](high-availability.md#tls-on-the-cluster-port).
 
-TLS uses pure-Rust `rustls`. Default protocol versions: TLS 1.2 and 1.3.
+TLS uses pure-Rust `rustls`, with TLS 1.2 and 1.3. The server doesn't
+request or verify client certificates.
 
 ### Dev certs
 
@@ -155,25 +178,28 @@ EXSPEED_TLS_CERT=dev-cert.pem EXSPEED_TLS_KEY=dev-key.pem \
 Clients that don't trust your dev CA need to opt in:
 
 - CLI: `EXSPEED_INSECURE_SKIP_VERIFY=1 exspeed streams`
-- TypeScript SDK: `new ExspeedClient({ tls: { rejectUnauthorized: false } })`
+- TypeScript SDK: `ExspeedClient.connect({ tls: { rejectUnauthorized: false } })`,
+  or better, `tls: { ca: readFileSync("dev-cert.pem") }` to trust the dev
+  cert explicitly.
 
-> The SDK's `Publisher` class doesn't pass `auth` or `tls` through yet, so
-> it can't connect to a secured server. Use `client.publish()` instead.
+`client.publisher()` and every other SDK API run on the client's own
+connection, so they use its `token` and `tls` settings.
 
 ## Rotation
 
-Cert and token rotation require a server restart. On a single node the
+Certificates, the shared token and `credentials.toml` are read at startup,
+so rotating any of them takes a server restart. On a single node the
 restart is a blip of a few seconds. In multi-pod mode a gracefully stopped
 leader releases its lease, so a follower takes over within about one
 heartbeat interval (a crashed leader is replaced once its lease TTL, 15 s by
-default, runs out). Live SIGHUP reload is on the roadmap but not in v1.
+default, runs out). Restart the nodes one at a time.
 
-## What's not in v1
+## Not supported
 
-- mTLS (no client-cert verification)
+- mTLS: the server doesn't verify client certificates
 - SASL / JWT / OAuth2
-- Live SIGHUP reload of `credentials.toml` — changes need a restart
-- Rate limiting on failed auth attempts — use an ingress WAF or fail2ban
+- Reloading certificates or credentials without a restart
+- Rate limiting on failed auth attempts: use an ingress WAF or fail2ban
 
 The target deployment model is "trust the network boundary" (VPC, service
 mesh, Hetzner private network, k8s namespace) with per-app scoped

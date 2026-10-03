@@ -275,7 +275,8 @@ All errors extend `ExspeedError`:
 | `TimeoutError` | No response within `requestTimeoutMs` (plus a pull's or read's own wait). |
 | `ProtocolError` | The server sent something this SDK can't decode. |
 
-`ServerError.code` is HTTP-like, and `ErrorCode` names the codes:
+`ServerError.code` is HTTP-like. `ErrorCode` names every code below except
+the two query-only ones (408, 422):
 
 | Code | Meaning | `detail` |
 |------|---------|----------|
@@ -283,15 +284,19 @@ All errors extend `ExspeedError`:
 | 401 | Not authenticated | |
 | 403 | The credential lacks the needed permission | |
 | 404 | Stream or consumer not found | |
+| 408 | A `query` timed out | |
 | 409 | Exists with different settings; stream still has consumers; `msgId` reused with a different body | `{ stored_offset }`, `{ consumers }` |
+| 422 | A `query` exceeded the server's query memory limit | |
 | 429 | Retry later (dedup map full, too many concurrent waits on one connection) | `{ retry_after_secs }` |
 | 500 | Internal error | |
-| 503 | Not the leader, or still starting | `{ leader }` |
+| 503 | Not the leader, still starting (dedup rebuild), or too few in-sync replicas | `{ leader }`, `{ in_sync, required }` |
+| 507 | The server's disk is full; nothing was written | |
 
 `detail` is passed through as the server sent it, with snake_case keys. For
 503 errors, `err.leaderHint` holds the leader's address when the server knows
-it. The SDK does not follow it automatically: connect a client to that
-address.
+it. A failed request isn't retried against the leader automatically; the
+client follows leader hints only when it connects or reconnects (see
+[Clusters](#clusters)).
 
 ```ts
 try {
@@ -378,14 +383,15 @@ const client = await ExspeedClient.connect({
   token: process.env.EXSPEED_TOKEN, // the server's --auth-token, or a credential token
   tls: true,                        // verify against the system CAs
   // tls: { ca: readFileSync("ca.pem") }               // private CA
-  // tls: { ca, cert, key }                            // mutual TLS
+  // tls: { ca, cert, key }                            // client certificate, for a TLS proxy that checks one
   // tls: { servername: "exspeed.internal" }           // SNI / certificate name override
 });
 ```
 
 `tls` takes `true` or any Node
 [`tls.connect` options](https://nodejs.org/api/tls.html#tlsconnectoptions-callback).
-Certificates are verified by default. A wrong or missing token fails
+Certificates are verified by default. The Exspeed server itself doesn't
+request client certificates. A wrong or missing token fails
 `connect()` with `ServerError` 401. A token without permission for an
 operation gets 403. With scoped credentials, `listStreams` and
 `listConsumers` return only what the credential can see. See
