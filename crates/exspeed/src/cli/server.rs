@@ -5,27 +5,24 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Args;
-use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot, Semaphore};
-use tokio_util::codec::{FramedRead, FramedWrite};
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, info_span, warn, Instrument};
 
 use exspeed_broker::broker_append::BrokerAppend;
-use exspeed_broker::consumer_state::DeliveryBatch;
 use exspeed_broker::replication::{ReplicationClient, ReplicationCoordinator, ReplicationServer};
 use exspeed_broker::Broker;
-use exspeed_common::auth::{Action, CredentialStore, Identity, Permission, StreamGlob};
-use exspeed_common::types::StreamName;
+use exspeed_common::auth::CredentialStore;
 use exspeed_connectors::ConnectorManager;
 use exspeed_processing::ExqlEngine;
-use exspeed_protocol::codec::ExspeedCodec;
-use exspeed_protocol::messages::record_delivery::RecordDelivery;
-use exspeed_protocol::messages::{ClientMessage, ServerMessage};
 use exspeed_storage::file::FileStorage;
 use exspeed_streams::StorageEngine;
-use sha2::{Digest, Sha256};
+
+use crate::session::{self, SessionContext};
+
+/// A TLS handshake must finish within this time or the socket is dropped.
+const TLS_ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Default cluster-replication bind address. Matches the advertised default
 /// in the replication design doc and the Plan G Wave 5 contract.
@@ -87,62 +84,6 @@ fn replication_follower_queue_records() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .map(|v| v.min(MAX))
         .unwrap_or(100_000)
-}
-
-/// Synthetic identity used when auth is globally disabled. Grants every verb
-/// against every stream so the per-op `authorize` gates short-circuit to
-/// allow. Cheap to construct (a few allocations); called once per Connect
-/// in the open-broker case.
-fn anonymous_identity() -> Identity {
-    Identity {
-        name: "anonymous".to_string(),
-        permissions: vec![Permission {
-            streams: StreamGlob::compile("*", "anonymous").expect("* is a valid glob"),
-            actions: Action::Publish | Action::Subscribe | Action::Admin,
-        }],
-    }
-}
-
-/// Send a 401 error frame and bump `exspeed_auth_denied_total`. Used when a
-/// data-plane op arrives before a successful Connect.
-async fn reject_unauthenticated<W>(
-    framed: &mut FramedWrite<W, ExspeedCodec>,
-    correlation_id: u32,
-    metrics: &exspeed_common::Metrics,
-    op: &'static str,
-) -> Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    metrics.auth_denied("unauthorized", "tcp", op);
-    let response = ServerMessage::Error {
-        code: 401,
-        message: "unauthorized".into(),
-    }
-    .into_frame(correlation_id);
-    framed.send(response).await?;
-    Ok(())
-}
-
-/// Send a 403 error frame and bump `exspeed_auth_denied_total`. The
-/// connection stays open — only the offending op is rejected.
-async fn reject_forbidden<W>(
-    framed: &mut FramedWrite<W, ExspeedCodec>,
-    correlation_id: u32,
-    metrics: &exspeed_common::Metrics,
-    op: &'static str,
-) -> Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    metrics.auth_denied("forbidden", "tcp", op);
-    let response = ServerMessage::Error {
-        code: 403,
-        message: "forbidden".into(),
-    }
-    .into_frame(correlation_id);
-    framed.send(response).await?;
-    Ok(())
 }
 
 /// Storage durability mode for the `--storage-sync` CLI flag.
@@ -220,11 +161,28 @@ pub struct ServerArgs {
     #[arg(long, default_value_t = 4 * 1024 * 1024, env = "EXSPEED_SYNC_BYTES")]
     pub storage_sync_bytes: usize,
 
-    /// mpsc channel capacity for per-subscription delivery tasks. Larger values
-    /// tolerate burstier producers at the cost of more memory per subscription.
-    /// Wired through ServerArgs now; consumed by the broker in a future task.
-    #[arg(long, default_value_t = 8192, env = "EXSPEED_DELIVERY_BUFFER")]
-    pub delivery_buffer: usize,
+}
+
+impl ServerArgs {
+    /// Defaults identical to the CLI's, with the given data directory. Handy
+    /// for embedding the server (tests, benchmarks).
+    pub fn new(data_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            bind: "0.0.0.0:5933".into(),
+            api_bind: "0.0.0.0:8080".into(),
+            data_dir: data_dir.into(),
+            auth_token: None,
+            credentials_file: None,
+            tls_cert: None,
+            tls_key: None,
+            storage_sync: StorageSyncArg::Sync,
+            storage_flush_window_us: 500,
+            storage_flush_threshold_records: 256,
+            storage_flush_threshold_bytes: 1_048_576,
+            storage_sync_interval_ms: 10,
+            storage_sync_bytes: 4 * 1024 * 1024,
+        }
+    }
 }
 
 pub async fn run(args: ServerArgs) -> Result<()> {
@@ -341,10 +299,9 @@ where
         warn!("TLS disabled — do not expose broker ports to the public internet");
     }
 
-    // Acquire exclusive data-dir lock — held for the lifetime of this process.
-    // Leaks intentionally; the OS releases the flock on process exit.
-    let lock = crate::cli::server_lock::acquire_data_dir_lock(&args.data_dir)?;
-    Box::leak(Box::new(lock));
+    // Exclusive data-dir lock, held until this function returns (or the
+    // process exits) so an embedded server can be restarted in-process.
+    let _data_dir_lock = crate::cli::server_lock::acquire_data_dir_lock(&args.data_dir)?;
 
     // Build storage sync mode from CLI args.
     let storage_sync_mode = match args.storage_sync {
@@ -368,14 +325,6 @@ where
         flush_threshold_records: args.storage_flush_threshold_records,
         flush_threshold_bytes: args.storage_flush_threshold_bytes,
     };
-
-    // Set delivery_buffer env var so Task 8 (broker mpsc bump) can pick it up.
-    // SAFETY: single-threaded at this point in startup; no other thread reads this var yet.
-    // LINT: set_var is deprecated in edition 2024 for unsafe reasons but acceptable here.
-    #[allow(deprecated)]
-    unsafe {
-        std::env::set_var("EXSPEED_DELIVERY_BUFFER", args.delivery_buffer.to_string());
-    }
 
     // Create storage
     let file_storage = Arc::new(FileStorage::open_with_mode(
@@ -440,27 +389,6 @@ where
             rebuild_set.spawn(async move { ba.rebuild_stream(&s, &sd).await });
         }
     }
-
-    // Build consumer store (selects backend from EXSPEED_CONSUMER_STORE or EXSPEED_OFFSET_STORE)
-    let consumer_backend = std::env::var("EXSPEED_CONSUMER_STORE")
-        .or_else(|_| std::env::var("EXSPEED_OFFSET_STORE"))
-        .unwrap_or_else(|_| "file".to_string());
-    let consumer_store = exspeed_broker::consumer_store::from_env(&args.data_dir)
-        .await
-        .expect("failed to initialize consumer store");
-    info!(
-        backend = consumer_backend.as_str(),
-        "consumer store initialized"
-    );
-
-    // Build work coordinator (uses same backend as consumer store).
-    let work_coordinator = exspeed_broker::work_coordinator::from_env()
-        .await
-        .expect("failed to initialize work coordinator");
-    info!(
-        supports_coordination = work_coordinator.supports_coordination(),
-        "work coordinator initialized"
-    );
 
     // Build lease backend (same env var dispatch as work coordinator).
     let lease = exspeed_broker::lease::from_env()
@@ -602,11 +530,8 @@ where
         storage.clone(),
         broker_append,
         args.data_dir.clone(),
-        consumer_store,
-        work_coordinator.clone(),
         lease.clone(),
         metrics.clone(),
-        args.delivery_buffer,
     );
     let broker = Arc::new(match replication_coordinator.as_ref() {
         Some(coord) => broker_builder.with_replication_coordinator(coord.clone()),
@@ -615,10 +540,6 @@ where
     // Only the leader accepts writes. Every write path (TCP, HTTP, webhooks,
     // connectors, ExQL) goes through `broker.log`, which enforces this.
     broker.log.set_write_gate(leadership.clone());
-    broker
-        .load_consumers()
-        .await
-        .map_err(|e| anyhow::anyhow!(e))?;
 
     // Spawn watcher that flips `dedup_ready` once all per-stream rebuild tasks finish.
     {
@@ -642,28 +563,6 @@ where
         args.data_dir.clone(),
         cancel_token.clone(),
     );
-
-    // Spawn queue-depth sampler (5s interval) — reports per-subscription
-    // delivery channel fill ratio to `subscription_queue_fill_ratio`.
-    exspeed_broker::queue_depth_task::spawn_queue_depth_sampler(broker.clone(), metrics.clone());
-
-    // Warn if grouped consumers exist but the coordinator doesn't support
-    // multi-pod coordination (file/s3 backends).
-    if !work_coordinator.supports_coordination() {
-        let consumers = broker.consumers.read().unwrap();
-        let grouped_count = consumers
-            .values()
-            .filter(|c| !c.config.group.is_empty())
-            .count();
-        if grouped_count > 0 {
-            warn!(
-                grouped_consumers = grouped_count,
-                "grouped consumers exist but the active backend does not support multi-pod \
-                 coordination — running multiple pods will cause duplicate deliveries. \
-                 Set EXSPEED_CONSUMER_STORE=postgres or redis for multi-pod safety."
-            );
-        }
-    }
 
     // Create offset store (backend selected by EXSPEED_OFFSET_STORE env var)
     let offset_backend =
@@ -753,6 +652,7 @@ where
         let connector_manager_sup = connector_manager_for_supervisor;
         let exql_sup = exql_for_supervisor;
         let storage_sup = file_storage.clone();
+        let consumers_sup = broker.consumers.clone();
         let supervisor_cancel = cancel_token.clone();
         // Retention task emits `RetentionTrimmed` replication events in
         // multi-pod mode; `None` in single-pod short-circuits the emit
@@ -779,6 +679,12 @@ where
                 }
                 let token = leadership_sup.current_child_token().await;
                 info!("leader supervisor: assuming leadership; starting work");
+                // Consumers run only on the leader; they restore their state
+                // from `__consumers` and stop when the token is cancelled.
+                if let Err(e) = consumers_sup.start(token.clone()).await {
+                    error!(error = %e, "failed to start consumers; resigning tenure");
+                    token.cancel();
+                }
 
                 tokio::select! {
                     _ = connector_manager_sup.run_all(token.clone()) => {}
@@ -1071,6 +977,16 @@ where
     let conn_sem = Arc::new(Semaphore::new(max_conns));
     info!(max_conns, "connection cap configured");
 
+    let session_ctx = Arc::new(SessionContext {
+        broker: broker.clone(),
+        exql: exql_for_tcp,
+        credential_store: credential_store.clone(),
+        metrics: metrics.clone(),
+        node_id: leadership.holder_id.to_string(),
+        // Leader hints for clients arrive with the HA work (Phase 6).
+        leader_hint: Arc::new(|| None),
+    });
+
     loop {
         tokio::select! {
             biased;
@@ -1100,18 +1016,13 @@ where
                 info!(%peer, "new connection");
                 metrics.connection_opened();
 
-                let broker = broker.clone();
-                let exql = exql_for_tcp.clone();
+                let session_ctx = session_ctx.clone();
                 let metrics_clone = metrics.clone();
-                let metrics_for_handler = metrics.clone();
-                let credential_store_clone = credential_store.clone();
                 let tls_config_clone = tls_config.clone();
                 let conn_token = cancel_token.child_token();
                 // Per-connection span: `identity` starts empty and is filled
-                // in via `Span::current().record(...)` when Connect succeeds.
-                // Every `info!`/`warn!` inside this connection inherits the
-                // field, so log aggregators can slice by tenant without
-                // needing each call-site to pass `identity = ...`.
+                // in when Connect succeeds, so every log line inside this
+                // connection carries it.
                 let conn_span = info_span!(
                     "connection",
                     %peer,
@@ -1123,28 +1034,13 @@ where
                         let result: Result<()> = async move {
                             if let Some(tls_cfg) = tls_config_clone {
                                 let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
-                                let tls_stream = acceptor.accept(socket).await?;
-                                handle_connection(
-                                    tls_stream,
-                                    peer,
-                                    broker,
-                                    exql,
-                                    credential_store_clone,
-                                    metrics_for_handler,
-                                    conn_token,
-                                )
-                                .await
+                                let tls_stream =
+                                    tokio::time::timeout(TLS_ACCEPT_TIMEOUT, acceptor.accept(socket))
+                                        .await
+                                        .map_err(|_| anyhow::anyhow!("TLS handshake timed out"))??;
+                                session::run(tls_stream, peer, session_ctx, conn_token).await
                             } else {
-                                handle_connection(
-                                    socket,
-                                    peer,
-                                    broker,
-                                    exql,
-                                    credential_store_clone,
-                                    metrics_for_handler,
-                                    conn_token,
-                                )
-                                .await
+                                session::run(socket, peer, session_ctx, conn_token).await
                             }
                         }
                         .await;
@@ -1181,858 +1077,5 @@ where
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     info!("server stopped");
-    Ok(())
-}
-
-async fn handle_connection<S>(
-    socket: S,
-    peer: SocketAddr,
-    broker: Arc<Broker>,
-    exql: Arc<ExqlEngine>,
-    credential_store: Option<Arc<CredentialStore>>,
-    metrics: Arc<exspeed_common::Metrics>,
-    cancel: CancellationToken,
-) -> Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let (reader, writer) = tokio::io::split(socket);
-    let mut framed_read = FramedRead::new(reader, ExspeedCodec::new());
-    let mut framed_write = FramedWrite::new(writer, ExspeedCodec::new());
-
-    // Authenticated principal on this connection. `None` until a successful
-    // Connect. When credential_store is None we still attach a synthetic
-    // "anonymous" identity on Connect so per-op gates short-circuit.
-    let mut identity: Option<Arc<Identity>> = None;
-
-    // Per-connection subscription state (single subscription per TCP connection).
-    // Tracks (consumer_name, subscriber_id) so disconnect cleanup removes the right subscriber.
-    let mut active_subscription: Option<(String, String)> = None;
-    // Stream bound to the active subscription (captured on Subscribe OK).
-    // Authz for Fetch/Ack/Nack uses this because those ops don't carry a
-    // stream name on the wire. Intentionally frozen at Subscribe-time — a
-    // mid-subscription consumer rebind (rare: delete + recreate with a
-    // different stream under the same name) would authorize against the
-    // old stream, but the broker tears down the delivery task in that
-    // case so the invariant holds end-to-end.
-    let mut active_sub_stream: Option<StreamName> = None;
-    let mut delivery_rx: Option<mpsc::Receiver<DeliveryBatch>> = None;
-    let mut cancel_tx: Option<oneshot::Sender<()>> = None;
-
-    loop {
-        tokio::select! {
-            biased;
-            // Branch 0: process-wide shutdown (SIGTERM/SIGINT).
-            // `biased` ensures cancel wins races against in-flight reads.
-            _ = cancel.cancelled() => {
-                info!(%peer, "connection cancelled by shutdown");
-                break;
-            }
-            // Branch 1: incoming frame from client
-            frame_result = framed_read.next() => {
-                match frame_result {
-                    Some(Ok(frame)) => {
-                        let correlation_id = frame.correlation_id;
-
-                        let parsed = ClientMessage::from_frame(frame);
-
-                        // First-frame gate: before a successful Connect, only
-                        // Connect itself is allowed. Ping is cheap but we still
-                        // require Connect first to keep the gate simple.
-                        if identity.is_none() {
-                            match &parsed {
-                                Ok(ClientMessage::Connect(_)) => { /* allowed */ }
-                                _ => {
-                                    warn!(%peer, "rejected op before auth");
-                                    metrics.auth_denied("unauthorized", "tcp", "pre_connect");
-                                    let response = ServerMessage::Error {
-                                        code: 401,
-                                        message: "unauthorized".into(),
-                                    }
-                                    .into_frame(correlation_id);
-                                    framed_write.send(response).await?;
-                                    break;
-                                }
-                            }
-                        }
-
-                        match parsed {
-                            Ok(ClientMessage::Connect(req)) => {
-                                // TODO(post-plan-g): this Connect handshake duplicates
-                                // `crates/exspeed-broker/src/replication/server.rs`
-                                // `read_connect_and_authorize`. Extract a shared helper.
-                                // The exhaustive match on `req.auth_type` below forces a
-                                // compile error in BOTH sites when a new AuthType variant
-                                // is added, so the two paths cannot silently drift.
-                                use exspeed_protocol::messages::connect::AuthType;
-                                let result: Result<Arc<Identity>, &'static str> =
-                                    if let Some(store) = credential_store.as_ref() {
-                                        match req.auth_type {
-                                            AuthType::Token => {
-                                                let digest: [u8; 32] =
-                                                    Sha256::digest(&req.auth_payload).into();
-                                                match store.lookup(&digest) {
-                                                    Some(id) => Ok(id),
-                                                    None => Err("unauthorized"),
-                                                }
-                                            }
-                                            // Non-Token variants are rejected. Listed
-                                            // explicitly so adding a new AuthType forces a
-                                            // compile error in both Connect sites.
-                                            AuthType::None
-                                            | AuthType::MTls
-                                            | AuthType::Sasl => Err("unauthorized"),
-                                        }
-                                    } else {
-                                        // Auth off — attach a synthetic anonymous identity
-                                        // with full access so the per-op gates short-circuit.
-                                        Ok(Arc::new(anonymous_identity()))
-                                    };
-                                match result {
-                                    Ok(id) => {
-                                        // Populate the enclosing connection span's
-                                        // `identity` field so every subsequent log
-                                        // line on this connection carries it.
-                                        tracing::Span::current()
-                                            .record("identity", id.name.as_str());
-                                        info!(
-                                            %peer,
-                                            client_id = %req.client_id,
-                                            identity = %id.name,
-                                            "CONNECT authenticated"
-                                        );
-                                        identity = Some(id);
-                                        let response = ServerMessage::ConnectOk(
-                                            exspeed_protocol::messages::ConnectResponse {
-                                                server_version: exspeed_protocol::messages::WIRE_VERSION,
-                                            },
-                                        )
-                                        .into_frame(correlation_id);
-                                        framed_write.send(response).await?;
-                                    }
-                                    Err(msg) => {
-                                        metrics.auth_denied("unauthorized", "tcp", "Connect");
-                                        warn!(%peer, client_id = %req.client_id, "CONNECT rejected");
-                                        let response = ServerMessage::Error {
-                                            code: 401,
-                                            message: msg.to_string(),
-                                        }
-                                        .into_frame(correlation_id);
-                                        framed_write.send(response).await?;
-                                        break; // close the socket
-                                    }
-                                }
-                            }
-                            Ok(ClientMessage::Ping) => {
-                                // Ping is not scoped — no authz gate beyond
-                                // the first-frame check above.
-                                let response = ServerMessage::Pong.into_frame(correlation_id);
-                                framed_write.send(response).await?;
-                            }
-                            Ok(ClientMessage::Publish(req)) => {
-                                let Some(id) = identity.as_ref() else {
-                                    reject_unauthenticated(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Publish",
-                                    )
-                                    .await?;
-                                    continue;
-                                };
-                                let stream_name = match StreamName::try_from(req.stream.as_str()) {
-                                    Ok(n) => n,
-                                    Err(_) => {
-                                        // Fall through to broker, which already
-                                        // returns a 400 for invalid stream names.
-                                        let response = broker
-                                            .handle_message(ClientMessage::Publish(req))
-                                            .await;
-                                        framed_write
-                                            .send(response.into_frame(correlation_id))
-                                            .await?;
-                                        continue;
-                                    }
-                                };
-                                if !id.authorize(Action::Publish, &stream_name) {
-                                    reject_forbidden(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Publish",
-                                    )
-                                    .await?;
-                                    continue;
-                                }
-                                let response = broker
-                                    .handle_message(ClientMessage::Publish(req))
-                                    .await;
-                                framed_write
-                                    .send(response.into_frame(correlation_id))
-                                    .await?;
-                            }
-                            Ok(ClientMessage::PublishBatch(req)) => {
-                                use exspeed_protocol::messages::publish_batch::{
-                                    BatchResult, PublishBatchOkResponse,
-                                };
-                                use exspeed_streams::record::Record;
-
-                                let Some(id) = identity.as_ref() else {
-                                    reject_unauthenticated(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "PublishBatch",
-                                    )
-                                    .await?;
-                                    continue;
-                                };
-
-                                let stream_name = match StreamName::try_from(req.stream.as_str()) {
-                                    Ok(n) => n,
-                                    Err(_) => {
-                                        let response = ServerMessage::Error {
-                                            code: 400,
-                                            message: "invalid stream name".into(),
-                                        }
-                                        .into_frame(correlation_id);
-                                        framed_write.send(response).await?;
-                                        continue;
-                                    }
-                                };
-
-                                if !id.authorize(Action::Publish, &stream_name) {
-                                    reject_forbidden(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "PublishBatch",
-                                    )
-                                    .await?;
-                                    continue;
-                                }
-
-                                let records: Vec<Record> = req
-                                    .records
-                                    .into_iter()
-                                    .map(|br| Record {
-                                        subject: br.subject,
-                                        key: br.key,
-                                        value: br.value,
-                                        headers: exspeed_broker::handlers::with_msg_id(
-                                            br.headers, br.msg_id,
-                                        ),
-                                        timestamp_ns: None,
-                                    })
-                                    .collect();
-
-                                let results =
-                                    match broker.log.append_batch(&stream_name, records).await {
-                                        Ok(r) => r,
-                                        Err(e) => {
-                                            let response =
-                                                exspeed_broker::handlers::log_error_response(e)
-                                                    .into_frame(correlation_id);
-                                            framed_write.send(response).await?;
-                                            continue;
-                                        }
-                                    };
-
-                                let batch_results: Vec<BatchResult> = results
-                                    .into_iter()
-                                    .map(|r| match r {
-                                        exspeed_broker::broker_append::AppendResult::Written(
-                                            offset,
-                                            _ts,
-                                        ) => BatchResult::Written { offset: offset.0 },
-                                        exspeed_broker::broker_append::AppendResult::Duplicate(
-                                            offset,
-                                        ) => BatchResult::Duplicate {
-                                            offset: offset.0,
-                                            duplicate_of: offset.0,
-                                        },
-                                    })
-                                    .collect();
-
-                                let resp = PublishBatchOkResponse {
-                                    results: batch_results,
-                                };
-                                let mut buf = bytes::BytesMut::new();
-                                resp.encode(&mut buf);
-                                framed_write
-                                    .send(exspeed_protocol::frame::Frame::new(
-                                        exspeed_protocol::opcodes::OpCode::PublishBatchOk,
-                                        correlation_id,
-                                        buf.freeze(),
-                                    ))
-                                    .await?;
-                            }
-                            Ok(ClientMessage::Fetch(req)) => {
-                                let Some(id) = identity.as_ref() else {
-                                    reject_unauthenticated(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Fetch",
-                                    )
-                                    .await?;
-                                    continue;
-                                };
-                                let stream_name = match StreamName::try_from(req.stream.as_str()) {
-                                    Ok(n) => n,
-                                    Err(_) => {
-                                        let response = broker
-                                            .handle_message(ClientMessage::Fetch(req))
-                                            .await;
-                                        framed_write
-                                            .send(response.into_frame(correlation_id))
-                                            .await?;
-                                        continue;
-                                    }
-                                };
-                                if !id.authorize(Action::Subscribe, &stream_name) {
-                                    reject_forbidden(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Fetch",
-                                    )
-                                    .await?;
-                                    continue;
-                                }
-                                let response = broker
-                                    .handle_message(ClientMessage::Fetch(req))
-                                    .await;
-                                framed_write
-                                    .send(response.into_frame(correlation_id))
-                                    .await?;
-                            }
-                            Ok(ClientMessage::CreateStream(req)) => {
-                                let Some(id) = identity.as_ref() else {
-                                    reject_unauthenticated(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "CreateStream",
-                                    )
-                                    .await?;
-                                    continue;
-                                };
-                                let stream_name =
-                                    match StreamName::try_from(req.stream_name.as_str()) {
-                                        Ok(n) => n,
-                                        Err(_) => {
-                                            let response = broker
-                                                .handle_message(ClientMessage::CreateStream(req))
-                                                .await;
-                                            framed_write
-                                                .send(response.into_frame(correlation_id))
-                                                .await?;
-                                            continue;
-                                        }
-                                    };
-                                if !id.authorize(Action::Admin, &stream_name) {
-                                    reject_forbidden(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "CreateStream",
-                                    )
-                                    .await?;
-                                    continue;
-                                }
-                                let response = broker
-                                    .handle_message(ClientMessage::CreateStream(req))
-                                    .await;
-                                framed_write
-                                    .send(response.into_frame(correlation_id))
-                                    .await?;
-                            }
-                            Ok(ClientMessage::CreateConsumer(req)) => {
-                                let Some(id) = identity.as_ref() else {
-                                    reject_unauthenticated(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "CreateConsumer",
-                                    )
-                                    .await?;
-                                    continue;
-                                };
-                                let stream_name =
-                                    match StreamName::try_from(req.stream.as_str()) {
-                                        Ok(n) => n,
-                                        Err(_) => {
-                                            let response = broker
-                                                .handle_message(ClientMessage::CreateConsumer(req))
-                                                .await;
-                                            framed_write
-                                                .send(response.into_frame(correlation_id))
-                                                .await?;
-                                            continue;
-                                        }
-                                    };
-                                if !id.authorize(Action::Admin, &stream_name) {
-                                    reject_forbidden(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "CreateConsumer",
-                                    )
-                                    .await?;
-                                    continue;
-                                }
-                                let response = broker
-                                    .handle_message(ClientMessage::CreateConsumer(req))
-                                    .await;
-                                framed_write
-                                    .send(response.into_frame(correlation_id))
-                                    .await?;
-                            }
-                            Ok(ClientMessage::DeleteConsumer(req)) => {
-                                let Some(id) = identity.as_ref() else {
-                                    reject_unauthenticated(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "DeleteConsumer",
-                                    )
-                                    .await?;
-                                    continue;
-                                };
-                                // Look up the consumer's attached stream.
-                                // If the consumer doesn't exist, let the broker
-                                // return the authoritative 404 to avoid leaking
-                                // existence via an authz denial.
-                                let maybe_stream = {
-                                    let consumers = broker.consumers.read().unwrap();
-                                    consumers
-                                        .get(&req.name)
-                                        .map(|c| c.config.stream.clone())
-                                };
-                                if let Some(ref s) = maybe_stream {
-                                    if let Ok(n) = StreamName::try_from(s.as_str()) {
-                                        if !id.authorize(Action::Admin, &n) {
-                                            reject_forbidden(
-                                                &mut framed_write,
-                                                correlation_id,
-                                                &metrics,
-                                                "DeleteConsumer",
-                                            )
-                                            .await?;
-                                            continue;
-                                        }
-                                    }
-                                    // Malformed stored stream name falls through
-                                    // to the broker which returns the canonical error.
-                                }
-                                let response = broker
-                                    .handle_message(ClientMessage::DeleteConsumer(req))
-                                    .await;
-                                framed_write
-                                    .send(response.into_frame(correlation_id))
-                                    .await?;
-                            }
-                            Ok(ClientMessage::Ack(req)) => {
-                                let Some(id) = identity.as_ref() else {
-                                    reject_unauthenticated(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Ack",
-                                    )
-                                    .await?;
-                                    continue;
-                                };
-                                // Ack/Nack don't carry a stream name on the wire —
-                                // authorize against the stream bound to the active
-                                // subscription. No active subscription → 403:
-                                // you can't ack what you didn't subscribe to.
-                                let Some(stream_name) = active_sub_stream.as_ref() else {
-                                    reject_forbidden(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Ack",
-                                    )
-                                    .await?;
-                                    continue;
-                                };
-                                // The ack must target the consumer this connection
-                                // subscribed to; otherwise a client could move any
-                                // other consumer's offset.
-                                let owns_consumer = active_subscription
-                                    .as_ref()
-                                    .is_some_and(|(c, _)| c == &req.consumer_name);
-                                if !owns_consumer || !id.authorize(Action::Subscribe, stream_name) {
-                                    reject_forbidden(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Ack",
-                                    )
-                                    .await?;
-                                    continue;
-                                }
-                                let response = broker
-                                    .handle_message(ClientMessage::Ack(req))
-                                    .await;
-                                framed_write
-                                    .send(response.into_frame(correlation_id))
-                                    .await?;
-                            }
-                            Ok(ClientMessage::Nack(req)) => {
-                                let Some(id) = identity.as_ref() else {
-                                    reject_unauthenticated(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Nack",
-                                    )
-                                    .await?;
-                                    continue;
-                                };
-                                let Some(stream_name) = active_sub_stream.as_ref() else {
-                                    reject_forbidden(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Nack",
-                                    )
-                                    .await?;
-                                    continue;
-                                };
-                                // The ack must target the consumer this connection
-                                // subscribed to; otherwise a client could move any
-                                // other consumer's offset.
-                                let owns_consumer = active_subscription
-                                    .as_ref()
-                                    .is_some_and(|(c, _)| c == &req.consumer_name);
-                                if !owns_consumer || !id.authorize(Action::Subscribe, stream_name) {
-                                    reject_forbidden(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Nack",
-                                    )
-                                    .await?;
-                                    continue;
-                                }
-                                let response = broker
-                                    .handle_message(ClientMessage::Nack(req))
-                                    .await;
-                                framed_write
-                                    .send(response.into_frame(correlation_id))
-                                    .await?;
-                            }
-                            Ok(ClientMessage::Seek(req)) => {
-                                let Some(id) = identity.as_ref() else {
-                                    reject_unauthenticated(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Seek",
-                                    )
-                                    .await?;
-                                    continue;
-                                };
-                                // Seek is keyed by consumer_name. Derive the
-                                // target stream from broker state; if the
-                                // consumer is missing, let the broker return
-                                // its own 404.
-                                let maybe_stream = {
-                                    let consumers = broker.consumers.read().unwrap();
-                                    consumers
-                                        .get(&req.consumer_name)
-                                        .map(|c| c.config.stream.clone())
-                                };
-                                if let Some(ref s) = maybe_stream {
-                                    if let Ok(n) = StreamName::try_from(s.as_str()) {
-                                        if !id.authorize(Action::Subscribe, &n) {
-                                            reject_forbidden(
-                                                &mut framed_write,
-                                                correlation_id,
-                                                &metrics,
-                                                "Seek",
-                                            )
-                                            .await?;
-                                            continue;
-                                        }
-                                    }
-                                    // Malformed stored stream name falls through
-                                    // to the broker which returns the canonical error.
-                                }
-                                let response = broker
-                                    .handle_message(ClientMessage::Seek(req))
-                                    .await;
-                                framed_write
-                                    .send(response.into_frame(correlation_id))
-                                    .await?;
-                            }
-                            Ok(ClientMessage::Subscribe(req)) => {
-                                let Some(id) = identity.as_ref() else {
-                                    reject_unauthenticated(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Subscribe",
-                                    )
-                                    .await?;
-                                    continue;
-                                };
-                                if active_subscription.is_some() {
-                                    let response = ServerMessage::Error {
-                                        code: 400,
-                                        message: "already subscribed; unsubscribe first".into(),
-                                    }
-                                    .into_frame(correlation_id);
-                                    framed_write.send(response).await?;
-                                    continue;
-                                }
-
-                                // Resolve consumer → stream before subscribing so
-                                // we can authorize. Unknown consumer → let the
-                                // broker emit its own error (today: 400); don't
-                                // deny via 403 just because authz couldn't
-                                // resolve, or we'd leak consumer existence.
-                                let maybe_stream = {
-                                    let consumers = broker.consumers.read().unwrap();
-                                    consumers
-                                        .get(&req.consumer_name)
-                                        .map(|c| c.config.stream.clone())
-                                };
-                                let authz_stream = maybe_stream
-                                    .as_deref()
-                                    .and_then(|s| StreamName::try_from(s).ok());
-                                if let Some(ref n) = authz_stream {
-                                    if !id.authorize(Action::Subscribe, n) {
-                                        reject_forbidden(
-                                            &mut framed_write,
-                                            correlation_id,
-                                            &metrics,
-                                            "Subscribe",
-                                        )
-                                        .await?;
-                                        continue;
-                                    }
-                                }
-
-                                // Auto-generate subscriber_id if client didn't provide one
-                                // (legacy client, or new client opting out of explicit IDs).
-                                let subscriber_id = if req.subscriber_id.is_empty() {
-                                    uuid::Uuid::new_v4().to_string()
-                                } else {
-                                    req.subscriber_id.clone()
-                                };
-
-                                match broker.subscribe(&req.consumer_name, &subscriber_id) {
-                                    Ok((rx, cancel)) => {
-                                        active_subscription =
-                                            Some((req.consumer_name.clone(), subscriber_id));
-                                        active_sub_stream = authz_stream;
-                                        delivery_rx = Some(rx);
-                                        drop(cancel_tx.replace(cancel));
-                                        framed_write
-                                            .send(ServerMessage::Ok.into_frame(correlation_id))
-                                            .await?;
-                                    }
-                                    Err(e) => {
-                                        let response = ServerMessage::Error {
-                                            code: 400,
-                                            message: e,
-                                        }
-                                        .into_frame(correlation_id);
-                                        framed_write.send(response).await?;
-                                    }
-                                }
-                            }
-                            Ok(ClientMessage::Unsubscribe(req)) => {
-                                // Unsubscribe doesn't need an authz gate beyond
-                                // authentication — you can always drop your own
-                                // subscription. Still require identity for
-                                // defense-in-depth against the unreachable case.
-                                if identity.is_none() {
-                                    reject_unauthenticated(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Unsubscribe",
-                                    )
-                                    .await?;
-                                    continue;
-                                }
-                                // Use the subscriber_id the client sent, or fall back to the one
-                                // the server generated on the Subscribe call (stored in active_subscription).
-                                let subscriber_id = if !req.subscriber_id.is_empty() {
-                                    req.subscriber_id.clone()
-                                } else if let Some((_, ref sub_id)) = active_subscription {
-                                    sub_id.clone()
-                                } else {
-                                    String::new()
-                                };
-                                if !subscriber_id.is_empty() {
-                                    let _ = broker.unsubscribe(&req.consumer_name, &subscriber_id);
-                                }
-                                drop(cancel_tx.take());
-                                delivery_rx = None;
-                                active_subscription = None;
-                                active_sub_stream = None;
-                                framed_write
-                                    .send(ServerMessage::Ok.into_frame(correlation_id))
-                                    .await?;
-                            }
-                            Ok(ClientMessage::Query(sql)) => {
-                                use exspeed_processing::types::value_to_json;
-
-                                // A query can read any stream (and registered
-                                // external databases), so it needs global admin —
-                                // the same rule as POST /api/v1/queries.
-                                let Some(id) = identity.as_ref() else {
-                                    reject_unauthenticated(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Query",
-                                    )
-                                    .await?;
-                                    continue;
-                                };
-                                if !id.has_global_admin() {
-                                    reject_forbidden(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Query",
-                                    )
-                                    .await?;
-                                    continue;
-                                }
-
-                                let result = exql.execute_bounded(&sql).await;
-                                let response = match result {
-                                    Ok(result_set) => {
-                                        let rows: Vec<Vec<serde_json::Value>> = result_set
-                                            .rows
-                                            .iter()
-                                            .map(|row| row.values.iter().map(value_to_json).collect())
-                                            .collect();
-                                        let row_count = rows.len();
-                                        let json = serde_json::json!({
-                                            "columns": result_set.columns,
-                                            "rows": rows,
-                                            "row_count": row_count,
-                                            "execution_time_ms": result_set.execution_time_ms,
-                                        });
-                                        let payload = serde_json::to_vec(&json).unwrap();
-                                        ServerMessage::QueryResult(bytes::Bytes::from(payload))
-                                    }
-                                    Err(e) => {
-                                        let json = e.to_json();
-                                        let payload = serde_json::to_vec(&json).unwrap();
-                                        ServerMessage::Error {
-                                            code: 400,
-                                            message: String::from_utf8(payload).unwrap(),
-                                        }
-                                    }
-                                };
-                                framed_write.send(response.into_frame(correlation_id)).await?;
-                            }
-                            Err(e) => {
-                                warn!(%peer, "unhandled message: {}", e);
-                                let response = ServerMessage::Error {
-                                    code: 400,
-                                    message: e.to_string(),
-                                }
-                                .into_frame(correlation_id);
-                                framed_write.send(response).await?;
-                            }
-                        }
-                    }
-                    Some(Err(e)) => {
-                        error!(%peer, "frame decode error: {}", e);
-                        return Err(e.into());
-                    }
-                    None => break, // client disconnected
-                }
-            }
-
-            // Branch 2: outgoing delivery batch from active subscription
-            delivery = async {
-                match delivery_rx.as_mut() {
-                    Some(rx) => rx.recv().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                if let Some(batch) = delivery {
-                    // Guard: check if subscription is still active without cloning.
-                    if active_subscription.is_none() {
-                        warn!(
-                            %peer,
-                            "received delivery batch after subscription was cleared; \
-                             dropping batch and tearing down delivery channel"
-                        );
-                        delivery_rx = None;
-                        drop(cancel_tx.take());
-                        continue;
-                    }
-
-                    if batch.records.len() == 1 {
-                        // Single-record path: one Record frame (0x82). Grouped consumers
-                        // always deliver size-1 batches; this keeps that path allocation-free.
-                        // Clone consumer_name only here where it's used.
-                        let consumer_name = match active_subscription.as_ref() {
-                            Some((name, _)) => name.clone(),
-                            None => unreachable!("guarded above"),
-                        };
-                        let d = batch.records.into_iter().next().unwrap();
-                        let record_delivery = RecordDelivery {
-                            consumer_name,
-                            offset: d.record.offset.0,
-                            timestamp: d.record.timestamp,
-                            subject: d.record.subject,
-                            delivery_attempt: d.delivery_attempt,
-                            key: d.record.key,
-                            value: d.record.value,
-                            headers: d.record.headers,
-                        };
-                        let response = ServerMessage::Record(record_delivery);
-                        framed_write.send(response.into_frame(0)).await?;
-                    } else {
-                        // Batch path: one RecordsBatch frame (0x83) for the whole batch.
-                        // Moves payload Bytes out of each DeliveryRecord — no extra clones.
-                        use exspeed_protocol::messages::records_batch::{BatchRecord, RecordsBatch};
-
-                        let records: Vec<BatchRecord> = batch
-                            .records
-                            .into_iter()
-                            .map(|d| BatchRecord {
-                                offset: d.record.offset.0,
-                                timestamp: d.record.timestamp,
-                                subject: d.record.subject,
-                                key: d.record.key,
-                                value: d.record.value,
-                                headers: d.record.headers,
-                            })
-                            .collect();
-
-                        let response = ServerMessage::RecordsBatch(RecordsBatch { records });
-                        framed_write.send(response.into_frame(0)).await?;
-                    }
-                } else {
-                    // Channel closed — delivery task stopped
-                    delivery_rx = None;
-                    drop(cancel_tx.take());
-                    active_subscription = None;
-                }
-            }
-        }
-    }
-
-    // Clean up: if this connection had an active subscription, unsubscribe this
-    // specific subscriber so other subscribers on the same consumer are unaffected.
-    if let Some((ref consumer_name, ref subscriber_id)) = active_subscription {
-        let _ = broker.unsubscribe(consumer_name, subscriber_id);
-    }
-
     Ok(())
 }

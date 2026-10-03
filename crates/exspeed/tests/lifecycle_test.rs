@@ -53,7 +53,6 @@ async fn start_test_server(max_conns: u32) -> (String, tempfile::TempDir) {
             storage_flush_threshold_bytes: 1_048_576,
             storage_sync_interval_ms: 10,
             storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
         })
         .await
         .unwrap();
@@ -121,7 +120,6 @@ async fn sigterm_signal_token_stops_accept_loop() {
                 storage_flush_threshold_bytes: 1_048_576,
                 storage_sync_interval_ms: 10,
                 storage_sync_bytes: 4 * 1024 * 1024,
-                delivery_buffer: 8192,
             },
             async {
                 let _ = rx.await;
@@ -186,7 +184,6 @@ async fn readyz_returns_503_when_data_dir_unwritable() {
             storage_flush_threshold_bytes: 1_048_576,
             storage_sync_interval_ms: 10,
             storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
         })
         .await
         .unwrap();

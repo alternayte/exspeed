@@ -5,8 +5,9 @@ pub mod subject;
 pub mod types;
 
 pub use metrics::Metrics;
-pub use subject::subject_matches;
+pub use subject::{subject_matches, SubjectFilter, SubjectFilters};
 pub use types::{validate_resource_name, InvalidName, Offset, PartitionId, StreamName};
 pub use types::{
-    DEFAULT_PORT, FRAME_HEADER_SIZE, MAX_NAME_LEN, MAX_PAYLOAD_SIZE, PROTOCOL_VERSION,
+    DEFAULT_PORT, FRAME_HEADER_SIZE, INTERNAL_STREAM_PREFIX, MAX_NAME_LEN, MAX_PAYLOAD_SIZE,
+    PROTOCOL_VERSION,
 };

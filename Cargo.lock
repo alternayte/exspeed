@@ -1449,6 +1449,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-server",
+ "base64 0.22.1",
  "bytes",
  "exspeed-broker",
  "exspeed-common",
@@ -1526,6 +1527,23 @@ dependencies = [
  "tracing",
  "twox-hash",
  "uuid",
+]
+
+[[package]]
+name = "exspeed-client"
+version = "0.5.0"
+dependencies = [
+ "bytes",
+ "exspeed-common",
+ "exspeed-protocol",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -1617,6 +1635,7 @@ dependencies = [
  "bytes",
  "exspeed-common",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio-util",
  "tracing",

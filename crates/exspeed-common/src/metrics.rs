@@ -72,6 +72,9 @@ pub struct Metrics {
     /// Labels: `connector`, `action` (`halt` | `halt_no_dlq` | `dlq_batch` |
     /// `loop_forever` | `source_loop_forever`).
     pub connector_transient_exhausted_total: Counter<u64>,
+    /// Records a consumer gave up on after `max_deliver` attempts or a term.
+    /// Labels: `consumer`, `outcome` (`dlq` | `dropped`).
+    pub consumer_dead_letters_total: Counter<u64>,
     /// Fill ratio (0.0–1.0) of the per-subscription delivery mpsc channel.
     /// Labeled by `consumer` and `subscriber`.
     pub subscription_queue_fill_ratio: Gauge<f64>,
@@ -319,6 +322,10 @@ impl Metrics {
             .u64_counter("exspeed_connector_start_errors_total")
             .with_description("Connector start failures (connect or CREATE TABLE)")
             .build();
+        let consumer_dead_letters_total = meter
+            .u64_counter("exspeed_consumer_dead_letters")
+            .with_description("Records dead-lettered (or dropped) by consumers")
+            .build();
         let connector_dlq_total = meter
             .u64_counter("exspeed_connector_dlq_total")
             .with_description("Records routed to a connector DLQ stream")
@@ -408,6 +415,7 @@ impl Metrics {
             connector_dlq_failures_total,
             connector_retry_attempts_total,
             connector_transient_exhausted_total,
+            consumer_dead_letters_total,
             subscription_queue_fill_ratio,
             dedup_map_entries,
             dedup_writes_total,
@@ -437,6 +445,17 @@ impl Metrics {
     // -- helper methods -----------------------------------------------------
 
     /// Increment `records_published` by 1 for the given stream.
+    /// Count a record a consumer dead-lettered (`outcome` = `dlq`) or dropped.
+    pub fn record_consumer_dead_letter(&self, consumer: &str, outcome: &'static str) {
+        self.consumer_dead_letters_total.add(
+            1,
+            &[
+                KeyValue::new("consumer", consumer.to_owned()),
+                KeyValue::new("outcome", outcome),
+            ],
+        );
+    }
+
     pub fn record_publish(&self, stream: &str) {
         self.records_published
             .add(1, &[KeyValue::new("stream", stream.to_owned())]);

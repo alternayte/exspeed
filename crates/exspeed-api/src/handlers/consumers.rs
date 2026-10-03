@@ -1,41 +1,108 @@
+//! Consumer management over HTTP. Delivery itself is TCP-only (push
+//! subscriptions and pulls); HTTP covers create / inspect / seek / delete.
+
 use std::sync::Arc;
 
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use exspeed_common::auth::Identity;
+use exspeed_broker::consumer::ConsumerError;
+use exspeed_common::auth::{Action, Identity};
 use exspeed_common::StreamName;
-use exspeed_protocol::messages::{ClientMessage, DeleteConsumerRequest};
+use exspeed_protocol::client::{ConsumerSpec, SeekTo};
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::state::AppState;
 
-pub async fn list_consumers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let consumers = state.broker.consumers.read().unwrap();
-    let list: Vec<_> = consumers
-        .values()
-        .map(|cs| {
-            json!({
-                "name": cs.config.name,
-                "stream": cs.config.stream,
-                "group": cs.config.group,
-                "subject_filter": cs.config.subject_filter,
-                "offset": cs.config.offset,
-            })
-        })
-        .collect();
-    (StatusCode::OK, Json(json!(list)))
+pub(crate) fn consumer_error(e: ConsumerError) -> Response {
+    let status = StatusCode::from_u16(e.code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (status, Json(json!({"error": e.to_string()}))).into_response()
 }
 
-/// Helper: look up the stream name attached to a consumer. Returns a parsed
-/// `StreamName` if the consumer exists and its stream is a valid name, or
-/// `None` if the consumer doesn't exist (caller should return 404). If the
-/// stored stream name is invalid (e.g. legacy data), treat as 404.
-fn consumer_stream(state: &AppState, consumer: &str) -> Option<StreamName> {
-    let consumers = state.broker.consumers.read().ok()?;
-    let cs = consumers.get(consumer)?;
-    StreamName::try_from(cs.config.stream.as_str()).ok()
+#[derive(Deserialize, Default)]
+pub struct ListParams {
+    pub stream: Option<String>,
+}
+
+pub async fn list_consumers(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ListParams>,
+    identity: Option<Extension<Arc<Identity>>>,
+) -> Response {
+    match state.broker.consumers.list(params.stream.as_deref()).await {
+        Ok(list) => {
+            let visible: Vec<_> = list
+                .into_iter()
+                .filter(|i| match identity.as_ref() {
+                    None => true,
+                    Some(Extension(id)) => StreamName::try_from(i.spec.stream.as_str())
+                        .map(|s| id.authorize(Action::Admin, &s))
+                        .unwrap_or(false),
+                })
+                .collect();
+            (StatusCode::OK, Json(json!(visible))).into_response()
+        }
+        Err(e) => consumer_error(e),
+    }
+}
+
+/// Resolve the consumer's stream and require admin on it. `Err` carries
+/// the response to return (404 for unknown consumers, 403 on deny).
+async fn authorize(
+    state: &AppState,
+    name: &str,
+    identity: &Option<Extension<Arc<Identity>>>,
+) -> Result<(), Response> {
+    let Some(stream) = state.broker.consumers.stream_of(name).await else {
+        return Err(consumer_error(ConsumerError::NotFound(name.to_string())));
+    };
+    if let Some(Extension(id)) = identity.as_ref() {
+        let Ok(s) = StreamName::try_from(stream.as_str()) else {
+            return Err(super::forbid());
+        };
+        if let Some(resp) = super::require_scoped_admin(id, &s) {
+            return Err(resp);
+        }
+    }
+    Ok(())
+}
+
+pub async fn create_consumer(
+    State(state): State<Arc<AppState>>,
+    identity: Option<Extension<Arc<Identity>>>,
+    Json(spec): Json<ConsumerSpec>,
+) -> Response {
+    if spec.ephemeral {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "ephemeral consumers are tied to a TCP connection; create them over the client protocol"})),
+        )
+            .into_response();
+    }
+    if let Some(Extension(id)) = identity.as_ref() {
+        for s in std::iter::once(&spec.stream).chain(spec.dlq_stream.as_ref()) {
+            match StreamName::try_from(s.as_str()) {
+                Ok(n) => {
+                    if let Some(resp) = super::require_scoped_admin(id, &n) {
+                        return resp;
+                    }
+                }
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error": format!("invalid stream name '{s}': {e}")})),
+                    )
+                        .into_response()
+                }
+            }
+        }
+    }
+    match state.broker.consumers.create(spec).await {
+        Ok(info) => (StatusCode::CREATED, Json(json!(info))).into_response(),
+        Err(e) => consumer_error(e),
+    }
 }
 
 pub async fn get_consumer(
@@ -43,50 +110,12 @@ pub async fn get_consumer(
     Path(name): Path<String>,
     identity: Option<Extension<Arc<Identity>>>,
 ) -> Response {
-    // Resolve the consumer -> stream mapping BEFORE the authz check so we
-    // 403 (not 404) for a caller who can't admin the attached stream.
-    // If the consumer doesn't exist we have nothing to authz against; fall
-    // through to the 404 branch below (handled after the authz gate, which
-    // is a no-op in that case because the Option chain never returns Some).
-    let stream = consumer_stream(&state, &name);
-
-    if let Some(Extension(id)) = identity.as_ref() {
-        if let Some(ref s) = stream {
-            if let Some(resp) = super::require_scoped_admin(id, s) {
-                return resp;
-            }
-        } else {
-            // Unknown consumer: 404 without leaking existence of other
-            // consumers. No authz check possible — fall through.
-        }
+    if let Err(r) = authorize(&state, &name, &identity).await {
+        return r;
     }
-
-    let consumers = state.broker.consumers.read().unwrap();
-    match consumers.get(&name) {
-        Some(cs) => {
-            let head = state
-                .storage
-                .stream_head_offset(&cs.config.stream)
-                .unwrap_or(0);
-            let lag = head.saturating_sub(cs.config.offset);
-            (
-                StatusCode::OK,
-                Json(json!({
-                    "name": cs.config.name,
-                    "stream": cs.config.stream,
-                    "group": cs.config.group,
-                    "subject_filter": cs.config.subject_filter,
-                    "offset": cs.config.offset,
-                    "lag": lag,
-                })),
-            )
-                .into_response()
-        }
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("consumer '{}' not found", name)})),
-        )
-            .into_response(),
+    match state.broker.consumers.info(&name).await {
+        Ok(info) => (StatusCode::OK, Json(json!(info))).into_response(),
+        Err(e) => consumer_error(e),
     }
 }
 
@@ -95,29 +124,46 @@ pub async fn delete_consumer(
     Path(name): Path<String>,
     identity: Option<Extension<Arc<Identity>>>,
 ) -> Response {
-    let stream = consumer_stream(&state, &name);
-
-    if let Some(Extension(id)) = identity.as_ref() {
-        if let Some(ref s) = stream {
-            if let Some(resp) = super::require_scoped_admin(id, s) {
-                return resp;
-            }
-        }
+    if let Err(r) = authorize(&state, &name, &identity).await {
+        return r;
     }
+    match state.broker.consumers.delete(&name).await {
+        Ok(()) => (StatusCode::OK, Json(json!({"deleted": name}))).into_response(),
+        Err(e) => consumer_error(e),
+    }
+}
 
-    let req = DeleteConsumerRequest { name: name.clone() };
-    match state
-        .broker
-        .handle_message(ClientMessage::DeleteConsumer(req))
-        .await
-    {
-        exspeed_protocol::messages::ServerMessage::Ok => {
-            (StatusCode::OK, Json(json!({"deleted": name}))).into_response()
-        }
-        _ => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("consumer '{}' not found", name)})),
-        )
-            .into_response(),
+/// Body of `POST /api/v1/consumers/{name}/seek`: exactly one field.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeekBody {
+    Earliest,
+    Latest,
+    Offset(u64),
+    /// Unix milliseconds.
+    TimestampMs(u64),
+}
+
+pub async fn seek_consumer(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    identity: Option<Extension<Arc<Identity>>>,
+    Json(body): Json<SeekBody>,
+) -> Response {
+    if let Err(r) = authorize(&state, &name, &identity).await {
+        return r;
+    }
+    let to = match body {
+        SeekBody::Earliest => SeekTo::Earliest,
+        SeekBody::Latest => SeekTo::Latest,
+        SeekBody::Offset(o) => SeekTo::Offset(o),
+        SeekBody::TimestampMs(ms) => SeekTo::Time(ms),
+    };
+    match state.broker.consumers.seek(&name, to).await {
+        Ok(()) => match state.broker.consumers.info(&name).await {
+            Ok(info) => (StatusCode::OK, Json(json!(info))).into_response(),
+            Err(e) => consumer_error(e),
+        },
+        Err(e) => consumer_error(e),
     }
 }

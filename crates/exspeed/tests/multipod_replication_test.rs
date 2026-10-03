@@ -153,7 +153,6 @@ async fn spawn_pod() -> PodHandle {
         storage_flush_threshold_bytes: 1_048_576,
         storage_sync_interval_ms: 10,
         storage_sync_bytes: 4 * 1024 * 1024,
-        delivery_buffer: 8192,
     };
     let task = tokio::spawn(async move {
         let _ = exspeed::cli::server::run(args).await;
@@ -416,7 +415,6 @@ async fn multipod_e2e_bootstrap_failover_rejoin() {
         storage_flush_threshold_bytes: 1_048_576,
         storage_sync_interval_ms: 10,
         storage_sync_bytes: 4 * 1024 * 1024,
-        delivery_buffer: 8192,
     };
     let rejoined_api_port: u16 = dying_api_bind.rsplit(':').next().unwrap().parse().unwrap();
     let _rejoined_task = tokio::spawn(async move {

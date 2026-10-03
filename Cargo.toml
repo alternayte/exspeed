@@ -12,6 +12,7 @@ members = [
     "crates/exspeed-processing",
     "crates/exspeed-bench",
     "crates/exspeed-testkit",
+    "crates/exspeed-client",
 ]
 
 [workspace.package]

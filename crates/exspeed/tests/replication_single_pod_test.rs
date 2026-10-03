@@ -61,7 +61,6 @@ async fn start_single_pod_server() -> SinglePodHarness {
         storage_flush_threshold_bytes: 1_048_576,
         storage_sync_interval_ms: 10,
         storage_sync_bytes: 4 * 1024 * 1024,
-        delivery_buffer: 8192,
     };
 
     tokio::spawn(async move {

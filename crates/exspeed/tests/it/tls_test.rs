@@ -33,7 +33,6 @@ async fn tls_cert_without_key_refuses_to_start() {
         storage_flush_threshold_bytes: 1_048_576,
         storage_sync_interval_ms: 10,
         storage_sync_bytes: 4 * 1024 * 1024,
-        delivery_buffer: 8192,
     };
 
     let result = exspeed::cli::server::run(args).await;
@@ -65,7 +64,6 @@ async fn tls_key_without_cert_refuses_to_start() {
         storage_flush_threshold_bytes: 1_048_576,
         storage_sync_interval_ms: 10,
         storage_sync_bytes: 4 * 1024 * 1024,
-        delivery_buffer: 8192,
     };
 
     let result = exspeed::cli::server::run(args).await;
@@ -114,7 +112,6 @@ async fn tls_enabled_tcp_handshakes_with_rustls() {
         storage_flush_threshold_bytes: 1_048_576,
         storage_sync_interval_ms: 10,
         storage_sync_bytes: 4 * 1024 * 1024,
-        delivery_buffer: 8192,
     };
 
     tokio::spawn(async move {
@@ -185,7 +182,6 @@ async fn tls_enabled_http_responds_to_rustls_request() {
         storage_flush_threshold_bytes: 1_048_576,
         storage_sync_interval_ms: 10,
         storage_sync_bytes: 4 * 1024 * 1024,
-        delivery_buffer: 8192,
     };
 
     tokio::spawn(async move {
@@ -229,7 +225,6 @@ async fn auth_and_tls_together_end_to_end() {
         storage_flush_threshold_bytes: 1_048_576,
         storage_sync_interval_ms: 10,
         storage_sync_bytes: 4 * 1024 * 1024,
-        delivery_buffer: 8192,
     };
 
     tokio::spawn(async move {

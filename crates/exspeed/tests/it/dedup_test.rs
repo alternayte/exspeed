@@ -60,7 +60,6 @@ async fn start_server_temp() -> (String, String, PathBuf, CancellationToken) {
         storage_flush_threshold_bytes: 1_048_576,
         storage_sync_interval_ms: 10,
         storage_sync_bytes: 4 * 1024 * 1024,
-        delivery_buffer: 8192,
     };
     let cancel_for_server = cancel.clone();
     tokio::spawn(async move {
@@ -100,7 +99,6 @@ async fn start_server_at(data_dir: PathBuf) -> (String, String, CancellationToke
         storage_flush_threshold_bytes: 1_048_576,
         storage_sync_interval_ms: 10,
         storage_sync_bytes: 4 * 1024 * 1024,
-        delivery_buffer: 8192,
     };
     let cancel_for_server = cancel.clone();
     tokio::spawn(async move {

@@ -107,10 +107,21 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/v1/streams/{name}/publish",
             post(streams::publish_to_stream),
         )
-        .route("/api/v1/consumers", get(consumers::list_consumers))
+        .route(
+            "/api/v1/streams/{name}/records",
+            get(streams::read_records),
+        )
+        .route(
+            "/api/v1/consumers",
+            get(consumers::list_consumers).post(consumers::create_consumer),
+        )
         .route(
             "/api/v1/consumers/{name}",
             get(consumers::get_consumer).delete(consumers::delete_consumer),
+        )
+        .route(
+            "/api/v1/consumers/{name}/seek",
+            post(consumers::seek_consumer),
         )
         .route(
             "/api/v1/connectors",

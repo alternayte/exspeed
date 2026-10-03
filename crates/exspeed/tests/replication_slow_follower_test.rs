@@ -138,7 +138,6 @@ async fn spawn_pod() -> PodHandle {
         storage_flush_threshold_bytes: 1_048_576,
         storage_sync_interval_ms: 10,
         storage_sync_bytes: 4 * 1024 * 1024,
-        delivery_buffer: 8192,
     };
 
     let task = tokio::spawn(async move {

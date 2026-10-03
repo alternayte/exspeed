@@ -11,7 +11,6 @@ use serde_json::json;
 use exspeed_broker::broker_append::AppendResult;
 use exspeed_common::auth::Identity;
 use exspeed_common::StreamName;
-use exspeed_protocol::messages::{ClientMessage, DeleteConsumerRequest, ServerMessage};
 use exspeed_storage::file::stream_config::{StreamConfig, StreamConfigFile};
 use exspeed_streams::{Record, StorageError};
 
@@ -543,17 +542,10 @@ pub async fn delete_stream(
 
         let cascaded_consumers = blockers.consumers.clone();
         for cname in &cascaded_consumers {
-            let resp = state
-                .broker
-                .handle_message(ClientMessage::DeleteConsumer(DeleteConsumerRequest {
-                    name: cname.clone(),
-                }))
-                .await;
-            if let ServerMessage::Error { code, message } = resp {
+            if let Err(e) = state.broker.consumers.delete(cname).await {
                 tracing::warn!(
                     consumer = %cname,
-                    error_code = code,
-                    error = %message,
+                    error = %e,
                     "cascade: consumer delete returned error, continuing"
                 );
             }
@@ -623,13 +615,10 @@ impl Blockers {
 async fn collect_blockers(state: &Arc<AppState>, stream: &str) -> Blockers {
     let mut b = Blockers::default();
 
-    {
-        let guard = state.broker.consumers.read().unwrap();
-        for (name, cs) in guard.iter() {
-            if cs.config.stream == stream {
-                b.consumers.push(name.clone());
-                b.subscriptions += cs.subscribers.len();
-            }
+    if let Ok(list) = state.broker.consumers.list(Some(stream)).await {
+        for info in list {
+            b.subscriptions += info.subscribers as usize;
+            b.consumers.push(info.spec.name);
         }
     }
 
@@ -646,4 +635,128 @@ async fn collect_blockers(state: &Arc<AppState>, stream: &str) -> Blockers {
     }
 
     b
+}
+
+#[derive(Deserialize)]
+pub struct ReadParams {
+    /// First offset to return (default: the earliest retained record).
+    pub from: Option<u64>,
+    /// Maximum records to return (default 100, max 1000).
+    pub limit: Option<usize>,
+    /// Subject filter (`orders.*`, `orders.>`); empty matches all.
+    #[serde(default)]
+    pub filter: String,
+}
+
+/// Render a payload for JSON: embedded as JSON when it parses, as a string
+/// when it is UTF-8, and base64 otherwise.
+fn payload_json(b: &[u8]) -> (serde_json::Value, &'static str) {
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(b) {
+        return (v, "json");
+    }
+    match std::str::from_utf8(b) {
+        Ok(s) => (serde_json::Value::String(s.to_string()), "utf8"),
+        Err(_) => {
+            use base64::Engine;
+            (
+                serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(b)),
+                "base64",
+            )
+        }
+    }
+}
+
+/// `GET /api/v1/streams/{name}/records?from=&limit=&filter=` — browse a
+/// stream without creating a consumer. Returns `next_offset` to continue.
+pub async fn read_records(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(params): Query<ReadParams>,
+    identity: Option<Extension<Arc<Identity>>>,
+) -> Response {
+    let stream_name = match StreamName::try_from(name.as_str()) {
+        Ok(n) => n,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid stream name: {e}")})),
+            )
+                .into_response()
+        }
+    };
+    if let Some(Extension(id)) = identity.as_ref() {
+        if let Some(resp) = super::require_scoped_admin(id, &stream_name) {
+            return resp;
+        }
+    }
+    let filter = match exspeed_common::SubjectFilter::parse(&params.filter) {
+        Ok(f) => f,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+        }
+    };
+    let limit = params.limit.unwrap_or(100).clamp(1, 1000);
+    let storage = &state.broker.storage;
+    let (earliest, _) = match storage.stream_bounds(&stream_name).await {
+        Ok(b) => b,
+        Err(e) => return log_error_response(&state, &stream_name, e.into()),
+    };
+    let mut cursor = exspeed_common::Offset(params.from.unwrap_or(earliest.0).max(earliest.0));
+    let mut out = Vec::new();
+    let mut high_watermark = cursor;
+    // Bounded scan so a selective filter can't turn one request into a
+    // full-stream read.
+    'scan: for _ in 0..16 {
+        let batch = match storage
+            .read_batch(
+                &stream_name,
+                cursor,
+                exspeed_streams::ReadLimits {
+                    max_records: 1000,
+                    max_bytes: 4 * 1024 * 1024,
+                },
+            )
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => return log_error_response(&state, &stream_name, e.into()),
+        };
+        high_watermark = batch.high_watermark;
+        cursor = batch.next_offset;
+        if batch.records.is_empty() {
+            break;
+        }
+        for r in &batch.records {
+            if !filter.matches(&r.subject) {
+                continue;
+            }
+            let (value, encoding) = payload_json(&r.value);
+            out.push(json!({
+                "offset": r.offset.0,
+                "timestamp_ms": r.timestamp / 1_000_000,
+                "subject": r.subject,
+                "key": r.key.as_ref().map(|k| String::from_utf8_lossy(k).into_owned()),
+                "value": value,
+                "encoding": encoding,
+                "headers": r.headers.iter().map(|(k, v)| json!([k, v])).collect::<Vec<_>>(),
+            }));
+            if out.len() >= limit {
+                cursor = exspeed_common::Offset(r.offset.0 + 1);
+                break 'scan;
+            }
+        }
+        if cursor >= high_watermark {
+            break;
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "stream": name,
+            "records": out,
+            "next_offset": cursor.0,
+            "high_watermark": high_watermark.0,
+        })),
+    )
+        .into_response()
 }

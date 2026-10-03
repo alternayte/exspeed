@@ -707,12 +707,7 @@ async fn send_error<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    use exspeed_protocol::messages::ServerMessage;
-    let frame = ServerMessage::Error {
-        code,
-        message: message.into(),
-    }
-    .into_frame(correlation_id);
+    let frame = exspeed_protocol::Response::error(code, message).into_frame(correlation_id);
     framed_write
         .send(frame)
         .await

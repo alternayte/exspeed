@@ -50,6 +50,7 @@ rand = "0.8"
 
 [dev-dependencies]
 exspeed-testkit = { path = "../exspeed-testkit" }
+exspeed-client = { path = "../exspeed-client" }
 tempfile = "3"
 rcgen = { workspace = true }
 tokio-postgres = { workspace = true }
