@@ -1,5 +1,8 @@
+//! External databases, reachable from bounded queries through registered
+//! connections only.
+
 pub mod connections;
-pub mod mssql;
 pub mod postgres;
 
 pub use connections::{ConnectionConfig, ConnectionRegistry};
+pub use postgres::{ExternalConfig, ExternalTables};

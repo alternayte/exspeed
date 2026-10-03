@@ -133,13 +133,24 @@ impl ConnectionRegistry {
 
     /// Add a new connection, persisting it as a JSON file.
     pub fn add(&self, config: ConnectionConfig) -> Result<(), String> {
+        validate_connection_name(&config.name)?;
+        if !SUPPORTED_DRIVERS.contains(&config.driver.as_str()) {
+            return Err(format!(
+                "unsupported driver '{}'; supported: {}",
+                config.driver,
+                SUPPORTED_DRIVERS.join(", ")
+            ));
+        }
         let json_dir = self.data_dir.join("connections");
         fs::create_dir_all(&json_dir)
             .map_err(|e| format!("failed to create connections dir: {e}"))?;
 
         let file_path = json_dir.join(format!("{}.json", config.name));
         let json = serde_json::to_string_pretty(&config).map_err(|e| format!("serialize: {e}"))?;
-        fs::write(&file_path, json).map_err(|e| format!("write {}: {e}", file_path.display()))?;
+        let tmp = json_dir.join(format!(".{}.json.tmp", config.name));
+        fs::write(&tmp, json).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        fs::rename(&tmp, &file_path)
+            .map_err(|e| format!("rename {}: {e}", file_path.display()))?;
 
         self.connections
             .write()
@@ -150,7 +161,10 @@ impl ConnectionRegistry {
 
     /// Remove a connection from the registry and delete its JSON file if present.
     pub fn remove(&self, name: &str) -> Result<(), String> {
-        self.connections.write().unwrap().remove(name);
+        validate_connection_name(name)?;
+        if self.connections.write().unwrap().remove(name).is_none() {
+            return Err(format!("connection '{name}' not found"));
+        }
 
         let file_path = self
             .data_dir
@@ -174,6 +188,25 @@ impl ConnectionRegistry {
             .map(|c| (c.name.clone(), c.driver.clone()))
             .collect()
     }
+}
+
+/// Drivers external tables can read from.
+pub const SUPPORTED_DRIVERS: &[&str] = &["postgres", "postgresql"];
+
+/// Connection names become file names and SQL schema names: keep them to
+/// `[A-Za-z0-9_-]{1,64}`.
+pub fn validate_connection_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(format!(
+            "invalid connection name '{name}' (allowed: 1-64 of a-z, A-Z, 0-9, -, _)"
+        ));
+    }
+    Ok(())
 }
 
 /// Resolve `${VAR}` placeholders in a string by looking up environment variables.
@@ -319,8 +352,8 @@ url = "postgresql://localhost/mydb"
         registry
             .add(ConnectionConfig {
                 name: "b".into(),
-                driver: "mssql".into(),
-                url: "mssql://localhost/b".into(),
+                driver: "postgresql".into(),
+                url: "postgresql://localhost/b".into(),
             })
             .unwrap();
 
@@ -328,7 +361,30 @@ url = "postgresql://localhost/mydb"
         pairs.sort();
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0], ("a".to_string(), "postgres".to_string()));
-        assert_eq!(pairs[1], ("b".to_string(), "mssql".to_string()));
+        assert_eq!(pairs[1], ("b".to_string(), "postgresql".to_string()));
+    }
+
+    #[test]
+    fn rejects_bad_names_and_drivers() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ConnectionRegistry::new(dir.path().to_path_buf());
+        for name in ["../x", "", "a/b", "a.b"] {
+            assert!(registry
+                .add(ConnectionConfig {
+                    name: name.into(),
+                    driver: "postgres".into(),
+                    url: "postgresql://localhost/a".into(),
+                })
+                .is_err());
+        }
+        assert!(registry
+            .add(ConnectionConfig {
+                name: "ok".into(),
+                driver: "mssql".into(),
+                url: "mssql://localhost/a".into(),
+            })
+            .is_err());
+        assert!(registry.remove("../consumers/foo").is_err());
     }
 
     #[test]
