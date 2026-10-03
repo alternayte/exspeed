@@ -18,6 +18,10 @@ hosting = "github"
 # gets only the X.Y.Z tag).
 publish-jobs = ["./publish-docker"]
 publish-prereleases = true
+# Releases start from Actions -> Release -> Run workflow (tag input); the
+# workflow creates the tag and the GitHub Release. "dry-run" builds everything
+# without publishing.
+dispatch-releases = true
 
 [dist.github-custom-job-permissions]
 "publish-docker" = { contents = "read", packages = "write" }
