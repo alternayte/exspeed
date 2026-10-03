@@ -46,7 +46,13 @@ docker run -d --name exspeed -p 5933:5933 -p 8080:8080 \
 
 The image runs `exspeed server --data-dir /var/lib/exspeed` and has a
 `HEALTHCHECK` that runs `exspeed healthcheck`. That command exits 0 when
-`/readyz` answers 200, and you can also use it in other probes.
+`/readyz` answers 200, and you can also use it in other probes. It finds
+the server the way `exspeed server` resolves its settings (config file in
+`EXSPEED_CONFIG`, then the environment): `/readyz` on the `api_bind` port
+over loopback, `https` when a TLS certificate is configured. Change the
+listeners with `EXSPEED_API_BIND` / the config file rather than command-line
+flags (the probe can't see flags), or set `EXSPEED_HEALTHCHECK_URL` (or
+`--url`) to probe a specific URL. Self-signed certificates are accepted.
 
 The repository's `docker-compose.yml` starts Exspeed together with
 Postgres, RabbitMQ, MinIO, MySQL and SQL Server. It is meant for developing
@@ -111,7 +117,8 @@ On `SIGTERM` or `SIGINT` the server shuts down in this order:
    In-flight requests get up to `server.drain_timeout_secs` (10 s); the
    HTTP server is waited for before storage closes.
 2. Stop connectors. Sinks flush and commit, and sources finish their
-   batch, within 30 s.
+   batch. Steps 2 to 5 share `server.stop_timeout_secs` (30 s), so a
+   shutdown takes at most `drain_timeout_secs + stop_timeout_secs`.
 3. Resign leadership. This stops consumers, continuous queries and
    retention. In a cluster it releases the lease so a follower takes over
    within one heartbeat interval.
@@ -120,7 +127,9 @@ On `SIGTERM` or `SIGINT` the server shuts down in this order:
 5. Write the final dedup snapshot.
 6. Flush and fsync every partition, then release the data-dir lock.
 
-In Kubernetes, set `terminationGracePeriodSeconds` to at least 60 so the
+In Kubernetes, set `terminationGracePeriodSeconds` above
+`drain_timeout_secs + stop_timeout_secs` (40 s by default; 60 is a good
+value) so the
 kubelet doesn't `SIGKILL` the process partway through. The Helm chart does
 this.
 

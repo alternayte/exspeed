@@ -34,4 +34,8 @@ VOLUME /var/lib/exspeed
 HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
   CMD ["exspeed", "healthcheck"]
 ENTRYPOINT ["exspeed"]
-CMD ["server", "--data-dir", "/var/lib/exspeed", "--bind", "0.0.0.0:5933", "--api-bind", "0.0.0.0:8080"]
+# Listeners are left to the defaults (0.0.0.0:5933 / 0.0.0.0:8080) so that
+# EXSPEED_BIND / EXSPEED_API_BIND or a config file can change them; flags
+# would override both, and `exspeed healthcheck` derives its URL from the
+# same environment and config file.
+CMD ["server", "--data-dir", "/var/lib/exspeed"]

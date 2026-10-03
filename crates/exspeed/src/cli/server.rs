@@ -65,11 +65,18 @@ pub struct ServerArgs {
     pub max_connections: usize,
     /// How long open connections get to finish on shutdown.
     pub drain_timeout_secs: u64,
+    /// Total budget for the shutdown steps after the drain: stopping
+    /// connectors, continuous queries and consumers (their final state),
+    /// the leader supervisor and the final dedup snapshot. Each step gets
+    /// what is left of it.
+    pub stop_timeout_secs: u64,
     /// Bearer token `/metrics` requires; `None` = `/metrics` is open.
     pub metrics_token: Option<String>,
     /// `log` or `file`.
     pub connector_offset_store: String,
     pub cluster: ClusterArgs,
+    /// ExQL engine limits (`[exql]`).
+    pub exql: ExqlArgs,
     /// `text` / `json`; `None` = the environment decides.
     pub log_format: Option<String>,
     pub log_level: Option<String>,
@@ -83,6 +90,58 @@ pub struct ServerArgs {
     /// An already-bound HTTP API listener, used instead of binding
     /// `api_bind` (see `tcp_listener`).
     pub api_listener: Option<Arc<std::net::TcpListener>>,
+}
+
+/// ExQL settings (`[exql]`).
+#[derive(Debug, Clone)]
+pub struct ExqlArgs {
+    /// Bounded query timeout.
+    pub query_timeout_secs: u64,
+    /// Rows a bounded query returns before its result is marked `truncated`.
+    pub query_max_rows: usize,
+    /// Memory pool shared by all bounded queries, in MiB.
+    pub query_memory_mb: usize,
+    /// DataFusion target partitions for bounded queries.
+    pub query_partitions: usize,
+    /// How often continuous queries checkpoint.
+    pub checkpoint_ms: u64,
+    /// Allowed lateness when a continuous query names no GRACE PERIOD.
+    pub default_grace_ms: u64,
+    /// Records whose event time is further than this from the watermark
+    /// are not allowed to move it.
+    pub max_event_time_skew_ms: u64,
+}
+
+impl Default for ExqlArgs {
+    fn default() -> Self {
+        Self {
+            query_timeout_secs: 30,
+            query_max_rows: 10_000,
+            query_memory_mb: 512,
+            query_partitions: 1,
+            checkpoint_ms: 5_000,
+            default_grace_ms: 0,
+            max_event_time_skew_ms: 86_400_000,
+        }
+    }
+}
+
+impl ExqlArgs {
+    /// The engine config, with the same bounds `ExqlConfig::from_env` used.
+    pub fn engine_config(&self) -> exspeed_processing::ExqlConfig {
+        use std::time::Duration;
+        // TODO(exql): pass `max_event_time_skew_ms` once the engine config
+        // has the field.
+        exspeed_processing::ExqlConfig {
+            query_timeout: Duration::from_secs(self.query_timeout_secs.max(1)),
+            max_result_rows: self.query_max_rows.max(1),
+            memory_limit_bytes: self.query_memory_mb.max(16) * 1024 * 1024,
+            target_partitions: self.query_partitions.clamp(1, 64),
+            checkpoint_interval: Duration::from_millis(self.checkpoint_ms.max(100)),
+            default_grace_ms: self.default_grace_ms.min(i64::MAX as u64) as i64,
+            ..Default::default()
+        }
+    }
 }
 
 /// Multi-pod settings (`[cluster]`).
@@ -212,9 +271,11 @@ impl ServerArgs {
             dedup_window_secs: 300,
             max_connections: 1024,
             drain_timeout_secs: 10,
+            stop_timeout_secs: 30,
             metrics_token: None,
             connector_offset_store: "log".into(),
             cluster: ClusterArgs::default(),
+            exql: ExqlArgs::default(),
             log_format: None,
             log_level: None,
             config_file: None,
@@ -684,7 +745,7 @@ where
             args.data_dir.clone(),
             leadership.clone(),
             metrics.clone(),
-            exspeed_processing::ExqlConfig::from_env(),
+            args.exql.engine_config(),
         )
         .map_err(|e| anyhow::anyhow!("ExQL engine: {e}"))?,
     );
@@ -983,26 +1044,26 @@ where
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+    // The remaining steps share one budget, so shutdown takes at most
+    // drain_timeout_secs + stop_timeout_secs (plus the final fsync).
+    let stop_deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(args.stop_timeout_secs);
+    let left = move || stop_deadline.saturating_duration_since(tokio::time::Instant::now());
+
     // Stop connectors: sinks flush and commit, sources finish their batch.
-    if tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        connector_manager_for_shutdown.shutdown(),
-    )
-    .await
-    .is_err()
+    if tokio::time::timeout(left(), connector_manager_for_shutdown.shutdown())
+        .await
+        .is_err()
     {
-        warn!("connectors did not stop within 30s");
+        warn!("connectors did not stop within the stop timeout");
     }
 
     // Stop continuous queries; each writes a final checkpoint.
-    if tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        exql_for_shutdown.shutdown(),
-    )
-    .await
-    .is_err()
+    if tokio::time::timeout(left(), exql_for_shutdown.shutdown())
+        .await
+        .is_err()
     {
-        warn!("continuous queries did not stop within 10s");
+        warn!("continuous queries did not stop within the stop timeout");
     }
 
     // Step down: cancel the leader token (stopping consumers, continuous
@@ -1012,18 +1073,15 @@ where
     let consumers_stop = broker.consumers.clone();
     leadership
         .resign_after(async move {
-            if !consumers_stop
-                .wait_stopped(std::time::Duration::from_secs(10))
-                .await
-            {
-                warn!("consumers did not stop within 10s");
+            if !consumers_stop.wait_stopped(left()).await {
+                warn!("consumers did not stop within the stop timeout");
             }
         })
         .await;
     if let Some(c) = &cluster {
         c.shutdown().await;
     }
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), supervisor_handle).await;
+    let _ = tokio::time::timeout(left(), supervisor_handle).await;
 
     // The HTTP API stopped accepting at the cancel and has had the drain
     // budget for in-flight requests; wait for it (bounded) so no handler
@@ -1040,7 +1098,10 @@ where
 
     // Final dedup snapshot (taken by the snapshot task on cancel).
     if let Some(h) = snapshot_handle {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), h).await;
+        // Never skip the snapshot outright: it saves a full log scan on
+        // the next start.
+        let budget = left().max(std::time::Duration::from_secs(1));
+        let _ = tokio::time::timeout(budget, h).await;
     }
 
     // Flush and fsync every partition, then release the data-dir lock

@@ -368,3 +368,62 @@ async fn shutdown_waits_for_the_http_api() {
         "the HTTP listener is closed when the server returns"
     );
 }
+
+#[tokio::test]
+async fn shutdown_respects_drain_and_stop_timeouts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tcp = bound();
+    let tcp_addr = tcp.local_addr().unwrap();
+    let api = bound();
+    let api_addr = api.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    let args = exspeed::cli::server::ServerArgs {
+        tcp_listener: Some(tcp),
+        api_listener: Some(api),
+        drain_timeout_secs: 1,
+        stop_timeout_secs: 1,
+        ..exspeed::cli::server::ServerArgs::new(tmp.path())
+    };
+    let h = tokio::spawn(exspeed::cli::server::run_with_shutdown(args, async {
+        let _ = rx.await;
+    }));
+    let url = format!("http://{api_addr}/readyz");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !matches!(reqwest::get(&url).await, Ok(r) if r.status() == 200) {
+        assert!(tokio::time::Instant::now() < deadline, "never ready");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // A client with a live subscription and a pending long poll.
+    let c = exspeed_client::Client::connect(
+        &tcp_addr.to_string(),
+        exspeed_client::ConnectOptions::default(),
+    )
+    .await
+    .unwrap();
+    c.create_stream(exspeed_client::StreamSpec::named("s"))
+        .await
+        .unwrap();
+    c.create_consumer(exspeed_client::ConsumerSpec::new("w", "s"))
+        .await
+        .unwrap();
+    let _sub = c.subscribe("w", 10).await.unwrap();
+    let poll = {
+        let c = c.clone();
+        tokio::spawn(async move { c.read("s", 0, 10, Duration::from_secs(30), "").await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let started = std::time::Instant::now();
+    let _ = tx.send(());
+    tokio::time::timeout(Duration::from_secs(10), h)
+        .await
+        .expect("server stops")
+        .unwrap()
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "shutdown took {:?}",
+        started.elapsed()
+    );
+    poll.abort();
+}
