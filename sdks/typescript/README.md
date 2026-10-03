@@ -231,7 +231,7 @@ consumer.
 
 | Call | Effect |
 |------|--------|
-| `msg.ack()` | Done. Fire-and-forget: no round trip. |
+| `msg.ack()` | Done. Fire-and-forget: no round trip; acks made in the same event-loop turn share one frame. |
 | `await msg.nack(delayMs?)` | Redeliver after `delayMs`, or after the consumer's `backoffMs` when omitted. |
 | `await msg.term(reason)` | Never redeliver: dead-letter now. |
 | `await msg.inProgress()` | Still working: reset the ack deadline. |

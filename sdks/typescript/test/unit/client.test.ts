@@ -219,6 +219,44 @@ describe("subscriptions", () => {
     ]);
   });
 
+  it("sends acks made in the same tick as one frame, before any later request", async () => {
+    const c = await setup();
+    server.handler = (conn, corr, req) => {
+      if (req.type === "Subscribe") {
+        conn.replyMany([
+          [corr, { type: "SubscribeOk", subId: 1 }],
+          [0, { type: "Deliver", subId: 1, records: [rec(1), rec(2), rec(3)] }],
+        ]);
+      }
+    };
+    const sub = await c.subscribe("c");
+    const msgs = [(await sub.next())!, (await sub.next())!, (await sub.next())!];
+    for (const m of msgs) m.ack();
+    void c.ping();
+    await server.until(() => server.last.of("Ping").length === 1);
+    // (window 256: no Credit is due after three messages)
+    expect(server.last.received.slice(2).map((r) => r.req.type)).toEqual(["Ack", "Ping"]);
+    expect(server.last.of("Ack").map((r) => [r.corr, r.req.offsets])).toEqual([[0, [1, 2, 3]]]);
+  });
+
+  it("flushes queued acks on close", async () => {
+    const c = await setup();
+    server.handler = (conn, corr, req) => {
+      if (req.type === "Subscribe") {
+        conn.replyMany([
+          [corr, { type: "SubscribeOk", subId: 1 }],
+          [0, { type: "Deliver", subId: 1, records: [rec(4)] }],
+        ]);
+      }
+    };
+    const sub = await c.subscribe("c");
+    (await sub.next())!.ack();
+    const conn = server.last;
+    await c.close();
+    client = null;
+    await server.until(() => conn.of("Ack").length === 1);
+  });
+
   it("reports failed fire-and-forget requests as 'error' events", async () => {
     const c = await setup();
     const errors: ServerError[] = [];

@@ -62,9 +62,10 @@ export class Message extends StreamRecord {
   }
 
   /**
-   * Acknowledge (fire-and-forget: no round trip). If the connection is down
-   * the ack is dropped and the record will be redelivered. Failures reported
-   * by the server surface as the client's `"error"` event. Use
+   * Acknowledge (fire-and-forget: no round trip). Acks made in the same
+   * event-loop turn are sent together, as one frame. If the connection is
+   * down the ack is dropped and the record will be redelivered. Failures
+   * reported by the server surface as the client's `"error"` event. Use
    * `client.ack(consumer, offsets)` to wait for confirmation.
    */
   ack(): void {

@@ -65,6 +65,8 @@ export class ExspeedClient extends EventEmitter {
   /** Ephemeral consumers this client created, re-created after a reconnect. */
   private readonly ephemeral = new Map<string, ConsumerSpec>();
   private readonly host: SubscriptionHost;
+  private pendingAcks = new Map<string, number[]>();
+  private ackFlushScheduled = false;
 
   private constructor(conn: Connection, connOpts: ConnectionOptions, reconnect: Required<ReconnectOptions> | null) {
     super();
@@ -127,6 +129,7 @@ export class ExspeedClient extends EventEmitter {
    */
   async close(): Promise<void> {
     if (this.state === "closed") return;
+    this.flushAcks(); // acks made just before close() still go out
     this.state = "closed";
     for (const sub of [...this.subs]) sub.end({ code: 0, message: "client closed" }, false);
     await this.conn.close();
@@ -341,15 +344,38 @@ export class ExspeedClient extends EventEmitter {
 
   // ---- plumbing -------------------------------------------------------------
 
+  /**
+   * Queue a fire-and-forget ack. Acks made in the same event-loop turn go
+   * out as one `Ack` frame per consumer (flushed on `setImmediate`), and
+   * always before any later request, so wire order matches call order.
+   * Coalescing matters: the server does work per `Ack` command, so one ack
+   * per frame throttles consumption badly.
+   */
   private ackNowait(consumer: string, offsets: number[]): void {
     if (this.state !== "connected") return; // redelivered after the reconnect
-    this.conn.send({ type: "Ack", consumer, offsets });
+    const queued = this.pendingAcks.get(consumer);
+    if (queued) queued.push(...offsets);
+    else this.pendingAcks.set(consumer, [...offsets]);
+    if (!this.ackFlushScheduled) {
+      this.ackFlushScheduled = true;
+      setImmediate(() => this.flushAcks());
+    }
+  }
+
+  private flushAcks(): void {
+    this.ackFlushScheduled = false;
+    if (this.pendingAcks.size === 0) return;
+    const acks = [...this.pendingAcks];
+    this.pendingAcks.clear();
+    if (this.state !== "connected") return;
+    for (const [consumer, offsets] of acks) this.conn.send({ type: "Ack", consumer, offsets });
   }
 
   /** @internal Send a request on the current connection. */
   request(req: Request, opts?: RequestOptions): Promise<Response> {
     if (this.state === "closed") return Promise.reject(new ConnectionError("client is closed"));
     if (this.state === "reconnecting") return Promise.reject(new ConnectionError("not connected (reconnecting)"));
+    this.flushAcks();
     return this.conn.request(req, opts);
   }
 
@@ -385,6 +411,7 @@ export class ExspeedClient extends EventEmitter {
       return;
     }
     this.state = "reconnecting";
+    this.pendingAcks.clear(); // those records will be redelivered
     for (const sub of this.subs) sub.suspend();
     this.emit("disconnect", err);
     void this.reconnectLoop(this.reconnectOpts);
