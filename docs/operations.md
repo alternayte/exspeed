@@ -56,8 +56,8 @@ flags (the probe can't see flags), or set `EXSPEED_HEALTHCHECK_URL` (or
 `--url`) to probe a specific URL. Self-signed certificates are accepted.
 
 The repository's `docker-compose.yml` starts Exspeed together with
-Postgres, RabbitMQ, MinIO, MySQL and SQL Server. It is meant for developing
-connectors; see [development.md](development.md).
+Postgres, RabbitMQ, an S3-compatible store (moto), MySQL and SQL Server. It
+is meant for developing connectors; see [development.md](development.md).
 
 ## Kubernetes (Helm)
 
@@ -67,7 +67,8 @@ a single-node StatefulSet with these settings:
 - a persistent volume
 - `fsGroup: 1000`
 - startup, readiness and liveness probes on `/readyz`
-- a 30 s termination grace period
+- a 60 s termination grace period
+- `LOG_FORMAT=json`
 
 ```bash
 helm install exspeed deploy/helm/exspeed \
@@ -111,7 +112,7 @@ two file descriptors per sealed segment (data + index) and about three per
 stream for its active segment (reader, writer, index), plus one per client connection, connector and
 replication link. Segments roll at 256 MiB by default, so a node holding
 1 TiB has about 4,096 sealed segments, which is ~8,200 descriptors for
-storage alone. There is no descriptor cache yet, so raise the limit
+storage alone. Exspeed has no descriptor cache, so raise the limit
 (`ulimit -n`, systemd `LimitNOFILE=`, Docker `--ulimit nofile=`; on
 Kubernetes it comes from the container runtime) to at least
 `2 × sealed segments + 3 × streams + max connections + headroom`. Running out
@@ -133,13 +134,15 @@ On `SIGTERM` or `SIGINT` the server shuts down in this order:
    HTTP server is waited for before storage closes.
 2. Stop connectors. Sinks flush and commit, and sources finish their
    batch. Steps 2 to 5 share `server.stop_timeout_secs` (30 s), so a
-   shutdown takes at most `drain_timeout_secs + stop_timeout_secs`.
-3. Resign leadership. This stops consumers, continuous queries and
-   retention. In a cluster it releases the lease so a follower takes over
-   within one heartbeat interval.
-4. Wait for consumers to persist their final state: ack floors, unacked
-   records and delivery counts.
-5. Write the final dedup snapshot.
+   shutdown takes at most `drain_timeout_secs + stop_timeout_secs` (plus
+   the final fsync).
+3. Stop continuous queries. Each writes a final checkpoint.
+4. Resign leadership. This stops consumers and retention, and waits for
+   the consumers to persist their final state (ack floors, unacked records
+   and delivery counts) while writes are still open. Then writes close,
+   and in a cluster the lease is released so a follower takes over within
+   one heartbeat interval.
+5. Write the final dedup snapshot (single node).
 6. Flush and fsync every partition, then release the data-dir lock.
 
 In Kubernetes, set `terminationGracePeriodSeconds` above
@@ -151,14 +154,15 @@ this.
 ## Startup failures
 
 `exspeed server` exits with an error, rather than running half-started, when
-either listener can't be bound (port in use, bad address), a TLS file can't
-be loaded, or the connector or ExQL catalog can't be read. `/readyz` only
+either listener (or, in a cluster, the cluster port) can't be bound (port in
+use, bad address), a TLS file can't be loaded, the lease backend can't be
+reached, or the connector or ExQL catalog can't be read. `/readyz` only
 turns 200 after both listeners serve.
 
 If a node wins the leader lease but can't start the leader's work (reloading
 the ExQL or connector catalog, or starting consumers, fails), it steps down:
 writes close, the lease is released so another node can lead, and the node
-competes again after a hold-off that doubles per failed attempt (1 s up to
+competes again after a hold-off that doubles per failed attempt (2 s up to
 32 s). A single node simply retries after the hold-off. Each step-down is
 logged at `error` and counted as
 `exspeed_leader_transitions_total{direction="stepped_down"}`.
@@ -185,9 +189,14 @@ contract already allows.
 | Endpoint | Returns 200 when | Recommended use |
 |---|---|---|
 | `/healthz` | This pod is the cluster leader | LB traffic routing (only the leader serves traffic — see [high-availability.md](high-availability.md)) |
-| `/readyz` | Startup complete (both listeners serving) **and** `data_dir` is writable | k8s `readinessProbe` and startup gates |
+| `/readyz` | Startup complete (both listeners serving), the leader's dedup maps rebuilt, **and** `data_dir` is writable | k8s `readinessProbe` and startup gates |
 
-Single-node deployments still benefit from `/readyz` — it stays 503 during storage recovery and connector startup, so an LB or systemd unit knows when the broker is actually serving.
+Single-node deployments still benefit from `/readyz`. The HTTP API isn't
+served until storage recovery and catalog loading finish (a probe waits or
+times out), and `/readyz` then answers `503 {"status":
+"dedup_rebuild_in_progress"}` until the dedup maps are rebuilt, so an LB or
+systemd unit knows when the broker is actually serving. Other 503 bodies
+are `{"status": "starting"}` and `{"status": "data_dir_unwritable"}`.
 
 A stream whose partition is fenced (read-only after an IO error that couldn't
 be rolled back) does **not** make the node unready, since that would take
@@ -199,7 +208,7 @@ writes to the stream fail until a restart runs recovery.
 
 ## Non-root container
 
-The published Docker image runs as `uid 1000` (no shell, no home dir). For Kubernetes with a mounted PV:
+The published Docker image runs as `uid 1000` (user `exspeed`, login shell `nologin`). For Kubernetes with a mounted PV:
 
 ```yaml
 spec:
@@ -209,7 +218,7 @@ spec:
     fsGroup: 1000          # so the PV is writable by uid 1000
   containers:
     - name: exspeed
-      image: exspeed:latest
+      image: nayth/exspeed:latest
       ...
 ```
 
@@ -256,8 +265,8 @@ files as secrets.
   includes exactly the records below it: every record in
   `[earliest_offset, next_offset)` of the manifest, byte for byte. Records
   appended after that are not in the backup. A record that was not yet
-  visible to readers (not yet fsynced in sync mode, or above the replication
-  floor in multi-pod mode) is never included.
+  visible to readers (in `sync` mode, one not yet fsynced) is never
+  included.
 - **Not across streams.** Streams are snapshotted one after another, all
   before the first byte is sent, so the snapshots are milliseconds apart.
   There is no atomic cut across streams: if your application writes to
@@ -269,9 +278,9 @@ files as secrets.
   consumers, sink connectors and continuous queries can redeliver or
   reprocess records written just before the backup, but never skip any.
   Query output and sources that use idempotency keys are deduplicated when
-  they replay within the stream's dedup window. The legacy file-based
-  connector offset store (`connector-offsets/`) is copied after the streams
-  and has no such guarantee.
+  they replay within the stream's dedup window. The file-based connector
+  offset store (`connector-offsets/`, `[connectors] offset_store = "file"`)
+  is copied after the streams and has no such guarantee.
 - **Configuration directories** are copied file by file when the archive
   reaches them, after all streams.
 - **Retention and compaction keep running.** Segments that retention deletes
@@ -292,9 +301,9 @@ exspeed server --data-dir /var/lib/exspeed
 
 `restore` takes the data-directory lock, so it refuses to run while a server
 uses the directory. It refuses a non-empty data directory unless you pass
-`--force`. With `--force` it replaces `streams/`, the configuration
-directories and the replication state, and keeps other files such as
-`credentials.toml` and `exspeed.toml`. The archive is unpacked into a
+`--force`. With `--force` it replaces `streams/` and the configuration
+directories, and keeps other files such as `credentials.toml`,
+`exspeed.toml`, `node_id` and `cluster/`. The archive is unpacked into a
 staging directory and checked before anything is replaced:
 
 - the manifest must come first, with a supported format and version;
@@ -322,9 +331,9 @@ backup`, it includes everything in the directory, credentials included.
 
 Back up from the leader (followers answer `GET /api/v1/backup` with 503).
 The archive holds no node identity, epoch histories or lease state. To
-rebuild a cluster from it, restore into one node's data directory, start
-that node first so it takes the lease, then start the other nodes with
-empty data directories. They replicate everything from it.
+rebuild a cluster from it, restore into an empty data directory for one
+node, start that node first so it takes the lease, then start the other
+nodes with empty data directories. They replicate everything from it.
 
 ## Metrics
 
