@@ -3,7 +3,7 @@
 //! (within their credit) and pull requests, redelivering on timeout or nack,
 //! dead-lettering, and persisting snapshots.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -102,6 +102,10 @@ pub(crate) struct Actor {
     store: Arc<ConsumerStore>,
     metrics: Arc<Metrics>,
     subs: Vec<Subscriber>,
+    /// Which subscription each pushed, still-unacked record went to, so a
+    /// subscriber that goes away (crash, disconnect) has its records
+    /// redelivered to the others immediately instead of after `ack_wait`.
+    owners: HashMap<u64, u32>,
     rr: usize,
     pulls: VecDeque<PullWaiter>,
     dirty: bool,
@@ -145,6 +149,7 @@ impl Actor {
             store,
             metrics,
             subs: Vec::new(),
+            owners: HashMap::new(),
             rr: 0,
             pulls: VecDeque::new(),
             dirty: false,
@@ -238,7 +243,19 @@ impl Actor {
                 let _ = ready.send(());
                 self.caught_up = false;
             }
-            Cmd::Detach { sub_id } => self.subs.retain(|s| s.sub_id != sub_id),
+            Cmd::Detach { sub_id } => {
+                self.subs.retain(|s| s.sub_id != sub_id);
+                let orphaned: Vec<u64> = self
+                    .owners
+                    .iter()
+                    .filter(|(_, &owner)| owner == sub_id)
+                    .map(|(&o, _)| o)
+                    .collect();
+                for o in orphaned {
+                    self.owners.remove(&o);
+                    self.dirty |= self.core.nack(o, Some(Duration::ZERO), now);
+                }
+            }
             Cmd::Credit { sub_id, credits } => {
                 if let Some(s) = self.subs.iter_mut().find(|s| s.sub_id == sub_id) {
                     s.credits = s.credits.saturating_add(credits);
@@ -267,6 +284,7 @@ impl Actor {
             }
             Cmd::Ack { offsets } => {
                 for o in offsets {
+                    self.owners.remove(&o);
                     self.dirty |= self.core.ack(o);
                 }
             }
@@ -568,6 +586,13 @@ impl Actor {
             }
             Taker::Push(i) => {
                 self.subs[i].credits -= 1;
+                self.owners.insert(rec.offset, self.subs[i].sub_id);
+                // Drop entries for records that left in-flight some other
+                // way (expired, dead-lettered, seek) so the map stays bounded.
+                if self.owners.len() > 2 * self.core.capacity_hint() {
+                    let core = &self.core;
+                    self.owners.retain(|o, _| core.is_in_flight(*o));
+                }
                 batches[i].push(rec);
             }
         }

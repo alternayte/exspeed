@@ -495,3 +495,44 @@ async fn demotion_ends_subscriptions_with_503() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(m.info("c").await.unwrap_err(), ConsumerError::NotLeader);
 }
+
+/// A subscriber that disappears (crash, disconnect) must not strand its
+/// unacked records until `ack_wait`: they go to the remaining subscribers
+/// right away.
+#[tokio::test]
+async fn departed_subscriber_records_are_redelivered_immediately() {
+    let e = env();
+    e.stream("s").await;
+    let (m, _t) = e.manager().await;
+    m.create(ConsumerSpec {
+        ack_wait_ms: 60_000,
+        ..spec("c", "s")
+    })
+    .await
+    .unwrap();
+
+    let mut gone = m.subscribe("c", 3).await.unwrap();
+    e.publish("s", "a", 3).await;
+    let got = collect(&mut gone, 3).await;
+    assert_eq!(got.len(), 3);
+
+    let mut survivor = m.subscribe("c", 10).await.unwrap();
+    assert_quiet(&mut survivor, 100).await;
+    m.unsubscribe("c", gone.sub_id).await;
+
+    let redelivered = collect(&mut survivor, 3).await;
+    let mut offsets: Vec<u64> = redelivered.iter().map(|r| r.offset).collect();
+    offsets.sort();
+    assert_eq!(offsets, vec![0, 1, 2]);
+    assert!(redelivered.iter().all(|r| r.delivery_count == 2));
+
+    // Acked records are not redelivered when their subscriber leaves.
+    m.ack("c", offsets).await.unwrap();
+    e.publish("s", "a", 1).await;
+    let r = collect(&mut survivor, 1).await;
+    assert_eq!(r[0].offset, 3);
+    m.ack("c", vec![3]).await.unwrap();
+    let mut third = m.subscribe("c", 10).await.unwrap();
+    m.unsubscribe("c", survivor.sub_id).await;
+    assert_quiet(&mut third, 200).await;
+}

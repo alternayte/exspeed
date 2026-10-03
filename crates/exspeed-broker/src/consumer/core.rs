@@ -197,6 +197,15 @@ impl Core {
         hit
     }
 
+    pub fn is_in_flight(&self, offset: u64) -> bool {
+        self.in_flight.contains_key(&offset)
+    }
+
+    /// Rough upper bound on how many records can be unacked at once.
+    pub fn capacity_hint(&self) -> usize {
+        (self.spec.max_ack_pending as usize).max(64)
+    }
+
     /// Return a record for redelivery after `delay` (or the backoff).
     pub fn nack(&mut self, offset: u64, delay: Option<Duration>, now: Instant) -> bool {
         let Some(f) = self.in_flight.remove(&offset) else {
