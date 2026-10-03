@@ -20,12 +20,27 @@ connector config and SDK API all change.
 - Compaction (`compaction = true` per stream): keeps the latest record per
   key; tombstones delete keys.
 - Removed: bloom filters, secondary indexes (`.sidx`), S3 tiering and its
-  `EXSPEED_STORAGE_S3_*` variables. The segment format is now version 2, and
-  old data dirs are refused.
+  `EXSPEED_STORAGE_S3_*` variables.
+- Records are stored in the client protocol's `WireRecord` encoding
+  (segment format version 3; older data dirs are refused). `Read`, consumer
+  push (`Deliver`) and pull (`Messages`) build their replies from the raw
+  segment bytes: one `pread`, the delivery count patched in place, subjects
+  parsed in place for filtering, no decoding or per-record allocation. New
+  `StorageEngine::read_raw` returning a `RawBatch`. Each record keeps its own
+  length and CRC32C, so torn-write detection, recovery, compaction, backup
+  and truncation work as before. The connection writer flushes once per
+  burst of queued frames instead of once per frame.
 
 ### Consumers and client protocol v2 (Phase 2)
 
 - New binary protocol ([docs/protocol.md](docs/protocol.md)), version byte 2.
+  A `WireRecord` is the stored record: `u32 len`, `u32 crc` (CRC32C, which
+  the Rust client verifies), `u16 delivery_count`, `u64 offset`,
+  `u64 timestamp_ns` (nanoseconds; was milliseconds), then the fields.
+  `WireRecord::timestamp_ms` became `timestamp_ns` (with a `timestamp_ms()`
+  helper) in the Rust client; the TypeScript SDK adds
+  `StreamRecord.timestampNs` (a `bigint`) next to `timestamp` (ms) and
+  exports `verifyRecordCrc`.
   It adds out-of-order replies, fire-and-forget acks and credits,
   `SubscriptionEnded` pushes, JSON admin replies, structured errors with
   details, and handshake and idle timeouts.

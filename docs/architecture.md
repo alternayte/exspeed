@@ -121,7 +121,7 @@ Frames are capped at 16 MB.
     stream.json                      retention, dedup and compaction config
     dedup_snapshot.bin               periodic dedup-map snapshot
     partitions/0/
-      00000000000000000000.seg       append-only segment (CRC32C-framed records), rolls at 256 MB
+      00000000000000000000.seg       append-only segment (wire-encoded records), rolls at 256 MB
       00000000000000000000.idx       sparse offset + time index, one entry about every 4 KiB
       00000000000000000000.meta      sealed-segment metadata (offsets, timestamps, length)
       truncate.json                  only while a truncation is in progress
@@ -153,8 +153,40 @@ node-local on purpose: operators ship the same files to every pod. Dedup
 snapshots are node-local caches that can be rebuilt from the log.
 
 Segment files are named after their base offset and start with a 16-byte
-header (magic `EXSG`, format version 2). Older segment files are refused;
+header (magic `EXSG`, format version 3). Older segment files are refused;
 there is no migration because nobody runs Exspeed in production yet.
+
+**Record format.** After the header, a segment holds records back to back
+in exactly the encoding the client protocol uses for a `WireRecord`
+([protocol.md](protocol.md#shared-structures)). One module,
+`exspeed_common::record_format`, defines it for the storage engine, the
+server, the Rust client and (mirrored) the TypeScript SDK. All integers are
+little-endian:
+
+| Bytes | Field | Notes |
+|-------|-------|-------|
+| 0–3 | `len` `u32` | Bytes after this field (record size − 4). |
+| 4–7 | `crc` `u32` | CRC32C of bytes 10..end, i.e. everything after `delivery_count`. |
+| 8–9 | `delivery_count` `u16` | Always 0 on disk. The server patches it in place when a consumer delivers the record, which is why the CRC skips it. |
+| 10–17 | `offset` `u64` | |
+| 18–25 | `timestamp_ns` `u64` | Append time, nanoseconds since the Unix epoch. |
+| 26– | `subject` | `u16` length + UTF-8. |
+| | `key` | `u8` flag (0 absent, 1 present), then `u32` length + bytes when present. |
+| | `value` | `u32` length + bytes. |
+| | `headers` | `u16` count, then (`u16` length + UTF-8 key, `u16` length + UTF-8 value) pairs. |
+
+A record is 35 bytes plus its subject, key, value and headers, and at most
+64 MiB. The per-record length and CRC are what recovery, compaction and
+backup use to walk and validate a segment, so torn writes are detected as
+before: the scan stops at the first record whose length runs past the end
+of the file or whose CRC doesn't match.
+
+Why this shape: the length prefix lets the server find record boundaries
+(and a client skip records) without parsing; the fixed-position
+`delivery_count`, kept outside the CRC, can be set per delivery without
+re-encoding or recomputing anything; and nanosecond timestamps are what the
+storage engine already keeps for `seek_by_time` and replication, so the
+wire carries the stored value instead of a converted one.
 
 **Writes.** Each partition has one dedicated writer thread. Every change to
 the partition (appends, segment rolls, retention, truncation, installing a
@@ -174,9 +206,44 @@ sets it yet.
 
 **Reads.** Readers never take the writer's lock and never fsync. They load
 the segment list (swapped atomically by the writer), binary-search it, look
-up the sparse index, then `pread` and decode forward. `seek_by_time`
-returns the first record with a timestamp at or after the target, across
-all segments, or the high watermark if there is none.
+up the sparse index, then `pread` forward. `seek_by_time` returns the first
+record with a timestamp at or after the target, across all segments, or the
+high watermark if there is none. There are two read APIs:
+
+- `StorageEngine::read_raw` returns a `RawBatch`: the records' bytes as
+  they are in the segment, plus a count, the next offset and the high
+  watermark. `FileStorage` does one `pread` per segment touched, sized from
+  the limits and the segment's average record size (a second `pread` only
+  when that estimate was low), checks each record's length and CRC, and
+  returns a view of the read buffer. It never decodes a record or
+  allocates per record, and once it has a record it stops at the segment
+  boundary rather than copying two buffers together. This is what serves
+  clients: TCP `Read`, consumer push (`Deliver`) and pull (`Messages`).
+- `read` / `read_batch` decode into `StoredRecord`s, for everything that
+  needs the fields: ExQL, connectors, the HTTP API, replication, dead
+  lettering.
+
+```mermaid
+flowchart LR
+  seg[("segment file")] -->|"one pread"| raw["RawBatch<br/>(wire-encoded bytes)"]
+  raw -->|"zero-copy slices<br/>(subject parsed in place when filtering)"| read["ReadResult"]
+  raw -->|"delivery_count patched in place,<br/>zero-copy slices per subscriber"| cons["Deliver / Messages"]
+  read --> w["connection writer:<br/>frame header + chunks"]
+  cons --> w
+  w --> sock(["socket"])
+```
+
+A stateless `Read` with no subject filter sends the batch as one chunk.
+With a filter, each record's subject is parsed in place (no allocation) and
+each run of consecutive matching records becomes one slice of the buffer.
+A consumer sets `delivery_count` to 1 for the whole batch (or to the
+redelivery count for a single redelivered record), then hands each push
+subscriber or pull waiter slices of the buffer, one per run of consecutive
+records it receives. The connection's writer task writes the frame header,
+the small response head and the chunks into a 64 KiB buffered writer
+(large chunks bypass the buffer), and flushes once per burst of queued
+frames. The record bytes are therefore copied once from the page cache by
+`pread` and once into the socket.
 
 **Failures.** If a write or fsync fails, the writer truncates the file back
 to the last committed length and returns an error. The failed batch was
