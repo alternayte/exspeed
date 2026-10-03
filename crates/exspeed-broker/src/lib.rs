@@ -1,6 +1,7 @@
 pub mod broker;
 pub mod broker_append;
 pub mod broker_append_snapshot;
+pub mod catalog;
 pub mod consumer;
 pub mod leadership;
 pub mod lease;
