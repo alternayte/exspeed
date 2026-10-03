@@ -33,6 +33,8 @@ as **file key / env var / flag**.
 | `server.data_dir` | `EXSPEED_DATA_DIR` | `--data-dir` | `./exspeed-data` | Data directory. The server takes an exclusive `flock` on it. |
 | `server.max_connections` | `EXSPEED_MAX_CONNS` | `--max-connections` | `1024` | Concurrent client connections. Extra connections are refused and counted. |
 | `server.drain_timeout_secs` | `EXSPEED_DRAIN_TIMEOUT_SECS` | — | `10` | Time open connections and in-flight HTTP requests get on shutdown |
+| `server.handshake_timeout_secs` | `EXSPEED_HANDSHAKE_TIMEOUT_SECS` | — | `10` | A TCP client must finish TLS and send `Connect` within this, or the connection is closed |
+| `server.idle_timeout_secs` | `EXSPEED_IDLE_TIMEOUT_SECS` | — | `120` | A TCP connection that sends no frame (clients ping) for this long is closed |
 | `server.stop_timeout_secs` | `EXSPEED_STOP_TIMEOUT_SECS` | — | `30` | Total budget, after the drain, for stopping connectors, continuous queries and consumers (final state) and writing the dedup snapshot. Shutdown takes at most `drain_timeout_secs + stop_timeout_secs`. |
 | `server.metrics_token` | `EXSPEED_METRICS_TOKEN` | — | — | When set, `GET /metrics` requires `Authorization: Bearer <token>` ([security.md](security.md#metrics-token)) |
 

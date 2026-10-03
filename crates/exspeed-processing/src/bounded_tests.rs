@@ -218,6 +218,16 @@ async fn time_filters() {
     .await
     .unwrap();
     assert_eq!(res.rows, vec![vec![json!(0)]]);
+    // The time bound is pushed into the scan (an empty offset range), not
+    // only filtered after reading every record.
+    let plan = run(
+        &r,
+        "EXPLAIN SELECT offset FROM orders WHERE timestamp < now() - INTERVAL '1 hour'",
+    )
+    .await
+    .unwrap();
+    let text = serde_json::to_string(&plan.rows).unwrap();
+    assert!(text.contains("offsets=[0, 0)"), "{text}");
 }
 
 #[tokio::test]
@@ -350,6 +360,55 @@ async fn external_postgres_join() {
     .await
     .unwrap_err();
     assert_eq!(e.code(), "PLAN_ERROR", "{e}");
+
+    // Projection and filters reach Postgres; numeric(p, s) is a decimal.
+    sqlx::query("ALTER TABLE exql_regions ADD COLUMN rate NUMERIC(10, 2)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE exql_regions SET rate = CASE code WHEN 'eu' THEN 12.34 ELSE 0.5 END")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let res = run(
+        &r,
+        "SELECT name, rate FROM wh.exql_regions WHERE code = 'eu' AND \"we\"\"ird\" >= 1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(res.rows, vec![vec![json!("Europe"), json!(12.34)]]);
+    let plan = run(
+        &r,
+        "EXPLAIN SELECT name FROM wh.exql_regions WHERE code IN ('eu', 'xx')",
+    )
+    .await
+    .unwrap();
+    let text = serde_json::to_string(&plan.rows).unwrap();
+    assert!(text.contains("ExternalSnapshotExec"), "{text}");
+    // A filter that can't be pushed is still applied locally.
+    let res = run(
+        &r,
+        "SELECT code FROM wh.exql_regions WHERE upper(name) LIKE 'UNITED%'",
+    )
+    .await
+    .unwrap();
+    assert_eq!(res.rows, vec![vec![json!("us")]]);
+    // A memory pool smaller than the snapshot refuses the scan.
+    let cfg = ExqlConfig {
+        memory_limit_bytes: 1,
+        ..ExqlConfig::default()
+    };
+    let r2 = r.clone();
+    let state = build_state(&cfg, runtime_env(&cfg).unwrap(), r2).unwrap();
+    let e = execute(
+        state,
+        "SELECT name FROM wh.exql_regions WHERE code = 'us'",
+        &cfg,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(e.code(), "RESOURCES_EXHAUSTED", "{e}");
+
     sqlx::query("DROP TABLE exql_regions")
         .execute(&pool)
         .await

@@ -811,3 +811,33 @@ async fn extreme_event_times_neither_fail_nor_poison_the_watermark() {
     .await;
     node.stop().await;
 }
+
+#[tokio::test]
+async fn continuous_queries_cannot_read_external_tables() {
+    let w = World::new().await;
+    w.stream("ev").await;
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::start(&w, dir.path(), test_config()).await;
+    // Never contacted: the plan is rejected before any fetch.
+    node.engine
+        .add_connection(crate::external::ConnectionConfig {
+            name: "wh".into(),
+            driver: "postgres".into(),
+            url: "postgresql://nobody@127.0.0.1:1/none".into(),
+        })
+        .await
+        .unwrap();
+    let e = node
+        .engine
+        .execute(
+            "CREATE STREAM joined AS SELECT e.key, c.name FROM ev e JOIN wh.customers c ON e.key = c.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        e.to_string().contains("only available in bounded queries"),
+        "{e}"
+    );
+    assert!(node.engine.list_queries().is_empty());
+    node.stop().await;
+}

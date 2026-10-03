@@ -20,7 +20,6 @@ use exspeed_streams::StorageEngine;
 use crate::session::{self, SessionContext};
 
 /// A TLS handshake must finish within this time or the socket is dropped.
-const TLS_ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Default cluster-replication bind address. Matches the advertised default
 /// in the replication design doc and the Plan G Wave 5 contract.
@@ -70,6 +69,10 @@ pub struct ServerArgs {
     /// the leader supervisor and the final dedup snapshot. Each step gets
     /// what is left of it.
     pub stop_timeout_secs: u64,
+    /// TCP clients must finish TLS and send `Connect` within this.
+    pub handshake_timeout_secs: u64,
+    /// A TCP connection that sends no frame for this long is closed.
+    pub idle_timeout_secs: u64,
     /// Bearer token `/metrics` requires; `None` = `/metrics` is open.
     pub metrics_token: Option<String>,
     /// `log` or `file`.
@@ -271,6 +274,8 @@ impl ServerArgs {
             max_connections: 1024,
             drain_timeout_secs: 10,
             stop_timeout_secs: 30,
+            handshake_timeout_secs: 10,
+            idle_timeout_secs: 120,
             metrics_token: None,
             connector_offset_store: "log".into(),
             cluster: ClusterArgs::default(),
@@ -941,7 +946,10 @@ where
     let conn_sem = Arc::new(Semaphore::new(max_conns));
     info!(max_conns, "connection cap configured");
 
+    let tls_accept_timeout = std::time::Duration::from_secs(args.handshake_timeout_secs.max(1));
     let session_ctx = Arc::new(SessionContext {
+        handshake_timeout: tls_accept_timeout,
+        idle_timeout: std::time::Duration::from_secs(args.idle_timeout_secs.max(1)),
         broker: broker.clone(),
         exql: exql_for_tcp,
         credential_store: credential_store.clone(),
@@ -1001,7 +1009,7 @@ where
                             if let Some(tls_cfg) = tls_config_clone {
                                 let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
                                 let tls_stream =
-                                    tokio::time::timeout(TLS_ACCEPT_TIMEOUT, acceptor.accept(socket))
+                                    tokio::time::timeout(tls_accept_timeout, acceptor.accept(socket))
                                         .await
                                         .map_err(|_| anyhow::anyhow!("TLS handshake timed out"))??;
                                 session::run(tls_stream, peer, session_ctx, conn_token).await

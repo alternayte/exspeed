@@ -58,6 +58,11 @@ const OUTBOUND_BUFFER: usize = 1024;
 
 /// Everything a session needs from the server.
 pub struct SessionContext {
+    /// The handshake must complete within this (default [`HANDSHAKE_TIMEOUT`]).
+    pub handshake_timeout: Duration,
+    /// A connection with no frame for this long is closed (default
+    /// [`IDLE_TIMEOUT`]).
+    pub idle_timeout: Duration,
     pub broker: Arc<Broker>,
     pub exql: Arc<ExqlEngine>,
     /// `None` = authentication disabled (every client gets full access).
@@ -166,7 +171,7 @@ where
     let mut sink = FramedWrite::new(writer, ExspeedCodec::new());
 
     // --- Handshake ---------------------------------------------------------
-    let first = match tokio::time::timeout(HANDSHAKE_TIMEOUT, frames.next()).await {
+    let first = match tokio::time::timeout(ctx.handshake_timeout, frames.next()).await {
         Err(_) => {
             warn!(%peer, "handshake timed out");
             return Ok(());
@@ -256,7 +261,7 @@ where
     let result = loop {
         let next = tokio::select! {
             _ = cancel.cancelled() => break Ok(()),
-            r = tokio::time::timeout(IDLE_TIMEOUT, frames.next()) => r,
+            r = tokio::time::timeout(ctx.idle_timeout, frames.next()) => r,
         };
         let frame = match next {
             Err(_) => {

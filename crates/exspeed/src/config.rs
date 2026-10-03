@@ -67,6 +67,8 @@ pub struct ServerSection {
     pub max_connections: Option<usize>,
     pub drain_timeout_secs: Option<u64>,
     pub stop_timeout_secs: Option<u64>,
+    pub handshake_timeout_secs: Option<u64>,
+    pub idle_timeout_secs: Option<u64>,
     pub metrics_token: Option<String>,
 }
 
@@ -242,6 +244,8 @@ struct Layer {
     max_connections: Option<usize>,
     drain_timeout_secs: Option<u64>,
     stop_timeout_secs: Option<u64>,
+    handshake_timeout_secs: Option<u64>,
+    idle_timeout_secs: Option<u64>,
     metrics_token: Option<String>,
     auth_token: Option<String>,
     credentials_file: Option<PathBuf>,
@@ -303,6 +307,8 @@ impl Layer {
             max_connections: f.server.max_connections,
             drain_timeout_secs: f.server.drain_timeout_secs,
             stop_timeout_secs: f.server.stop_timeout_secs,
+            handshake_timeout_secs: f.server.handshake_timeout_secs,
+            idle_timeout_secs: f.server.idle_timeout_secs,
             metrics_token: f.server.metrics_token,
             auth_token: f.auth.token,
             credentials_file: f.auth.credentials_file,
@@ -370,6 +376,11 @@ impl Layer {
                 s("EXSPEED_DRAIN_TIMEOUT_SECS"),
             )?,
             stop_timeout_secs: num("EXSPEED_STOP_TIMEOUT_SECS", s("EXSPEED_STOP_TIMEOUT_SECS"))?,
+            handshake_timeout_secs: num(
+                "EXSPEED_HANDSHAKE_TIMEOUT_SECS",
+                s("EXSPEED_HANDSHAKE_TIMEOUT_SECS"),
+            )?,
+            idle_timeout_secs: num("EXSPEED_IDLE_TIMEOUT_SECS", s("EXSPEED_IDLE_TIMEOUT_SECS"))?,
             metrics_token: s("EXSPEED_METRICS_TOKEN"),
             auth_token: s("EXSPEED_AUTH_TOKEN"),
             credentials_file: s("EXSPEED_CREDENTIALS_FILE").map(PathBuf::from),
@@ -488,6 +499,8 @@ impl Layer {
         set!(max_connections => max_connections);
         set!(drain_timeout_secs => drain_timeout_secs);
         set!(stop_timeout_secs => stop_timeout_secs);
+        set!(handshake_timeout_secs => handshake_timeout_secs);
+        set!(idle_timeout_secs => idle_timeout_secs);
         if self.metrics_token.is_some() {
             t.metrics_token = self.metrics_token;
         }
@@ -733,6 +746,8 @@ data_dir = {data_dir:?}
 max_connections = {maxc}
 drain_timeout_secs = {drain}
 stop_timeout_secs = {stop}
+handshake_timeout_secs = {hs}
+idle_timeout_secs = {idle}
 metrics_token = {mtoken}
 
 [auth]
@@ -801,6 +816,8 @@ level = {ll}
         maxc = a.max_connections,
         drain = a.drain_timeout_secs,
         stop = a.stop_timeout_secs,
+        hs = a.handshake_timeout_secs,
+        idle = a.idle_timeout_secs,
         mtoken = secret(&a.metrics_token),
         token = secret(&a.auth_token),
         creds = opt_path(&a.credentials_file),
@@ -860,6 +877,8 @@ data_dir = "./exspeed-data"      # (EXSPEED_DATA_DIR, --data-dir)
 max_connections = 1024           # (EXSPEED_MAX_CONNS, --max-connections)
 drain_timeout_secs = 10          # time given to open connections and HTTP requests on shutdown (EXSPEED_DRAIN_TIMEOUT_SECS)
 stop_timeout_secs = 30           # budget for stopping connectors, queries and consumers after the drain (EXSPEED_STOP_TIMEOUT_SECS)
+handshake_timeout_secs = 10      # TCP clients must send Connect (and finish TLS) within this (EXSPEED_HANDSHAKE_TIMEOUT_SECS)
+idle_timeout_secs = 120          # TCP connections with no frame for this long are closed (EXSPEED_IDLE_TIMEOUT_SECS)
 # metrics_token = "..."          # when set, GET /metrics requires `Authorization: Bearer <token>` (EXSPEED_METRICS_TOKEN)
 
 [auth]
@@ -947,6 +966,8 @@ mod tests {
         assert_eq!(a.connector_offset_store, d.connector_offset_store);
         assert_eq!(a.drain_timeout_secs, d.drain_timeout_secs);
         assert_eq!(a.stop_timeout_secs, d.stop_timeout_secs);
+        assert_eq!(a.handshake_timeout_secs, d.handshake_timeout_secs);
+        assert_eq!(a.idle_timeout_secs, d.idle_timeout_secs);
         assert_eq!(a.exql.query_timeout_secs, d.exql.query_timeout_secs);
         assert_eq!(a.exql.query_memory_mb, d.exql.query_memory_mb);
         assert_eq!(a.exql.checkpoint_ms, d.exql.checkpoint_ms);

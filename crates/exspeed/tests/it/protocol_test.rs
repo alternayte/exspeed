@@ -351,3 +351,66 @@ async fn many_concurrent_requests_on_one_connection() {
     assert_eq!(offsets, (0..50).collect::<Vec<_>>());
     wait.abort();
 }
+
+/// Reads frames until the server closes the connection; returns how long
+/// that took.
+async fn until_closed(
+    r: &mut FramedRead<tokio::net::tcp::OwnedReadHalf, ExspeedCodec>,
+) -> Duration {
+    let start = std::time::Instant::now();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), r.next()).await {
+            Err(_) => panic!("connection still open after 10 s"),
+            Ok(None) | Ok(Some(Err(_))) => return start.elapsed(),
+            Ok(Some(Ok(_))) => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn silent_and_idle_connections_are_closed() {
+    let server = TestServer::builder()
+        .with(|a| {
+            a.handshake_timeout_secs = 1;
+            a.idle_timeout_secs = 1;
+        })
+        .start()
+        .await;
+
+    // No Connect at all: closed after the handshake timeout.
+    let (mut r, _w) = raw(&server.addr).await;
+    let t = until_closed(&mut r).await;
+    assert!(t >= Duration::from_millis(800), "closed too early: {t:?}");
+
+    // Connected, then silent: closed after the idle timeout.
+    let (mut r, mut w) = raw(&server.addr).await;
+    w.send(
+        Request::Connect {
+            client_id: "idle".into(),
+            token: None,
+        }
+        .into_frame(1),
+    )
+    .await
+    .unwrap();
+    let t = until_closed(&mut r).await;
+    assert!(t >= Duration::from_millis(800), "closed too early: {t:?}");
+
+    // A client that keeps sending stays connected past the idle timeout.
+    let (mut r, mut w) = raw(&server.addr).await;
+    w.send(
+        Request::Connect {
+            client_id: "busy".into(),
+            token: None,
+        }
+        .into_frame(1),
+    )
+    .await
+    .unwrap();
+    recv(&mut r).await.expect("ConnectOk");
+    for i in 0..6u32 {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        w.send(Request::Ping.into_frame(10 + i)).await.unwrap();
+        recv(&mut r).await.expect("pong");
+    }
+}
