@@ -39,7 +39,8 @@ async fn latency_scenario_reports_sensible_percentiles() {
     assert!(r.latency_us.max >= r.latency_us.p99);
     assert!(
         r.latency_us.p50 < 1_000_000,
-        "p50 should be < 1s in an embedded test"
+        "p50 should be < 1s in an embedded test: {:?}",
+        r.latency_us
     );
 }
 

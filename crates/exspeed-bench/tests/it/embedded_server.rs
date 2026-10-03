@@ -7,9 +7,22 @@ pub struct EmbeddedServer {
     pub tcp_addr: String,
     #[allow(dead_code)]
     pub api_addr: String,
+    /// Held for the test's lifetime: benchmark scenarios measure throughput
+    /// and latency, so two of them must never run at the same time (the
+    /// test harness runs tests in parallel; a publish scenario saturating
+    /// the CPU turns another test's latency into queueing time).
+    _exclusive: tokio::sync::OwnedMutexGuard<()>,
 }
 
+static EXCLUSIVE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<()>>> =
+    std::sync::OnceLock::new();
+
 pub async fn start() -> EmbeddedServer {
+    let exclusive = EXCLUSIVE
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+        .lock_owned()
+        .await;
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().to_path_buf();
     let tcp_port_l = exspeed_testkit::bind_local();
@@ -40,5 +53,9 @@ pub async fn start() -> EmbeddedServer {
     });
 
     sleep(Duration::from_millis(250)).await;
-    EmbeddedServer { tcp_addr, api_addr }
+    EmbeddedServer {
+        tcp_addr,
+        api_addr,
+        _exclusive: exclusive,
+    }
 }
