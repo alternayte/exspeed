@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use exspeed_common::{Offset, StreamName};
-use exspeed_streams::{ReadLimits, Record, StorageEngine, StoredRecord};
+use exspeed_streams::{RawBatch, ReadLimits, Record, StorageEngine, StoredRecord};
 
 use crate::file::{FileStorage, StorageOptions, StorageSyncMode};
 
@@ -80,8 +80,85 @@ pub async fn append_n(s: &impl StorageEngine, st: &StreamName, start: u64, n: u6
     }
 }
 
-/// Read everything from `from` to the high watermark with `read_batch`.
+/// Read everything from `from` to the high watermark with `read_batch`,
+/// and check that `read_raw` returns exactly the same records.
 pub async fn read_all(s: &impl StorageEngine, st: &StreamName, from: u64) -> Vec<StoredRecord> {
+    let decoded = read_all_decoded(s, st, from).await;
+    let raw = read_all_raw(s, st, from).await;
+    assert_same_records(&decoded, &raw);
+    decoded
+}
+
+/// Field-by-field equality of two record lists.
+pub fn assert_same_records(a: &[StoredRecord], b: &[StoredRecord]) {
+    assert_eq!(a.len(), b.len(), "record counts differ");
+    for (x, y) in a.iter().zip(b) {
+        assert_eq!(x.offset, y.offset);
+        assert_eq!(x.timestamp, y.timestamp, "timestamp @{}", x.offset.0);
+        assert_eq!(x.subject, y.subject, "subject @{}", x.offset.0);
+        assert_eq!(x.key, y.key, "key @{}", x.offset.0);
+        assert_eq!(x.value, y.value, "value @{}", x.offset.0);
+        assert_eq!(x.headers, y.headers, "headers @{}", x.offset.0);
+    }
+}
+
+/// Decode the records of a raw batch, checking its invariants.
+pub fn decode_raw(b: &RawBatch) -> Vec<StoredRecord> {
+    let bytes = b.bytes.clone().freeze();
+    let mut out = Vec::new();
+    for p in b.records() {
+        let p = p.expect("raw batch is well formed");
+        let raw = bytes.slice(p.range());
+        crate::encoding::check_crc(&raw).unwrap();
+        assert_eq!(exspeed_common::record_format::delivery_count(&raw), 0);
+        out.push(crate::encoding::decode_frame(&raw).unwrap());
+    }
+    assert_eq!(out.len(), b.count, "count matches the bytes");
+    if let Some(last) = out.last() {
+        assert_eq!(b.next_offset.0, last.offset.0 + 1);
+    }
+    for w in out.windows(2) {
+        assert!(w[0].offset < w[1].offset, "offsets increase");
+    }
+    out
+}
+
+/// Read everything from `from` to the high watermark with `read_raw`.
+pub async fn read_all_raw(s: &impl StorageEngine, st: &StreamName, from: u64) -> Vec<StoredRecord> {
+    let mut out = Vec::new();
+    let mut next = Offset(from);
+    loop {
+        let b = s
+            .read_raw(
+                st,
+                next,
+                ReadLimits {
+                    max_records: 89,
+                    max_bytes: 3000,
+                },
+            )
+            .await
+            .unwrap();
+        let recs = decode_raw(&b);
+        assert!(recs.len() <= 89);
+        if recs.len() > 1 {
+            assert!(b.bytes.len() <= 3000, "byte limit");
+        }
+        out.extend(recs);
+        if b.next_offset >= b.high_watermark {
+            return out;
+        }
+        assert!(b.next_offset > next, "read_raw made no progress");
+        next = b.next_offset;
+    }
+}
+
+/// Read everything from `from` to the high watermark with `read_batch`.
+pub async fn read_all_decoded(
+    s: &impl StorageEngine,
+    st: &StreamName,
+    from: u64,
+) -> Vec<StoredRecord> {
     let mut out = Vec::new();
     let mut next = Offset(from);
     loop {

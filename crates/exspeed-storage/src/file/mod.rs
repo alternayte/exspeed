@@ -36,7 +36,8 @@ use crossbeam_channel::{RecvTimeoutError, Sender};
 use dashmap::DashMap;
 use exspeed_common::{Offset, StreamName};
 use exspeed_streams::{
-    ReadBatch, ReadLimits, Record, StorageEngine, StorageError, StoredRecord, StreamConfig,
+    RawBatch, ReadBatch, ReadLimits, Record, StorageEngine, StorageError, StoredRecord,
+    StreamConfig,
 };
 use tracing::{error, info, warn};
 
@@ -723,6 +724,20 @@ impl StorageEngine for FileStorage {
         blocking(move || {
             h.shared
                 .read(from.0, limits.max_records.max(1), limits.max_bytes, false)
+        })
+        .await
+    }
+
+    async fn read_raw(
+        &self,
+        stream: &StreamName,
+        from: Offset,
+        limits: ReadLimits,
+    ) -> Result<RawBatch, StorageError> {
+        let h = self.handle(stream)?;
+        blocking(move || {
+            h.shared
+                .read_raw(from.0, limits.max_records.max(1), limits.max_bytes)
         })
         .await
     }
