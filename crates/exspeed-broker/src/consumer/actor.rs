@@ -7,8 +7,10 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bytes::{Bytes, BytesMut};
+use exspeed_common::record_format;
 use exspeed_common::{Metrics, Offset, StreamName, SubjectFilters};
-use exspeed_protocol::client::{code, SeekTo, WireRecord};
+use exspeed_protocol::client::{code, EncodedRecords, SeekTo};
 use exspeed_streams::{ReadLimits, Record, StorageError, StoredRecord};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -24,6 +26,9 @@ const PERSIST_INTERVAL: Duration = Duration::from_millis(100);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Upper bound on records read per pump step.
 const READ_BATCH: usize = 256;
+/// Send a push subscriber's pending records once they reach this size, so
+/// one `Deliver` frame stays well below the protocol's payload limit.
+const PUSH_FLUSH_BYTES: usize = 4 * 1024 * 1024;
 
 pub(crate) enum Cmd {
     Attach {
@@ -44,7 +49,7 @@ pub(crate) enum Cmd {
         max_messages: u32,
         max_bytes: u32,
         expires: Duration,
-        reply: oneshot::Sender<Result<Vec<WireRecord>, ConsumerError>>,
+        reply: oneshot::Sender<Result<EncodedRecords, ConsumerError>>,
     },
     Ack {
         offsets: Vec<u64>,
@@ -83,14 +88,14 @@ struct PullWaiter {
     max_messages: usize,
     max_bytes: usize,
     deadline: Instant,
-    records: Vec<WireRecord>,
-    bytes: usize,
-    reply: oneshot::Sender<Result<Vec<WireRecord>, ConsumerError>>,
+    records: EncodedRecords,
+    reply: oneshot::Sender<Result<EncodedRecords, ConsumerError>>,
 }
 
 impl PullWaiter {
     fn full(&self) -> bool {
-        self.records.len() >= self.max_messages || self.bytes >= self.max_bytes
+        self.records.count() as usize >= self.max_messages
+            || self.records.byte_len() >= self.max_bytes
     }
 }
 
@@ -114,20 +119,13 @@ pub(crate) struct Actor {
     caught_up: bool,
 }
 
-pub fn to_wire(r: &StoredRecord, delivery_count: u16) -> WireRecord {
-    WireRecord {
-        offset: r.offset.0,
-        timestamp_ms: r.timestamp / 1_000_000,
-        delivery_count,
-        subject: r.subject.clone(),
-        key: r.key.clone(),
-        value: r.value.clone(),
-        headers: r.headers.clone(),
-    }
-}
-
-fn wire_size(r: &WireRecord) -> usize {
-    r.value.len() + r.subject.len() + r.key.as_ref().map_or(0, |k| k.len()) + 32
+/// A run of consecutive records from one read buffer that all go to the
+/// same taker; handed over as one zero-copy chunk.
+struct Run {
+    taker: Taker,
+    start: usize,
+    end: usize,
+    count: u32,
 }
 
 impl Actor {
@@ -273,11 +271,10 @@ impl Actor {
                     max_bytes: if max_bytes == 0 {
                         4 * 1024 * 1024
                     } else {
-                        max_bytes as usize
+                        (max_bytes as usize).min(8 * 1024 * 1024)
                     },
                     deadline: now + expires.min(Duration::from_secs(300)),
-                    records: Vec::new(),
-                    bytes: 0,
+                    records: EncodedRecords::new(),
                     reply,
                 });
                 self.caught_up = false;
@@ -434,13 +431,19 @@ impl Actor {
     }
 
     /// Deliver as much as possible: due redeliveries first, then new records.
+    ///
+    /// Records are never decoded here. They are read in their wire encoding
+    /// ([`exspeed_streams::StorageEngine::read_raw`]), their
+    /// `delivery_count` is patched in place, and each taker receives
+    /// zero-copy slices of the read buffer. Only the subject is parsed (in
+    /// place, without allocating) when the consumer has subject filters.
     async fn pump(&mut self) {
         let now = Instant::now();
         self.subs.retain(|s| !s.tx.is_closed());
         // Pullers that gave up (connection closed) must not be handed records.
         self.pulls.retain(|p| !p.reply.is_closed());
         self.core.expire(now);
-        let mut batches: Vec<Vec<WireRecord>> = vec![Vec::new(); self.subs.len()];
+        let mut batches: Vec<EncodedRecords> = vec![EncodedRecords::new(); self.subs.len()];
 
         // 1. Redeliveries and dead letters.
         let due = self.core.due(now, READ_BATCH);
@@ -461,12 +464,16 @@ impl Actor {
                     let Some(taker) = self.next_taker() else {
                         break;
                     };
-                    match self.read_one(offset).await {
-                        Ok(Some(rec)) => {
-                            let wire = to_wire(&rec, deliveries.saturating_add(1));
+                    match self.read_one_raw(offset).await {
+                        Ok(Some(mut rec)) => {
+                            record_format::set_delivery_count(
+                                &mut rec,
+                                deliveries.saturating_add(1),
+                            );
                             self.core.delivered(offset, deliveries, now);
                             self.dirty = true;
-                            self.give(taker, wire, &mut batches);
+                            self.take_credit(taker);
+                            self.give(taker, rec.freeze(), 1, &[offset], &mut batches);
                         }
                         Ok(None) => {
                             self.core.gone(offset);
@@ -493,7 +500,7 @@ impl Actor {
             let batch = match self
                 .log
                 .storage()
-                .read_batch(
+                .read_raw(
                     &self.stream,
                     Offset(self.core.next_read),
                     ReadLimits {
@@ -524,7 +531,7 @@ impl Actor {
                     break;
                 }
             };
-            if batch.records.is_empty() {
+            if batch.count == 0 {
                 if batch.next_offset.0 > self.core.next_read {
                     self.core.next_read = batch.next_offset.0;
                     self.dirty = true;
@@ -532,36 +539,85 @@ impl Actor {
                 exhausted = true;
                 break;
             }
+            let (next_offset, high_watermark) = (batch.next_offset, batch.high_watermark);
+            let mut buf = batch.bytes;
+            let mut positions = Vec::with_capacity(batch.count);
+            for p in record_format::iter(&buf) {
+                match p {
+                    Ok(p) => positions.push(p),
+                    Err(e) => {
+                        tracing::warn!(consumer = %self.core.spec.name, error = %e,
+                                       "malformed raw batch");
+                        break;
+                    }
+                }
+            }
+            // Everything handed out from this batch is a first delivery.
+            for p in &positions {
+                record_format::set_delivery_count(&mut buf[p.range()], 1);
+            }
+            let buf = buf.freeze();
+            let mut run: Option<Run> = None;
+            let mut run_offsets: Vec<u64> = Vec::new();
             let mut progressed = false;
-            for rec in &batch.records {
-                if rec.offset.0 < self.core.next_read {
+            for p in &positions {
+                if p.offset < self.core.next_read {
                     continue;
                 }
-                if !self.filters.matches(&rec.subject) {
-                    self.core.next_read = rec.offset.0 + 1;
-                    self.dirty = true;
-                    progressed = true;
-                    continue;
+                if !self.filters.is_all() {
+                    let matches = record_format::subject(&buf[p.range()])
+                        .is_ok_and(|s| self.filters.matches(s));
+                    if !matches {
+                        self.flush_run(&buf, run.take(), &mut run_offsets, &mut batches);
+                        self.core.next_read = p.offset + 1;
+                        self.dirty = true;
+                        progressed = true;
+                        continue;
+                    }
                 }
                 let Some(taker) = self.next_taker() else {
                     break;
                 };
-                let wire = to_wire(rec, 1);
-                self.core.delivered(rec.offset.0, 0, now);
-                self.core.next_read = rec.offset.0 + 1;
+                self.take_credit(taker);
+                self.core.delivered(p.offset, 0, now);
+                self.core.next_read = p.offset + 1;
                 self.dirty = true;
                 progressed = true;
-                self.give(taker, wire, &mut batches);
+                match &mut run {
+                    Some(r) if r.taker == taker && r.end == p.start => {
+                        r.end = p.end();
+                        r.count += 1;
+                    }
+                    _ => {
+                        self.flush_run(&buf, run.take(), &mut run_offsets, &mut batches);
+                        run = Some(Run {
+                            taker,
+                            start: p.start,
+                            end: p.end(),
+                            count: 1,
+                        });
+                    }
+                }
+                run_offsets.push(p.offset);
+                // Hand the run over as soon as a pull waiter is full, so
+                // `next_taker` sees it as full.
+                if let (Taker::Pull(i), Some(r)) = (taker, run.as_ref()) {
+                    let w = &self.pulls[i];
+                    if w.records.count() as usize + r.count as usize >= w.max_messages
+                        || w.records.byte_len() + (r.end - r.start) >= w.max_bytes
+                    {
+                        self.flush_run(&buf, run.take(), &mut run_offsets, &mut batches);
+                    }
+                }
                 if self.core.capacity_for_new() == 0 {
                     break;
                 }
             }
+            self.flush_run(&buf, run.take(), &mut run_offsets, &mut batches);
             if !progressed {
                 break;
             }
-            if batch.next_offset.0 >= batch.high_watermark.0
-                && self.core.next_read >= batch.high_watermark.0
-            {
+            if next_offset.0 >= high_watermark.0 && self.core.next_read >= high_watermark.0 {
                 exhausted = true;
                 break;
             }
@@ -579,27 +635,80 @@ impl Actor {
         self.settle_pulls(Instant::now(), exhausted);
     }
 
-    fn give(&mut self, taker: Taker, rec: WireRecord, batches: &mut [Vec<WireRecord>]) {
+    /// A push subscriber spends one credit per record.
+    fn take_credit(&mut self, taker: Taker) {
+        if let Taker::Push(i) = taker {
+            self.subs[i].credits -= 1;
+        }
+    }
+
+    fn flush_run(
+        &mut self,
+        buf: &Bytes,
+        run: Option<Run>,
+        offsets: &mut Vec<u64>,
+        batches: &mut [EncodedRecords],
+    ) {
+        if let Some(r) = run {
+            let chunk = buf.slice(r.start..r.end);
+            let offs = std::mem::take(offsets);
+            self.give(r.taker, chunk, r.count, &offs, batches);
+        }
+    }
+
+    /// Hand `count` encoded records (with offsets `offsets`) to a taker.
+    fn give(
+        &mut self,
+        taker: Taker,
+        chunk: Bytes,
+        count: u32,
+        offsets: &[u64],
+        batches: &mut [EncodedRecords],
+    ) {
         match taker {
-            Taker::Pull(i) => {
-                let p = &mut self.pulls[i];
-                p.bytes += wire_size(&rec);
-                p.records.push(rec);
-            }
+            Taker::Pull(i) => self.pulls[i].records.push_chunk(chunk, count),
             Taker::Push(i) => {
-                self.subs[i].credits -= 1;
-                self.owners.insert(rec.offset, self.subs[i].sub_id);
+                let sub_id = self.subs[i].sub_id;
+                for &o in offsets {
+                    self.owners.insert(o, sub_id);
+                }
                 // Drop entries for records that left in-flight some other
                 // way (expired, dead-lettered, seek) so the map stays bounded.
                 if self.owners.len() > 2 * self.core.capacity_hint() {
                     let core = &self.core;
                     self.owners.retain(|o, _| core.is_in_flight(*o));
                 }
-                batches[i].push(rec);
+                batches[i].push_chunk(chunk, count);
+                if batches[i].byte_len() >= PUSH_FLUSH_BYTES {
+                    let full = std::mem::take(&mut batches[i]);
+                    let _ = self.subs[i].tx.send(SubEvent::Deliver(full));
+                }
             }
         }
     }
 
+    /// The record at exactly `offset`, in its wire encoding.
+    async fn read_one_raw(&self, offset: u64) -> Result<Option<BytesMut>, StorageError> {
+        match self
+            .log
+            .storage()
+            .read_raw(
+                &self.stream,
+                Offset(offset),
+                ReadLimits {
+                    max_records: 1,
+                    max_bytes: 1,
+                },
+            )
+            .await
+        {
+            Ok(b) if b.count > 0 && record_format::offset(&b.bytes) == offset => Ok(Some(b.bytes)),
+            Ok(_) | Err(StorageError::OffsetOutOfRange { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The record at exactly `offset`, decoded (for dead-lettering).
     async fn read_one(&self, offset: u64) -> Result<Option<StoredRecord>, StorageError> {
         match self
             .log
@@ -720,7 +829,7 @@ fn drain(rx: &mut mpsc::Receiver<Cmd>, code: u16, message: &str) {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Taker {
     Pull(usize),
     Push(usize),

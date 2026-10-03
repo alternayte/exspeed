@@ -79,7 +79,7 @@ fn spec(name: &str, stream: &str) -> ConsumerSpec {
 
 async fn next_batch(sub: &mut super::Subscription) -> Vec<WireRecord> {
     match timeout(Duration::from_secs(5), sub.events.recv()).await {
-        Ok(Some(SubEvent::Deliver(r))) => r,
+        Ok(Some(SubEvent::Deliver(r))) => r.decode().unwrap(),
         other => panic!("expected a delivery, got {other:?}"),
     }
 }
@@ -153,8 +153,8 @@ async fn subscribers_on_one_consumer_share_the_work() {
     let mut from_b = 0;
     while seen.len() < 100 {
         tokio::select! {
-            Some(SubEvent::Deliver(r)) = a.events.recv() => { from_a += r.len(); seen.extend(r); }
-            Some(SubEvent::Deliver(r)) = b.events.recv() => { from_b += r.len(); seen.extend(r); }
+            Some(SubEvent::Deliver(r)) = a.events.recv() => { let r = r.decode().unwrap(); from_a += r.len(); seen.extend(r); }
+            Some(SubEvent::Deliver(r)) = b.events.recv() => { let r = r.decode().unwrap(); from_b += r.len(); seen.extend(r); }
             _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("timed out at {}", seen.len()),
         }
     }
@@ -296,6 +296,8 @@ async fn pull_long_polls_until_data_arrives() {
     let empty = m
         .pull("c", 10, 0, Duration::from_millis(150))
         .await
+        .unwrap()
+        .decode()
         .unwrap();
     assert!(empty.is_empty());
     assert!(t0.elapsed() >= Duration::from_millis(140));
@@ -309,6 +311,8 @@ async fn pull_long_polls_until_data_arrives() {
         .await
         .unwrap()
         .unwrap()
+        .unwrap()
+        .decode()
         .unwrap();
     assert!(!got.is_empty());
     assert_eq!(got[0].offset, 0);
@@ -328,6 +332,8 @@ async fn subject_filters_skip_other_records() {
     let got = m
         .pull("c", 100, 0, Duration::from_millis(200))
         .await
+        .unwrap()
+        .decode()
         .unwrap();
     assert_eq!(got.len(), 6);
     assert!(got.iter().all(|r| r.subject.starts_with("orders.")));
@@ -402,7 +408,12 @@ async fn state_survives_restart_and_unacked_records_come_back() {
     {
         let (m, token) = e.manager().await;
         m.create(spec("c", "s")).await.unwrap();
-        let got = m.pull("c", 5, 0, Duration::from_millis(200)).await.unwrap();
+        let got = m
+            .pull("c", 5, 0, Duration::from_millis(200))
+            .await
+            .unwrap()
+            .decode()
+            .unwrap();
         assert_eq!(got.len(), 5);
         m.ack("c", vec![0, 1, 3]).await.unwrap();
         // Let the debounced persist run, then "crash".
@@ -417,6 +428,8 @@ async fn state_survives_restart_and_unacked_records_come_back() {
     let again = m
         .pull("c", 10, 0, Duration::from_millis(200))
         .await
+        .unwrap()
+        .decode()
         .unwrap();
     let offsets: Vec<u64> = again.iter().map(|r| r.offset).collect();
     assert_eq!(
@@ -458,6 +471,8 @@ async fn seek_repositions() {
     let got = m
         .pull("c", 10, 0, Duration::from_millis(200))
         .await
+        .unwrap()
+        .decode()
         .unwrap();
     assert_eq!(got.first().unwrap().offset, 7);
     m.seek("c", SeekTo::Latest).await.unwrap();
@@ -562,7 +577,12 @@ async fn consumer_state_stream_is_compacted() {
         m.create(spec("c", "s")).await.unwrap();
         // Ack one record at a time, letting each snapshot persist.
         for o in 0..30u64 {
-            let got = m.pull("c", 1, 0, Duration::from_millis(200)).await.unwrap();
+            let got = m
+                .pull("c", 1, 0, Duration::from_millis(200))
+                .await
+                .unwrap()
+                .decode()
+                .unwrap();
             assert_eq!(got[0].offset, o);
             m.ack("c", vec![o]).await.unwrap();
             tokio::time::sleep(Duration::from_millis(110)).await;
