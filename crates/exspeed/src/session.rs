@@ -144,6 +144,8 @@ struct ConnState {
     ctx: Arc<SessionContext>,
     subs: HashMap<u32, SubEntry>,
     ephemeral: Vec<String>,
+    /// This connection's publish pipeline (started on the first publish).
+    publishes: Option<mpsc::Sender<PublishJob>>,
     /// Cancelled when the connection ends, so waiting requests (queries,
     /// pulls, long-poll reads) stop instead of running on for nobody.
     closed: CancellationToken,
@@ -290,6 +292,7 @@ where
         ctx: ctx.clone(),
         subs: HashMap::new(),
         ephemeral: Vec::new(),
+        publishes: None,
         closed: cancel.child_token(),
     };
     let waits = Arc::new(Semaphore::new(MAX_CONCURRENT_WAITS));
@@ -457,6 +460,176 @@ async fn authorize_consumer(
     }
 }
 
+/// One publish request waiting in a connection's publish pipeline.
+struct PublishJob {
+    corr: u32,
+    stream: StreamName,
+    records: Vec<Record>,
+    /// `Publish` (one record, `PublishOk`) rather than `PublishBatch`.
+    single: bool,
+    start: std::time::Instant,
+}
+
+impl PublishJob {
+    fn new(corr: u32, stream: StreamName, records: Vec<Record>, single: bool) -> Self {
+        Self {
+            corr,
+            stream,
+            records,
+            single,
+            start: std::time::Instant::now(),
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        self.records
+            .iter()
+            .map(|r| r.value.len() + r.subject.len() + r.key.as_ref().map_or(0, |k| k.len()))
+            .sum()
+    }
+
+    fn respond(&self, ctx: &SessionContext, results: Vec<AppendResult>) -> Response {
+        if self.single {
+            ctx.metrics
+                .record_publish_latency(self.stream.as_str(), self.start.elapsed().as_secs_f64());
+            let (offset, duplicate) = match results.into_iter().next() {
+                Some(AppendResult::Written(o, _)) => (o.0, false),
+                Some(AppendResult::Duplicate(o)) => (o.0, true),
+                None => {
+                    return Response::error(code::INTERNAL, "publish returned no result");
+                }
+            };
+            Response::PublishOk { offset, duplicate }
+        } else {
+            Response::PublishBatchOk {
+                results: results
+                    .into_iter()
+                    .map(|r| match r {
+                        AppendResult::Written(o, _) => (o.0, false),
+                        AppendResult::Duplicate(o) => (o.0, true),
+                    })
+                    .collect(),
+            }
+        }
+    }
+}
+
+/// Requests a connection may queue in its publish pipeline before the read
+/// loop waits (backpressure).
+const PUBLISH_QUEUE: usize = 1024;
+/// Most records / bytes appended together from queued publish requests.
+const PUBLISH_COALESCE_RECORDS: usize = 4096;
+const PUBLISH_COALESCE_BYTES: usize = 8 * 1024 * 1024;
+
+impl ConnState {
+    /// Queue a publish in this connection's pipeline. Publishes are applied
+    /// in arrival order, but the read loop doesn't wait for them, so a
+    /// pipelining client's requests share fsyncs instead of paying one
+    /// each.
+    async fn publish(&mut self, out: &Out, job: PublishJob) {
+        let tx = self.publishes.get_or_insert_with(|| {
+            let (tx, rx) = mpsc::channel(PUBLISH_QUEUE);
+            tokio::spawn(publish_pipeline(self.ctx.clone(), out.clone(), rx));
+            tx
+        });
+        if let Err(mpsc::error::SendError(job)) = tx.send(job).await {
+            out.send(
+                job.corr,
+                Response::error(code::UNAVAILABLE, "connection closing"),
+            )
+            .await;
+        }
+    }
+}
+
+/// Applies one connection's publishes in order. Requests already queued
+/// for the same stream are appended together (one storage batch, one
+/// fsync); each request still gets its own reply.
+async fn publish_pipeline(ctx: Arc<SessionContext>, out: Out, mut rx: mpsc::Receiver<PublishJob>) {
+    let mut next: Option<PublishJob> = None;
+    loop {
+        let first = match next.take() {
+            Some(j) => j,
+            None => match rx.recv().await {
+                Some(j) => j,
+                None => return,
+            },
+        };
+        let mut records = first.records.len();
+        let mut bytes = first.bytes();
+        let mut group = vec![first];
+        while records < PUBLISH_COALESCE_RECORDS && bytes < PUBLISH_COALESCE_BYTES {
+            match rx.try_recv() {
+                Ok(j) if j.stream == group[0].stream => {
+                    records += j.records.len();
+                    bytes += j.bytes();
+                    group.push(j);
+                }
+                Ok(j) => {
+                    next = Some(j);
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        append_group(&ctx, &out, group).await;
+    }
+}
+
+async fn append_group(ctx: &SessionContext, out: &Out, mut group: Vec<PublishJob>) {
+    let log = &ctx.broker.log;
+    if group.len() == 1 {
+        let job = group.pop().expect("one job");
+        return append_one(ctx, out, job).await;
+    }
+    let stream = group[0].stream.clone();
+    let all: Vec<Record> = group
+        .iter()
+        .flat_map(|j| j.records.iter().cloned())
+        .collect();
+    match log.append_batch(&stream, all).await {
+        Ok(results) => {
+            let mut results = results.into_iter();
+            for job in group {
+                let mine: Vec<AppendResult> = results.by_ref().take(job.records.len()).collect();
+                out.send(job.corr, job.respond(ctx, mine)).await;
+            }
+        }
+        // Rejected before anything was written, because of one request's
+        // records: apply the requests one by one so only that one fails.
+        Err(LogError::InvalidRecord(_))
+        | Err(LogError::Storage(StorageError::KeyCollision { .. })) => {
+            for job in group {
+                append_one(ctx, out, job).await;
+            }
+        }
+        // Anything else (not leader, storage, replication) is what each
+        // request would have seen on its own.
+        Err(e) => {
+            let resp = log_error_response(ctx, e);
+            for job in group {
+                out.send(job.corr, resp.clone()).await;
+            }
+        }
+    }
+}
+
+async fn append_one(ctx: &SessionContext, out: &Out, mut job: PublishJob) {
+    let log = &ctx.broker.log;
+    let result = if job.single {
+        let record = job.records.pop().expect("one record");
+        log.append(&job.stream, record).await.map(|r| vec![r])
+    } else {
+        log.append_batch(&job.stream, std::mem::take(&mut job.records))
+            .await
+    };
+    let resp = match result {
+        Ok(results) => job.respond(ctx, results),
+        Err(e) => log_error_response(ctx, e),
+    };
+    out.send(job.corr, resp).await;
+}
+
 async fn dispatch(
     req: Request,
     corr: u32,
@@ -506,25 +679,12 @@ async fn dispatch(
             if name.is_internal() || !identity.authorize(Action::Publish, &name) {
                 return forbid(&ctx, out, corr, "Publish").await;
             }
-            let start = std::time::Instant::now();
-            let resp = match broker.log.append(&name, to_record(record)).await {
-                Ok(r) => {
-                    ctx.metrics
-                        .record_publish_latency(name.as_str(), start.elapsed().as_secs_f64());
-                    match r {
-                        AppendResult::Written(o, _) => Response::PublishOk {
-                            offset: o.0,
-                            duplicate: false,
-                        },
-                        AppendResult::Duplicate(o) => Response::PublishOk {
-                            offset: o.0,
-                            duplicate: true,
-                        },
-                    }
-                }
-                Err(e) => log_error_response(&ctx, e),
-            };
-            out.send(corr, resp).await;
+            state
+                .publish(
+                    out,
+                    PublishJob::new(corr, name, vec![to_record(record)], true),
+                )
+                .await;
         }
         Request::PublishBatch { stream, records } => {
             let name = match stream_name(&stream) {
@@ -535,19 +695,9 @@ async fn dispatch(
                 return forbid(&ctx, out, corr, "PublishBatch").await;
             }
             let records = records.into_iter().map(to_record).collect();
-            let resp = match broker.log.append_batch(&name, records).await {
-                Ok(results) => Response::PublishBatchOk {
-                    results: results
-                        .into_iter()
-                        .map(|r| match r {
-                            AppendResult::Written(o, _) => (o.0, false),
-                            AppendResult::Duplicate(o) => (o.0, true),
-                        })
-                        .collect(),
-                },
-                Err(e) => log_error_response(&ctx, e),
-            };
-            out.send(corr, resp).await;
+            state
+                .publish(out, PublishJob::new(corr, name, records, false))
+                .await;
         }
 
         // ---- Streams -------------------------------------------------------

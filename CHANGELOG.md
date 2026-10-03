@@ -254,6 +254,11 @@ with the test that proves it.
   dead-lettered; http_poll keeps validators only after a readable body.
 - The `examples/order-processing` configs load, and CI validates every
   example config.
+- Publishes on one TCP connection were applied one at a time, each waiting
+  for its own fsync before the next request was read, so a pipelining
+  client got about one record per fsync (under 100/s on a busy host). The
+  connection now feeds an ordered publish pipeline that appends queued
+  publishes together and keeps reading.
 
 **Added**
 

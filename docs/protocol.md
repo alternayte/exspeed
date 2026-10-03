@@ -38,6 +38,13 @@ Decoders reject truncated payloads and trailing bytes.
 - A request carries a non-zero correlation id, and its response echoes it.
   Responses can arrive **out of order**: a long pull or long-poll read does not
   block the requests behind it.
+- `Publish` and `PublishBatch` requests on one connection are applied **in the
+  order they were sent**, and the connection keeps reading while they are
+  written. Publishes already queued for the same stream are appended
+  together (one storage batch, one fsync), so a client that pipelines
+  publishes without waiting for each reply shares fsyncs instead of paying
+  one per record. Each request still gets its own reply. A request that
+  depends on a publish (a read of it, say) should wait for its reply.
 - The server sends pushes (`Deliver`, `SubscriptionEnded`) with correlation id
   `0`.
 - A request sent with correlation id `0` is **fire-and-forget**: no reply on
