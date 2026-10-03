@@ -41,6 +41,7 @@ use exspeed_processing::ExqlEngine;
 use exspeed_protocol::client::{code, ConsumerSpec, PublishRecord, Request, Response, StreamSpec};
 use exspeed_protocol::codec::ExspeedCodec;
 use exspeed_protocol::frame::Frame;
+use exspeed_protocol::ProtocolError;
 use exspeed_streams::{ReadLimits, Record, StorageError, StreamConfig};
 
 /// The first frame must be `Connect` and arrive within this time.
@@ -147,7 +148,24 @@ where
             return Ok(());
         }
         Ok(None) => return Ok(()),
-        Ok(Some(f)) => f?,
+        Ok(Some(Ok(f))) => f,
+        Ok(Some(Err(e))) => {
+            // Undecodable first frame (old client, wrong port, garbage): say
+            // why in a v2 Error frame before closing instead of hanging up
+            // silently.
+            let message = match &e {
+                ProtocolError::UnsupportedVersion(v) => format!(
+                    "unsupported protocol version {v}; this server speaks {}",
+                    exspeed_common::PROTOCOL_VERSION
+                ),
+                other => other.to_string(),
+            };
+            warn!(%peer, error = %e, "undecodable handshake frame");
+            let _ = sink
+                .send(Response::error(code::BAD_REQUEST, message).into_frame(0))
+                .await;
+            return Err(e.into());
+        }
     };
     let corr = first.correlation_id;
     let (client_id, token) = match Request::from_frame(&first) {

@@ -54,6 +54,9 @@ Decoders reject truncated payloads and trailing bytes.
    should `Ping` every 15–30 seconds.
 4. A frame that can't be decoded (bad version, unknown opcode, oversize
    length) gets `Error 400` with correlation id 0, and the connection closes.
+   This applies to the very first frame too: a client speaking another
+   version gets a v2 `Error 400` "unsupported protocol version N; this server
+   speaks 2" before the close.
    A request whose *payload* is malformed gets `Error 400` with its own
    correlation id, and the connection stays open.
 5. When the connection closes, the server ends its subscriptions and deletes
