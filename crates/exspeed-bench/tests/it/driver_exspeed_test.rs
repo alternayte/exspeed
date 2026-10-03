@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connects_and_ensures_stream_is_idempotent() {
     let srv = start().await;
     let mut client = ExspeedClient::connect(&srv.tcp_addr).await.unwrap();
@@ -15,7 +15,7 @@ async fn connects_and_ensures_stream_is_idempotent() {
     client.ensure_stream("bench-stream").await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn producer_sends_at_least_some_records_in_2s() {
     let srv = start().await;
     let mut setup = ExspeedClient::connect(&srv.tcp_addr).await.unwrap();
@@ -38,7 +38,7 @@ async fn producer_sends_at_least_some_records_in_2s() {
     assert_eq!(stats.messages, count.load(Ordering::Relaxed));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn consumer_records_latency_for_pushed_records() {
     let srv = start().await;
     let mut setup = ExspeedClient::connect(&srv.tcp_addr).await.unwrap();
@@ -86,7 +86,7 @@ async fn consumer_records_latency_for_pushed_records() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn publisher_coalesces_concurrent_publishes_in_order() {
     let srv = start().await;
     let mut setup = ExspeedClient::connect(&srv.tcp_addr).await.unwrap();
@@ -132,7 +132,7 @@ async fn publisher_coalesces_concurrent_publishes_in_order() {
     assert_eq!(r.records.len(), 200);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn publisher_with_zero_window_sends_singles() {
     let srv = start().await;
     let mut setup = ExspeedClient::connect(&srv.tcp_addr).await.unwrap();
