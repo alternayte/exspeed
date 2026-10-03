@@ -1,8 +1,5 @@
 # Getting started
 
-> **Status:** Exspeed is pre-1.0 and not yet production-ready. See
-> [REVIEW.md](REVIEW.md) for the known gaps and the plan to close them.
-
 ## Install
 
 **Prebuilt binary** (macOS, Linux, Windows; built by cargo-dist for each release):
@@ -38,7 +35,9 @@ The server listens on:
 | `8080` | HTTP API, `/metrics`, `/healthz`, `/readyz`, `/webhooks/*` |
 | `5934` | Replication (multi-pod mode only) |
 
-Data goes to `./exspeed-data` by default (`--data-dir` to change).
+Data goes to `./exspeed-data` by default (`--data-dir` to change); the
+Docker image uses `/var/lib/exspeed`. Every setting is described in
+[configuration.md](configuration.md).
 
 ## First stream
 
@@ -46,7 +45,8 @@ Data goes to `./exspeed-data` by default (`--data-dir` to change).
 # Create a stream (default retention: 7 days / 10 GB)
 exspeed create orders
 
-# Publish a few records. Subjects are dot-delimited; keys are optional.
+# Publish a few records. Subjects are dot-delimited (the stream name when
+# omitted); keys are optional.
 exspeed pub orders '{"total": 99, "region": "eu"}' --subject order.eu.created --key ord-1
 exspeed pub orders '{"total": 42, "region": "us"}' --subject order.us.created --key ord-2
 
@@ -78,19 +78,24 @@ Applications use the binary protocol through the TypeScript SDK
 ```ts
 import { ExspeedClient } from "@exspeed/sdk";
 
-const client = new ExspeedClient({ host: "localhost", port: 5933, clientId: "worker-1" });
-await client.connect();
+const client = await ExspeedClient.connect({ host: "localhost", port: 5933, clientId: "worker-1" });
 
-await client.createConsumer({ name: "order-processor", stream: "orders", startFrom: "earliest" });
+// Idempotent: every worker instance can run this.
+await client.createConsumer({ name: "order-processor", stream: "orders", deliver: "all" });
 
 for await (const msg of await client.subscribe("order-processor")) {
   console.log(msg.subject, msg.json());
-  await msg.ack();
+  msg.ack();
 }
 ```
 
-> Acks are cumulative and there is no automatic redelivery yet; see
-> [concepts.md](concepts.md#current-delivery-semantics).
+Each record is acknowledged individually. A record that isn't acked within
+the consumer's `ack_wait_ms` (30 s by default), or that is nacked, or whose
+subscriber disconnects, is redelivered with a higher `deliveryCount`. After
+`max_deliver` deliveries (5 by default) it is dead-lettered to the
+consumer's `dlq_stream`, when one is set. Run several copies of the worker
+with the same consumer name to share the work. See
+[concepts.md](concepts.md#consumers).
 
 ## Next steps
 

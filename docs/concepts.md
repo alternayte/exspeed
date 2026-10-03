@@ -19,11 +19,15 @@ that exceed either limit. Segments roll at 256 MB.
 | Field | Description |
 |-------|-------------|
 | `offset` | Monotonic `u64` position in the stream, assigned on append |
-| `timestamp` | Append time (ms in bounded queries; see the ExQL caveats) |
+| `timestamp` | Append time, stored in nanoseconds. ExQL exposes it as a millisecond timestamp |
 | `subject` | Dot-delimited routing string, e.g. `order.eu.created` |
-| `key` | Optional entity key (bytes). Used by SEEK, joins, and idempotent upserts |
+| `key` | Optional entity key (bytes). Compacted streams keep the newest record per key; ExQL exposes it as the `key` column |
 | `payload` | Opaque bytes. ExQL treats it as JSON |
 | `headers` | List of `(key, value)` string pairs |
+
+Every write path checks the same limits: a subject of at most 1024 bytes, a
+key of at most 64 KiB, a value of at most 8 MiB, and at most 256 headers
+(64 KiB in total).
 
 ## Subjects and filters
 
@@ -56,11 +60,11 @@ HTTP (`POST /api/v1/consumers`):
 | `deliver` | `all` | Where to start: `all`, `new`, `{from_offset}`, `{from_time}` (ms) |
 | `ack` | `explicit` | `explicit`, or `none` (delivery counts as processed) |
 | `ack_wait_ms` | 30000 | Redeliver if not acked within this time |
-| `max_deliver` | 5 | Attempts before dead-lettering |
-| `backoff_ms` | — | Redelivery delays per attempt (after a nack or timeout) |
+| `max_deliver` | 5 | Attempts before dead-lettering (`0` = retry forever) |
+| `backoff_ms` | — | Redelivery delays by delivery count, after a nack or timeout (the last value repeats; empty = redeliver at once) |
 | `max_ack_pending` | 1000 | Unacked records allowed before delivery pauses |
-| `dlq_stream` | — | Where records go after `max_deliver` attempts or a `term` |
-| `ephemeral` | false | Deleted when the creating connection closes |
+| `dlq_stream` | — | Where records go after `max_deliver` attempts or a `term`. Unset: they are dropped and counted |
+| `ephemeral` | false | Deleted when the creating connection closes (TCP only) |
 
 **Delivery.** Clients either **subscribe** (push, with a credit window the
 SDK tops up automatically) or **pull** batches with a long-poll. Each
@@ -97,9 +101,9 @@ The wire-level details are in [protocol.md](protocol.md#consumers).
 
 ## Idempotent publish
 
-Publishes can carry a `msg_id`. Within the stream's dedup window, a retry
-with the same `msg_id` and the same body returns the original offset. The
-same `msg_id` with a different body is rejected. See
+Publishes can carry a `msg_id`. Within the stream's dedup window (default
+5 minutes), a retry with the same `msg_id` and the same body returns the
+original offset. The same `msg_id` with a different body is rejected. See
 [idempotent-publish.md](idempotent-publish.md).
 
 ## Continuous queries and materialized tables
@@ -114,15 +118,18 @@ query) or continuously:
   VIEW`) keeps the current aggregate per key, backed by the changelog stream
   `<t>`. It is readable via `/api/v1/views/<t>` and `SELECT * FROM <t>`.
 
-Continuous queries run on event time with watermarks, checkpoint their
-state, and survive restarts without duplicating output.
+Continuous queries run on event time with watermarks and checkpoint their
+state. After a restart or failover they resume from the checkpoint; output
+records carry deterministic idempotency keys, so a resumed query doesn't
+duplicate its output.
 
 See [exql.md](exql.md).
 
 ## Connectors
 
 **Sources** pull from external systems into a stream, for example Postgres
-CDC, outbox tables, webhooks, RabbitMQ, or HTTP polling. **Sinks** push a
+CDC or polling, outbox tables, SQL Server CDC, JDBC polling, webhooks,
+RabbitMQ, or HTTP polling. **Sinks** push a
 stream out to external systems, for example JDBC databases, HTTP endpoints,
 S3, or RabbitMQ. They are configured as TOML files in `connectors.d/` or via
 the HTTP API. See [connectors.md](connectors.md).
@@ -131,5 +138,5 @@ the HTTP API. See [connectors.md](connectors.md).
 
 In a cluster exactly one node holds the lease: the leader takes writes and
 runs consumers, connectors and continuous queries. The other nodes replicate
-its whole log and take over on failure. With `acks = all`, acknowledged
-writes survive a failover. See [high-availability.md](high-availability.md).
+its whole log and take over on failure. With `acks = all` (the default),
+acknowledged writes survive a failover. See [high-availability.md](high-availability.md).

@@ -19,9 +19,15 @@ and the record browser (`GET /api/v1/streams/{name}/records`, which takes
 `subscribe` or `admin` on the stream) requires an **admin** permission
 (`openapi.json` needs none):
 
-- **Global admin** for queries, tables, connectors, connections, leases,
-  cluster routes and backups.
-- **Admin on the stream** for stream routes.
+- **Global admin** (`admin` on `streams = "*"`) for queries, tables,
+  connectors, connections and backups.
+- **Admin on the stream** for stream routes, including publish, and for
+  consumer routes (admin on the consumer's stream; creating a consumer with
+  a `dlq_stream` also needs admin on that stream).
+- **Admin on any stream** for `/api/v1/leases` and `/api/v1/cluster`.
+
+A missing or unknown token gets `401`; a token without the needed
+permission gets `403`.
 
 | Path | Auth |
 |------|------|
@@ -31,7 +37,8 @@ and the record browser (`GET /api/v1/streams/{name}/records`, which takes
 | `GET /api/v1/openapi.json` | none |
 | `POST /webhooks/*` | none, unless the webhook connector sets its own |
 
-In multi-pod mode, standbys answer `503` on `/api/v1/*`. The exceptions are
+In multi-pod mode, standbys answer `503` on `/api/v1/*`, with the leader's
+client address in `leader` when it is known. The exceptions are
 `/api/v1/leases`, `/api/v1/cluster`, `/api/v1/whoami`,
 `/api/v1/openapi.json` and `GET /api/v1/streams/{name}/records` (followers
 serve reads from their replica). See [high-availability.md](high-availability.md).
@@ -46,8 +53,8 @@ publishing to or deleting one answers `403`.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/healthz` | `200` only on the cluster leader. Use it for load-balancer routing. |
-| `GET` | `/readyz` | `200` once startup has finished and `data_dir` is writable. Use it for k8s readiness. |
+| `GET` | `/healthz` | `200` `{leader: true, node_id}` on the cluster leader (always, on a single node); `503` `{leader: false, node_id, leader_hint}` on a follower. Use it for load-balancer routing. |
+| `GET` | `/readyz` | `200` `{status: "ready"}` once startup has finished, the leader's dedup rebuild is done and `data_dir` is writable; otherwise `503` with `status` `starting`, `dedup_rebuild_in_progress` or `data_dir_unwritable`. A fenced (failed) stream doesn't make the node unready: the answer is then `200` `{status: "degraded", failed_streams: [{stream, reason}]}`. Use it for k8s readiness. |
 | `GET` | `/metrics` | Prometheus text format |
 
 ### Streams
@@ -56,11 +63,11 @@ publishing to or deleting one answers `403`.
 |--------|------|--------------|-------------|
 | `GET` | `/api/v1/streams` | `?internal=true` | List the streams the caller has any permission on. Internal `__` streams are included only with `internal=true`, for global admins. |
 | `POST` | `/api/v1/streams` | `{"name", "max_age_secs"?, "max_bytes"?, "dedup_window_secs"?, "dedup_max_entries"?, "compaction"?}` | Create a stream. `compaction: true` keeps only the latest record per key. |
-| `GET` | `/api/v1/streams/{name}` | | Offsets, size, retention and dedup settings |
-| `PATCH` | `/api/v1/streams/{name}` | `{"max_age_secs"?, "max_bytes"?, "dedup_window_secs"?, "dedup_max_entries"?}` | Update settings |
-| `DELETE` | `/api/v1/streams/{name}` | `?force=true` | Delete. Without `force`, fails if connectors, queries or consumers still reference the stream. |
-| `POST` | `/api/v1/streams/{name}/publish` | `{"subject", "data", "key"?, "msg_id"?}` | Publish one record. The `x-idempotency-key` header can be used instead of `msg_id`. |
-| `GET` | `/api/v1/streams/{name}/records?from=&limit=&filter=&wait_ms=` | | Browse records without a consumer: `{records, next_offset, high_watermark}`. Needs `subscribe` or `admin`; any node answers. `wait_ms` (≤ 30000) long-polls: with nothing new at `from`, the server waits for records before answering. `limit` ≤ 1000; each record has `offset`, `timestamp_ms`, `subject`, `key`, `value` (JSON when it parses, else a UTF-8 string, else base64; see `encoding`), `headers`. |
+| `GET` | `/api/v1/streams/{name}` | | `storage_bytes`, `head_offset` (the next offset), retention, dedup and compaction settings, and `status` (`healthy`, or `failed` with a `failure` reason when the partition is fenced read-only) |
+| `PATCH` | `/api/v1/streams/{name}` | `{"max_age_secs"?, "max_bytes"?, "dedup_window_secs"?, "dedup_max_entries"?}` | Update settings; absent fields keep their value |
+| `DELETE` | `/api/v1/streams/{name}` | `?force=true` | Delete. Without `force`, answers `409` with the `blockers` (connectors, queries, consumers, subscriptions) that still reference the stream; with it, deletes them too. |
+| `POST` | `/api/v1/streams/{name}/publish` | `{"data", "subject"?, "key"?, "msg_id"?}` | Publish one record. `data` is any JSON value, stored as its JSON encoding; `subject` defaults to the stream name. The `x-idempotency-key` header can be used instead of `msg_id`. `201` when stored, `200` for a duplicate, `409` when the `msg_id` was used with a different body, `503` while not leader, during the dedup rebuild or when the dedup map is full (with `Retry-After`). |
+| `GET` | `/api/v1/streams/{name}/records?from=&limit=&filter=&wait_ms=` | | Browse records without a consumer: `{records, next_offset, high_watermark}`. Needs `subscribe` or `admin`; any node answers. `wait_ms` (≤ 30000) long-polls: with nothing new at `from`, the server waits for records before answering. `from` defaults to the earliest retained record, `limit` to 100 (≤ 1000); each record has `offset`, `timestamp_ms`, `subject`, `key`, `value` (JSON when it parses, else a UTF-8 string, else base64; see `encoding`), `headers`. |
 
 ```bash
 curl -X POST localhost:8080/api/v1/streams -H 'Content-Type: application/json' \
@@ -80,9 +87,12 @@ consumers. See [concepts.md](concepts.md#consumers) for the model.
 |--------|------|------|-------------|
 | `GET` | `/api/v1/consumers[?stream=]` | | List consumers (with state) |
 | `POST` | `/api/v1/consumers` | consumer spec, e.g. `{"name": "billing", "stream": "orders", "filter_subjects": ["orders.placed"], "dlq_stream": "orders-dlq"}` | Create a durable consumer. Idempotent for an identical spec, `409` if it differs. Returns `201` with consumer info. |
-| `GET` | `/api/v1/consumers/{name}` | | Spec, `next_offset`, `ack_floor`, `num_unacked`, `num_waiting`, `lag`, `subscribers`, `stats` |
+| `GET` | `/api/v1/consumers/{name}` | | Spec, `next_offset`, `ack_floor`, `num_unacked`, `num_in_flight`, `num_waiting`, `lag`, `subscribers`, `pull_waiters`, `stats` |
 | `POST` | `/api/v1/consumers/{name}/seek` | one of `"earliest"`, `"latest"`, `{"offset": n}`, `{"timestamp_ms": t}` | Reposition; drops unacked state |
 | `DELETE` | `/api/v1/consumers/{name}` | | Delete; active subscriptions end with code 404 |
+
+Ephemeral consumers belong to a TCP connection, so `POST /api/v1/consumers`
+rejects `"ephemeral": true` with `400`.
 
 ### Queries (ExQL)
 
@@ -97,7 +107,7 @@ consumers. See [concepts.md](concepts.md#consumers) for the model.
 | `DELETE` | `/api/v1/queries/{id}` | | `DROP QUERY`: stop and remove the query; its output stream is kept |
 
 A bounded query returns the rows below. `truncated` is true when more than
-`EXSPEED_QUERY_MAX_ROWS` rows matched:
+`exql.query_max_rows` (`EXSPEED_QUERY_MAX_ROWS`, default 10000) rows matched:
 
 ```json
 {"columns": ["region", "n"], "rows": [["eu", 42]], "row_count": 1, "execution_time_ms": 12, "truncated": false}
@@ -121,8 +131,8 @@ memory limit, 503 not leader):
 {"error": "parse error: …", "code": "PARSE_ERROR", "line": 1, "column": 25}
 ```
 
-`CREATE INDEX` returns `UNSUPPORTED`; the `/api/v1/indexes` endpoints have
-been removed.
+Secondary indexes are not supported: `CREATE INDEX` returns
+`UNSUPPORTED`.
 
 ### Materialized tables
 
@@ -158,7 +168,7 @@ been removed.
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/api/v1/whoami` | Identity and permissions of the caller's token |
-| `GET` | `/api/v1/leases` | The live `cluster:leader` lease record: holder, epoch, endpoints, ISR |
+| `GET` | `/api/v1/leases` | Live lease records (`name`, `holder`, `epoch`, `expires_at`, `replication_endpoint`, `client_endpoint`, `isr`); empty on a single node. Any node. |
 | `GET` | `/api/v1/cluster` | Any node. Role, epoch, leader endpoints; ISR and follower lag on the leader, replication session on a follower |
 
 ### Operations
@@ -172,7 +182,7 @@ been removed.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/webhooks/{path}` | Ingest the request body through a matching `http_webhook` connector. Returns `{"offset": N}` once stored; `401`, `409` (idempotency key reused with another body), `503` (not leader). |
+| `POST` | `/webhooks/{path}` | Ingest the request body through a matching `http_webhook` connector. Returns `200` `{"offset": N}` once stored; `400` (rejected by the connector), `401` (the connector's own auth failed), `404` (no webhook connector for the path), `409` (idempotency key reused with another body), `503` (not leader, or retryable). |
 
 ## TCP protocol
 
