@@ -34,7 +34,7 @@ impl LeaderLease for AlwaysRejectLease {
 /// Build an AppState with the desired leadership state.
 pub async fn make_state_with_leader(leader: bool) -> Arc<exspeed_api::AppState> {
     use exspeed_broker::broker_append::BrokerAppend;
-    use exspeed_broker::{consumer_store, work_coordinator, Broker};
+    use exspeed_broker::Broker;
     use exspeed_connectors::{offset_store, ConnectorManager};
     use exspeed_processing::ExqlEngine;
     use exspeed_storage::file::FileStorage;
@@ -73,21 +73,12 @@ pub async fn make_state_with_leader(leader: bool) -> Arc<exspeed_api::AppState> 
     }
 
     let ba = Arc::new(BrokerAppend::new(storage_dyn.clone(), 60));
-    let cs = consumer_store::from_env(tmp.path())
-        .await
-        .expect("consumer store");
-    let wc = work_coordinator::from_env()
-        .await
-        .expect("work coordinator");
     let broker = Arc::new(Broker::new(
         storage_dyn.clone(),
         ba.clone(),
         tmp.path().to_path_buf(),
-        cs,
-        wc,
         lease.clone(),
         metrics.clone(),
-        exspeed_broker::broker::DEFAULT_DELIVERY_BUFFER,
     ));
     // Mark dedup rebuild as complete — the helper represents a fully started
     // server for test purposes. Tests that want to exercise the not-ready

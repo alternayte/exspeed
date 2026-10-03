@@ -85,14 +85,7 @@ async fn connection_cap_rejects_overflow() {
     drop(c2);
 }
 
-use bytes::{Bytes, BytesMut};
-use exspeed_protocol::codec::ExspeedCodec;
-use exspeed_protocol::frame::Frame;
-use exspeed_protocol::messages::connect::{AuthType, ConnectRequest};
-use exspeed_protocol::opcodes::OpCode;
-use futures_util::{SinkExt, StreamExt};
 use tokio::sync::oneshot;
-use tokio_util::codec::{FramedRead, FramedWrite};
 
 #[tokio::test]
 async fn sigterm_signal_token_stops_accept_loop() {
@@ -131,25 +124,15 @@ async fn sigterm_signal_token_stops_accept_loop() {
     // Give the server a moment to bind the listener.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Open a connection, send CONNECT, then trigger shutdown.
-    let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
-        .await
-        .unwrap();
-    let (reader, writer) = stream.into_split();
-    let mut framed_read = FramedRead::new(reader, ExspeedCodec::new());
-    let mut framed_write = FramedWrite::new(writer, ExspeedCodec::new());
-    let mut payload = BytesMut::new();
-    ConnectRequest {
-        client_id: "shutdown-test".into(),
-        auth_type: AuthType::None,
-        auth_payload: Bytes::new(),
-    }
-    .encode(&mut payload);
-    framed_write
-        .send(Frame::new(OpCode::Connect, 1, payload.freeze()))
-        .await
-        .unwrap();
-    let _ = framed_read.next().await.unwrap().unwrap(); // OK
+    // Open a connection (with a live subscription), then trigger shutdown:
+    // the server must not wait on idle clients beyond the drain deadline.
+    let client = exspeed_client::Client::connect(
+        &format!("127.0.0.1:{port}"),
+        exspeed_client::ConnectOptions::default(),
+    )
+    .await
+    .unwrap();
+    client.ping().await.unwrap();
 
     let _ = tx.send(());
 
@@ -157,6 +140,9 @@ async fn sigterm_signal_token_stops_accept_loop() {
     let outer = result.expect("server should exit within 15s");
     let inner = outer.expect("server task should not panic");
     inner.expect("server should return Ok on graceful shutdown");
+    // The client sees the connection close.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(client.ping().await.is_err());
 }
 
 #[tokio::test]

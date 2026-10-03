@@ -51,9 +51,7 @@ impl ConsumerStore {
                     .create_stream(&self.stream, &Self::stream_config())
                     .await
                 {
-                    Ok(()) | Err(LogError::Storage(StorageError::StreamAlreadyExists(_))) => {
-                        Ok(())
-                    }
+                    Ok(()) | Err(LogError::Storage(StorageError::StreamAlreadyExists(_))) => Ok(()),
                     Err(e) => Err(e),
                 }
             }

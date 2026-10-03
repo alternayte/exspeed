@@ -20,9 +20,11 @@ pub struct TestServer {
     handle: Option<JoinHandle<anyhow::Result<()>>>,
 }
 
+type Configure = Box<dyn FnOnce(&mut ServerArgs) + Send>;
+
 pub struct Builder {
     data_dir: Option<PathBuf>,
-    configure: Vec<Box<dyn FnOnce(&mut ServerArgs) + Send>>,
+    configure: Vec<Configure>,
 }
 
 impl Builder {

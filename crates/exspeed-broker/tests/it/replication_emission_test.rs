@@ -10,13 +10,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use exspeed_broker::broker_append::AppendResult;
 use exspeed_broker::replication::{ReplicationCoordinator, ReplicationEvent};
 use exspeed_broker::{broker::Broker, broker_append::BrokerAppend};
 use exspeed_common::{Metrics, StreamName};
-use exspeed_protocol::messages::{
-    ClientMessage, CreateStreamRequest, PublishRequest, ServerMessage,
-};
 use exspeed_storage::memory::MemoryStorage;
+use exspeed_streams::{Record, StreamConfig};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 
@@ -24,27 +23,50 @@ fn make_broker(coord: Arc<ReplicationCoordinator>) -> (Broker, TempDir) {
     let dir = TempDir::new().unwrap();
     let storage = Arc::new(MemoryStorage::new());
     let broker_append = Arc::new(BrokerAppend::new(storage.clone(), 300));
-    let consumer_store = Arc::new(
-        exspeed_broker::consumer_store::file::FileConsumerStore::new(dir.path().to_path_buf()),
-    );
-    let work_coordinator = Arc::new(exspeed_broker::work_coordinator::noop::NoopWorkCoordinator);
     let lease = Arc::new(exspeed_broker::lease::NoopLeaderLease::new());
     let metrics = Arc::new(Metrics::new().0);
     let broker = Broker::new(
         storage,
         broker_append,
         dir.path().to_path_buf(),
-        consumer_store,
-        work_coordinator,
         lease,
         metrics,
-        exspeed_broker::broker::DEFAULT_DELIVERY_BUFFER,
     )
     .with_replication_coordinator(coord);
     broker
         .dedup_ready
         .store(true, std::sync::atomic::Ordering::Release);
     (broker, dir)
+}
+
+async fn create(broker: &Broker, name: &str, max_age_secs: u64, max_bytes: u64) {
+    let cfg = StreamConfig::from_request(max_age_secs, max_bytes, 0, 0);
+    broker
+        .log
+        .create_stream(&StreamName::try_from(name).unwrap(), &cfg)
+        .await
+        .unwrap();
+}
+
+async fn publish(broker: &Broker, stream: &str, msg_id: Option<&str>) -> AppendResult {
+    let mut headers = vec![];
+    if let Some(id) = msg_id {
+        headers.push(("x-idempotency-key".to_string(), id.to_string()));
+    }
+    broker
+        .log
+        .append(
+            &StreamName::try_from(stream).unwrap(),
+            Record {
+                key: None,
+                value: Bytes::from_static(b"payload"),
+                subject: "orders.created".into(),
+                headers,
+                timestamp_ns: None,
+            },
+        )
+        .await
+        .unwrap()
 }
 
 fn metrics() -> Arc<Metrics> {
@@ -67,33 +89,14 @@ async fn publish_emits_records_appended() {
     let (_id, mut rx) = coord.register_follower();
     let (broker, _dir) = make_broker(coord.clone());
 
-    broker
-        .handle_message(ClientMessage::CreateStream(CreateStreamRequest {
-            stream_name: "orders".into(),
-            max_age_secs: 0,
-            max_bytes: 0,
-        }))
-        .await;
+    create(&broker, "orders", 0, 0).await;
 
     // Drain the StreamCreated event emitted by create_stream; the test
     // below has a dedicated case for that.
     let _ = drain(&mut rx).await;
 
-    let resp = broker
-        .handle_message(ClientMessage::Publish(PublishRequest {
-            stream: "orders".into(),
-            subject: "orders.created".into(),
-            key: None,
-            msg_id: None,
-            value: Bytes::from_static(b"payload"),
-            headers: vec![],
-        }))
-        .await;
-    match resp {
-        ServerMessage::PublishOk { offset, duplicate } => {
-            assert_eq!(offset, 0);
-            assert!(!duplicate);
-        }
+    match publish(&broker, "orders", None).await {
+        AppendResult::Written(offset, _) => assert_eq!(offset.0, 0),
         other => panic!("unexpected publish response: {other:?}"),
     }
 
@@ -116,14 +119,7 @@ async fn create_stream_emits_stream_created() {
     let (_id, mut rx) = coord.register_follower();
     let (broker, _dir) = make_broker(coord.clone());
 
-    let resp = broker
-        .handle_message(ClientMessage::CreateStream(CreateStreamRequest {
-            stream_name: "orders".into(),
-            max_age_secs: 3600,
-            max_bytes: 1_000_000,
-        }))
-        .await;
-    assert!(matches!(resp, ServerMessage::Ok));
+    create(&broker, "orders", 3600, 1_000_000).await;
 
     let events = drain(&mut rx).await;
     assert_eq!(events.len(), 1);
@@ -143,13 +139,7 @@ async fn delete_stream_emits_stream_deleted() {
     let (_id, mut rx) = coord.register_follower();
     let (broker, _dir) = make_broker(coord.clone());
 
-    broker
-        .handle_message(ClientMessage::CreateStream(CreateStreamRequest {
-            stream_name: "orders".into(),
-            max_age_secs: 0,
-            max_bytes: 0,
-        }))
-        .await;
+    create(&broker, "orders", 0, 0).await;
     // drain the StreamCreated event.
     let _ = drain(&mut rx).await;
 
@@ -174,54 +164,22 @@ async fn duplicate_publish_does_not_emit() {
     let (_id, mut rx) = coord.register_follower();
     let (broker, _dir) = make_broker(coord.clone());
 
-    broker
-        .handle_message(ClientMessage::CreateStream(CreateStreamRequest {
-            stream_name: "orders".into(),
-            max_age_secs: 0,
-            max_bytes: 0,
-        }))
-        .await;
+    create(&broker, "orders", 0, 0).await;
     let _ = drain(&mut rx).await;
 
     // First publish with msg_id → Written + emits.
-    let resp = broker
-        .handle_message(ClientMessage::Publish(PublishRequest {
-            stream: "orders".into(),
-            subject: "orders.created".into(),
-            key: None,
-            msg_id: Some("unique-id".into()),
-            value: Bytes::from_static(b"payload"),
-            headers: vec![],
-        }))
-        .await;
     assert!(matches!(
-        resp,
-        ServerMessage::PublishOk {
-            duplicate: false,
-            ..
-        }
+        publish(&broker, "orders", Some("unique-id")).await,
+        AppendResult::Written(..)
     ));
 
     let first = drain(&mut rx).await;
     assert_eq!(first.len(), 1, "first publish should emit one event");
 
     // Second publish with same msg_id + body → Duplicate, must NOT emit.
-    let resp = broker
-        .handle_message(ClientMessage::Publish(PublishRequest {
-            stream: "orders".into(),
-            subject: "orders.created".into(),
-            key: None,
-            msg_id: Some("unique-id".into()),
-            value: Bytes::from_static(b"payload"),
-            headers: vec![],
-        }))
-        .await;
     assert!(matches!(
-        resp,
-        ServerMessage::PublishOk {
-            duplicate: true,
-            ..
-        }
+        publish(&broker, "orders", Some("unique-id")).await,
+        AppendResult::Duplicate(..)
     ));
 
     let second = drain(&mut rx).await;

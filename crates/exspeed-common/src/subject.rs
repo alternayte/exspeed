@@ -204,13 +204,32 @@ mod tests {
     #[test]
     fn compiled_filter_agrees_with_subject_matches() {
         let subjects = [
-            "", "a", "a.b", "a.b.c", "orders.eu.created", "orders.created", "x.y",
+            "",
+            "a",
+            "a.b",
+            "a.b.c",
+            "orders.eu.created",
+            "orders.created",
+            "x.y",
         ];
-        let patterns = ["", "a", "a.*", "a.>", "*.b", "orders.*.created", "orders.>", "*"];
+        let patterns = [
+            "",
+            "a",
+            "a.*",
+            "a.>",
+            "*.b",
+            "orders.*.created",
+            "orders.>",
+            "*",
+        ];
         for p in patterns {
             let f = SubjectFilter::parse(p).unwrap();
             for s in subjects {
-                assert_eq!(f.matches(s), subject_matches(s, p), "pattern {p:?} subject {s:?}");
+                assert_eq!(
+                    f.matches(s),
+                    subject_matches(s, p),
+                    "pattern {p:?} subject {s:?}"
+                );
             }
         }
     }
@@ -229,6 +248,8 @@ mod tests {
         assert!(f.matches("a.x"));
         assert!(f.matches("b.x.y"));
         assert!(!f.matches("c.x"));
-        assert!(SubjectFilters::parse::<&str>(&[]).unwrap().matches("anything"));
+        assert!(SubjectFilters::parse::<&str>(&[])
+            .unwrap()
+            .matches("anything"));
     }
 }

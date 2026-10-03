@@ -150,7 +150,10 @@ where
         Ok(Request::Connect { client_id, token }) => (client_id, token),
         Ok(_) | Err(_) => {
             let _ = sink
-                .send(Response::error(code::UNAUTHORIZED, "first frame must be Connect").into_frame(corr))
+                .send(
+                    Response::error(code::UNAUTHORIZED, "first frame must be Connect")
+                        .into_frame(corr),
+                )
                 .await;
             return Ok(());
         }
@@ -338,6 +341,7 @@ async fn authorize_consumer(
     identity: &Identity,
     consumer: &str,
     action: Action,
+    management: bool,
 ) -> Result<(), Response> {
     let Some(stream) = ctx.broker.consumers.stream_of(consumer).await else {
         return Err(if ctx.broker.log.can_write() {
@@ -347,7 +351,10 @@ async fn authorize_consumer(
         });
     };
     let name = stream_name(&stream)?;
-    if identity.authorize(action, &name) {
+    // Admin on the stream also covers consumer management (info, seek).
+    let admin_ok =
+        action == Action::Subscribe && management && identity.authorize(Action::Admin, &name);
+    if identity.authorize(action, &name) || admin_ok {
         Ok(())
     } else {
         Err(Response::error(code::FORBIDDEN, "forbidden"))
@@ -373,8 +380,11 @@ async fn dispatch(
 
     match req {
         Request::Connect { .. } => {
-            out.send(corr, Response::error(code::BAD_REQUEST, "already connected"))
-                .await;
+            out.send(
+                corr,
+                Response::error(code::BAD_REQUEST, "already connected"),
+            )
+            .await;
         }
         Request::Ping => out.send(corr, Response::Pong).await,
         Request::Metadata => {
@@ -446,7 +456,9 @@ async fn dispatch(
 
         // ---- Streams -------------------------------------------------------
         Request::CreateStream(spec) | Request::UpdateStream(spec)
-            if spec.name.starts_with(exspeed_common::INTERNAL_STREAM_PREFIX) =>
+            if spec
+                .name
+                .starts_with(exspeed_common::INTERNAL_STREAM_PREFIX) =>
         {
             forbid(&ctx, out, corr, "CreateStream").await;
         }
@@ -538,6 +550,9 @@ async fn dispatch(
                     names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
                     let mut infos = Vec::new();
                     for n in names {
+                        if n.is_internal() && !identity.has_global_admin() {
+                            continue;
+                        }
                         if identity.authorize(Action::Admin, &n)
                             || identity.authorize(Action::Subscribe, &n)
                             || identity.authorize(Action::Publish, &n)
@@ -563,7 +578,10 @@ async fn dispatch(
             }
             let Ok(permit) = waits.clone().try_acquire_owned() else {
                 return out
-                    .send(corr, Response::error(code::TOO_MANY_REQUESTS, "too many concurrent requests"))
+                    .send(
+                        corr,
+                        Response::error(code::TOO_MANY_REQUESTS, "too many concurrent requests"),
+                    )
                     .await;
             };
             let out = out.clone();
@@ -581,7 +599,7 @@ async fn dispatch(
             out.send(corr, resp).await;
         }
         Request::DeleteConsumer { name } => {
-            if let Err(r) = authorize_consumer(&ctx, identity, &name, Action::Admin).await {
+            if let Err(r) = authorize_consumer(&ctx, identity, &name, Action::Admin, false).await {
                 return out.send(corr, r).await;
             }
             let resp = match broker.consumers.delete(&name).await {
@@ -592,7 +610,8 @@ async fn dispatch(
             out.send(corr, resp).await;
         }
         Request::ConsumerInfo { name } => {
-            if let Err(r) = authorize_consumer(&ctx, identity, &name, Action::Subscribe).await {
+            if let Err(r) = authorize_consumer(&ctx, identity, &name, Action::Subscribe, true).await
+            {
                 return out.send(corr, r).await;
             }
             let resp = match broker.consumers.info(&name).await {
@@ -608,7 +627,10 @@ async fn dispatch(
                         .into_iter()
                         .filter(|i| {
                             StreamName::try_from(i.spec.stream.as_str())
-                                .map(|n| identity.authorize(Action::Subscribe, &n))
+                                .map(|n| {
+                                    identity.authorize(Action::Subscribe, &n)
+                                        || identity.authorize(Action::Admin, &n)
+                                })
                                 .unwrap_or(false)
                         })
                         .collect();
@@ -619,7 +641,9 @@ async fn dispatch(
             out.send(corr, resp).await;
         }
         Request::SeekConsumer { consumer, to } => {
-            if let Err(r) = authorize_consumer(&ctx, identity, &consumer, Action::Subscribe).await {
+            if let Err(r) =
+                authorize_consumer(&ctx, identity, &consumer, Action::Subscribe, true).await
+            {
                 return out.send(corr, r).await;
             }
             let resp = match broker.consumers.seek(&consumer, to).await {
@@ -629,7 +653,9 @@ async fn dispatch(
             out.send(corr, resp).await;
         }
         Request::Subscribe { consumer, credits } => {
-            if let Err(r) = authorize_consumer(&ctx, identity, &consumer, Action::Subscribe).await {
+            if let Err(r) =
+                authorize_consumer(&ctx, identity, &consumer, Action::Subscribe, false).await
+            {
                 return out.send(corr, r).await;
             }
             let mut sub = match broker.consumers.subscribe(&consumer, credits).await {
@@ -647,11 +673,14 @@ async fn dispatch(
                         SubEvent::Deliver(records) => Response::Deliver { sub_id, records },
                         SubEvent::Ended { code, message } => {
                             fwd_out
-                                .send(0, Response::SubscriptionEnded {
-                                    sub_id,
-                                    code,
-                                    message,
-                                })
+                                .send(
+                                    0,
+                                    Response::SubscriptionEnded {
+                                        sub_id,
+                                        code,
+                                        message,
+                                    },
+                                )
                                 .await;
                             return;
                         }
@@ -672,10 +701,17 @@ async fn dispatch(
         Request::Credit { sub_id, credits } => {
             let Some(entry) = state.subs.get(&sub_id) else {
                 return out
-                    .send(corr, Response::error(code::NOT_FOUND, "unknown subscription"))
+                    .send(
+                        corr,
+                        Response::error(code::NOT_FOUND, "unknown subscription"),
+                    )
                     .await;
             };
-            match broker.consumers.credit(&entry.consumer, sub_id, credits).await {
+            match broker
+                .consumers
+                .credit(&entry.consumer, sub_id, credits)
+                .await
+            {
                 Ok(()) => reply_ok(corr).await,
                 Err(e) => out.send(corr, consumer_error_response(&ctx, e)).await,
             }
@@ -693,12 +729,17 @@ async fn dispatch(
             max_bytes,
             expires_ms,
         } => {
-            if let Err(r) = authorize_consumer(&ctx, identity, &consumer, Action::Subscribe).await {
+            if let Err(r) =
+                authorize_consumer(&ctx, identity, &consumer, Action::Subscribe, false).await
+            {
                 return out.send(corr, r).await;
             }
             let Ok(permit) = waits.clone().try_acquire_owned() else {
                 return out
-                    .send(corr, Response::error(code::TOO_MANY_REQUESTS, "too many concurrent requests"))
+                    .send(
+                        corr,
+                        Response::error(code::TOO_MANY_REQUESTS, "too many concurrent requests"),
+                    )
                     .await;
             };
             let out = out.clone();
@@ -723,7 +764,9 @@ async fn dispatch(
             });
         }
         Request::Ack { consumer, offsets } => {
-            if let Err(r) = authorize_consumer(&ctx, identity, &consumer, Action::Subscribe).await {
+            if let Err(r) =
+                authorize_consumer(&ctx, identity, &consumer, Action::Subscribe, false).await
+            {
                 return out.send(corr, r).await;
             }
             match broker.consumers.ack(&consumer, offsets).await {
@@ -736,7 +779,9 @@ async fn dispatch(
             offset,
             delay_ms,
         } => {
-            if let Err(r) = authorize_consumer(&ctx, identity, &consumer, Action::Subscribe).await {
+            if let Err(r) =
+                authorize_consumer(&ctx, identity, &consumer, Action::Subscribe, false).await
+            {
                 return out.send(corr, r).await;
             }
             match broker.consumers.nack(&consumer, offset, delay_ms).await {
@@ -749,7 +794,9 @@ async fn dispatch(
             offset,
             reason,
         } => {
-            if let Err(r) = authorize_consumer(&ctx, identity, &consumer, Action::Subscribe).await {
+            if let Err(r) =
+                authorize_consumer(&ctx, identity, &consumer, Action::Subscribe, false).await
+            {
                 return out.send(corr, r).await;
             }
             match broker.consumers.term(&consumer, offset, reason).await {
@@ -758,7 +805,9 @@ async fn dispatch(
             }
         }
         Request::InProgress { consumer, offsets } => {
-            if let Err(r) = authorize_consumer(&ctx, identity, &consumer, Action::Subscribe).await {
+            if let Err(r) =
+                authorize_consumer(&ctx, identity, &consumer, Action::Subscribe, false).await
+            {
                 return out.send(corr, r).await;
             }
             match broker.consumers.in_progress(&consumer, offsets).await {
@@ -789,7 +838,10 @@ async fn dispatch(
             };
             let Ok(permit) = waits.clone().try_acquire_owned() else {
                 return out
-                    .send(corr, Response::error(code::TOO_MANY_REQUESTS, "too many concurrent requests"))
+                    .send(
+                        corr,
+                        Response::error(code::TOO_MANY_REQUESTS, "too many concurrent requests"),
+                    )
                     .await;
             };
             let out = out.clone();
@@ -822,8 +874,11 @@ async fn create_consumer(
         Ok(n) => n,
         Err(r) => return r,
     };
-    if !identity.authorize(Action::Subscribe, &stream) {
-        ctx.metrics.auth_denied("forbidden", "tcp", "CreateConsumer");
+    if !identity.authorize(Action::Subscribe, &stream)
+        && !identity.authorize(Action::Admin, &stream)
+    {
+        ctx.metrics
+            .auth_denied("forbidden", "tcp", "CreateConsumer");
         return Response::error(code::FORBIDDEN, "forbidden");
     }
     // Dead-lettering writes to another stream on the caller's behalf.
@@ -831,7 +886,8 @@ async fn create_consumer(
         match StreamName::try_from(dlq.as_str()) {
             Ok(d) if !d.is_internal() && identity.authorize(Action::Publish, &d) => {}
             Ok(_) => {
-                ctx.metrics.auth_denied("forbidden", "tcp", "CreateConsumer");
+                ctx.metrics
+                    .auth_denied("forbidden", "tcp", "CreateConsumer");
                 return Response::error(code::FORBIDDEN, "no publish permission on dlq_stream");
             }
             Err(e) => return Response::error(code::BAD_REQUEST, format!("dlq_stream: {e}")),

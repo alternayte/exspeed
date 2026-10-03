@@ -94,6 +94,31 @@ impl Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+impl Error {
+    /// A copy for fanning one failure out to several waiters.
+    fn duplicate(&self) -> Error {
+        match self {
+            Error::Io(e) => Error::Io(std::io::Error::new(e.kind(), e.to_string())),
+            Error::Protocol(m) => Error::Protocol(m.clone()),
+            Error::Server {
+                code,
+                message,
+                detail,
+            } => Error::Server {
+                code: *code,
+                message: message.clone(),
+                detail: detail.clone(),
+            },
+            Error::Closed => Error::Closed,
+            Error::Timeout => Error::Timeout,
+            Error::Unexpected(m) => Error::Unexpected(m.clone()),
+        }
+    }
+}
+
+mod publisher;
+pub use publisher::{Publisher, PublisherBuilder};
+
 #[derive(Debug, Clone)]
 pub struct ConnectOptions {
     pub client_id: String,
@@ -326,6 +351,11 @@ impl Client {
         Ok(Client { inner })
     }
 
+    /// A coalescing publisher on this connection; see [`Publisher`].
+    pub fn publisher(&self) -> PublisherBuilder {
+        PublisherBuilder::new(self.clone())
+    }
+
     pub fn server_info(&self) -> &ServerInfo {
         &self.inner.info
     }
@@ -341,7 +371,10 @@ impl Client {
 
     // ---- request plumbing -------------------------------------------------
 
-    async fn request_with_timeout(&self, req: Request, timeout: Duration) -> Result<Response> {
+    /// Register and send a request; the returned future resolves with the
+    /// response. Splitting send from wait lets callers pipeline requests
+    /// while preserving their order on the wire.
+    async fn send_request(&self, req: Request) -> Result<(u32, oneshot::Receiver<Response>)> {
         let corr = self.inner.next_corr();
         let (tx, rx) = oneshot::channel();
         {
@@ -355,16 +388,17 @@ impl Client {
             self.inner.routes.lock().unwrap().pending.remove(&corr);
             return Err(Error::Closed);
         }
+        Ok((corr, rx))
+    }
+
+    async fn await_response(
+        &self,
+        corr: u32,
+        rx: oneshot::Receiver<Response>,
+        timeout: Duration,
+    ) -> Result<Response> {
         match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(Response::Error {
-                code,
-                message,
-                detail,
-            })) => Err(Error::Server {
-                code,
-                message,
-                detail: detail.and_then(|d| serde_json::from_slice(&d).ok()),
-            }),
+            Ok(Ok(r @ Response::Error { .. })) => Err(into_error(r)),
             Ok(Ok(r)) => Ok(r),
             Ok(Err(_)) => Err(Error::Closed),
             Err(_) => {
@@ -372,6 +406,11 @@ impl Client {
                 Err(Error::Timeout)
             }
         }
+    }
+
+    async fn request_with_timeout(&self, req: Request, timeout: Duration) -> Result<Response> {
+        let (corr, rx) = self.send_request(req).await?;
+        self.await_response(corr, rx, timeout).await
     }
 
     async fn request(&self, req: Request) -> Result<Response> {
@@ -868,7 +907,10 @@ impl Subscription {
 
     /// Like [`next`](Self::next) but gives up after `timeout`.
     pub async fn next_timeout(&mut self, timeout: Duration) -> Option<Message> {
-        tokio::time::timeout(timeout, self.next()).await.ok().flatten()
+        tokio::time::timeout(timeout, self.next())
+            .await
+            .ok()
+            .flatten()
     }
 
     /// Return credit to the server once half the window has been consumed,

@@ -42,7 +42,10 @@ pub use self::actor::to_wire;
 pub enum SubEvent {
     Deliver(Vec<WireRecord>),
     /// No more deliveries for this subscription.
-    Ended { code: u16, message: String },
+    Ended {
+        code: u16,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -195,7 +198,8 @@ impl ConsumerManager {
     /// spec succeeds (idempotent); a different spec is a conflict.
     pub async fn create(&self, spec: ConsumerSpec) -> Result<ConsumerInfo, ConsumerError> {
         let token = self.running_token().await?;
-        validate_resource_name(&spec.name, "consumer name").map_err(|e| ConsumerError::Invalid(e.to_string()))?;
+        validate_resource_name(&spec.name, "consumer name")
+            .map_err(|e| ConsumerError::Invalid(e.to_string()))?;
         let stream = StreamName::try_from(spec.stream.as_str())
             .map_err(|e| ConsumerError::Invalid(e.to_string()))?;
         SubjectFilters::parse(&spec.filter_subjects).map_err(ConsumerError::Invalid)?;

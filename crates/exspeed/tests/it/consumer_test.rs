@@ -120,7 +120,9 @@ async fn subject_filters() {
         "orders.eu.placed",
         "orders.placed",
     ] {
-        c.publish("orders", PublishRecord::new(s, "{}")).await.unwrap();
+        c.publish("orders", PublishRecord::new(s, "{}"))
+            .await
+            .unwrap();
     }
     c.create_consumer(ConsumerSpec {
         filter_subjects: vec!["orders.placed".into(), "orders.eu.>".into()],
@@ -350,7 +352,10 @@ async fn deliver_policies_and_seek() {
     .await
     .unwrap();
 
-    let r = c.pull("from7", 10, Duration::from_millis(500)).await.unwrap();
+    let r = c
+        .pull("from7", 10, Duration::from_millis(500))
+        .await
+        .unwrap();
     assert_eq!(r.first().map(|r| r.offset), Some(7));
 
     let r = c
@@ -359,7 +364,10 @@ async fn deliver_policies_and_seek() {
         .unwrap();
     assert!(r.is_empty());
     publish_n(&c, "s", "x", 1).await;
-    let r = c.pull("new-only", 10, Duration::from_secs(2)).await.unwrap();
+    let r = c
+        .pull("new-only", 10, Duration::from_secs(2))
+        .await
+        .unwrap();
     assert_eq!(r.first().map(|r| r.offset), Some(10));
 
     c.seek("new-only", SeekTo::Offset(4)).await.unwrap();

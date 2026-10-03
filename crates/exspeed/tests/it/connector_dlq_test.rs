@@ -11,18 +11,8 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::post;
 use axum::Router;
-use bytes::{Bytes, BytesMut};
-use futures_util::{SinkExt, StreamExt};
-use tokio::net::TcpStream;
-use tokio::time::timeout;
-use tokio_util::codec::{FramedRead, FramedWrite};
 
-use exspeed_protocol::codec::ExspeedCodec;
-use exspeed_protocol::frame::Frame;
-use exspeed_protocol::messages::connect::{AuthType, ConnectRequest};
-use exspeed_protocol::messages::fetch::FetchRequest;
-use exspeed_protocol::messages::records_batch::RecordsBatch;
-use exspeed_protocol::opcodes::OpCode;
+use crate::common::TestServer;
 
 // ---------------------------------------------------------------------------
 // Mock HTTP server
@@ -87,109 +77,40 @@ async fn start_mock_http() -> (String, MockState) {
 // Exspeed server startup
 // ---------------------------------------------------------------------------
 
-async fn start_server() -> (String, String) {
-    let tcp_port = exspeed_testkit::pick_unused_port().unwrap();
-    let http_port = exspeed_testkit::pick_unused_port().unwrap();
-    let tcp_addr = format!("127.0.0.1:{tcp_port}");
-    let http_addr = format!("127.0.0.1:{http_port}");
-    let dir = tempfile::TempDir::new().unwrap();
-    let data_dir = dir.path().to_path_buf();
-    let tcp_addr_clone = tcp_addr.clone();
-    let http_addr_clone = http_addr.clone();
-    tokio::spawn(async move {
-        let _keep = dir;
-        exspeed::cli::server::run(exspeed::cli::server::ServerArgs {
-            bind: tcp_addr_clone,
-            api_bind: http_addr_clone,
-            data_dir,
-            auth_token: None,
-            credentials_file: None,
-            tls_cert: None,
-            tls_key: None,
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-        })
-        .await
-        .unwrap();
-    });
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    (tcp_addr, format!("http://127.0.0.1:{http_port}"))
+/// Returns the server (keep it alive) and its HTTP base URL.
+async fn start_server() -> (TestServer, String) {
+    let server = TestServer::start().await;
+    let http = format!("http://{}", server.api_addr);
+    (server, http)
 }
 
 // ---------------------------------------------------------------------------
-// TCP record fetch helper — reads records from a stream via the wire protocol
+// Record fetch helper
 // ---------------------------------------------------------------------------
-
-type FramedReader = FramedRead<tokio::net::tcp::OwnedReadHalf, ExspeedCodec>;
-type FramedWriter = FramedWrite<tokio::net::tcp::OwnedWriteHalf, ExspeedCodec>;
-
-async fn connect_to(addr: &str) -> (FramedReader, FramedWriter) {
-    let stream = TcpStream::connect(addr).await.unwrap();
-    let (reader, writer) = stream.into_split();
-    (
-        FramedRead::new(reader, ExspeedCodec::new()),
-        FramedWrite::new(writer, ExspeedCodec::new()),
-    )
-}
-
-async fn send_recv(writer: &mut FramedWriter, reader: &mut FramedReader, frame: Frame) -> Frame {
-    writer.send(frame).await.unwrap();
-    timeout(Duration::from_secs(5), reader.next())
-        .await
-        .expect("timeout")
-        .unwrap()
-        .unwrap()
-}
-
-async fn tcp_connect_handshake(tcp_addr: &str) -> (FramedReader, FramedWriter) {
-    let (mut r, mut w) = connect_to(tcp_addr).await;
-    let req = ConnectRequest {
-        client_id: "dlq-test".into(),
-        auth_type: AuthType::None,
-        auth_payload: Bytes::new(),
-    };
-    let mut buf = BytesMut::new();
-    req.encode(&mut buf);
-    let frame = Frame::new(OpCode::Connect, 1, buf.freeze());
-    let resp = send_recv(&mut w, &mut r, frame).await;
-    assert_eq!(resp.opcode, OpCode::ConnectOk);
-    (r, w)
-}
 
 async fn fetch_records(
-    tcp_addr: &str,
+    server: &TestServer,
     stream: &str,
     max: u32,
 ) -> Vec<(u64, Vec<u8>, Vec<(String, String)>)> {
-    let (mut r, mut w) = tcp_connect_handshake(tcp_addr).await;
-    let req = FetchRequest {
-        stream: stream.into(),
-        offset: 0,
-        max_records: max,
-        subject_filter: String::new(),
-    };
-    let mut buf = BytesMut::new();
-    req.encode(&mut buf);
-    let frame = Frame::new(OpCode::Fetch, 2, buf.freeze());
-    let resp = send_recv(&mut w, &mut r, frame).await;
-    if resp.opcode != OpCode::RecordsBatch {
-        return Vec::new();
+    match server
+        .client()
+        .await
+        .read(stream, 0, max, Duration::ZERO, "")
+        .await
+    {
+        Ok(r) => r
+            .records
+            .into_iter()
+            .map(|rec| (rec.offset, rec.value.to_vec(), rec.headers))
+            .collect(),
+        Err(_) => Vec::new(),
     }
-    let batch = RecordsBatch::decode(resp.payload.clone()).unwrap();
-    batch
-        .records
-        .into_iter()
-        .map(|rec| (rec.offset, rec.value.to_vec(), rec.headers))
-        .collect()
 }
 
 /// Poll for at least `want` records in a stream, up to `deadline_secs`.
 async fn wait_for_records(
-    tcp_addr: &str,
+    tcp_addr: &TestServer,
     stream: &str,
     want: usize,
     deadline_secs: u64,

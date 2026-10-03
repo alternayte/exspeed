@@ -1,170 +1,47 @@
+//! Exspeed benchmark driver, built on `exspeed-client`.
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
-use bytes::{Buf, Bytes, BytesMut};
+use anyhow::{Context, Result};
+use bytes::Bytes;
 use futures_util::stream::FuturesUnordered;
-use futures_util::{SinkExt, StreamExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::TcpStream;
-use tokio_util::codec::{FramedRead, FramedWrite};
-
+use futures_util::StreamExt;
 use hdrhistogram::Histogram;
 
-use exspeed_protocol::codec::ExspeedCodec;
-use exspeed_protocol::frame::Frame;
-use exspeed_protocol::messages::ack::AckRequest;
-use exspeed_protocol::messages::connect::{AuthType, ConnectRequest};
-use exspeed_protocol::messages::consumer::{CreateConsumerRequest, StartFrom, SubscribeRequest};
-use exspeed_protocol::messages::publish::PublishRequest;
-use exspeed_protocol::messages::record_delivery::RecordDelivery;
-use exspeed_protocol::messages::stream_mgmt::CreateStreamRequest;
-use exspeed_protocol::opcodes::OpCode;
+use exspeed_client::{
+    code, Client, ConnectOptions, ConsumerSpec, DeliverPolicy, PublishRecord, StreamSpec,
+};
 
 pub const PUBLISH_TS_HEADER: &str = "bench.publish_us";
 
-pub type Reader = FramedRead<OwnedReadHalf, ExspeedCodec>;
-pub type Writer = FramedWrite<OwnedWriteHalf, ExspeedCodec>;
-
+/// Setup connection used by scenarios (stream creation etc.).
 pub struct ExspeedClient {
-    /// Exposed for subsequent tasks (Subscribe/Ack) that issue frames on the
-    /// same TCP connection without going through this wrapper.
-    pub reader: Reader,
-    /// See `reader`.
-    pub writer: Writer,
-    next_corr: u32,
+    pub client: Client,
 }
 
 impl ExspeedClient {
     pub async fn connect(addr: &str) -> Result<Self> {
-        let stream = TcpStream::connect(addr).await.context("tcp connect")?;
-        stream.set_nodelay(true).ok();
-        let (r, w) = stream.into_split();
-        let mut client = Self {
-            reader: FramedRead::new(r, ExspeedCodec::new()),
-            writer: FramedWrite::new(w, ExspeedCodec::new()),
-            next_corr: 1,
-        };
-        client.connect_handshake().await?;
-        Ok(client)
-    }
-
-    async fn connect_handshake(&mut self) -> Result<()> {
-        let req = ConnectRequest {
-            client_id: "exspeed-bench".into(),
-            auth_type: AuthType::None,
-            auth_payload: Bytes::new(),
-        };
-        let mut buf = BytesMut::new();
-        req.encode(&mut buf);
-        let corr = self.alloc_corr();
-        self.writer
-            .send(Frame::new(OpCode::Connect, corr, buf.freeze()))
-            .await?;
-        let resp = self
-            .reader
-            .next()
+        let client = Client::connect(addr, ConnectOptions::default().client_id("exspeed-bench"))
             .await
-            .ok_or_else(|| anyhow!("connect closed"))??;
-        if resp.opcode != OpCode::ConnectOk {
-            return Err(anyhow!("expected ConnectOk, got {:?}", resp.opcode));
-        }
-        Ok(())
+            .context("connect")?;
+        Ok(Self { client })
     }
 
+    /// Create the stream if it doesn't exist (any existing config is kept).
     pub async fn ensure_stream(&mut self, name: &str) -> Result<()> {
-        let req = CreateStreamRequest {
-            stream_name: name.into(),
-            max_age_secs: 0,
-            max_bytes: 0,
-        };
-        let mut buf = BytesMut::new();
-        req.encode(&mut buf);
-        let corr = self.alloc_corr();
-        self.writer
-            .send(Frame::new(OpCode::CreateStream, corr, buf.freeze()))
-            .await?;
-        let resp = self
-            .reader
-            .next()
-            .await
-            .ok_or_else(|| anyhow!("closed"))??;
-        match resp.opcode {
-            OpCode::Ok => Ok(()),
-            OpCode::Error => {
-                // Any Error response is treated as "stream already exists". This is the
-                // only Error path reachable in a well-formed benchmark run. Invalid
-                // stream names would also land here and be silently ignored; if
-                // ensure_stream ever starts being called with dynamic/untrusted names,
-                // decode the error payload and only accept code == 409.
-                Ok(())
-            }
-            other => Err(anyhow!("ensure_stream: unexpected opcode {other:?}")),
+        match self.client.create_stream(StreamSpec::named(name)).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.code() == Some(code::CONFLICT) => Ok(()),
+            Err(e) => Err(e.into()),
         }
     }
+}
 
-    pub fn alloc_corr(&mut self) -> u32 {
-        let c = self.next_corr;
-        // CorrelID 0 is reserved for push-delivered records, so skip it on wrap.
-        self.next_corr = match self.next_corr.wrapping_add(1) {
-            0 => 1,
-            n => n,
-        };
-        c
-    }
-
-    /// Publishes a single record with the publish_us header encoded as ASCII decimal.
-    pub async fn publish_once(
-        &mut self,
-        stream: &str,
-        value: &Bytes,
-        origin: Instant,
-    ) -> Result<()> {
-        let us = origin.elapsed().as_micros() as u64;
-        let req = PublishRequest {
-            stream: stream.into(),
-            subject: "bench".into(),
-            key: None,
-            msg_id: None,
-            value: value.clone(),
-            headers: vec![(PUBLISH_TS_HEADER.to_owned(), format!("{us}"))],
-        };
-        let mut buf = BytesMut::new();
-        req.encode(&mut buf);
-        let corr = self.alloc_corr();
-        self.writer
-            .send(Frame::new(OpCode::Publish, corr, buf.freeze()))
-            .await?;
-        let resp = self
-            .reader
-            .next()
-            .await
-            .ok_or_else(|| anyhow!("closed"))??;
-        match resp.opcode {
-            OpCode::PublishOk => Ok(()),
-            OpCode::Error => {
-                let mut p = resp.payload;
-                let code = if p.remaining() >= 2 {
-                    p.get_u16_le()
-                } else {
-                    0
-                };
-                let msg = if p.remaining() >= 2 {
-                    let len = p.get_u16_le() as usize;
-                    if p.remaining() >= len {
-                        String::from_utf8_lossy(&p.slice(..len)).into_owned()
-                    } else {
-                        String::new()
-                    }
-                } else {
-                    String::new()
-                };
-                Err(anyhow!("publish error (code={code:#06x}): {msg}"))
-            }
-            other => Err(anyhow!("publish: unexpected opcode {other:?}")),
-        }
-    }
+fn bench_record(payload: &Bytes, origin: Instant) -> PublishRecord {
+    let us = origin.elapsed().as_micros() as u64;
+    PublishRecord::new("bench", payload.clone()).header(PUBLISH_TS_HEADER, us.to_string())
 }
 
 pub struct ProducerStats {
@@ -173,12 +50,9 @@ pub struct ProducerStats {
     pub wall_secs: f64,
 }
 
-/// Spawn `tasks` producer loops all sharing one coalescing Publisher. Each task
-/// keeps `in_flight_per_task` publishes in-flight simultaneously via
-/// FuturesUnordered, giving the Publisher's flusher `tasks × in_flight_per_task`
-/// concurrent enqueues and enabling fat-batch coalescing.
-/// `origin` is the shared start instant for publish_us headers so the consumer
-/// can compute deltas with `now.duration_since(origin)`.
+/// `tasks` producer loops sharing one coalescing publisher, each keeping 64
+/// publishes in flight. `origin` is the shared start instant for the
+/// publish-time header so consumers can compute end-to-end latency.
 pub async fn run_producer(
     addr: &str,
     stream: &str,
@@ -188,75 +62,50 @@ pub async fn run_producer(
     origin: Instant,
     shared_count: Arc<AtomicU64>,
 ) -> Result<ProducerStats> {
-    use crate::driver::publisher::PublisherBuilder;
-
-    let payload: Bytes = Bytes::from(vec![b'x'; payload_bytes]);
-    let stream = stream.to_owned();
-    let start = Instant::now();
-
-    // Shared Publisher across all tasks: coalesces cross-task concurrent publishes.
-    let publisher = PublisherBuilder::new(addr)
+    let payload = Bytes::from(vec![b'x'; payload_bytes]);
+    let client = ExspeedClient::connect(addr).await?.client;
+    let publisher = client
+        .publisher()
         .max_batch_records(512)
         .batch_window(Duration::from_micros(100))
-        .max_in_flight(8192) // enough for tasks × in_flight_per_task
-        .build()
-        .await?;
-
-    let in_flight_per_task: usize = 64;
+        .max_in_flight(8192)
+        .build();
+    let start = Instant::now();
+    let in_flight_per_task = 64;
     let mut handles = Vec::with_capacity(tasks);
-
     for _ in 0..tasks {
         let publisher = publisher.clone();
-        let stream = stream.clone();
+        let stream = stream.to_string();
         let payload = payload.clone();
         let shared_count = shared_count.clone();
         handles.push(tokio::spawn(async move {
             let deadline = Instant::now() + duration;
             let mut local: u64 = 0;
-            let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
-
-            while Instant::now() < deadline {
-                // Top up in-flight window.
+            let mut in_flight = FuturesUnordered::new();
+            loop {
                 while in_flight.len() < in_flight_per_task && Instant::now() < deadline {
-                    let us = origin.elapsed().as_micros() as u64;
-                    let req = exspeed_protocol::messages::publish::PublishRequest {
-                        stream: stream.clone(),
-                        subject: "bench".into(),
-                        key: None,
-                        msg_id: None,
-                        value: payload.clone(),
-                        headers: vec![(PUBLISH_TS_HEADER.to_owned(), format!("{us}"))],
-                    };
-                    in_flight.push(publisher.publish(req));
+                    let p = publisher.clone();
+                    let rec = bench_record(&payload, origin);
+                    let s = stream.clone();
+                    in_flight.push(async move { p.publish(&s, rec).await });
                 }
-                // Drain one completion before topping up again.
-                if let Some(_result) = in_flight.next().await {
-                    local += 1;
-                    if local.is_multiple_of(256) {
-                        shared_count.fetch_add(256, Ordering::Relaxed);
+                match in_flight.next().await {
+                    Some(r) => {
+                        r?;
+                        local += 1;
+                        shared_count.fetch_add(1, Ordering::Relaxed);
                     }
+                    None => break,
                 }
             }
-
-            // Drain remaining in-flight.
-            while let Some(_result) = in_flight.next().await {
-                local += 1;
-                if local.is_multiple_of(256) {
-                    shared_count.fetch_add(256, Ordering::Relaxed);
-                }
-            }
-            shared_count.fetch_add(local % 256, Ordering::Relaxed);
-
             Ok::<u64, anyhow::Error>(local)
         }));
     }
-
-    let mut total: u64 = 0;
+    let mut total = 0;
     for h in handles {
         total += h.await??;
     }
     publisher.close().await.ok();
-
     Ok(ProducerStats {
         messages: total,
         bytes: total * payload_bytes as u64,
@@ -272,12 +121,12 @@ pub async fn run_producer_at_rate(
     rate_per_sec: u64,
     origin: Instant,
 ) -> Result<ProducerStats> {
-    use crate::driver::publisher::PublisherBuilder;
-    let payload: Bytes = Bytes::from(vec![b'x'; payload_bytes]);
-    let publisher = PublisherBuilder::new(addr)
+    let payload = Bytes::from(vec![b'x'; payload_bytes]);
+    let client = ExspeedClient::connect(addr).await?.client;
+    let publisher = client
+        .publisher()
         .batch_window(Duration::from_micros(100))
-        .build()
-        .await?;
+        .build();
     let interval_ns = 1_000_000_000u64 / rate_per_sec.max(1);
     let mut ticker = tokio::time::interval(Duration::from_nanos(interval_ns));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
@@ -286,16 +135,13 @@ pub async fn run_producer_at_rate(
     let mut sent: u64 = 0;
     while Instant::now() < deadline {
         ticker.tick().await;
-        let us = origin.elapsed().as_micros() as u64;
-        let req = exspeed_protocol::messages::publish::PublishRequest {
-            stream: stream.into(),
-            subject: "bench".into(),
-            key: None,
-            msg_id: None,
-            value: payload.clone(),
-            headers: vec![(PUBLISH_TS_HEADER.to_owned(), format!("{us}"))],
-        };
-        let _ = publisher.publish(req).await;
+        let p = publisher.clone();
+        let rec = bench_record(&payload, origin);
+        let s = stream.to_string();
+        // Fire and forget: the rate is set by the ticker, not by acks.
+        tokio::spawn(async move {
+            let _ = p.publish(&s, rec).await;
+        });
         sent += 1;
     }
     publisher.close().await.ok();
@@ -311,10 +157,9 @@ pub struct ConsumerStats {
     pub latency_histogram: Histogram<u64>,
 }
 
-/// Subscribe to `stream` as a new consumer, record end-to-end latency for each
-/// received record into an hdrhistogram keyed by microseconds, and return after
-/// `duration`. End-to-end latency is computed as `origin.elapsed() - publish_us`,
-/// so both sides must share the same `origin` instant (single-node benchmark).
+/// Create (or reuse) consumer `consumer_name` delivering only new records,
+/// subscribe, and record end-to-end latency (µs) until `duration` elapses.
+/// Acks are batched and sent without waiting for replies.
 pub async fn run_consumer(
     addr: &str,
     stream: &str,
@@ -322,154 +167,68 @@ pub async fn run_consumer(
     duration: Duration,
     origin: Instant,
 ) -> Result<ConsumerStats> {
-    let mut client = ExspeedClient::connect(addr).await?;
-
-    // Create consumer starting from latest (ok if it already exists on reruns).
-    let create_req = CreateConsumerRequest {
-        name: consumer_name.into(),
-        stream: stream.into(),
-        group: String::new(),
-        subject_filter: String::new(),
-        start_from: StartFrom::Latest,
-        start_offset: 0,
+    let client = ExspeedClient::connect(addr).await?.client;
+    let spec = ConsumerSpec {
+        deliver: DeliverPolicy::New,
+        max_ack_pending: 100_000,
+        ..ConsumerSpec::new(consumer_name, stream)
     };
-    let mut buf = BytesMut::new();
-    create_req.encode(&mut buf);
-    let corr = client.alloc_corr();
-    client
-        .writer
-        .send(Frame::new(OpCode::CreateConsumer, corr, buf.freeze()))
-        .await?;
-    match client.reader.next().await {
-        Some(Ok(_)) => {} // Ok or Error(AlreadyExists) — either means we can proceed
-        Some(Err(e)) => return Err(e.into()),
-        None => return Err(anyhow!("connection closed during CreateConsumer")),
+    match client.create_consumer(spec).await {
+        Ok(_) => {}
+        Err(e) if e.code() == Some(code::CONFLICT) => {}
+        Err(e) => return Err(e.into()),
     }
-
-    // Subscribe
-    let sub_req = SubscribeRequest {
-        consumer_name: consumer_name.into(),
-        subscriber_id: String::new(),
-    };
-    let mut buf = BytesMut::new();
-    sub_req.encode(&mut buf);
-    let corr = client.alloc_corr();
-    client
-        .writer
-        .send(Frame::new(OpCode::Subscribe, corr, buf.freeze()))
-        .await?;
-    let resp = client
-        .reader
-        .next()
-        .await
-        .ok_or_else(|| anyhow!("closed"))??;
-    if !matches!(resp.opcode, OpCode::Ok) {
-        return Err(anyhow!("subscribe: unexpected opcode {:?}", resp.opcode));
-    }
+    let mut sub = client.subscribe(consumer_name, 4096).await?;
 
     let mut hist = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).expect("histogram bounds");
-    let mut messages: u64 = 0;
+    let mut messages = 0u64;
     let deadline = Instant::now() + duration;
+    const ACK_BATCH: usize = 256;
+    const ACK_WINDOW: Duration = Duration::from_millis(5);
+    let mut pending_acks = Vec::with_capacity(ACK_BATCH);
+    let mut last_ack = Instant::now();
 
-    // Cumulative-ack batching: the broker's Ack opcode advances the consumer's
-    // stored offset to N (implicitly acking 0..N), so we only need to send one
-    // Ack per batch rather than one per record.
-    const ACK_BATCH_SIZE: u64 = 64;
-    const ACK_BATCH_WINDOW_MS: u64 = 5;
-
-    let mut highest_unacked: Option<u64> = None;
-    let mut records_since_last_ack: u64 = 0;
-    let mut last_ack_time = Instant::now();
-
-    while Instant::now() < deadline {
+    loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let next = match tokio::time::timeout(remaining, client.reader.next()).await {
-            Ok(Some(Ok(f))) => f,
-            Ok(Some(Err(e))) => return Err(e.into()),
-            Ok(None) => break,
-            Err(_) => break, // deadline reached
-        };
-        // Dispatch: accept both Record (0x82) and RecordsBatch (0x83); skip everything else.
-        let deliveries: Vec<(u64, Vec<(String, String)>)> = if next.opcode == OpCode::Record {
-            let d = RecordDelivery::decode(next.payload)?;
-            vec![(d.offset, d.headers)]
-        } else if next.opcode == OpCode::RecordsBatch {
-            use exspeed_protocol::messages::records_batch::RecordsBatch;
-            let batch = RecordsBatch::decode(next.payload)?;
-            batch
-                .records
-                .into_iter()
-                .map(|r| (r.offset, r.headers))
-                .collect()
-        } else {
+        if remaining.is_zero() {
+            break;
+        }
+        let Some(msg) = sub.next_timeout(remaining.min(ACK_WINDOW)).await else {
+            if sub.end_reason().is_some() {
+                break;
+            }
+            if !pending_acks.is_empty() {
+                client
+                    .ack_nowait(consumer_name, std::mem::take(&mut pending_acks))
+                    .await?;
+                last_ack = Instant::now();
+            }
             continue;
         };
-
-        for (offset, headers) in deliveries {
-            // Find publish_us header; ignore records without it (shouldn't happen in bench runs).
-            if let Some(v) = headers
-                .iter()
-                .find(|(k, _)| k == PUBLISH_TS_HEADER)
-                .map(|(_, v)| v)
-            {
-                match v.parse::<u64>() {
-                    Ok(sent_us) => {
-                        let now_us = origin.elapsed().as_micros() as u64;
-                        if now_us > sent_us {
-                            let _ = hist.record(now_us - sent_us);
-                        }
-                    }
-                    Err(_) => {
-                        // Malformed header — skip rather than poison the histogram.
-                    }
-                }
-            }
-
-            highest_unacked = Some(offset);
-            records_since_last_ack += 1;
-            messages += 1;
-        }
-
-        // Send one cumulative Ack every 64 records or every 5 ms, whichever
-        // comes first.  The broker advances its stored offset to N on Ack(N),
-        // implicitly acking everything below, so batching is safe.
-        let should_ack = records_since_last_ack >= ACK_BATCH_SIZE
-            || last_ack_time.elapsed() >= Duration::from_millis(ACK_BATCH_WINDOW_MS);
-        if should_ack {
-            if let Some(off) = highest_unacked {
-                let ack = AckRequest {
-                    consumer_name: consumer_name.into(),
-                    offset: off,
-                };
-                let mut ack_buf = BytesMut::new();
-                ack.encode(&mut ack_buf);
-                let corr = client.alloc_corr();
-                client
-                    .writer
-                    .send(Frame::new(OpCode::Ack, corr, ack_buf.freeze()))
-                    .await?;
-                highest_unacked = None;
-                records_since_last_ack = 0;
-                last_ack_time = Instant::now();
+        if let Some(sent_us) = msg
+            .record
+            .headers
+            .iter()
+            .find(|(k, _)| k == PUBLISH_TS_HEADER)
+            .and_then(|(_, v)| v.parse::<u64>().ok())
+        {
+            let now_us = origin.elapsed().as_micros() as u64;
+            if now_us > sent_us {
+                let _ = hist.record(now_us - sent_us);
             }
         }
+        messages += 1;
+        pending_acks.push(msg.record.offset);
+        if pending_acks.len() >= ACK_BATCH || last_ack.elapsed() >= ACK_WINDOW {
+            client
+                .ack_nowait(consumer_name, std::mem::take(&mut pending_acks))
+                .await?;
+            last_ack = Instant::now();
+        }
     }
-
-    // Final flush — ack any records received since the last batch boundary.
-    if let Some(off) = highest_unacked {
-        let ack = AckRequest {
-            consumer_name: consumer_name.into(),
-            offset: off,
-        };
-        let mut ack_buf = BytesMut::new();
-        ack.encode(&mut ack_buf);
-        let corr = client.alloc_corr();
-        client
-            .writer
-            .send(Frame::new(OpCode::Ack, corr, ack_buf.freeze()))
-            .await?;
+    if !pending_acks.is_empty() {
+        client.ack_nowait(consumer_name, pending_acks).await?;
     }
-
     Ok(ConsumerStats {
         messages,
         latency_histogram: hist,

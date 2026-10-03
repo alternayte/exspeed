@@ -160,8 +160,15 @@ async fn subscribers_on_one_consumer_share_the_work() {
     }
     let mut offsets: Vec<u64> = seen.iter().map(|r| r.offset).collect();
     offsets.sort_unstable();
-    assert_eq!(offsets, (0..100).collect::<Vec<_>>(), "each record exactly once");
-    assert!(from_a > 0 && from_b > 0, "both subscribers got work: {from_a}/{from_b}");
+    assert_eq!(
+        offsets,
+        (0..100).collect::<Vec<_>>(),
+        "each record exactly once"
+    );
+    assert!(
+        from_a > 0 && from_b > 0,
+        "both subscribers got work: {from_a}/{from_b}"
+    );
 }
 
 #[tokio::test]
@@ -255,8 +262,7 @@ async fn term_dead_letters_immediately() {
         .await
         .unwrap();
     assert_eq!(b.records.len(), 1);
-    assert!(b
-        .records[0]
+    assert!(b.records[0]
         .headers
         .iter()
         .any(|(k, v)| k == "exspeed-dlq-reason" && v == "unparseable"));
@@ -287,7 +293,10 @@ async fn pull_long_polls_until_data_arrives() {
 
     // Nothing there: returns empty after the timeout.
     let t0 = std::time::Instant::now();
-    let empty = m.pull("c", 10, 0, Duration::from_millis(150)).await.unwrap();
+    let empty = m
+        .pull("c", 10, 0, Duration::from_millis(150))
+        .await
+        .unwrap();
     assert!(empty.is_empty());
     assert!(t0.elapsed() >= Duration::from_millis(140));
 
@@ -316,7 +325,10 @@ async fn subject_filters_skip_other_records() {
     let mut s = spec("c", "s");
     s.filter_subjects = vec!["orders.*".into()];
     m.create(s).await.unwrap();
-    let got = m.pull("c", 100, 0, Duration::from_millis(200)).await.unwrap();
+    let got = m
+        .pull("c", 100, 0, Duration::from_millis(200))
+        .await
+        .unwrap();
     assert_eq!(got.len(), 6);
     assert!(got.iter().all(|r| r.subject.starts_with("orders.")));
     m.ack("c", got.iter().map(|r| r.offset).collect())
@@ -402,9 +414,16 @@ async fn state_survives_restart_and_unacked_records_come_back() {
     let info = m.info("c").await.unwrap();
     assert_eq!(info.ack_floor, 2);
     assert_eq!(info.num_unacked, 2);
-    let again = m.pull("c", 10, 0, Duration::from_millis(200)).await.unwrap();
+    let again = m
+        .pull("c", 10, 0, Duration::from_millis(200))
+        .await
+        .unwrap();
     let offsets: Vec<u64> = again.iter().map(|r| r.offset).collect();
-    assert_eq!(offsets, vec![2, 4], "only the unacked records are redelivered");
+    assert_eq!(
+        offsets,
+        vec![2, 4],
+        "only the unacked records are redelivered"
+    );
     assert!(again.iter().all(|r| r.delivery_count == 2));
 }
 
@@ -436,7 +455,10 @@ async fn seek_repositions() {
     let (m, _t) = e.manager().await;
     m.create(spec("c", "s")).await.unwrap();
     m.seek("c", SeekTo::Offset(7)).await.unwrap();
-    let got = m.pull("c", 10, 0, Duration::from_millis(200)).await.unwrap();
+    let got = m
+        .pull("c", 10, 0, Duration::from_millis(200))
+        .await
+        .unwrap();
     assert_eq!(got.first().unwrap().offset, 7);
     m.seek("c", SeekTo::Latest).await.unwrap();
     assert_eq!(m.info("c").await.unwrap().next_offset, 10);

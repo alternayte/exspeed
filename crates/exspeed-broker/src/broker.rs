@@ -62,7 +62,10 @@ impl Broker {
 
     /// Attach a `ReplicationCoordinator` so every write is fanned out to
     /// connected followers.
-    pub fn with_replication_coordinator(mut self, coordinator: Arc<ReplicationCoordinator>) -> Self {
+    pub fn with_replication_coordinator(
+        mut self,
+        coordinator: Arc<ReplicationCoordinator>,
+    ) -> Self {
         self.log.set_replication(coordinator.clone());
         self.replication_coordinator = Some(coordinator);
         self

@@ -160,7 +160,6 @@ pub struct ServerArgs {
     /// Currently reserved for future use — timer-only in this release.
     #[arg(long, default_value_t = 4 * 1024 * 1024, env = "EXSPEED_SYNC_BYTES")]
     pub storage_sync_bytes: usize,
-
 }
 
 impl ServerArgs {

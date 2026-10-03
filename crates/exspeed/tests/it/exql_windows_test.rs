@@ -1,103 +1,23 @@
-use bytes::{Bytes, BytesMut};
-use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use tokio::net::TcpStream;
-use tokio::time::{timeout, Duration};
-use tokio_util::codec::{FramedRead, FramedWrite};
+use tokio::time::Duration;
 
-use exspeed_protocol::codec::ExspeedCodec;
-use exspeed_protocol::frame::Frame;
-use exspeed_protocol::messages::connect::{AuthType, ConnectRequest};
-use exspeed_protocol::messages::publish::PublishRequest;
-use exspeed_protocol::opcodes::OpCode;
+use exspeed_client::PublishRecord;
+
+use crate::common::TestServer;
 
 // ---------------------------------------------------------------------------
-// Helpers (same pattern as exql_test.rs)
+// Helpers
 // ---------------------------------------------------------------------------
 
-async fn start_server() -> (String, String) {
-    let tcp_port = exspeed_testkit::pick_unused_port().unwrap();
-    let http_port = exspeed_testkit::pick_unused_port().unwrap();
-    let tcp_addr = format!("127.0.0.1:{}", tcp_port);
-    let http_addr = format!("127.0.0.1:{}", http_port);
-
-    let dir = tempfile::TempDir::new().unwrap();
-    let args = exspeed::cli::server::ServerArgs {
-        bind: tcp_addr.clone(),
-        data_dir: dir.path().to_path_buf(),
-        api_bind: http_addr.clone(),
-        auth_token: None,
-        credentials_file: None,
-        tls_cert: None,
-        tls_key: None,
-        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-        storage_flush_window_us: 500,
-        storage_flush_threshold_records: 256,
-        storage_flush_threshold_bytes: 1_048_576,
-        storage_sync_interval_ms: 10,
-        storage_sync_bytes: 4 * 1024 * 1024,
-    };
-
-    tokio::spawn(async move {
-        let _keep = dir;
-        exspeed::cli::server::run(args).await.unwrap();
-    });
-
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    (tcp_addr, format!("http://{}", http_addr))
+/// Returns the server (keep it alive) and its HTTP base URL.
+async fn start_server() -> (TestServer, String) {
+    let server = TestServer::start().await;
+    let http = format!("http://{}", server.api_addr);
+    (server, http)
 }
 
-type FramedReader = FramedRead<tokio::net::tcp::OwnedReadHalf, ExspeedCodec>;
-type FramedWriter = FramedWrite<tokio::net::tcp::OwnedWriteHalf, ExspeedCodec>;
-
-async fn connect_to(addr: &str) -> (FramedReader, FramedWriter) {
-    let stream = TcpStream::connect(addr).await.unwrap();
-    let (reader, writer) = stream.into_split();
-    (
-        FramedRead::new(reader, ExspeedCodec::new()),
-        FramedWrite::new(writer, ExspeedCodec::new()),
-    )
-}
-
-async fn send_recv(writer: &mut FramedWriter, reader: &mut FramedReader, frame: Frame) -> Frame {
-    writer.send(frame).await.unwrap();
-    timeout(Duration::from_secs(5), reader.next())
-        .await
-        .expect("timeout waiting for response")
-        .unwrap()
-        .unwrap()
-}
-
-fn connect_frame(corr: u32) -> Frame {
-    let req = ConnectRequest {
-        client_id: "win-test".into(),
-        auth_type: AuthType::None,
-        auth_payload: Bytes::new(),
-    };
-    let mut buf = BytesMut::new();
-    req.encode(&mut buf);
-    Frame::new(OpCode::Connect, corr, buf.freeze())
-}
-
-fn publish_frame(stream: &str, subject: &str, value: &[u8], corr: u32) -> Frame {
-    let req = PublishRequest {
-        stream: stream.into(),
-        subject: subject.into(),
-        key: None,
-        msg_id: None,
-        value: Bytes::copy_from_slice(value),
-        headers: vec![],
-    };
-    let mut buf = BytesMut::new();
-    req.encode(&mut buf);
-    Frame::new(OpCode::Publish, corr, buf.freeze())
-}
-
-/// Create a stream via HTTP, then publish `records` via TCP.
-async fn setup_stream(stream_name: &str, records: &[(&str, &str)], tcp_addr: &str, http_url: &str) {
-    let client = reqwest::Client::new();
-
-    let resp = client
+async fn http_create_stream(http_url: &str, stream_name: &str) {
+    let resp = reqwest::Client::new()
         .post(format!("{}/api/v1/streams", http_url))
         .json(&serde_json::json!({"name": stream_name}))
         .send()
@@ -106,31 +26,26 @@ async fn setup_stream(stream_name: &str, records: &[(&str, &str)], tcp_addr: &st
     assert_eq!(
         resp.status(),
         201,
-        "failed to create stream '{}'",
-        stream_name
+        "failed to create stream '{stream_name}'"
     );
+}
 
-    let (mut reader, mut writer) = connect_to(tcp_addr).await;
-    let resp = send_recv(&mut writer, &mut reader, connect_frame(1)).await;
-    assert_eq!(
-        resp.opcode,
-        OpCode::ConnectOk,
-        "CONNECT should return ConnectOk"
-    );
-
-    for (i, (subject, payload)) in records.iter().enumerate() {
-        let resp = send_recv(
-            &mut writer,
-            &mut reader,
-            publish_frame(stream_name, subject, payload.as_bytes(), 10 + i as u32),
+/// Create a stream via HTTP, then publish `(subject, json)` records via TCP.
+async fn setup_stream(
+    stream_name: &str,
+    records: &[(&str, &str)],
+    server: &TestServer,
+    http_url: &str,
+) {
+    http_create_stream(http_url, stream_name).await;
+    let c = server.client().await;
+    for (subject, payload) in records {
+        c.publish(
+            stream_name,
+            PublishRecord::new(*subject, payload.to_string()),
         )
-        .await;
-        assert_eq!(
-            resp.opcode,
-            OpCode::PublishOk,
-            "PUBLISH record {} should return PublishOk",
-            i
-        );
+        .await
+        .unwrap();
     }
 }
 
@@ -460,22 +375,14 @@ async fn continuous_query_tumbling_picks_up_new_records() {
     );
 
     // 4. Publish 2 more records while the query is already running.
-    let (mut reader, mut writer) = connect_to(&tcp).await;
-    let resp = send_recv(&mut writer, &mut reader, connect_frame(1)).await;
-    assert_eq!(resp.opcode, OpCode::ConnectOk);
-    for i in 0..2 {
-        let resp = send_recv(
-            &mut writer,
-            &mut reader,
-            publish_frame(
-                "cq-tumble-live",
-                "event.created",
-                r#"{"val": 99}"#.as_bytes(),
-                100 + i,
-            ),
+    let c = tcp.client().await;
+    for _ in 0..2 {
+        c.publish(
+            "cq-tumble-live",
+            PublishRecord::new("event.created", r#"{"val": 99}"#),
         )
-        .await;
-        assert_eq!(resp.opcode, OpCode::PublishOk);
+        .await
+        .unwrap();
     }
 
     // 5. Wait for the new records to be processed.

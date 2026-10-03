@@ -438,7 +438,9 @@ impl Actor {
                     }
                 }
                 Due::Redeliver { offset, deliveries } => {
-                    let Some(taker) = self.next_taker() else { break };
+                    let Some(taker) = self.next_taker() else {
+                        break;
+                    };
                     match self.read_one(offset).await {
                         Ok(Some(rec)) => {
                             let wire = to_wire(&rec, deliveries.saturating_add(1));
@@ -537,7 +539,9 @@ impl Actor {
             if !progressed {
                 break;
             }
-            if batch.next_offset.0 >= batch.high_watermark.0 && self.core.next_read >= batch.high_watermark.0 {
+            if batch.next_offset.0 >= batch.high_watermark.0
+                && self.core.next_read >= batch.high_watermark.0
+            {
                 exhausted = true;
                 break;
             }
@@ -583,7 +587,11 @@ impl Actor {
             )
             .await
         {
-            Ok(b) => Ok(b.records.into_iter().next().filter(|r| r.offset.0 == offset)),
+            Ok(b) => Ok(b
+                .records
+                .into_iter()
+                .next()
+                .filter(|r| r.offset.0 == offset)),
             Err(StorageError::OffsetOutOfRange { .. }) => Ok(None),
             Err(e) => Err(e),
         }

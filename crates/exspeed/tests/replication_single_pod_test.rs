@@ -16,20 +16,10 @@
 
 use std::time::Duration;
 
-use bytes::{Bytes, BytesMut};
-use futures_util::{SinkExt, StreamExt};
 use tempfile::TempDir;
 use tokio::net::TcpStream;
-use tokio_util::codec::{FramedRead, FramedWrite};
 
-use exspeed_protocol::codec::ExspeedCodec;
-use exspeed_protocol::frame::Frame;
-use exspeed_protocol::messages::connect::{AuthType, ConnectRequest};
-use exspeed_protocol::messages::fetch::FetchRequest;
-use exspeed_protocol::messages::publish::PublishRequest;
-use exspeed_protocol::messages::stream_mgmt::CreateStreamRequest;
-use exspeed_protocol::messages::ServerMessage;
-use exspeed_protocol::opcodes::OpCode;
+use exspeed_client::{Client, ConnectOptions, PublishRecord, StreamSpec};
 
 struct SinglePodHarness {
     api_port: u16,
@@ -129,96 +119,21 @@ async fn cluster_followers_endpoint_returns_503_body_in_single_pod_mode() {
 async fn publish_and_fetch_still_works_in_single_pod_mode() {
     let h = start_single_pod_server().await;
 
-    let sock = TcpStream::connect(format!("127.0.0.1:{}", h.tcp_port))
-        .await
-        .expect("tcp connect");
-    let (r, w) = tokio::io::split(sock);
-    let mut framed_read = FramedRead::new(r, ExspeedCodec::new());
-    let mut framed_write = FramedWrite::new(w, ExspeedCodec::new());
-
-    // ---- Connect ----
-    let mut buf = BytesMut::new();
-    ConnectRequest {
-        client_id: "single-pod-test".into(),
-        auth_type: AuthType::None,
-        auth_payload: Bytes::new(),
-    }
-    .encode(&mut buf);
-    framed_write
-        .send(Frame::new(OpCode::Connect, 1, buf.freeze()))
+    let c = Client::connect(
+        &format!("127.0.0.1:{}", h.tcp_port),
+        ConnectOptions::default(),
+    )
+    .await
+    .expect("connect");
+    assert_eq!(c.server_info().leader, None);
+    c.create_stream(StreamSpec::named("sp-test")).await.unwrap();
+    let ack = c
+        .publish("sp-test", PublishRecord::new("t", "hello"))
         .await
         .unwrap();
-    let frame = framed_read.next().await.unwrap().unwrap();
-    assert!(
-        matches!(
-            ServerMessage::from_frame(frame),
-            Ok(ServerMessage::ConnectOk(_))
-        ),
-        "expected ConnectOk in single-pod mode with auth off",
-    );
-
-    // ---- CreateStream ----
-    let mut buf = BytesMut::new();
-    CreateStreamRequest {
-        stream_name: "sp-test".into(),
-        max_age_secs: 0,
-        max_bytes: 0,
-    }
-    .encode(&mut buf);
-    framed_write
-        .send(Frame::new(OpCode::CreateStream, 2, buf.freeze()))
-        .await
-        .unwrap();
-    // Response is Ok; we don't care which code as long as the server replies.
-    let _ = framed_read.next().await.unwrap().unwrap();
-
-    // ---- Publish ----
-    let mut buf = BytesMut::new();
-    PublishRequest {
-        stream: "sp-test".into(),
-        subject: "t".into(),
-        key: None,
-        msg_id: None,
-        value: Bytes::from_static(b"hello"),
-        headers: vec![],
-    }
-    .encode(&mut buf);
-    framed_write
-        .send(Frame::new(OpCode::Publish, 3, buf.freeze()))
-        .await
-        .unwrap();
-    let ack = framed_read.next().await.unwrap().unwrap();
-    match ServerMessage::from_frame(ack).expect("publish ack decode") {
-        ServerMessage::PublishOk { offset, duplicate } => {
-            assert!(!duplicate);
-            assert_eq!(offset, 0, "first publish lands at offset 0");
-        }
-        other => panic!("expected PublishOk, got {other:?}"),
-    }
-
-    // ---- Fetch ----
-    let mut buf = BytesMut::new();
-    FetchRequest {
-        stream: "sp-test".into(),
-        offset: 0,
-        max_records: 10,
-        subject_filter: String::new(),
-    }
-    .encode(&mut buf);
-    framed_write
-        .send(Frame::new(OpCode::Fetch, 4, buf.freeze()))
-        .await
-        .unwrap();
-    let records_frame = framed_read.next().await.unwrap().unwrap();
-    match ServerMessage::from_frame(records_frame).expect("fetch decode") {
-        ServerMessage::RecordsBatch(batch) => {
-            assert_eq!(
-                batch.records.len(),
-                1,
-                "expected exactly one record after publish"
-            );
-            assert_eq!(&batch.records[0].value[..], b"hello");
-        }
-        other => panic!("expected RecordsBatch, got {other:?}"),
-    }
+    assert!(!ack.duplicate);
+    assert_eq!(ack.offset, 0, "first publish lands at offset 0");
+    let r = c.read("sp-test", 0, 10, Duration::ZERO, "").await.unwrap();
+    assert_eq!(r.records.len(), 1);
+    assert_eq!(&r.records[0].value[..], b"hello");
 }

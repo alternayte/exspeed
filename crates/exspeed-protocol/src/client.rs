@@ -1055,7 +1055,7 @@ mod tests {
             timestamp_ms: 1_700_000_000_000 + i,
             delivery_count: (i % 3) as u16,
             subject: format!("orders.{i}"),
-            key: if i % 2 == 0 {
+            key: if i.is_multiple_of(2) {
                 Some(Bytes::from(format!("k{i}")))
             } else {
                 None
@@ -1264,9 +1264,10 @@ mod tests {
     fn consumer_spec_json_defaults() {
         let spec: ConsumerSpec = serde_json::from_str(r#"{"name":"c","stream":"s"}"#).unwrap();
         assert_eq!(spec, ConsumerSpec::new("c", "s"));
-        let spec: ConsumerSpec =
-            serde_json::from_str(r#"{"name":"c","stream":"s","deliver":{"from_offset":5},"ack":"none"}"#)
-                .unwrap();
+        let spec: ConsumerSpec = serde_json::from_str(
+            r#"{"name":"c","stream":"s","deliver":{"from_offset":5},"ack":"none"}"#,
+        )
+        .unwrap();
         assert_eq!(spec.deliver, DeliverPolicy::FromOffset(5));
         assert_eq!(spec.ack, AckPolicy::None);
     }

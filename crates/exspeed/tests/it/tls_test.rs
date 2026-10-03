@@ -1,17 +1,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::{Bytes, BytesMut};
-use exspeed_protocol::codec::ExspeedCodec;
-use exspeed_protocol::frame::Frame;
-use exspeed_protocol::messages::connect::{AuthType, ConnectRequest};
-use exspeed_protocol::opcodes::OpCode;
-use futures_util::{SinkExt, StreamExt};
+use exspeed_client::{Client, ConnectOptions, PublishRecord, StreamSpec};
 use tempfile::tempdir;
-use tokio::net::TcpStream;
-use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::TlsConnector;
-use tokio_util::codec::{FramedRead, FramedWrite};
 
 #[tokio::test]
 async fn tls_cert_without_key_refuses_to_start() {
@@ -117,48 +108,54 @@ async fn tls_enabled_tcp_handshakes_with_rustls() {
     tokio::spawn(async move {
         exspeed::cli::server::run(args).await.unwrap();
     });
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_for_port(port).await;
 
-    // Build a rustls client that trusts our self-signed cert.
-    let cert_pem = std::fs::read(&cert_path).unwrap();
+    let tls = client_config(&cert_path);
+    let addr = format!("127.0.0.1:{port}");
+    let c = Client::connect_tls(&addr, "localhost", tls.clone(), ConnectOptions::default())
+        .await
+        .unwrap();
+    c.create_stream(StreamSpec::named("tls")).await.unwrap();
+    c.publish("tls", PublishRecord::new("s", "over tls"))
+        .await
+        .unwrap();
+    let r = c.read("tls", 0, 10, Duration::ZERO, "").await.unwrap();
+    assert_eq!(r.records[0].value.as_ref(), b"over tls");
+
+    // A plaintext client can't talk to the TLS port.
+    assert!(Client::connect(&addr, ConnectOptions::default())
+        .await
+        .is_err());
+}
+
+fn client_config(cert_path: &std::path::Path) -> Arc<tokio_rustls::rustls::ClientConfig> {
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    let cert_pem = std::fs::read(cert_path).unwrap();
     let cert = rustls_pemfile::certs(&mut cert_pem.as_slice())
         .next()
         .unwrap()
         .unwrap();
     let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
     root_store.add(cert).unwrap();
-    let client_cfg = tokio_rustls::rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    let connector = TlsConnector::from(Arc::new(client_cfg));
+    Arc::new(
+        tokio_rustls::rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth(),
+    )
+}
 
-    let tcp = TcpStream::connect(format!("127.0.0.1:{port}"))
-        .await
-        .unwrap();
-    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
-    let tls_stream = connector.connect(server_name, tcp).await.unwrap();
-
-    let (r, w) = tokio::io::split(tls_stream);
-    let mut fr = FramedRead::new(r, ExspeedCodec::new());
-    let mut fw = FramedWrite::new(w, ExspeedCodec::new());
-
-    let mut payload = BytesMut::new();
-    ConnectRequest {
-        client_id: "tls-test".to_string(),
-        auth_type: AuthType::None,
-        auth_payload: Bytes::new(),
+async fn wait_for_port(port: u16) {
+    for _ in 0..200 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    .encode(&mut payload);
-    fw.send(Frame::new(OpCode::Connect, 1, payload.freeze()))
-        .await
-        .unwrap();
-
-    let resp = tokio::time::timeout(Duration::from_secs(2), fr.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert_eq!(resp.opcode, OpCode::ConnectOk);
+    panic!("server did not listen on {port}");
 }
 
 #[tokio::test]
@@ -253,4 +250,22 @@ async fn auth_and_tls_together_end_to_end() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 401);
+
+    // TCP over TLS with and without the token.
+    let tls = client_config(&cert_path);
+    let addr = format!("127.0.0.1:{port}");
+    let c = Client::connect_tls(
+        &addr,
+        "localhost",
+        tls.clone(),
+        ConnectOptions::default().token("e2e-secret"),
+    )
+    .await
+    .unwrap();
+    c.ping().await.unwrap();
+    let err = Client::connect_tls(&addr, "localhost", tls, ConnectOptions::default())
+        .await
+        .err()
+        .expect("unauthenticated connect must fail");
+    assert_eq!(err.code(), Some(401));
 }

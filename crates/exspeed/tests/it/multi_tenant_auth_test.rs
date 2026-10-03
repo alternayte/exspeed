@@ -10,32 +10,15 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use bytes::{Bytes, BytesMut};
-use futures_util::{SinkExt, StreamExt};
 use tempfile::NamedTempFile;
 use tokio::net::TcpStream;
-use tokio::time::timeout;
-use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 
-use exspeed_protocol::codec::ExspeedCodec;
-use exspeed_protocol::frame::Frame;
-use exspeed_protocol::messages::ack::{AckRequest, NackRequest};
-use exspeed_protocol::messages::connect::{AuthType, ConnectRequest};
-use exspeed_protocol::messages::consumer::{CreateConsumerRequest, StartFrom, SubscribeRequest};
-use exspeed_protocol::messages::fetch::FetchRequest;
-use exspeed_protocol::messages::publish::PublishRequest;
-use exspeed_protocol::messages::seek::SeekRequest;
-use exspeed_protocol::messages::stream_mgmt::CreateStreamRequest;
-use exspeed_protocol::messages::ServerMessage;
-use exspeed_protocol::opcodes::OpCode;
+use exspeed_client::{Client, ConnectOptions, ConsumerSpec, PublishRecord, SeekTo, StreamSpec};
 
 // ---------------------------------------------------------------------------
 // Type aliases
 // ---------------------------------------------------------------------------
-
-type FramedReader = FramedRead<tokio::net::tcp::OwnedReadHalf, ExspeedCodec>;
-type FramedWriter = FramedWrite<tokio::net::tcp::OwnedWriteHalf, ExspeedCodec>;
 
 // ---------------------------------------------------------------------------
 // File helpers
@@ -139,169 +122,37 @@ impl Drop for TestServer {
 // TCP helpers
 // ---------------------------------------------------------------------------
 
-async fn connect_to(addr: &str) -> (FramedReader, FramedWriter) {
-    let stream = TcpStream::connect(addr).await.unwrap();
-    let (reader, writer) = stream.into_split();
-    (
-        FramedRead::new(reader, ExspeedCodec::new()),
-        FramedWrite::new(writer, ExspeedCodec::new()),
-    )
+async fn try_client(addr: &str, token: Option<&str>) -> exspeed_client::Result<Client> {
+    let opts = ConnectOptions {
+        token: token.map(str::to_string),
+        ..Default::default()
+    };
+    Client::connect(addr, opts).await
 }
 
-/// Send a frame and wait for a response with a matching correlation id.
-/// Push-delivered records (correlation_id = 0) are discarded.
-async fn send_recv(writer: &mut FramedWriter, reader: &mut FramedReader, frame: Frame) -> Frame {
-    let corr = frame.correlation_id;
-    writer.send(frame).await.unwrap();
-    loop {
-        let resp = timeout(Duration::from_secs(5), reader.next())
-            .await
-            .expect("timeout waiting for response")
-            .unwrap()
-            .unwrap();
-        if resp.correlation_id == corr {
-            return resp;
-        }
+async fn client(addr: &str, token: &str) -> Client {
+    try_client(addr, Some(token)).await.expect("connect")
+}
+
+fn assert_code<T: std::fmt::Debug>(r: exspeed_client::Result<T>, expected: u16) {
+    match r {
+        Err(e) => assert_eq!(e.code(), Some(expected), "unexpected error: {e}"),
+        Ok(v) => panic!("expected error {expected}, got Ok({v:?})"),
     }
 }
 
-fn connect_frame(client_id: &str, token: Option<&str>, corr: u32) -> Frame {
-    let (auth_type, payload) = match token {
-        Some(t) => (AuthType::Token, Bytes::copy_from_slice(t.as_bytes())),
-        None => (AuthType::None, Bytes::new()),
-    };
-    let req = ConnectRequest {
-        client_id: client_id.into(),
-        auth_type,
-        auth_payload: payload,
-    };
-    let mut buf = BytesMut::new();
-    req.encode(&mut buf);
-    Frame::new(OpCode::Connect, corr, buf.freeze())
-}
-
-fn create_stream_frame(name: &str, corr: u32) -> Frame {
-    let req = CreateStreamRequest {
-        stream_name: name.into(),
-        max_age_secs: 0,
-        max_bytes: 0,
-    };
-    let mut buf = BytesMut::new();
-    req.encode(&mut buf);
-    Frame::new(OpCode::CreateStream, corr, buf.freeze())
-}
-
-fn publish_frame(stream: &str, subject: &str, value: &[u8], corr: u32) -> Frame {
-    let req = PublishRequest {
-        stream: stream.into(),
-        subject: subject.into(),
-        key: None,
-        msg_id: None,
-        value: Bytes::copy_from_slice(value),
-        headers: vec![],
-    };
-    let mut buf = BytesMut::new();
-    req.encode(&mut buf);
-    Frame::new(OpCode::Publish, corr, buf.freeze())
-}
-
-fn fetch_frame(stream: &str, offset: u64, corr: u32) -> Frame {
-    let req = FetchRequest {
-        stream: stream.into(),
-        offset,
-        max_records: 10,
-        subject_filter: String::new(),
-    };
-    let mut buf = BytesMut::new();
-    req.encode(&mut buf);
-    Frame::new(OpCode::Fetch, corr, buf.freeze())
-}
-
-fn create_consumer_frame(name: &str, stream: &str, corr: u32) -> Frame {
-    let req = CreateConsumerRequest {
-        name: name.into(),
-        stream: stream.into(),
-        group: String::new(),
-        subject_filter: String::new(),
-        start_from: StartFrom::Earliest,
-        start_offset: 0,
-    };
-    let mut buf = BytesMut::new();
-    req.encode(&mut buf);
-    Frame::new(OpCode::CreateConsumer, corr, buf.freeze())
-}
-
-fn subscribe_frame(consumer_name: &str, corr: u32) -> Frame {
-    let req = SubscribeRequest {
-        consumer_name: consumer_name.into(),
-        subscriber_id: String::new(),
-    };
-    let mut buf = BytesMut::new();
-    req.encode(&mut buf);
-    Frame::new(OpCode::Subscribe, corr, buf.freeze())
-}
-
-fn ack_frame(consumer_name: &str, offset: u64, corr: u32) -> Frame {
-    let req = AckRequest {
-        consumer_name: consumer_name.into(),
-        offset,
-    };
-    let mut buf = BytesMut::new();
-    req.encode(&mut buf);
-    Frame::new(OpCode::Ack, corr, buf.freeze())
-}
-
-fn nack_frame(consumer_name: &str, offset: u64, corr: u32) -> Frame {
-    let req = NackRequest {
-        consumer_name: consumer_name.into(),
-        offset,
-    };
-    let mut buf = BytesMut::new();
-    req.encode(&mut buf);
-    Frame::new(OpCode::Nack, corr, buf.freeze())
-}
-
-fn seek_frame(consumer_name: &str, timestamp: u64, corr: u32) -> Frame {
-    let req = SeekRequest {
-        consumer_name: consumer_name.into(),
-        timestamp,
-    };
-    let mut buf = BytesMut::new();
-    req.encode(&mut buf);
-    Frame::new(OpCode::Seek, corr, buf.freeze())
-}
-
-/// Pre-create a stream + consumer on `addr` as the given admin token. Used
-/// by tests that exercise a scoped credential's data-plane op against a
-/// real stream. Uses TCP for consumer creation because the HTTP API has no
-/// POST /api/v1/consumers route.
+/// Admin creates a stream and a consumer on it.
 async fn admin_setup_stream_and_consumer(
     addr: &str,
     admin_token: &str,
     stream: &str,
     consumer: &str,
 ) {
-    let (mut r, mut w) = connect_to(addr).await;
-    let resp = send_recv(&mut w, &mut r, connect_frame("admin", Some(admin_token), 1)).await;
-    assert_eq!(resp.opcode, OpCode::ConnectOk, "admin connect failed");
-    let resp = send_recv(&mut w, &mut r, create_stream_frame(stream, 2)).await;
-    assert_eq!(resp.opcode, OpCode::Ok, "admin create_stream failed");
-    let resp = send_recv(&mut w, &mut r, create_consumer_frame(consumer, stream, 3)).await;
-    assert_eq!(resp.opcode, OpCode::Ok, "admin create_consumer failed");
-}
-
-/// Assert the frame is an Error with the given HTTP-style status code.
-fn assert_error(frame: Frame, code: u16) {
-    assert_eq!(
-        frame.opcode,
-        OpCode::Error,
-        "expected Error frame, got {:?}",
-        frame.opcode
-    );
-    match ServerMessage::from_frame(frame).unwrap() {
-        ServerMessage::Error { code: c, .. } => assert_eq!(c, code, "error code mismatch"),
-        other => panic!("expected Error variant, got {other:?}"),
-    }
+    let c = client(addr, admin_token).await;
+    c.create_stream(StreamSpec::named(stream)).await.unwrap();
+    c.create_consumer(ConsumerSpec::new(consumer, stream))
+        .await
+        .unwrap();
 }
 
 // ===========================================================================
@@ -322,24 +173,12 @@ permissions = [{{ streams = "*", actions = ["publish"] }}]
     ));
     let srv = start_server(Some(creds.path().to_path_buf()), None).await;
 
-    let (mut reader, mut writer) = connect_to(&srv.tcp_addr).await;
-    let resp = send_recv(
-        &mut writer,
-        &mut reader,
-        connect_frame("c", Some("unknown"), 1),
-    )
-    .await;
-    assert_error(resp, 401);
-
-    // Server should close the socket after the 401. The next read returns
-    // None (EOF) within a short window.
-    let next = timeout(Duration::from_secs(2), reader.next()).await;
-    match next {
-        Ok(None) => {}         // clean EOF
-        Ok(Some(Err(_))) => {} // transport error from broken read
-        Ok(Some(Ok(frame))) => panic!("expected socket close, got frame {frame:?}"),
-        Err(_) => panic!("timeout waiting for socket close"),
-    }
+    // The handshake fails with 401 and the server closes the connection.
+    assert_code(
+        try_client(&srv.tcp_addr, Some("unknown")).await.map(|_| ()),
+        401,
+    );
+    assert_code(try_client(&srv.tcp_addr, None).await.map(|_| ()), 401);
 }
 
 // 2 -------------------------------------------------------------------------
@@ -356,31 +195,13 @@ permissions = [{{ streams = "orders-*", actions = ["publish", "admin"] }}]
     ));
     let srv = start_server(Some(creds.path().to_path_buf()), None).await;
 
-    let (mut reader, mut writer) = connect_to(&srv.tcp_addr).await;
-    let resp = send_recv(
-        &mut writer,
-        &mut reader,
-        connect_frame("c", Some("tok-orders"), 1),
-    )
-    .await;
-    assert_eq!(resp.opcode, OpCode::ConnectOk);
-
-    // Pre-create the stream (admin on orders-*) then publish.
-    let resp = send_recv(
-        &mut writer,
-        &mut reader,
-        create_stream_frame("orders-placed", 2),
-    )
-    .await;
-    assert_eq!(resp.opcode, OpCode::Ok);
-
-    let resp = send_recv(
-        &mut writer,
-        &mut reader,
-        publish_frame("orders-placed", "evt", b"hello", 3),
-    )
-    .await;
-    assert_eq!(resp.opcode, OpCode::PublishOk);
+    let c = client(&srv.tcp_addr, "tok-orders").await;
+    c.create_stream(StreamSpec::named("orders-placed"))
+        .await
+        .unwrap();
+    c.publish("orders-placed", PublishRecord::new("evt", "hello"))
+        .await
+        .unwrap();
 }
 
 // 3 -------------------------------------------------------------------------
@@ -476,27 +297,13 @@ permissions = [{{ streams = "*", actions = ["admin"] }}]
 
     admin_setup_stream_and_consumer(&srv.tcp_addr, "admin-token", "events", "c1").await;
 
-    let (mut reader, mut writer) = connect_to(&srv.tcp_addr).await;
-    let resp = send_recv(
-        &mut writer,
-        &mut reader,
-        connect_frame("c", Some("sub-token"), 1),
-    )
-    .await;
-    assert_eq!(resp.opcode, OpCode::ConnectOk);
-
-    // Publish → 403.
-    let resp = send_recv(
-        &mut writer,
-        &mut reader,
-        publish_frame("events", "evt", b"x", 2),
-    )
-    .await;
-    assert_error(resp, 403);
-
-    // Connection stays open — Subscribe succeeds on the same connection.
-    let resp = send_recv(&mut writer, &mut reader, subscribe_frame("c1", 3)).await;
-    assert_eq!(resp.opcode, OpCode::Ok);
+    let c = client(&srv.tcp_addr, "sub-token").await;
+    assert_code(
+        c.publish("events", PublishRecord::new("evt", "x")).await,
+        403,
+    );
+    // The connection stays usable: subscribing is allowed.
+    c.subscribe("c1", 8).await.expect("subscribe allowed");
 }
 
 // 7 -------------------------------------------------------------------------
@@ -513,26 +320,13 @@ permissions = [{{ streams = "orders-*", actions = ["publish", "admin"] }}]
     ));
     let srv = start_server(Some(creds.path().to_path_buf()), None).await;
 
-    let (mut reader, mut writer) = connect_to(&srv.tcp_addr).await;
-    let resp = send_recv(&mut writer, &mut reader, connect_frame("c", Some("t"), 1)).await;
-    assert_eq!(resp.opcode, OpCode::ConnectOk);
-
-    // admin on orders-* lets us create the stream for this test.
-    let resp = send_recv(
-        &mut writer,
-        &mut reader,
-        create_stream_frame("orders-placed", 2),
-    )
-    .await;
-    assert_eq!(resp.opcode, OpCode::Ok);
-
-    let resp = send_recv(
-        &mut writer,
-        &mut reader,
-        publish_frame("orders-placed", "evt", b"x", 3),
-    )
-    .await;
-    assert_eq!(resp.opcode, OpCode::PublishOk);
+    let c = client(&srv.tcp_addr, "t").await;
+    c.create_stream(StreamSpec::named("orders-placed"))
+        .await
+        .unwrap();
+    c.publish("orders-placed", PublishRecord::new("evt", "x"))
+        .await
+        .unwrap();
 }
 
 // 8 -------------------------------------------------------------------------
@@ -557,29 +351,17 @@ permissions = [{{ streams = "*", actions = ["admin"] }}]
     ));
     let srv = start_server(Some(creds.path().to_path_buf()), None).await;
 
-    // Admin pre-creates the payments-* stream over TCP (no HTTP consumer POST
-    // exists; stay on a single wire protocol per test).
-    {
-        let (mut r, mut w) = connect_to(&srv.tcp_addr).await;
-        send_recv(&mut w, &mut r, connect_frame("admin", Some("admin-tok"), 1)).await;
-        let resp = send_recv(&mut w, &mut r, create_stream_frame("payments-received", 2)).await;
-        assert_eq!(resp.opcode, OpCode::Ok);
-    }
-
-    let (mut reader, mut writer) = connect_to(&srv.tcp_addr).await;
-    send_recv(
-        &mut writer,
-        &mut reader,
-        connect_frame("c", Some("orders-tok"), 1),
-    )
-    .await;
-    let resp = send_recv(
-        &mut writer,
-        &mut reader,
-        publish_frame("payments-received", "evt", b"x", 2),
-    )
-    .await;
-    assert_error(resp, 403);
+    client(&srv.tcp_addr, "admin-tok")
+        .await
+        .create_stream(StreamSpec::named("payments-received"))
+        .await
+        .unwrap();
+    let c = client(&srv.tcp_addr, "orders-tok").await;
+    assert_code(
+        c.publish("payments-received", PublishRecord::new("evt", "x"))
+            .await,
+        403,
+    );
 }
 
 // 9 -------------------------------------------------------------------------
@@ -603,16 +385,8 @@ permissions = [{{ streams = "*", actions = ["admin"] }}]
     let srv = start_server(Some(creds.path().to_path_buf()), None).await;
 
     admin_setup_stream_and_consumer(&srv.tcp_addr, "admin-tok", "events", "c1").await;
-
-    let (mut reader, mut writer) = connect_to(&srv.tcp_addr).await;
-    send_recv(
-        &mut writer,
-        &mut reader,
-        connect_frame("c", Some("pub-tok"), 1),
-    )
-    .await;
-    let resp = send_recv(&mut writer, &mut reader, subscribe_frame("c1", 2)).await;
-    assert_error(resp, 403);
+    let c = client(&srv.tcp_addr, "pub-tok").await;
+    assert_code(c.subscribe("c1", 8).await.map(|s| s.id()), 403);
 }
 
 // 10 ------------------------------------------------------------------------
@@ -635,47 +409,34 @@ permissions = [{{ streams = "*", actions = ["admin", "publish"] }}]
     ));
     let srv = start_server(Some(creds.path().to_path_buf()), None).await;
 
-    // Admin pre-creates the stream + consumer and publishes a record via TCP.
     {
-        let (mut r, mut w) = connect_to(&srv.tcp_addr).await;
-        send_recv(&mut w, &mut r, connect_frame("admin", Some("admin-tok"), 1)).await;
-        let resp = send_recv(&mut w, &mut r, create_stream_frame("events", 2)).await;
-        assert_eq!(resp.opcode, OpCode::Ok);
-        let resp = send_recv(&mut w, &mut r, create_consumer_frame("c1", "events", 3)).await;
-        assert_eq!(resp.opcode, OpCode::Ok);
-        let resp = send_recv(
-            &mut w,
-            &mut r,
-            publish_frame("events", "evt", b"payload-1", 4),
-        )
-        .await;
-        assert_eq!(resp.opcode, OpCode::PublishOk);
+        let admin = client(&srv.tcp_addr, "admin-tok").await;
+        admin
+            .create_stream(StreamSpec::named("events"))
+            .await
+            .unwrap();
+        admin
+            .create_consumer(ConsumerSpec::new("c1", "events"))
+            .await
+            .unwrap();
+        admin
+            .publish("events", PublishRecord::new("evt", "payload-1"))
+            .await
+            .unwrap();
     }
-
-    // sub-only cred subscribes and should receive the pre-published record.
-    let (mut reader, mut writer) = connect_to(&srv.tcp_addr).await;
-    send_recv(
-        &mut writer,
-        &mut reader,
-        connect_frame("sub", Some("sub-tok"), 1),
-    )
-    .await;
-    let resp = send_recv(&mut writer, &mut reader, subscribe_frame("c1", 2)).await;
-    assert_eq!(resp.opcode, OpCode::Ok);
-
-    // Expect a Record push frame (correlation_id=0) within a few seconds.
-    let frame = timeout(Duration::from_secs(5), reader.next())
+    let c = client(&srv.tcp_addr, "sub-tok").await;
+    let mut sub = c.subscribe("c1", 8).await.unwrap();
+    let msg = sub
+        .next_timeout(Duration::from_secs(5))
         .await
-        .expect("timeout waiting for record")
-        .unwrap()
-        .unwrap();
-    assert_eq!(frame.opcode, OpCode::Record);
-    assert_eq!(frame.correlation_id, 0);
+        .expect("record delivered");
+    assert_eq!(msg.record.value.as_ref(), b"payload-1");
+    msg.ack().await.unwrap();
 }
 
 // 11 ------------------------------------------------------------------------
 #[tokio::test]
-async fn fetch_ack_nack_seek_all_require_subscribe_verb() {
+async fn read_pull_ack_nack_seek_all_require_subscribe_verb() {
     // pub-only cred — every subscribe-scoped op should 403.
     let creds = write_creds(&format!(
         r#"
@@ -695,31 +456,23 @@ permissions = [{{ streams = "*", actions = ["admin"] }}]
     let srv = start_server(Some(creds.path().to_path_buf()), None).await;
 
     admin_setup_stream_and_consumer(&srv.tcp_addr, "admin-tok", "events", "c1").await;
-
-    let (mut reader, mut writer) = connect_to(&srv.tcp_addr).await;
-    send_recv(
-        &mut writer,
-        &mut reader,
-        connect_frame("c", Some("pub-tok"), 1),
-    )
-    .await;
-
-    // Fetch → 403.
-    let resp = send_recv(&mut writer, &mut reader, fetch_frame("events", 0, 2)).await;
-    assert_error(resp, 403);
-
-    // Seek → 403 (resolves the consumer's stream, then denies).
-    let resp = send_recv(&mut writer, &mut reader, seek_frame("c1", 0, 3)).await;
-    assert_error(resp, 403);
-
-    // Ack — no active subscription so the server returns 403 regardless.
-    // Still counts as proof the subscribe-scoped verb is enforced.
-    let resp = send_recv(&mut writer, &mut reader, ack_frame("c1", 0, 4)).await;
-    assert_error(resp, 403);
-
-    // Nack → 403.
-    let resp = send_recv(&mut writer, &mut reader, nack_frame("c1", 0, 5)).await;
-    assert_error(resp, 403);
+    let c = client(&srv.tcp_addr, "pub-tok").await;
+    assert_code(
+        c.read("events", 0, 10, Duration::ZERO, "")
+            .await
+            .map(|r| r.records.len()),
+        403,
+    );
+    assert_code(c.pull("c1", 10, Duration::ZERO).await, 403);
+    assert_code(c.seek("c1", SeekTo::Earliest).await, 403);
+    assert_code(c.ack("c1", vec![0]).await, 403);
+    assert_code(c.nack("c1", 0, Duration::ZERO).await, 403);
+    assert_code(c.consumer_info("c1").await, 403);
+    // Creating a consumer needs subscribe on its stream too.
+    assert_code(
+        c.create_consumer(ConsumerSpec::new("c2", "events")).await,
+        403,
+    );
 }
 
 // 12 ------------------------------------------------------------------------
@@ -736,62 +489,121 @@ permissions = [{{ streams = "team-a-*", actions = ["admin"] }}]
     ));
     let srv = start_server(Some(creds.path().to_path_buf()), None).await;
 
-    let (mut reader, mut writer) = connect_to(&srv.tcp_addr).await;
-    send_recv(
-        &mut writer,
-        &mut reader,
-        connect_frame("c", Some("team-a-tok"), 1),
-    )
-    .await;
-
-    // In-scope → Ok.
-    let resp = send_recv(
-        &mut writer,
-        &mut reader,
-        create_stream_frame("team-a-orders", 2),
-    )
-    .await;
-    assert_eq!(resp.opcode, OpCode::Ok);
-
-    // Out-of-scope → 403.
-    let resp = send_recv(
-        &mut writer,
-        &mut reader,
-        create_stream_frame("team-b-orders", 3),
-    )
-    .await;
-    assert_error(resp, 403);
+    let c = client(&srv.tcp_addr, "team-a-tok").await;
+    c.create_stream(StreamSpec::named("team-a-orders"))
+        .await
+        .unwrap();
+    assert_code(
+        c.create_stream(StreamSpec::named("team-b-orders")).await,
+        403,
+    );
 }
 
 // 13 ------------------------------------------------------------------------
-// `DeleteStream` doesn't have a ClientMessage decoder today (see
-// `ClientMessage::from_frame` — no DeleteStream arm). Use HTTP instead: the
-// handlers/streams.rs module doesn't expose a DELETE route at the time of
-// writing, so we skip pending a route addition.
 #[tokio::test]
-#[ignore = "DeleteStream not wired in TCP decoder nor HTTP router (see streams.rs)"]
 async fn delete_stream_requires_scoped_admin() {
-    // Intentionally empty; kept as a placeholder so Sub-unit 6.2's numbering
-    // matches the plan.
+    let creds = write_creds(&format!(
+        r#"
+[[credentials]]
+name = "team-a"
+token_sha256 = "{a}"
+permissions = [{{ streams = "team-a-*", actions = ["admin"] }}]
+
+[[credentials]]
+name = "admin"
+token_sha256 = "{admin}"
+permissions = [{{ streams = "*", actions = ["admin"] }}]
+"#,
+        a = sha256_hex("team-a-tok"),
+        admin = sha256_hex("admin-tok"),
+    ));
+    let srv = start_server(Some(creds.path().to_path_buf()), None).await;
+    let admin = client(&srv.tcp_addr, "admin-tok").await;
+    admin
+        .create_stream(StreamSpec::named("team-b-x"))
+        .await
+        .unwrap();
+
+    let c = client(&srv.tcp_addr, "team-a-tok").await;
+    c.create_stream(StreamSpec::named("team-a-x"))
+        .await
+        .unwrap();
+    c.delete_stream("team-a-x").await.unwrap();
+    assert_code(c.delete_stream("team-b-x").await, 403);
 }
 
 // 14 ------------------------------------------------------------------------
-// TCP ListStreams opcode isn't decoded into a ClientMessage either (there's
-// no corresponding arm in ClientMessage). HTTP `GET /api/v1/streams` goes
-// through `require_admin`, which 403s any non-admin identity — so the plan's
-// alternate verification ("publish-only cred sees the stream list") doesn't
-// translate to the current HTTP surface. Skip.
 #[tokio::test]
-#[ignore = "ListStreams not wired in TCP decoder; HTTP list is admin-only"]
-async fn list_streams_returns_all_streams_for_any_authenticated_client() {}
+async fn list_streams_only_shows_permitted_streams() {
+    let creds = write_creds(&format!(
+        r#"
+[[credentials]]
+name = "orders"
+token_sha256 = "{o}"
+permissions = [{{ streams = "orders-*", actions = ["publish"] }}]
+
+[[credentials]]
+name = "admin"
+token_sha256 = "{admin}"
+permissions = [{{ streams = "*", actions = ["admin"] }}]
+"#,
+        o = sha256_hex("orders-tok"),
+        admin = sha256_hex("admin-tok"),
+    ));
+    let srv = start_server(Some(creds.path().to_path_buf()), None).await;
+    let admin = client(&srv.tcp_addr, "admin-tok").await;
+    admin
+        .create_stream(StreamSpec::named("orders-a"))
+        .await
+        .unwrap();
+    admin
+        .create_stream(StreamSpec::named("payments-a"))
+        .await
+        .unwrap();
+
+    let c = client(&srv.tcp_addr, "orders-tok").await;
+    let names: Vec<String> = c
+        .list_streams()
+        .await
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, vec!["orders-a".to_string()]);
+}
 
 // 15 ------------------------------------------------------------------------
-// The HTTP router doesn't expose DELETE /api/v1/streams/:name today. Skip
-// until a route exists; the scoped-admin gate in create_stream (test #12)
-// exercises the same `require_scoped_admin` path.
 #[tokio::test]
-#[ignore = "no DELETE /api/v1/streams/:name route in handlers/mod.rs"]
-async fn http_delete_stream_scoped_admin_enforced() {}
+async fn http_delete_stream_scoped_admin_enforced() {
+    let creds = write_creds(&format!(
+        r#"
+[[credentials]]
+name = "team-a"
+token_sha256 = "{a}"
+permissions = [{{ streams = "team-a-*", actions = ["admin"] }}]
+
+[[credentials]]
+name = "admin"
+token_sha256 = "{admin}"
+permissions = [{{ streams = "*", actions = ["admin"] }}]
+"#,
+        a = sha256_hex("team-a-tok"),
+        admin = sha256_hex("admin-tok"),
+    ));
+    let srv = start_server(Some(creds.path().to_path_buf()), None).await;
+    client(&srv.tcp_addr, "admin-tok")
+        .await
+        .create_stream(StreamSpec::named("team-b-x"))
+        .await
+        .unwrap();
+    let resp = reqwest::Client::new()
+        .delete(format!("http://{}/api/v1/streams/team-b-x", srv.http_addr))
+        .header("Authorization", "Bearer team-a-tok")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+}
 
 // 16 ------------------------------------------------------------------------
 #[tokio::test]
@@ -932,19 +744,9 @@ async fn env_var_only_injects_legacy_admin_with_full_permissions() {
     // `legacy-admin` credential with `*` + all verbs.
     let srv = start_server(None, Some("legacy-tok".into())).await;
 
-    // TCP: Connect + publish + admin (CreateStream) all succeed.
-    let (mut reader, mut writer) = connect_to(&srv.tcp_addr).await;
-    let resp = send_recv(
-        &mut writer,
-        &mut reader,
-        connect_frame("c", Some("legacy-tok"), 1),
-    )
-    .await;
-    assert_eq!(resp.opcode, OpCode::ConnectOk);
-    let resp = send_recv(&mut writer, &mut reader, create_stream_frame("s", 2)).await;
-    assert_eq!(resp.opcode, OpCode::Ok);
-    let resp = send_recv(&mut writer, &mut reader, publish_frame("s", "e", b"v", 3)).await;
-    assert_eq!(resp.opcode, OpCode::PublishOk);
+    let c = client(&srv.tcp_addr, "legacy-tok").await;
+    c.create_stream(StreamSpec::named("s")).await.unwrap();
+    c.publish("s", PublishRecord::new("e", "v")).await.unwrap();
 
     // HTTP whoami shows `legacy-admin`.
     let r = reqwest::Client::new()
@@ -972,21 +774,16 @@ permissions = [{{ streams = "*", actions = ["publish", "admin"] }}]
     ));
     let srv = start_server(Some(creds.path().to_path_buf()), Some("legacy-tok".into())).await;
 
-    // Client A: env-var / legacy-admin token.
-    let (mut r1, mut w1) = connect_to(&srv.tcp_addr).await;
-    let resp = send_recv(&mut w1, &mut r1, connect_frame("a", Some("legacy-tok"), 1)).await;
-    assert_eq!(resp.opcode, OpCode::ConnectOk);
-    let resp = send_recv(&mut w1, &mut r1, create_stream_frame("shared", 2)).await;
-    assert_eq!(resp.opcode, OpCode::Ok);
-    let resp = send_recv(&mut w1, &mut r1, publish_frame("shared", "e", b"A", 3)).await;
-    assert_eq!(resp.opcode, OpCode::PublishOk);
+    let a = client(&srv.tcp_addr, "legacy-tok").await;
+    a.create_stream(StreamSpec::named("shared")).await.unwrap();
+    a.publish("shared", PublishRecord::new("e", "A"))
+        .await
+        .unwrap();
 
-    // Client B: TOML token.
-    let (mut r2, mut w2) = connect_to(&srv.tcp_addr).await;
-    let resp = send_recv(&mut w2, &mut r2, connect_frame("b", Some("orders-tok"), 1)).await;
-    assert_eq!(resp.opcode, OpCode::ConnectOk);
-    let resp = send_recv(&mut w2, &mut r2, publish_frame("shared", "e", b"B", 2)).await;
-    assert_eq!(resp.opcode, OpCode::PublishOk);
+    let b = client(&srv.tcp_addr, "orders-tok").await;
+    b.publish("shared", PublishRecord::new("e", "B"))
+        .await
+        .unwrap();
 }
 
 // 21 ------------------------------------------------------------------------
@@ -1015,19 +812,11 @@ async fn no_auth_configured_is_open() {
     // No file, no env token → open broker (Plan B default).
     let srv = start_server(None, None).await;
 
-    // TCP: Connect with AuthType::None + any op works.
-    let (mut reader, mut writer) = connect_to(&srv.tcp_addr).await;
-    let resp = send_recv(&mut writer, &mut reader, connect_frame("c", None, 1)).await;
-    assert_eq!(resp.opcode, OpCode::ConnectOk);
-    let resp = send_recv(&mut writer, &mut reader, create_stream_frame("open", 2)).await;
-    assert_eq!(resp.opcode, OpCode::Ok);
-    let resp = send_recv(
-        &mut writer,
-        &mut reader,
-        publish_frame("open", "e", b"v", 3),
-    )
-    .await;
-    assert_eq!(resp.opcode, OpCode::PublishOk);
+    let c = try_client(&srv.tcp_addr, None).await.unwrap();
+    c.create_stream(StreamSpec::named("open")).await.unwrap();
+    c.publish("open", PublishRecord::new("e", "v"))
+        .await
+        .unwrap();
 
     // HTTP: no bearer → 200 on admin endpoints.
     let r = reqwest::Client::new()
@@ -1245,53 +1034,54 @@ permissions = [{{ streams = "*", actions = ["admin", "publish", "subscribe"] }}]
         admin_hash = sha256_hex("admin-tok"),
     ));
     let srv = start_server(Some(creds.path().to_path_buf()), None).await;
+
     admin_setup_stream_and_consumer(&srv.tcp_addr, "admin-tok", "payments", "pc").await;
 
-    let query = |sql: &str, corr: u32| {
-        Frame::new(OpCode::Query, corr, Bytes::copy_from_slice(sql.as_bytes()))
-    };
-
-    let (mut r, mut w) = connect_to(&srv.tcp_addr).await;
-    send_recv(&mut w, &mut r, connect_frame("s", Some("scoped-tok"), 1)).await;
-    let resp = send_recv(&mut w, &mut r, query("SELECT * FROM payments", 2)).await;
-    assert_error(resp, 403);
-
-    let (mut r, mut w) = connect_to(&srv.tcp_addr).await;
-    send_recv(&mut w, &mut r, connect_frame("a", Some("admin-tok"), 1)).await;
-    let resp = send_recv(&mut w, &mut r, query("SELECT * FROM payments", 2)).await;
-    assert_eq!(resp.opcode, OpCode::QueryResult);
+    let scoped = client(&srv.tcp_addr, "scoped-tok").await;
+    assert_code(scoped.query("SELECT * FROM payments").await, 403);
+    let admin = client(&srv.tcp_addr, "admin-tok").await;
+    admin.query("SELECT * FROM payments").await.unwrap();
 }
 
 // Regression (REVIEW blocker 10) ---------------------------------------------
 #[tokio::test]
-async fn ack_cannot_target_another_consumer() {
+async fn consumer_ops_are_scoped_to_the_consumers_stream() {
     let creds = write_creds(&format!(
         r#"
+[[credentials]]
+name = "orders"
+token_sha256 = "{orders_hash}"
+permissions = [{{ streams = "orders-*", actions = ["publish", "subscribe"] }}]
+
 [[credentials]]
 name = "admin"
 token_sha256 = "{admin_hash}"
 permissions = [{{ streams = "*", actions = ["admin", "publish", "subscribe"] }}]
 "#,
+        orders_hash = sha256_hex("orders-tok"),
         admin_hash = sha256_hex("admin-tok"),
     ));
     let srv = start_server(Some(creds.path().to_path_buf()), None).await;
-    admin_setup_stream_and_consumer(&srv.tcp_addr, "admin-tok", "events", "mine").await;
-    {
-        let (mut r, mut w) = connect_to(&srv.tcp_addr).await;
-        send_recv(&mut w, &mut r, connect_frame("a", Some("admin-tok"), 1)).await;
-        let resp = send_recv(&mut w, &mut r, create_consumer_frame("victim", "events", 2)).await;
-        assert_eq!(resp.opcode, OpCode::Ok);
-    }
+    admin_setup_stream_and_consumer(&srv.tcp_addr, "admin-tok", "orders-x", "mine").await;
+    admin_setup_stream_and_consumer(&srv.tcp_addr, "admin-tok", "payments-x", "victim").await;
 
-    let (mut r, mut w) = connect_to(&srv.tcp_addr).await;
-    send_recv(&mut w, &mut r, connect_frame("a", Some("admin-tok"), 1)).await;
-    let resp = send_recv(&mut w, &mut r, subscribe_frame("mine", 2)).await;
-    assert_eq!(resp.opcode, OpCode::Ok);
-
-    let resp = send_recv(&mut w, &mut r, ack_frame("victim", 1_000, 3)).await;
-    assert_error(resp, 403);
-    let resp = send_recv(&mut w, &mut r, nack_frame("victim", 0, 4)).await;
-    assert_error(resp, 403);
-    let resp = send_recv(&mut w, &mut r, ack_frame("mine", 0, 5)).await;
-    assert_eq!(resp.opcode, OpCode::Ok);
+    let c = client(&srv.tcp_addr, "orders-tok").await;
+    c.subscribe("mine", 8).await.unwrap();
+    // Acting on a consumer of a stream outside the credential's scope is
+    // forbidden, whatever the offset.
+    assert_code(c.ack("victim", vec![1_000]).await, 403);
+    assert_code(c.nack("victim", 0, Duration::ZERO).await, 403);
+    assert_code(c.subscribe("victim", 8).await.map(|s| s.id()), 403);
+    assert_code(c.delete_consumer("victim").await, 403);
+    // In scope: fine.
+    c.ack("mine", vec![0]).await.unwrap();
+    // A dead-letter stream outside the publish scope is rejected.
+    assert_code(
+        c.create_consumer(ConsumerSpec {
+            dlq_stream: Some("payments-x".into()),
+            ..ConsumerSpec::new("sneaky", "orders-x")
+        })
+        .await,
+        403,
+    );
 }

@@ -331,7 +331,11 @@ mod tests {
         c.next_read = 2;
         assert_eq!(c.ack_floor(), 0);
         c.ack(1);
-        assert_eq!(c.ack_floor(), 0, "acking out of order doesn't move the floor");
+        assert_eq!(
+            c.ack_floor(),
+            0,
+            "acking out of order doesn't move the floor"
+        );
         c.ack(0);
         assert_eq!(c.ack_floor(), 2);
         assert!(!c.ack(0), "acks are idempotent");

@@ -15,7 +15,9 @@ use exspeed_protocol::opcodes::OpCode;
 
 use crate::common::{create_stream, publish_n, TestServer};
 
-async fn raw(addr: &str) -> (
+async fn raw(
+    addr: &str,
+) -> (
     FramedRead<tokio::net::tcp::OwnedReadHalf, ExspeedCodec>,
     FramedWrite<tokio::net::tcp::OwnedWriteHalf, ExspeedCodec>,
 ) {
@@ -74,9 +76,13 @@ async fn malformed_request_gets_400_and_connection_survives() {
     let f = recv(&mut r).await.unwrap();
     assert_eq!(f.opcode, OpCode::ConnectOk);
 
-    w.send(Frame::new(OpCode::Publish, 2, Bytes::from_static(b"garbage")))
-        .await
-        .unwrap();
+    w.send(Frame::new(
+        OpCode::Publish,
+        2,
+        Bytes::from_static(b"garbage"),
+    ))
+    .await
+    .unwrap();
     let f = recv(&mut r).await.unwrap();
     assert_eq!(f.correlation_id, 2);
     match Response::from_frame(&f).unwrap() {
@@ -101,9 +107,12 @@ async fn publish_then_read_with_filter() {
         ("orders.placed", "c"),
         ("orders.us.placed", "d"),
     ] {
-        c.publish("orders", PublishRecord::new(subject, v).key("k1").header("h", "1"))
-            .await
-            .unwrap();
+        c.publish(
+            "orders",
+            PublishRecord::new(subject, v).key("k1").header("h", "1"),
+        )
+        .await
+        .unwrap();
     }
 
     let all = c.read("orders", 0, 100, Duration::ZERO, "").await.unwrap();
@@ -132,10 +141,19 @@ async fn publish_then_read_with_filter() {
     assert_eq!(deep.records.len(), 4);
 
     // Paging with max_records resumes right after the last record.
-    let page = c.read("orders", 0, 1, Duration::ZERO, "orders.placed").await.unwrap();
+    let page = c
+        .read("orders", 0, 1, Duration::ZERO, "orders.placed")
+        .await
+        .unwrap();
     assert_eq!(page.records.len(), 1);
     let page2 = c
-        .read("orders", page.next_offset, 1, Duration::ZERO, "orders.placed")
+        .read(
+            "orders",
+            page.next_offset,
+            1,
+            Duration::ZERO,
+            "orders.placed",
+        )
         .await
         .unwrap();
     assert_eq!(page2.records[0].value.as_ref(), b"c");
@@ -156,7 +174,9 @@ async fn read_long_polls_for_new_data() {
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!wait.is_finished(), "read should be waiting");
-    c.publish("events", PublishRecord::new("e", "x")).await.unwrap();
+    c.publish("events", PublishRecord::new("e", "x"))
+        .await
+        .unwrap();
     let res = tokio::time::timeout(Duration::from_secs(5), wait)
         .await
         .unwrap()
