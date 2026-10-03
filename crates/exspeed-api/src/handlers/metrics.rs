@@ -7,6 +7,15 @@ use prometheus::{Encoder, TextEncoder};
 
 use crate::state::AppState;
 
+/// Prometheus metrics (text exposition format). No auth.
+#[utoipa::path(
+    get,
+    path = "/metrics",
+    tag = "health",
+    responses(
+        (status = 200, description = "Prometheus text format", content_type = "text/plain", body = String),
+    )
+)]
 pub async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // 1. Update uptime gauge.
     state

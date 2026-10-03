@@ -1,3 +1,4 @@
+pub mod backup;
 pub mod cluster;
 pub mod connections;
 pub mod connectors;
@@ -56,12 +57,16 @@ pub(crate) fn require_global_admin(id: &Identity) -> Option<Response> {
 pub fn build_router(state: Arc<AppState>) -> Router {
     use axum::middleware::from_fn_with_state;
 
-    // Unauthenticated routes: probes, metrics, webhooks (webhooks carry their
-    // own per-webhook auth — see handlers/webhooks.rs).
+    // Unauthenticated routes: probes, metrics, the OpenAPI document (it
+    // describes the API, not its data), webhooks (webhooks carry their own
+    // per-webhook auth — see handlers/webhooks.rs). Every route added to
+    // this function must also be listed in `crate::openapi::ApiDoc`; the
+    // `openapi_test` integration test enforces it.
     let unauth = Router::new()
         .route("/healthz", get(health::healthz))
         .route("/readyz", get(health::readyz))
         .route("/metrics", get(metrics::prometheus_metrics))
+        .route("/api/v1/openapi.json", get(crate::openapi::openapi_json))
         .route("/webhooks/{*path}", post(webhooks::handle_webhook))
         .with_state(state.clone());
 
@@ -162,6 +167,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/v1/connections/{name}",
             delete(connections::delete_connection),
         )
+        .route("/api/v1/backup", get(backup::backup))
         .layer(from_fn_with_state(
             state.clone(),
             crate::middleware::leader_gate,

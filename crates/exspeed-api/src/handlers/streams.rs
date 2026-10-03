@@ -5,8 +5,9 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bytes::Bytes;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use utoipa::{IntoParams, ToSchema};
 
 use exspeed_broker::broker_append::AppendResult;
 use exspeed_common::auth::Identity;
@@ -14,13 +15,16 @@ use exspeed_common::StreamName;
 use exspeed_storage::file::stream_config::{StreamConfig, StreamConfigFile};
 use exspeed_streams::{Record, StorageError};
 
+use crate::openapi::ErrorBody;
 use crate::state::AppState;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct CreateStreamRequest {
     pub name: String,
+    /// Retention by age; 0 or absent = default (7 days).
     #[serde(default)]
     pub max_age_secs: u64,
+    /// Retention by size; 0 or absent = default (10 GiB).
     #[serde(default)]
     pub max_bytes: u64,
     pub dedup_window_secs: Option<u64>,
@@ -30,26 +34,58 @@ pub struct CreateStreamRequest {
     pub compaction: bool,
 }
 
-/// Build a `StreamInfo`-shaped JSON value from a name + config.
+/// A stream's size, offsets and settings.
+#[derive(Serialize, ToSchema)]
+pub struct StreamInfo {
+    pub name: String,
+    /// Bytes on disk, all segments.
+    pub storage_bytes: u64,
+    /// High watermark: the offset the next record gets.
+    pub head_offset: u64,
+    pub max_age_secs: u64,
+    pub max_bytes: u64,
+    pub dedup_window_secs: u64,
+    pub dedup_max_entries: u64,
+    pub compaction: bool,
+    /// Internal streams start with `__` (consumer state, offsets, ...).
+    pub internal: bool,
+}
+
 fn stream_info_json(
     name: &str,
     config: &StreamConfig,
     storage_bytes: u64,
     head_offset: u64,
-) -> serde_json::Value {
-    json!({
-        "name": name,
-        "storage_bytes": storage_bytes,
-        "head_offset": head_offset,
-        "max_age_secs": config.max_age_secs,
-        "max_bytes": config.max_bytes,
-        "dedup_window_secs": config.dedup_window_secs,
-        "dedup_max_entries": config.dedup_max_entries,
-        "compaction": config.compaction,
-        "internal": name.starts_with(exspeed_common::INTERNAL_STREAM_PREFIX),
-    })
+) -> StreamInfo {
+    StreamInfo {
+        name: name.to_string(),
+        storage_bytes,
+        head_offset,
+        max_age_secs: config.max_age_secs,
+        max_bytes: config.max_bytes,
+        dedup_window_secs: config.dedup_window_secs,
+        dedup_max_entries: config.dedup_max_entries,
+        compaction: config.compaction,
+        internal: name.starts_with(exspeed_common::INTERNAL_STREAM_PREFIX),
+    }
 }
 
+/// Body of `201 Created` from `POST /api/v1/streams`.
+#[derive(Serialize, ToSchema)]
+pub struct StreamCreated {
+    pub name: String,
+    /// Always `created`.
+    pub status: String,
+}
+
+/// List every stream the server has (internal ones included).
+#[utoipa::path(
+    get,
+    path = "/api/v1/streams",
+    tag = "streams",
+    security(("bearer" = [])),
+    responses((status = 200, description = "All streams", body = Vec<StreamInfo>))
+)]
 pub async fn list_streams(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let names = state.storage.list_streams();
     let mut streams = Vec::new();
@@ -63,9 +99,24 @@ pub async fn list_streams(State(state): State<Arc<AppState>>) -> impl IntoRespon
         streams.push(stream_info_json(name, &config, storage_bytes, head_offset));
     }
 
-    (StatusCode::OK, Json(json!(streams)))
+    (StatusCode::OK, Json(streams))
 }
 
+/// Create a stream. Requires admin on the new stream's name.
+#[utoipa::path(
+    post,
+    path = "/api/v1/streams",
+    tag = "streams",
+    security(("bearer" = [])),
+    request_body = CreateStreamRequest,
+    responses(
+        (status = 201, description = "Created", body = StreamCreated),
+        (status = 400, description = "Invalid name or settings", body = ErrorBody),
+        (status = 403, description = "No admin permission on the stream", body = ErrorBody),
+        (status = 409, description = "Already exists", body = ErrorBody),
+        (status = 503, description = "Not the leader", body = ErrorBody),
+    )
+)]
 pub async fn create_stream(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<Arc<Identity>>>,
@@ -113,7 +164,10 @@ pub async fn create_stream(
     match state.broker.log.create_stream(&stream_name, &cfg).await {
         Ok(()) => (
             StatusCode::CREATED,
-            Json(json!({"name": body.name, "status": "created"})),
+            Json(StreamCreated {
+                name: body.name,
+                status: "created".into(),
+            }),
         )
             .into_response(),
         Err(e) => log_error_response(&state, &stream_name, e),
@@ -199,6 +253,20 @@ pub(crate) fn log_error_response(
     }
 }
 
+/// One stream's offsets, size and settings.
+#[utoipa::path(
+    get,
+    path = "/api/v1/streams/{name}",
+    tag = "streams",
+    security(("bearer" = [])),
+    params(("name" = String, Path, description = "Stream name")),
+    responses(
+        (status = 200, description = "The stream", body = StreamInfo),
+        (status = 400, description = "Invalid stream name", body = ErrorBody),
+        (status = 403, description = "No admin permission on the stream", body = ErrorBody),
+        (status = 404, description = "No such stream", body = ErrorBody),
+    )
+)]
 pub async fn get_stream(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -250,7 +318,8 @@ pub async fn get_stream(
 // PATCH /api/v1/streams/:name
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+/// Partial update; absent fields keep their value.
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateStreamRequest {
     pub max_age_secs: Option<u64>,
     pub max_bytes: Option<u64>,
@@ -258,6 +327,21 @@ pub struct UpdateStreamRequest {
     pub dedup_max_entries: Option<u64>,
 }
 
+/// Update retention and dedup settings.
+#[utoipa::path(
+    patch,
+    path = "/api/v1/streams/{name}",
+    tag = "streams",
+    security(("bearer" = [])),
+    params(("name" = String, Path, description = "Stream name")),
+    request_body = UpdateStreamRequest,
+    responses(
+        (status = 200, description = "The updated stream", body = StreamInfo),
+        (status = 400, description = "Invalid settings, or dedup_max_entries below the live entry count", body = ErrorBody),
+        (status = 403, description = "No admin permission on the stream", body = ErrorBody),
+        (status = 404, description = "No such stream", body = ErrorBody),
+    )
+)]
 pub async fn patch_stream(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -366,17 +450,49 @@ pub async fn patch_stream(
 // Publish
 // ---------------------------------------------------------------------------
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, ToSchema)]
 pub struct PublishBody {
+    /// Defaults to the stream name.
     #[serde(default)]
     pub subject: String,
     #[serde(default)]
     pub key: Option<String>,
+    /// Any JSON value; stored as its JSON encoding.
     pub data: serde_json::Value,
+    /// Idempotency key (same as the `x-idempotency-key` header).
     #[serde(default)]
     pub msg_id: Option<String>,
 }
 
+/// Result of an HTTP publish.
+#[derive(Serialize, ToSchema)]
+pub struct PublishResponse {
+    pub offset: u64,
+    /// True when `msg_id` matched an earlier record within the dedup
+    /// window; `offset` is then that record's.
+    pub duplicate: bool,
+}
+
+/// Publish one record.
+#[utoipa::path(
+    post,
+    path = "/api/v1/streams/{name}/publish",
+    tag = "streams",
+    security(("bearer" = [])),
+    params(
+        ("name" = String, Path, description = "Stream name"),
+        ("x-idempotency-key" = Option<String>, Header, description = "Idempotency key, used when the body has no msg_id"),
+    ),
+    request_body = PublishBody,
+    responses(
+        (status = 201, description = "Stored", body = PublishResponse),
+        (status = 200, description = "Duplicate of an earlier record (nothing stored)", body = PublishResponse),
+        (status = 400, description = "Invalid record", body = ErrorBody),
+        (status = 404, description = "No such stream", body = ErrorBody),
+        (status = 409, description = "msg_id reused with a different body", body = ErrorBody),
+        (status = 503, description = "Not the leader, dedup rebuild in progress, or dedup map full (Retry-After)", body = ErrorBody),
+    )
+)]
 pub async fn publish_to_stream(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -465,12 +581,18 @@ pub async fn publish_to_stream(
             match result {
                 AppendResult::Written(offset, _) => (
                     StatusCode::CREATED,
-                    Json(json!({"offset": offset.0, "duplicate": false})),
+                    Json(PublishResponse {
+                        offset: offset.0,
+                        duplicate: false,
+                    }),
                 )
                     .into_response(),
                 AppendResult::Duplicate(offset) => (
                     StatusCode::OK,
-                    Json(json!({"offset": offset.0, "duplicate": true})),
+                    Json(PublishResponse {
+                        offset: offset.0,
+                        duplicate: true,
+                    }),
                 )
                     .into_response(),
             }
@@ -483,12 +605,59 @@ pub async fn publish_to_stream(
 // DELETE /api/v1/streams/:name
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct DeleteStreamQuery {
+    /// Also delete the connectors, queries and consumers that reference
+    /// the stream.
     #[serde(default)]
     pub force: bool,
 }
 
+/// What a forced delete removed along with the stream.
+#[derive(Serialize, ToSchema)]
+pub struct Cascaded {
+    pub consumers: Vec<String>,
+    pub connectors: Vec<String>,
+    pub queries: Vec<String>,
+    pub subscriptions_dropped: u64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct DeleteStreamResponse {
+    pub deleted: String,
+    pub cascaded: Cascaded,
+}
+
+/// What still references a stream (`409` from a delete without `force`).
+#[derive(Serialize, ToSchema)]
+pub struct StreamBlockers {
+    pub consumers: Vec<String>,
+    pub connectors: Vec<String>,
+    pub queries: Vec<String>,
+    pub subscriptions: u64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct StreamInUseError {
+    pub error: String,
+    pub blockers: StreamBlockers,
+}
+
+/// Delete a stream.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/streams/{name}",
+    tag = "streams",
+    security(("bearer" = [])),
+    params(("name" = String, Path, description = "Stream name"), DeleteStreamQuery),
+    responses(
+        (status = 200, description = "Deleted", body = DeleteStreamResponse),
+        (status = 403, description = "No admin permission on the stream", body = ErrorBody),
+        (status = 404, description = "No such stream", body = ErrorBody),
+        (status = 409, description = "Still referenced; retry with force=true", body = StreamInUseError),
+    )
+)]
 pub async fn delete_stream(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -649,7 +818,8 @@ async fn collect_blockers(state: &Arc<AppState>, stream: &str) -> Blockers {
     b
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ReadParams {
     /// First offset to return (default: the earliest retained record).
     pub from: Option<u64>,
@@ -678,8 +848,48 @@ fn payload_json(b: &[u8]) -> (serde_json::Value, &'static str) {
     }
 }
 
+/// One record as returned by `GET /api/v1/streams/{name}/records`.
+#[derive(Serialize, ToSchema)]
+pub struct RecordView {
+    pub offset: u64,
+    pub timestamp_ms: u64,
+    pub subject: String,
+    /// The key as (lossy) UTF-8.
+    pub key: Option<String>,
+    /// Embedded JSON when the payload parses as JSON, else a UTF-8 string,
+    /// else base64 (see `encoding`).
+    pub value: serde_json::Value,
+    /// `json`, `utf8` or `base64`.
+    pub encoding: String,
+    /// `[name, value]` pairs.
+    #[schema(value_type = Vec<Vec<String>>)]
+    pub headers: Vec<(String, String)>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct RecordsPage {
+    pub stream: String,
+    pub records: Vec<RecordView>,
+    /// Pass as `from` to continue.
+    pub next_offset: u64,
+    pub high_watermark: u64,
+}
+
 /// `GET /api/v1/streams/{name}/records?from=&limit=&filter=` — browse a
 /// stream without creating a consumer. Returns `next_offset` to continue.
+#[utoipa::path(
+    get,
+    path = "/api/v1/streams/{name}/records",
+    tag = "streams",
+    security(("bearer" = [])),
+    params(("name" = String, Path, description = "Stream name"), ReadParams),
+    responses(
+        (status = 200, description = "A page of records", body = RecordsPage),
+        (status = 400, description = "Invalid stream name or filter", body = ErrorBody),
+        (status = 403, description = "No admin permission on the stream", body = ErrorBody),
+        (status = 404, description = "No such stream", body = ErrorBody),
+    )
+)]
 pub async fn read_records(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -743,15 +953,18 @@ pub async fn read_records(
                 continue;
             }
             let (value, encoding) = payload_json(&r.value);
-            out.push(json!({
-                "offset": r.offset.0,
-                "timestamp_ms": r.timestamp / 1_000_000,
-                "subject": r.subject,
-                "key": r.key.as_ref().map(|k| String::from_utf8_lossy(k).into_owned()),
-                "value": value,
-                "encoding": encoding,
-                "headers": r.headers.iter().map(|(k, v)| json!([k, v])).collect::<Vec<_>>(),
-            }));
+            out.push(RecordView {
+                offset: r.offset.0,
+                timestamp_ms: r.timestamp / 1_000_000,
+                subject: r.subject.clone(),
+                key: r
+                    .key
+                    .as_ref()
+                    .map(|k| String::from_utf8_lossy(k).into_owned()),
+                value,
+                encoding: encoding.to_string(),
+                headers: r.headers.clone(),
+            });
             if out.len() >= limit {
                 cursor = exspeed_common::Offset(r.offset.0 + 1);
                 break 'scan;
@@ -763,12 +976,12 @@ pub async fn read_records(
     }
     (
         StatusCode::OK,
-        Json(json!({
-            "stream": name,
-            "records": out,
-            "next_offset": cursor.0,
-            "high_watermark": high_watermark.0,
-        })),
+        Json(RecordsPage {
+            stream: name,
+            records: out,
+            next_offset: cursor.0,
+            high_watermark: high_watermark.0,
+        }),
     )
         .into_response()
 }

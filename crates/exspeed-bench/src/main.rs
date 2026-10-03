@@ -55,6 +55,9 @@ enum Cmd {
     Latency(ScenarioArgs),
     /// Fan-out scaling benchmark
     Fanout(ScenarioArgs),
+    /// Catch-up throughput: drain an on-disk backlog with reads and with a
+    /// push consumer (Exspeed only)
+    Catchup(ScenarioArgs),
     /// ExQL continuous query throughput benchmark
     Exql(ExqlArgs),
     /// Run every scenario and write a single JSON result
@@ -81,6 +84,40 @@ struct ScenarioArgs {
     output: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = TargetArg::Exspeed)]
     target: TargetArg,
+    /// Override the profile's scenario duration (seconds)
+    #[arg(long)]
+    duration_secs: Option<u64>,
+    /// Override the profile's publish payload sizes (bytes, comma-separated)
+    #[arg(long, value_delimiter = ',')]
+    payload_sizes: Option<Vec<usize>>,
+    /// Override the profile's latency target rate (msg/s)
+    #[arg(long)]
+    rate: Option<u64>,
+    /// Override the profile's catch-up backlog size (records)
+    #[arg(long)]
+    catchup_records: Option<u64>,
+}
+
+impl ScenarioArgs {
+    fn profile(&self) -> Profile {
+        let mut p = self.profile.to_profile();
+        if let Some(secs) = self.duration_secs {
+            let d = std::time::Duration::from_secs(secs);
+            p.publish_duration = d;
+            p.latency_duration = d;
+            p.fanout_duration = d;
+        }
+        if let Some(sizes) = &self.payload_sizes {
+            p.publish_payload_sizes = sizes.clone();
+        }
+        if let Some(rate) = self.rate {
+            p.latency_target_rate = rate;
+        }
+        if let Some(n) = self.catchup_records {
+            p.catchup_records = n;
+        }
+        p
+    }
 }
 
 #[derive(clap::Args)]
@@ -167,24 +204,30 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Publish(a) => {
-            let profile = a.profile.to_profile();
+            let profile = a.profile();
             let mut result = new_result(&profile, a.sku, a.storage);
             result.scenarios.publish =
                 scenarios::publish::run(a.target.to_target(), &a.server, &profile).await?;
             write_output(&result, a.output)
         }
         Cmd::Latency(a) => {
-            let profile = a.profile.to_profile();
+            let profile = a.profile();
             let mut result = new_result(&profile, a.sku, a.storage);
             result.scenarios.latency =
                 Some(scenarios::latency::run(a.target.to_target(), &a.server, &profile).await?);
             write_output(&result, a.output)
         }
         Cmd::Fanout(a) => {
-            let profile = a.profile.to_profile();
+            let profile = a.profile();
             let mut result = new_result(&profile, a.sku, a.storage);
             result.scenarios.fanout =
                 scenarios::fanout::run(a.target.to_target(), &a.server, &profile).await?;
+            write_output(&result, a.output)
+        }
+        Cmd::Catchup(a) => {
+            let profile = a.profile();
+            let mut result = new_result(&profile, a.sku, a.storage);
+            result.scenarios.catchup = Some(scenarios::catchup::run(&a.server, &profile).await?);
             write_output(&result, a.output)
         }
         Cmd::Exql(a) => {
@@ -204,6 +247,10 @@ async fn main() -> Result<()> {
             result.scenarios.latency =
                 Some(scenarios::latency::run(target, &a.server, &profile).await?);
             result.scenarios.fanout = scenarios::fanout::run(target, &a.server, &profile).await?;
+            if matches!(target, exspeed_bench::driver::Target::Exspeed) {
+                result.scenarios.catchup =
+                    Some(scenarios::catchup::run(&a.server, &profile).await?);
+            }
             result.scenarios.exql =
                 Some(scenarios::exql::run(&a.server, &a.api, &profile, 5_000, 500_000, 6).await?);
             write_output(&result, Some(a.output))

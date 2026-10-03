@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "profile": "local",
+  "exspeed_version": "0.5.0",
+  "git_sha": "89202d9",
+  "host": {
+    "sku": "cloud VM (4 vCPU Xeon @ 2.8GHz, KVM)",
+    "vcpu": 4,
+    "ram_gb": 15,
+    "storage": "virtio disk, ext4",
+    "kernel": "6.18.44-fc-v64",
+    "os": "Linux (Ubuntu 24.04)"
+  },
+  "run_timestamp": "2026-10-03T08:24:11.762989577Z",
+  "scenarios": {
+    "latency": null,
+    "fanout": [
+      {
+        "consumers": 1,
+        "producer_rate": 5000,
+        "aggregate_consumer_rate": 4978.748221581481,
+        "max_lag_msgs": 1
+      },
+      {
+        "consumers": 4,
+        "producer_rate": 5000,
+        "aggregate_consumer_rate": 19910.73399857447,
+        "max_lag_msgs": 1
+      }
+    ],
+    "exql": null
+  }
+}

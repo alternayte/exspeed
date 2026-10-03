@@ -184,6 +184,28 @@ pub fn benchmarks_md(r: &BenchResult) -> String {
         let _ = writeln!(s);
     }
 
+    if let Some(c) = &r.scenarios.catchup {
+        let _ = writeln!(s, "## Catch-up (backlog drain)\n");
+        let _ = writeln!(
+            s,
+            "{} records of {} B already on disk:\n",
+            c.records, c.payload_bytes
+        );
+        let _ = writeln!(s, "| Reader | msg/s | MB/s |");
+        let _ = writeln!(s, "|--------|-------|------|");
+        let _ = writeln!(
+            s,
+            "| Stateless reads (1000 per request) | {:.0} | {:.1} |",
+            c.read_msg_per_sec, c.read_mb_per_sec
+        );
+        let _ = writeln!(
+            s,
+            "| Push consumer (deliver + ack) | {:.0} | {:.1} |",
+            c.consume_msg_per_sec, c.consume_mb_per_sec
+        );
+        let _ = writeln!(s);
+    }
+
     if let Some(e) = &r.scenarios.exql {
         let _ = writeln!(s, "## ExQL\n");
         let _ = writeln!(s, "Query: `{}`\n", e.query);

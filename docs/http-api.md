@@ -2,14 +2,23 @@
 
 Base URL: `http://<host>:8080`. Request and response bodies are JSON.
 
+The server describes this API as an OpenAPI 3.1 document at
+`GET /api/v1/openapi.json` (no auth needed). Load it into any OpenAPI tool
+(Swagger Editor, Redoc, an HTTP client generator); the server doesn't ship a
+UI. Schemas and status codes are there; this page is the overview.
+
+```bash
+curl -s localhost:8080/api/v1/openapi.json | jq '.paths | keys'
+```
+
 ## Authentication
 
 When auth is enabled, every `/api/v1/*` request must carry
 `Authorization: Bearer <token>`. Every `/api/v1/*` route except `whoami`
-requires an **admin** permission:
+requires an **admin** permission (`openapi.json` needs none):
 
-- **Global admin** for queries, tables, connectors, connections, leases
-  and cluster routes.
+- **Global admin** for queries, tables, connectors, connections, leases,
+  cluster routes and backups.
 - **Admin on the stream** for stream routes.
 
 | Path | Auth |
@@ -17,10 +26,11 @@ requires an **admin** permission:
 | `GET /healthz` | none |
 | `GET /readyz` | none |
 | `GET /metrics` | none |
+| `GET /api/v1/openapi.json` | none |
 | `POST /webhooks/*` | none, unless the webhook connector sets its own |
 
 In multi-pod mode, standbys answer `503` on `/api/v1/*`. The exceptions are
-`/api/v1/leases` and `/api/v1/whoami`. See [high-availability.md](high-availability.md).
+`/api/v1/leases`, `/api/v1/whoami` and `/api/v1/openapi.json`. See [high-availability.md](high-availability.md).
 
 ## Endpoints
 
@@ -142,6 +152,13 @@ been removed.
 | `GET` | `/api/v1/whoami` | Identity and permissions of the caller's token |
 | `GET` | `/api/v1/leases` | The live `cluster:leader` lease record: holder, epoch, endpoints, ISR |
 | `GET` | `/api/v1/cluster` | Any node. Role, epoch, leader endpoints; ISR and follower lag on the leader, replication session on a follower |
+
+### Operations
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/backup` | Online backup: a tar archive (`application/x-tar`) streamed while writes continue. The first entry is the `exspeed-backup.json` manifest with each stream's `[earliest_offset, next_offset)`. Global admin. Use `exspeed backup` / `exspeed restore`; see [operations.md](operations.md#backup-and-restore). |
+| `GET` | `/api/v1/openapi.json` | This API as an OpenAPI 3.1 document. No auth. |
 
 ### Webhooks
 

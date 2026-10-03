@@ -6,15 +6,19 @@ use axum::{Extension, Json};
 use exspeed_common::auth::Identity;
 use serde::Serialize;
 
-#[derive(Serialize)]
-struct WhoamiResponse {
+/// The caller's identity.
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct WhoamiResponse {
     name: String,
     permissions: Vec<PermissionJson>,
 }
 
-#[derive(Serialize)]
-struct PermissionJson {
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct PermissionJson {
+    /// Stream glob (`*`, `orders-*`).
     streams: String,
+    /// `publish`, `subscribe`, `admin`.
+    #[schema(value_type = Vec<String>)]
     actions: Vec<&'static str>,
 }
 
@@ -22,6 +26,16 @@ struct PermissionJson {
 /// globally disabled, reports a synthetic `anonymous` identity with full
 /// permissions so client-side debugging works consistently regardless of
 /// broker config.
+#[utoipa::path(
+    get,
+    path = "/api/v1/whoami",
+    tag = "cluster",
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "Name and permissions (anonymous with full permissions when auth is off)", body = WhoamiResponse),
+        (status = 401, description = "Missing or unknown token", body = crate::openapi::ErrorBody),
+    )
+)]
 pub async fn whoami(identity: Option<Extension<Arc<Identity>>>) -> Response {
     let Some(Extension(id)) = identity else {
         let body = WhoamiResponse {

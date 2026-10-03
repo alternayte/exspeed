@@ -110,3 +110,21 @@ async fn exql_returns_zero_with_warning_when_no_candidate_passes() {
     assert!(r.warning.is_some(), "warning should be set");
     assert!(r.warning.as_ref().unwrap().contains("no-candidate-passed"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catchup_scenario_drains_the_backlog() {
+    let srv = start().await;
+    let mut profile = Profile::local();
+    profile.catchup_records = 5_000;
+    let r = exspeed_bench::scenarios::catchup::run(&srv.tcp_addr, &profile)
+        .await
+        .unwrap();
+    assert_eq!(r.records, 5_000);
+    assert!(r.read_msg_per_sec > 0.0);
+    assert!(r.consume_msg_per_sec > 0.0);
+    // A second run reuses the backlog.
+    let again = exspeed_bench::scenarios::catchup::run(&srv.tcp_addr, &profile)
+        .await
+        .unwrap();
+    assert_eq!(again.records, 5_000);
+}
