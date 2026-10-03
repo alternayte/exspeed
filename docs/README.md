@@ -16,7 +16,7 @@
 | [ExQL](exql.md) | SQL over streams: bounded and continuous queries, views, windows, joins, indexes |
 | [Connectors](connectors.md) | Source and sink plugins, config format, retry and DLQ |
 | [Idempotent publish](idempotent-publish.md) | `msg_id` dedup semantics, sizing, alerts |
-| [TypeScript SDK](../sdks/typescript/README.md) | `@exspeed/sdk` |
+| [TypeScript SDK](../sdks/typescript/README.md) | `@exspeed/sdk`: publishing, push and pull consumers, reconnection, TLS and auth |
 
 ## Running Exspeed
 
