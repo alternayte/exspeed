@@ -49,6 +49,13 @@ pub struct StreamInfo {
     pub compaction: bool,
     /// Internal streams start with `__` (consumer state, offsets, ...).
     pub internal: bool,
+    /// `healthy`, or `failed`: the partition is fenced read-only after an
+    /// IO error it could not roll back. Writes fail until a restart runs
+    /// recovery; reads keep working.
+    pub status: String,
+    /// Why the partition failed (only when `status` is `failed`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
 }
 
 fn stream_info_json(
@@ -56,8 +63,16 @@ fn stream_info_json(
     config: &StreamConfig,
     storage_bytes: u64,
     head_offset: u64,
+    failure: Option<String>,
 ) -> StreamInfo {
     StreamInfo {
+        status: if failure.is_some() {
+            "failed"
+        } else {
+            "healthy"
+        }
+        .to_string(),
+        failure,
         name: name.to_string(),
         storage_bytes,
         head_offset,
@@ -70,6 +85,13 @@ fn stream_info_json(
     }
 }
 
+fn partition_failure(state: &AppState, stream: &str) -> Option<String> {
+    match state.storage.partition_status(stream) {
+        Some(exspeed_storage::file::PartitionStatus::Failed { reason }) => Some(reason),
+        _ => None,
+    }
+}
+
 /// Body of `201 Created` from `POST /api/v1/streams`.
 #[derive(Serialize, ToSchema)]
 pub struct StreamCreated {
@@ -78,25 +100,64 @@ pub struct StreamCreated {
     pub status: String,
 }
 
-/// List every stream the server has (internal ones included).
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ListStreamsQuery {
+    /// Also list internal `__` streams (consumer state, catalogs, offsets).
+    /// Only honoured for global admins.
+    #[serde(default)]
+    pub internal: bool,
+}
+
+/// List the streams the caller has any permission on (admin, publish or
+/// subscribe). Internal `__` streams are hidden unless `internal=true` and
+/// the caller is a global admin.
 #[utoipa::path(
     get,
     path = "/api/v1/streams",
     tag = "streams",
     security(("bearer" = [])),
-    responses((status = 200, description = "All streams", body = Vec<StreamInfo>))
+    params(ListStreamsQuery),
+    responses((status = 200, description = "The streams visible to the caller", body = Vec<StreamInfo>))
 )]
-pub async fn list_streams(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let names = state.storage.list_streams();
+pub async fn list_streams(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ListStreamsQuery>,
+    identity: Option<Extension<Arc<Identity>>>,
+) -> impl IntoResponse {
+    use exspeed_common::auth::Action;
+    let mut names = state.storage.list_streams();
+    names.sort();
     let mut streams = Vec::new();
 
     for name in &names {
+        let Ok(stream_name) = StreamName::try_from(name.as_str()) else {
+            continue;
+        };
+        let global_admin = identity.as_ref().is_none_or(|e| e.0.has_global_admin());
+        if stream_name.is_internal() && !(q.internal && global_admin) {
+            continue;
+        }
+        if let Some(Extension(id)) = identity.as_ref() {
+            if !(id.authorize(Action::Admin, &stream_name)
+                || id.authorize(Action::Publish, &stream_name)
+                || id.authorize(Action::Subscribe, &stream_name))
+            {
+                continue;
+            }
+        }
         let storage_bytes = state.storage.stream_storage_bytes(name).unwrap_or(0);
         let head_offset = state.storage.stream_head_offset(name).unwrap_or(0);
         let stream_dir = state.storage.data_dir().join("streams").join(name);
         let config = StreamConfig::load(&stream_dir).unwrap_or_default();
 
-        streams.push(stream_info_json(name, &config, storage_bytes, head_offset));
+        streams.push(stream_info_json(
+            name,
+            &config,
+            storage_bytes,
+            head_offset,
+            partition_failure(&state, name),
+        ));
     }
 
     (StatusCode::OK, Json(streams))
@@ -140,6 +201,9 @@ pub async fn create_stream(
         if let Some(resp) = super::require_scoped_admin(&id, &stream_name) {
             return resp;
         }
+    }
+    if let Some(resp) = super::forbid_internal_write(&stream_name) {
+        return resp;
     }
 
     // Build a full config with defaults applied for any missing dedup fields.
@@ -310,7 +374,13 @@ pub async fn get_stream(
 
     (
         StatusCode::OK,
-        Json(stream_info_json(&name, &config, storage_bytes, head_offset)),
+        Json(stream_info_json(
+            &name,
+            &config,
+            storage_bytes,
+            head_offset,
+            partition_failure(&state, &name),
+        )),
     )
         .into_response()
 }
@@ -364,6 +434,9 @@ pub async fn patch_stream(
         if let Some(resp) = super::require_scoped_admin(&id, &stream_name) {
             return resp;
         }
+    }
+    if let Some(resp) = super::forbid_internal_write(&stream_name) {
+        return resp;
     }
 
     let stream_dir = state.storage.data_dir().join("streams").join(&name);
@@ -442,7 +515,13 @@ pub async fn patch_stream(
 
     (
         StatusCode::OK,
-        Json(stream_info_json(&name, &cfg, storage_bytes, head_offset)),
+        Json(stream_info_json(
+            &name,
+            &cfg,
+            storage_bytes,
+            head_offset,
+            partition_failure(&state, &name),
+        )),
     )
         .into_response()
 }
@@ -489,6 +568,7 @@ pub struct PublishResponse {
         (status = 201, description = "Stored", body = PublishResponse),
         (status = 200, description = "Duplicate of an earlier record (nothing stored)", body = PublishResponse),
         (status = 400, description = "Invalid record", body = ErrorBody),
+        (status = 403, description = "No admin permission on the stream, or an internal `__` stream", body = ErrorBody),
         (status = 404, description = "No such stream", body = ErrorBody),
         (status = 409, description = "msg_id reused with a different body", body = ErrorBody),
         (status = 503, description = "Not the leader, dedup rebuild in progress, or dedup map full (Retry-After)", body = ErrorBody),
@@ -518,6 +598,9 @@ pub async fn publish_to_stream(
         if let Some(resp) = super::require_scoped_admin(&id, &stream_name) {
             return resp;
         }
+    }
+    if let Some(resp) = super::forbid_internal_write(&stream_name) {
+        return resp;
     }
 
     let subject = if body.subject.is_empty() {
@@ -681,6 +764,9 @@ pub async fn delete_stream(
             return resp;
         }
     }
+    if let Some(resp) = super::forbid_internal_write(&stream_name) {
+        return resp;
+    }
 
     if state.storage.stream_storage_bytes(&name).is_none() {
         return (
@@ -724,6 +810,7 @@ pub async fn delete_stream(
                 )
                     .into_response();
             }
+            state.metrics.forget_query(id);
         }
 
         let cascaded_consumers = blockers.consumers.clone();
@@ -829,7 +916,14 @@ pub struct ReadParams {
     /// Subject filter (`orders.*`, `orders.>`); empty matches all.
     #[serde(default)]
     pub filter: String,
+    /// Long-poll: when nothing at or after `from` matches yet, wait up to
+    /// this many milliseconds (max 30000) for new records instead of
+    /// answering an empty page at once. Default 0.
+    pub wait_ms: Option<u64>,
 }
+
+/// Longest `wait_ms` a records request may ask for.
+const MAX_RECORDS_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Render a payload for JSON: embedded as JSON when it parses, as a string
 /// when it is UTF-8, and base64 otherwise.
@@ -876,8 +970,11 @@ pub struct RecordsPage {
     pub high_watermark: u64,
 }
 
-/// `GET /api/v1/streams/{name}/records?from=&limit=&filter=` — browse a
-/// stream without creating a consumer. Returns `next_offset` to continue.
+/// `GET /api/v1/streams/{name}/records?from=&limit=&filter=&wait_ms=` —
+/// browse a stream without creating a consumer. Returns `next_offset` to
+/// continue. Needs `subscribe` or `admin` on the stream; served by every
+/// node (followers read their replica). With `wait_ms`, a caught-up reader
+/// waits for new records instead of polling.
 #[utoipa::path(
     get,
     path = "/api/v1/streams/{name}/records",
@@ -887,7 +984,7 @@ pub struct RecordsPage {
     responses(
         (status = 200, description = "A page of records", body = RecordsPage),
         (status = 400, description = "Invalid stream name or filter", body = ErrorBody),
-        (status = 403, description = "No admin permission on the stream", body = ErrorBody),
+        (status = 403, description = "No subscribe or admin permission on the stream", body = ErrorBody),
         (status = 404, description = "No such stream", body = ErrorBody),
     )
 )]
@@ -908,8 +1005,14 @@ pub async fn read_records(
         }
     };
     if let Some(Extension(id)) = identity.as_ref() {
-        if let Some(resp) = super::require_scoped_admin(id, &stream_name) {
-            return resp;
+        use exspeed_common::auth::Action;
+        if !id.authorize(Action::Subscribe, &stream_name)
+            && !id.authorize(Action::Admin, &stream_name)
+        {
+            state
+                .metrics
+                .auth_denied("forbidden", "http", "/api/v1/streams/{name}/records");
+            return super::forbid();
         }
     }
     let filter = match exspeed_common::SubjectFilter::parse(&params.filter) {
@@ -920,30 +1023,82 @@ pub async fn read_records(
     };
     let limit = params.limit.unwrap_or(100).clamp(1, 1000);
     let storage = &state.broker.storage;
+    // Subscribe before the first scan so an append between the scan and the
+    // wait isn't missed.
+    let mut appends = storage.watch_appends(&stream_name);
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_millis(params.wait_ms.unwrap_or(0)).min(MAX_RECORDS_WAIT);
     let (earliest, _) = match storage.stream_bounds(&stream_name).await {
         Ok(b) => b,
         Err(e) => return log_error_response(&state, &stream_name, e.into()),
     };
-    let mut cursor = exspeed_common::Offset(params.from.unwrap_or(earliest.0).max(earliest.0));
+    let mut start = exspeed_common::Offset(params.from.unwrap_or(earliest.0).max(earliest.0));
+    loop {
+        let page = match scan_records(storage.as_ref(), &stream_name, start, &filter, limit).await {
+            Ok(p) => p,
+            Err(e) => return log_error_response(&state, &stream_name, e.into()),
+        };
+        let (out, cursor, high_watermark) = page;
+        let caught_up = out.is_empty() && cursor >= high_watermark;
+        if caught_up && tokio::time::Instant::now() < deadline {
+            if let Some(rx) = appends.as_mut() {
+                // Wake when the high watermark passes the cursor (or give
+                // up at the deadline and answer the empty page).
+                let woke = tokio::time::timeout_at(deadline, rx.wait_for(|hw| *hw > cursor.0))
+                    .await
+                    .is_ok_and(|r| r.is_ok());
+                if woke {
+                    // Nothing matched up to `cursor`; scan on from there.
+                    start = cursor;
+                    continue;
+                }
+            }
+        }
+        return (
+            StatusCode::OK,
+            Json(RecordsPage {
+                stream: name,
+                records: out,
+                next_offset: cursor.0,
+                high_watermark: high_watermark.0,
+            }),
+        )
+            .into_response();
+    }
+}
+
+/// One bounded scan from `from`: the matching records (at most `limit`),
+/// the offset to continue at, and the high watermark.
+async fn scan_records(
+    storage: &dyn exspeed_streams::StorageEngine,
+    stream_name: &StreamName,
+    from: exspeed_common::Offset,
+    filter: &exspeed_common::SubjectFilter,
+    limit: usize,
+) -> Result<
+    (
+        Vec<RecordView>,
+        exspeed_common::Offset,
+        exspeed_common::Offset,
+    ),
+    StorageError,
+> {
+    let mut cursor = from;
     let mut out = Vec::new();
     let mut high_watermark = cursor;
     // Bounded scan so a selective filter can't turn one request into a
     // full-stream read.
     'scan: for _ in 0..16 {
-        let batch = match storage
+        let batch = storage
             .read_batch(
-                &stream_name,
+                stream_name,
                 cursor,
                 exspeed_streams::ReadLimits {
                     max_records: 1000,
                     max_bytes: 4 * 1024 * 1024,
                 },
             )
-            .await
-        {
-            Ok(b) => b,
-            Err(e) => return log_error_response(&state, &stream_name, e.into()),
-        };
+            .await?;
         high_watermark = batch.high_watermark;
         cursor = batch.next_offset;
         if batch.records.is_empty() {
@@ -975,14 +1130,5 @@ pub async fn read_records(
             break;
         }
     }
-    (
-        StatusCode::OK,
-        Json(RecordsPage {
-            stream: name,
-            records: out,
-            next_offset: cursor.0,
-            high_watermark: high_watermark.0,
-        }),
-    )
-        .into_response()
+    Ok((out, cursor, high_watermark))
 }

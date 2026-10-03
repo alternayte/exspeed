@@ -897,3 +897,119 @@ async fn randomized_partitions_and_restarts_lose_no_acknowledged_write() {
         wait_replicated(s, "jep", &truth).await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn followers_serve_record_reads_and_long_polls() {
+    let o = Opts::new();
+    let dirs = Dirs::new(2);
+    let a = start_node(&o, dirs.path(0)).await;
+    let b = start_node(&o, dirs.path(1)).await;
+    assert_eq!(leader_of(&[&a, &b]).await, 0);
+    let la = a.client().await;
+    la.create_stream(StreamSpec::named("t")).await.unwrap();
+    la.publish("t", PublishRecord::new("t.x", "0"))
+        .await
+        .unwrap();
+    let want = read_all(&la, "t").await;
+    wait_replicated(&b, "t", &want).await;
+
+    // The follower answers reads from its replica (no 503)...
+    let page: serde_json::Value = reqwest::get(b.api_url("/api/v1/streams/t/records"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(page["records"].as_array().unwrap().len(), 1, "{page}");
+
+    // ...and a long poll on it wakes when the next record replicates.
+    let wait = reqwest::get(b.api_url("/api/v1/streams/t/records?from=1&wait_ms=15000"));
+    let publish = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        la.publish("t", PublishRecord::new("t.x", "1"))
+            .await
+            .unwrap();
+    };
+    let started = std::time::Instant::now();
+    let (resp, ()) = tokio::join!(wait, publish);
+    let page: serde_json::Value = resp.unwrap().json().await.unwrap();
+    assert_eq!(page["records"][0]["offset"], 1, "{page}");
+    assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn continuous_queries_are_rejected_on_a_follower() {
+    let o = Opts::new();
+    let dirs = Dirs::new(2);
+    let a = start_node(&o, dirs.path(0)).await;
+    let b = start_node(&o, dirs.path(1)).await;
+    assert_eq!(leader_of(&[&a, &b]).await, 0);
+    let la = a.client().await;
+    la.create_stream(StreamSpec::named("src")).await.unwrap();
+    wait_replicated(&b, "src", &[]).await;
+
+    let sql = r#"CREATE STREAM out_s AS SELECT * FROM "src""#;
+    // HTTP: refused with 503 on the follower (both routes).
+    for path in ["/api/v1/queries/continuous", "/api/v1/queries"] {
+        let r = reqwest::Client::new()
+            .post(b.api_url(path))
+            .json(&serde_json::json!({ "sql": sql }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 503, "{path}");
+    }
+    // (TCP `Query` runs bounded queries only; it can't create one.)
+
+    // Nothing was registered or persisted: the leader has no query and no
+    // output stream.
+    let queries: serde_json::Value = reqwest::get(a.api_url("/api/v1/queries"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(queries, serde_json::json!([]), "{queries}");
+    assert!(la.stream_info("out_s").await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deleted_consumer_stays_deleted_after_failover() {
+    let o = Opts::new();
+    let dirs = Dirs::new(2);
+    let a = start_node(&o, dirs.path(0)).await;
+    let b = start_node(&o, dirs.path(1)).await;
+    assert_eq!(leader_of(&[&a, &b]).await, 0);
+    let la = a.client().await;
+    la.create_stream(StreamSpec::named("ev")).await.unwrap();
+    for name in ["keep", "drop"] {
+        la.create_consumer(ConsumerSpec::new(name, "ev"))
+            .await
+            .unwrap();
+    }
+    la.delete_consumer("drop").await.unwrap();
+    // Let `__consumers` (with the tombstone) reach the follower.
+    let want = read_all(&la, "__consumers").await;
+    wait_replicated(&b, "__consumers", &want).await;
+
+    o.backend().set_partitioned(&node_id(&a), true);
+    eventually(Duration::from_secs(20), || async {
+        is_leader(&b).await.then_some(())
+    })
+    .await;
+    let lb = b.client().await;
+    let names = eventually(Duration::from_secs(10), || {
+        let lb = lb.clone();
+        async move {
+            let list = lb.list_consumers(None).await.ok()?;
+            let names: Vec<String> = list
+                .iter()
+                .filter_map(|c| c["spec"]["name"].as_str().map(str::to_string))
+                .collect();
+            (!names.is_empty()).then_some(names)
+        }
+    })
+    .await;
+    assert_eq!(names, vec!["keep".to_string()]);
+    assert!(lb.consumer_info("drop").await.is_err());
+}

@@ -369,6 +369,21 @@ impl FileStorage {
         v
     }
 
+    /// Fence a stream's partition read-only, exactly as an IO error that
+    /// can't be rolled back does (a restart runs recovery and lifts it). For
+    /// fault-injection tests of the layers above storage. Returns `false` if
+    /// the stream is unknown.
+    #[doc(hidden)]
+    pub fn fence_stream(&self, stream: &str, reason: &str) -> bool {
+        match self.handle_by_name(stream) {
+            Some(h) => {
+                h.shared.fail(reason.to_string());
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Hold a stream's high watermark at or below `floor` (replication
     /// hook: visible = min(committed, floor)). `None` removes the floor.
     /// Returns `false` if the stream is unknown.

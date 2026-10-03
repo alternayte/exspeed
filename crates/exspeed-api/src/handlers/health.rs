@@ -47,12 +47,18 @@ pub async fn healthz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 /// against `data_dir` fails (read-only mount, full disk, permission
 /// loss, etc.). Returns 200 only when both checks pass. Intended for
 /// k8s readiness gates; `/healthz` is the load-balancer routing probe.
+///
+/// Fenced (failed) partitions don't make the node unready: one stream that
+/// can't take writes shouldn't take every other stream out of service.
+/// They turn the answer into `200 {"status": "degraded", "failed_streams":
+/// [{stream, reason}]}` and set `exspeed_partition_failed{stream}` to 1;
+/// alert on that gauge.
 #[utoipa::path(
     get,
     path = "/readyz",
     tag = "health",
     responses(
-        (status = 200, description = "`{status: \"ready\"}`", body = Object),
+        (status = 200, description = "`{status: \"ready\"}`, or `{status: \"degraded\", failed_streams: [{stream, reason}]}` when partitions are fenced", body = Object),
         (status = 503, description = "`{status}`: `starting`, `dedup_rebuild_in_progress` or `data_dir_unwritable`", body = Object),
     )
 )]
@@ -78,6 +84,18 @@ pub async fn readyz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"status": "data_dir_unwritable"})),
+        );
+    }
+
+    let failed = state.storage.failed_streams();
+    if !failed.is_empty() {
+        let list: Vec<_> = failed
+            .into_iter()
+            .map(|(stream, reason)| json!({"stream": stream, "reason": reason}))
+            .collect();
+        return (
+            StatusCode::OK,
+            Json(json!({"status": "degraded", "failed_streams": list})),
         );
     }
 

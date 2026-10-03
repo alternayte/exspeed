@@ -43,6 +43,23 @@ pub(crate) fn require_scoped_admin(id: &Identity, stream: &StreamName) -> Option
     }
 }
 
+/// Internal `__` streams (consumer state, catalogs, offsets) are written
+/// only by the server itself: every client write to one — create, update,
+/// publish, delete — is refused with 403, as over TCP.
+pub(crate) fn forbid_internal_write(stream: &StreamName) -> Option<Response> {
+    if stream.is_internal() {
+        Some(
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "internal streams are written only by the server"})),
+            )
+                .into_response(),
+        )
+    } else {
+        None
+    }
+}
+
 /// Verify the authenticated identity holds `Admin` with a wildcard-all
 /// glob (`streams = "*"`). Used for endpoints that span multiple streams
 /// (connectors, queries, views, connections).
@@ -93,6 +110,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         ))
         .with_state(state.clone());
 
+    // Record browsing: any authenticated caller (the handler requires
+    // subscribe or admin on the stream), and NOT leader-gated: reads are
+    // served by every node from its replica, like TCP reads.
+    let readers_router = Router::new()
+        .route("/api/v1/streams/{name}/records", get(streams::read_records))
+        .layer(from_fn_with_state(
+            state.clone(),
+            crate::middleware::require_authenticated,
+        ))
+        .with_state(state.clone());
+
     // Main authenticated router: admin-gated AND leader-gated.
     // Tower wrapping: `.layer(A).layer(B)` produces `B(A(handler))`, so
     // B (the LAST .layer() call) is the outermost wrapper and runs first.
@@ -113,7 +141,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/v1/streams/{name}/publish",
             post(streams::publish_to_stream),
         )
-        .route("/api/v1/streams/{name}/records", get(streams::read_records))
         .route(
             "/api/v1/consumers",
             get(consumers::list_consumers).post(consumers::create_consumer),
@@ -181,5 +208,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     unauth
         .merge(leases_router)
         .merge(whoami_router)
+        .merge(readers_router)
         .merge(authed)
 }

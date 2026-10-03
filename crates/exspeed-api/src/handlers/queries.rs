@@ -171,11 +171,14 @@ pub async fn delete_query(
         return r;
     }
     match state.exql.drop_query(&id).await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(json!({"status": "removed", "query_id": id})),
-        )
-            .into_response(),
+        Ok(()) => {
+            state.metrics.forget_query(&id);
+            (
+                StatusCode::OK,
+                Json(json!({"status": "removed", "query_id": id})),
+            )
+                .into_response()
+        }
         Err(e) => exql_error(&e),
     }
 }

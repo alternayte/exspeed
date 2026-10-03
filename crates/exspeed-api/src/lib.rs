@@ -45,64 +45,93 @@ impl TlsPaths {
     }
 }
 
-/// Serve the HTTP API. When `tls` is Some, uses axum-server with rustls;
-/// otherwise plain HTTP. Returns on error.
-///
-/// This variant runs until the listener fails fatally — it never receives a
-/// shutdown signal. Use `serve_with_shutdown` from the binary so SIGTERM can
-/// drain the API alongside the TCP listener.
+/// Serve the HTTP API on `addr` until the listener fails. Binds first, so
+/// a bind error is returned at once.
 pub async fn serve(
     state: Arc<AppState>,
     addr: SocketAddr,
     tls: Option<TlsPaths>,
 ) -> std::io::Result<()> {
-    serve_with_shutdown(state, addr, tls, std::future::pending()).await
+    let listener = std::net::TcpListener::bind(addr)?;
+    HttpServer::new(state, listener, tls)
+        .await?
+        .serve_with_shutdown(std::future::pending(), Duration::from_secs(10))
+        .await
 }
 
-/// Serve the HTTP API until either the listener fails or `shutdown`
-/// resolves. When `shutdown` resolves, axum-server stops accepting new
-/// connections and gives in-flight requests up to 10s to complete before
-/// closing them. Mirrors the 10s drain budget the TCP listener uses so the
-/// two halves of the server tear down in the same window.
-pub async fn serve_with_shutdown<F>(
-    state: Arc<AppState>,
+/// The HTTP API, bound and with its TLS config loaded, ready to serve.
+/// Building it surfaces every startup error (bad TLS files, a listener that
+/// can't be used) before the server reports itself ready.
+pub struct HttpServer {
+    router: axum::Router,
+    listener: std::net::TcpListener,
+    tls: Option<axum_server::tls_rustls::RustlsConfig>,
     addr: SocketAddr,
-    tls: Option<TlsPaths>,
-    shutdown: F,
-) -> std::io::Result<()>
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    let router = handlers::build_router(state);
+}
 
-    // axum-server's Handle is the only documented hook for graceful
-    // shutdown — bind/bind_rustls don't take a shutdown future directly.
-    // Spawn a forwarder so the caller's shutdown future drives the handle.
-    let handle = axum_server::Handle::new();
-    {
-        let handle_for_shutdown = handle.clone();
-        tokio::spawn(async move {
-            shutdown.await;
-            handle_for_shutdown.graceful_shutdown(Some(Duration::from_secs(10)));
-        });
+impl HttpServer {
+    /// Wrap an already-bound listener (the caller binds it, so a port
+    /// conflict is reported by the caller before anything is spawned).
+    pub async fn new(
+        state: Arc<AppState>,
+        listener: std::net::TcpListener,
+        tls: Option<TlsPaths>,
+    ) -> std::io::Result<Self> {
+        listener.set_nonblocking(true)?;
+        let addr = listener.local_addr()?;
+        let tls = match tls {
+            Some(paths) => Some(
+                axum_server::tls_rustls::RustlsConfig::from_pem_file(&paths.cert, &paths.key)
+                    .await?,
+            ),
+            None => None,
+        };
+        Ok(Self {
+            router: handlers::build_router(state),
+            listener,
+            tls,
+            addr,
+        })
     }
 
-    match tls {
-        Some(paths) => {
-            let cfg = axum_server::tls_rustls::RustlsConfig::from_pem_file(&paths.cert, &paths.key)
-                .await?;
-            info!("HTTP API listening on {} (TLS)", addr);
-            axum_server::bind_rustls(addr, cfg)
-                .handle(handle)
-                .serve(router.into_make_service())
-                .await
+    /// The bound address.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Serve until the listener fails or `shutdown` resolves. On shutdown
+    /// the server stops accepting connections and gives in-flight requests
+    /// up to `drain` to complete before closing them.
+    pub async fn serve_with_shutdown<F>(self, shutdown: F, drain: Duration) -> std::io::Result<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        // axum-server's Handle is the only documented hook for graceful
+        // shutdown; a forwarder lets the caller's future drive it.
+        let handle = axum_server::Handle::new();
+        {
+            let handle_for_shutdown = handle.clone();
+            tokio::spawn(async move {
+                shutdown.await;
+                handle_for_shutdown.graceful_shutdown(Some(drain));
+            });
         }
-        None => {
-            info!("HTTP API listening on {}", addr);
-            axum_server::bind(addr)
-                .handle(handle)
-                .serve(router.into_make_service())
-                .await
+        let service = self.router.into_make_service();
+        match self.tls {
+            Some(cfg) => {
+                info!("HTTP API listening on {} (TLS)", self.addr);
+                axum_server::from_tcp_rustls(self.listener, cfg)
+                    .handle(handle)
+                    .serve(service)
+                    .await
+            }
+            None => {
+                info!("HTTP API listening on {}", self.addr);
+                axum_server::from_tcp(self.listener)
+                    .handle(handle)
+                    .serve(service)
+                    .await
+            }
         }
     }
 }

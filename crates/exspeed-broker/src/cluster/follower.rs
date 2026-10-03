@@ -9,6 +9,13 @@
 //!    with their original offsets, timestamps, keys and headers
 //!    (`StorageEngine::append_at`); trim up to the leader's earliest offset;
 //!    adopt the leader's epoch history for the part of the log we now have.
+//!    A follower whose log ends before the leader's earliest offset (it was
+//!    away while retention moved on) holds records the leader no longer has
+//!    and a gap after them: it drops its copy and reseeds the stream from
+//!    the leader's earliest record.
+//!
+//! Trims are segment-granular on both sides, so a follower keeps at most
+//! one segment more than the leader.
 //!
 //! The follower writes to storage directly: it is the one writer that must
 //! not go through `Log` (whose leader gate rejects it by design).
@@ -248,11 +255,22 @@ async fn apply(
     let mut lag = 0u64;
     for sd in resp.streams {
         let stream = name(&sd.stream)?;
-        let (_, next) = match storage.stream_bounds(&stream).await {
+        let (earliest, mut next) = match storage.stream_bounds(&stream).await {
             Ok(b) => b,
             Err(StorageError::StreamNotFound(_)) => continue, // metadata comes next round
             Err(e) => return Err(format!("bounds of {stream}: {e}")),
         };
+        if matches!(sd.action, StreamAction::Records(_)) && next.0 < sd.earliest && earliest < next
+        {
+            warn!(
+                %stream,
+                local_next = next.0,
+                leader_earliest = sd.earliest,
+                "behind the leader's earliest offset; reseeding the stream"
+            );
+            reseed(cluster, &stream).await?;
+            next = Offset(0);
+        }
         match sd.action {
             StreamAction::Truncate(to) => {
                 warn!(%stream, from = to, to = next.0, "truncating records that diverged from the leader");
@@ -362,6 +380,30 @@ async fn reconcile(cluster: &Cluster, metas: &[StreamMeta]) -> Result<(), String
     Ok(())
 }
 
+/// Replace the local copy of `stream` with an empty one (same config and
+/// uid), so the leader's records can be applied from its earliest offset.
+async fn reseed(cluster: &Cluster, stream: &StreamName) -> Result<(), String> {
+    let storage = &cluster.storage;
+    let cfg = storage
+        .stream_config(stream)
+        .await
+        .map_err(|e| format!("config of {stream}: {e}"))?;
+    let uid = cluster.epochs.get(stream.as_str()).map(|h| h.uid);
+    delete(cluster, stream).await?;
+    storage
+        .create_stream_with(stream, &cfg)
+        .await
+        .map_err(|e| format!("recreate {stream}: {e}"))?;
+    if let Some(uid) = uid {
+        cluster
+            .epochs
+            .put(stream.as_str(), StreamEpochs::new(uid))
+            .map_err(|e| e.to_string())?;
+    }
+    cluster.metrics.inc_replication_reseed(stream.as_str());
+    Ok(())
+}
+
 async fn delete(cluster: &Cluster, stream: &StreamName) -> Result<(), String> {
     cluster
         .storage
@@ -370,5 +412,6 @@ async fn delete(cluster: &Cluster, stream: &StreamName) -> Result<(), String> {
         .map_err(|e| format!("delete {stream}: {e}"))?;
     cluster.epochs.remove(stream.as_str());
     cluster.log.dedup().forget_stream(stream).await;
+    cluster.metrics.forget_stream(stream.as_str());
     Ok(())
 }

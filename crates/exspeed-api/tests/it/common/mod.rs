@@ -22,6 +22,11 @@ pub async fn held_elsewhere() -> Arc<dyn LeaderLease> {
 
 /// Build an AppState with the desired leadership state.
 pub async fn make_state_with_leader(leader: bool) -> Arc<exspeed_api::AppState> {
+    make_state(leader, None).await
+}
+
+/// Like [`make_state_with_leader`], with a `/metrics` token.
+pub async fn make_state(leader: bool, metrics_token: Option<&str>) -> Arc<exspeed_api::AppState> {
     use exspeed_broker::broker_append::BrokerAppend;
     use exspeed_broker::Broker;
     use exspeed_connectors::{offset_store, ConnectorManager};
@@ -120,5 +125,6 @@ pub async fn make_state_with_leader(leader: bool) -> Arc<exspeed_api::AppState> 
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         data_dir,
         cluster: None,
+        metrics_token: metrics_token.map(str::to_string),
     })
 }

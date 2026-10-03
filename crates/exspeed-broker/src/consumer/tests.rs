@@ -687,3 +687,62 @@ async fn final_persist_survives_resign() {
         s.pending
     );
 }
+
+#[tokio::test]
+async fn dead_letters_survive_source_stream_recreation() {
+    // The DLQ keeps its dedup entries when the source stream is deleted and
+    // recreated; a different record at the same offset must still be
+    // dead-lettered (it used to collide on the deterministic key and retry
+    // forever).
+    let e = env();
+    let (m, _t) = e.manager().await;
+    let dlq_records = || async {
+        e.log
+            .storage()
+            .read_batch(&sn("dead"), Offset(0), ReadLimits::default())
+            .await
+            .map(|b| b.records)
+            .unwrap_or_default()
+    };
+    for (round, value) in ["first", "second"].into_iter().enumerate() {
+        e.stream("s").await;
+        e.log
+            .append(
+                &sn("s"),
+                Record {
+                    key: None,
+                    value: Bytes::from(value),
+                    subject: "x".into(),
+                    headers: vec![],
+                    timestamp_ns: None,
+                },
+            )
+            .await
+            .unwrap();
+        let mut s = spec("c", "s");
+        s.dlq_stream = Some("dead".into());
+        m.create(s).await.unwrap();
+        let mut sub = m.subscribe("c", 10).await.unwrap();
+        assert_eq!(collect(&mut sub, 1).await[0].offset, 0);
+        m.term("c", 0, "bad".into()).await.unwrap();
+        let want = round + 1;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while dlq_records().await.len() < want {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "round {round}: record not dead-lettered"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(m.info("c").await.unwrap().ack_floor, 1);
+        drop(sub);
+        m.delete("c").await.unwrap();
+        e.log.delete_stream(&sn("s")).await.unwrap();
+    }
+    let values: Vec<_> = dlq_records()
+        .await
+        .into_iter()
+        .map(|r| String::from_utf8(r.value.to_vec()).unwrap())
+        .collect();
+    assert_eq!(values, vec!["first", "second"]);
+}

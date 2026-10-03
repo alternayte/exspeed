@@ -12,8 +12,10 @@ pub struct EmbeddedServer {
 pub async fn start() -> EmbeddedServer {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().to_path_buf();
-    let tcp_port = exspeed_testkit::pick_unused_port().unwrap();
-    let api_port = exspeed_testkit::pick_unused_port().unwrap();
+    let tcp_port_l = exspeed_testkit::bind_local();
+    let tcp_port = tcp_port_l.local_addr().unwrap().port();
+    let api_port_l = exspeed_testkit::bind_local();
+    let api_port = api_port_l.local_addr().unwrap().port();
     let tcp_addr = format!("127.0.0.1:{tcp_port}");
     let api_addr = format!("127.0.0.1:{api_port}");
     let tcp_for_server = tcp_addr.clone();
@@ -23,7 +25,9 @@ pub async fn start() -> EmbeddedServer {
         let _tmp = tmp; // keep TempDir alive for the full server task lifetime
         exspeed::cli::server::run(exspeed::cli::server::ServerArgs {
             bind: tcp_for_server,
+            tcp_listener: Some(std::sync::Arc::new(tcp_port_l)),
             api_bind: api_for_server,
+            api_listener: Some(std::sync::Arc::new(api_port_l)),
             data_dir,
             auth_token: None,
             credentials_file: None,

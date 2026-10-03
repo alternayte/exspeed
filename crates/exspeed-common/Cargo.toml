@@ -10,9 +10,8 @@ crc32c = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# Only for `KeyValue`, the attribute type metric call sites use.
 opentelemetry = { workspace = true }
-opentelemetry_sdk = { workspace = true }
-opentelemetry-prometheus = { workspace = true }
 prometheus = { workspace = true }
 sha2 = "0.10"
 enumset = { version = "1", features = ["serde"] }

@@ -66,13 +66,17 @@ impl Builder {
                 (Some(t), p)
             }
         };
-        let port = exspeed_testkit::pick_unused_port().unwrap();
-        let api_port = exspeed_testkit::pick_unused_port().unwrap();
-        let addr = format!("127.0.0.1:{port}");
-        let api_addr = format!("127.0.0.1:{api_port}");
+        // Pre-bound listeners: no window between picking a port and the
+        // server binding it.
+        let tcp = exspeed_testkit::bind_local();
+        let api = exspeed_testkit::bind_local();
+        let addr = tcp.local_addr().unwrap().to_string();
+        let api_addr = api.local_addr().unwrap().to_string();
         let mut args = ServerArgs::new(&data_dir);
         args.bind = addr.clone();
         args.api_bind = api_addr.clone();
+        args.tcp_listener = Some(std::sync::Arc::new(tcp));
+        args.api_listener = Some(std::sync::Arc::new(api));
         let tls = {
             for f in self.configure {
                 f(&mut args);

@@ -380,7 +380,11 @@ pub struct ExternalTable {
 
 impl fmt::Debug for ExternalTable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ExternalTable({}.{}.{})", self.conn, self.schema_name, self.table)
+        write!(
+            f,
+            "ExternalTable({}.{}.{})",
+            self.conn, self.schema_name, self.table
+        )
     }
 }
 
@@ -477,10 +481,14 @@ impl<'a> Where<'a> {
                 let ph = self.placeholder(b);
                 Some(format!("{} {sym} {ph}", quote_ident(&col.name)))
             }
-            Expr::IsNull(inner) => Some(format!("{} IS NULL", quote_ident(&self.column(inner)?.name))),
-            Expr::IsNotNull(inner) => {
-                Some(format!("{} IS NOT NULL", quote_ident(&self.column(inner)?.name)))
-            }
+            Expr::IsNull(inner) => Some(format!(
+                "{} IS NULL",
+                quote_ident(&self.column(inner)?.name)
+            )),
+            Expr::IsNotNull(inner) => Some(format!(
+                "{} IS NOT NULL",
+                quote_ident(&self.column(inner)?.name)
+            )),
             Expr::InList(il) if !il.negated && !il.list.is_empty() && il.list.len() <= 1000 => {
                 let col = self.column(&il.expr)?;
                 let binds: Vec<Bind> = il
@@ -489,7 +497,11 @@ impl<'a> Where<'a> {
                     .map(|x| Self::bind(col.kind, x))
                     .collect::<Option<_>>()?;
                 let phs: Vec<String> = binds.into_iter().map(|b| self.placeholder(b)).collect();
-                Some(format!("{} IN ({})", quote_ident(&col.name), phs.join(", ")))
+                Some(format!(
+                    "{} IN ({})",
+                    quote_ident(&col.name),
+                    phs.join(", ")
+                ))
             }
             _ => None,
         }
@@ -580,7 +592,11 @@ impl TableProvider for ExternalTable {
             self.conn.clone(),
             format!(
                 "{sql} -- {}",
-                w.binds.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")
+                w.binds
+                    .iter()
+                    .map(|b| b.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
             ),
         );
         let schema = Arc::new(Schema::new(
@@ -592,9 +608,15 @@ impl TableProvider for ExternalTable {
             Some(b) => b,
             None => {
                 let fut = fetch_rows(&self.pool, &sql, &w.binds, &cols, schema.clone());
-                let batch = timed(&self.config, &self.conn, &self.schema_name, &self.table, fut)
-                    .await
-                    .map_err(|e| e.into_df())?;
+                let batch = timed(
+                    &self.config,
+                    &self.conn,
+                    &self.schema_name,
+                    &self.table,
+                    fut,
+                )
+                .await
+                .map_err(|e| e.into_df())?;
                 if batch.num_rows() > max {
                     return Err(ExqlError::Execution(format!(
                         "external table {}.{} has more than {max} matching rows",
@@ -717,7 +739,11 @@ struct ReservedExec {
 
 impl DisplayAs for ReservedExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "ExternalSnapshotExec: reserved={}", self.reservation.size())
+        write!(
+            f,
+            "ExternalSnapshotExec: reserved={}",
+            self.reservation.size()
+        )
     }
 }
 
