@@ -1,0 +1,19 @@
+Picked up JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.net.ssl.trustStoreType=JKS -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=35591 -Dhttp.nonProxyHosts=localhost|127.0.0.1|::1|127.*|0.*|::|169.254.*|api.anthropic.com|api-staging.anthropic.com|api-pr-preview.anthropic.com|mcp-proxy.anthropic.com|mcp-proxy-staging.anthropic.com|registry.npmjs.org|jsr.io|npm.jsr.io|pypi.org|files.pythonhosted.org|index.crates.io|proxy.golang.org|host.docker.internal|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*|192.168.*|100.64.0.0/10|*.svc.cluster.local|*.svc.cluster.local -Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes=
+5101 records sent, 1020.2 records/sec (1.00 MB/sec), 2462.2 ms avg latency, 3898.0 ms max latency.
+11910 records sent, 2380.6 records/sec (2.32 MB/sec), 6424.7 ms avg latency, 8409.0 ms max latency.
+13230 records sent, 2643.9 records/sec (2.58 MB/sec), 10886.3 ms avg latency, 13113.0 ms max latency.
+11985 records sent, 2397.0 records/sec (2.34 MB/sec), 12333.1 ms avg latency, 13576.0 ms max latency.
+14010 records sent, 2798.1 records/sec (2.73 MB/sec), 11876.8 ms avg latency, 12149.0 ms max latency.
+16530 records sent, 3300.7 records/sec (3.22 MB/sec), 11082.4 ms avg latency, 11944.0 ms max latency.
+15630 records sent, 3124.8 records/sec (3.05 MB/sec), 9993.4 ms avg latency, 10506.0 ms max latency.
+14865 records sent, 2971.8 records/sec (2.90 MB/sec), 9998.2 ms avg latency, 10412.0 ms max latency.
+17415 records sent, 3481.6 records/sec (3.40 MB/sec), 9370.1 ms avg latency, 10115.0 ms max latency.
+15915 records sent, 3181.7 records/sec (3.11 MB/sec), 9264.3 ms avg latency, 9507.0 ms max latency.
+14010 records sent, 2800.9 records/sec (2.74 MB/sec), 9600.3 ms avg latency, 10191.0 ms max latency.
+19005 records sent, 3801.0 records/sec (3.71 MB/sec), 9684.6 ms avg latency, 10242.0 ms max latency.
+16335 records sent, 3265.7 records/sec (3.19 MB/sec), 9094.2 ms avg latency, 9578.0 ms max latency.
+13305 records sent, 2661.0 records/sec (2.60 MB/sec), 9529.2 ms avg latency, 10287.0 ms max latency.
+15390 records sent, 3077.4 records/sec (3.01 MB/sec), 10668.1 ms avg latency, 10964.0 ms max latency.
+14700 records sent, 2936.5 records/sec (2.87 MB/sec), 10459.5 ms avg latency, 10937.0 ms max latency.
+17910 records sent, 3580.6 records/sec (3.50 MB/sec), 9743.8 ms avg latency, 10338.0 ms max latency.
+250000 records sent, 2907.145764 records/sec (2.84 MB/sec), 9830.23 ms avg latency, 13576.00 ms max latency, 9885 ms 50th, 12018 ms 95th, 12985 ms 99th, 13484 ms 99.9th.
