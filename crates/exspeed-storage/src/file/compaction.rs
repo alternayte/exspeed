@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::encoding::payload_key_value_len;
+use crate::encoding::frame_key_value_len;
 use crate::file::partition::PartitionShared;
 use crate::file::segment::{
     encode_index, header_bytes, FrameError, FrameIter, IndexBuilder, Segment, SegmentMeta,
@@ -76,7 +76,7 @@ fn for_each_frame(
         if frame.offset >= hwm {
             return Ok(());
         }
-        let (key, value_len) = payload_key_value_len(&frame.payload)
+        let (key, value_len) = frame_key_value_len(&frame.raw)
             .map_err(|r| io::Error::new(io::ErrorKind::InvalidData, r))?;
         f(
             frame.offset,

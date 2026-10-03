@@ -252,3 +252,143 @@ async fn replication_floor_holds_back_the_high_watermark() {
     assert_eq!(storage.stream_bounds(&s).await.unwrap().1, Offset(10));
     assert_eq!(read_all(&storage, &s, 0).await.len(), 10);
 }
+
+/// `read_raw` returns, for any start and limits, a contiguous prefix of
+/// what a full decoded read from that start returns.
+#[tokio::test]
+async fn read_raw_matches_decoded_reads() {
+    let dir = TempDir::new().unwrap();
+    let storage = small_segments(dir.path(), 2_000);
+    let s = stream("raw");
+    storage.create_stream(&s, 0, 0).await.unwrap();
+    let mut rng = Rng(7);
+    // Mixed sizes: tiny records with occasional large ones, so the read
+    // size estimate is sometimes far too small.
+    for i in 0..400u64 {
+        let size = if rng.below(10) == 0 {
+            1 + rng.below(20_000) as usize
+        } else {
+            rng.below(40) as usize
+        };
+        let r = exspeed_streams::Record {
+            key: (i % 3 == 0).then(|| bytes::Bytes::from(format!("k{i}"))),
+            value: bytes::Bytes::from(vec![b'x'; size]),
+            subject: format!("s.{}", i % 5),
+            headers: vec![("h".into(), format!("{i}"))],
+            timestamp_ns: None,
+        };
+        storage.append(&s, &r).await.unwrap();
+    }
+    assert!(segment_count(&storage, "raw") > 10);
+    let all = read_all(&storage, &s, 0).await;
+    assert_eq!(all.len(), 400);
+    for _ in 0..200 {
+        let from = rng.below(410);
+        let limits = ReadLimits {
+            max_records: 1 + rng.below(50) as usize,
+            max_bytes: 1 + rng.below(50_000) as usize,
+        };
+        let b = storage.read_raw(&s, Offset(from), limits).await.unwrap();
+        let got = decode_raw(&b);
+        assert_eq!(b.high_watermark, Offset(400));
+        let want: Vec<_> = all.iter().filter(|r| r.offset.0 >= from).cloned().collect();
+        if want.is_empty() {
+            assert!(got.is_empty());
+            assert_eq!(b.next_offset, Offset(from.max(400)));
+            continue;
+        }
+        assert!(!got.is_empty(), "at least one record when available");
+        assert!(got.len() <= limits.max_records);
+        if got.len() > 1 {
+            assert!(b.bytes.len() <= limits.max_bytes);
+        }
+        assert_same_records(&got, &want[..got.len()]);
+    }
+}
+
+/// Reads after a restart (sealed segments from disk) and from below the
+/// earliest retained offset (clamped) also work.
+#[tokio::test]
+async fn read_raw_after_restart_and_trim() {
+    let dir = TempDir::new().unwrap();
+    let s = stream("rawtrim");
+    {
+        let storage = small_segments(dir.path(), 500);
+        storage.create_stream(&s, 0, 0).await.unwrap();
+        append_n(&storage, &s, 0, 100).await;
+        storage.trim_up_to(&s, Offset(50)).await.unwrap();
+    }
+    let storage = small_segments(dir.path(), 500);
+    let (earliest, hwm) = storage.stream_bounds(&s).await.unwrap();
+    assert!(earliest.0 > 0 && earliest.0 <= 50);
+    let b = storage
+        .read_raw(&s, Offset(0), ReadLimits::default())
+        .await
+        .unwrap();
+    let got = decode_raw(&b);
+    assert_eq!(got[0].offset, earliest);
+    check_values(&got);
+    let raw = read_all_raw(&storage, &s, 0).await;
+    assert_eq!(raw.len() as u64, hwm.0 - earliest.0);
+    check_values(&raw);
+}
+
+/// The read byte budget counts each record's full wire size, headers
+/// included: records with 32 KB of headers and a tiny value must not all
+/// fit in a 64 KiB budget (they did when only key + value + subject were
+/// counted, which let responses overflow the 16 MiB frame limit). Both the
+/// decoding and the raw read paths, and the default trait implementation.
+#[tokio::test]
+async fn read_byte_budget_counts_headers() {
+    let dir = TempDir::new().unwrap();
+    let storage = small_segments(dir.path(), 1 << 30);
+    let memory = crate::memory::MemoryStorage::new();
+    let s = stream("hdr");
+    storage.create_stream(&s, 0, 0).await.unwrap();
+    memory.create_stream(&s, 0, 0).await.unwrap();
+    let hv = "h".repeat(32_000);
+    for i in 0..100u64 {
+        let r = exspeed_streams::Record {
+            headers: vec![("big".into(), hv.clone())],
+            ..plain(i)
+        };
+        storage.append(&s, &r).await.unwrap();
+        memory.append(&s, &r).await.unwrap();
+    }
+    let limits = ReadLimits {
+        max_records: 1000,
+        max_bytes: 64 * 1024,
+    };
+    for (what, engine) in [
+        ("file", &storage as &dyn StorageEngine),
+        ("memory", &memory as &dyn StorageEngine),
+    ] {
+        let b = engine.read_batch(&s, Offset(0), limits).await.unwrap();
+        let wire: usize = b.records.iter().map(|r| r.wire_size()).sum();
+        assert_eq!(b.records.len(), 2, "{what}: decoded read");
+        assert!(wire <= limits.max_bytes, "{what}: {wire}");
+        let raw = engine.read_raw(&s, Offset(0), limits).await.unwrap();
+        assert_eq!(raw.count, 2, "{what}: raw read");
+        assert!(raw.bytes.len() <= limits.max_bytes, "{what}");
+        assert_eq!(
+            raw.bytes.len(),
+            wire,
+            "{what}: wire_size matches the encoding"
+        );
+    }
+    // A record larger than the budget still comes back alone.
+    let one = ReadLimits {
+        max_records: 1000,
+        max_bytes: 1,
+    };
+    assert_eq!(
+        storage
+            .read_batch(&s, Offset(0), one)
+            .await
+            .unwrap()
+            .records
+            .len(),
+        1
+    );
+    assert_eq!(storage.read_raw(&s, Offset(0), one).await.unwrap().count, 1);
+}

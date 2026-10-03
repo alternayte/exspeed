@@ -15,18 +15,22 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
+use bytes::BytesMut;
+use exspeed_common::record_format;
 use exspeed_common::Offset;
-use exspeed_streams::{ReadBatch, StorageError, StoredRecord, StreamConfig};
+use exspeed_streams::{RawBatch, ReadBatch, StorageError, StoredRecord, StreamConfig};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use crate::encoding::decode_payload;
+use crate::encoding::{check_crc, decode_frame, frame_size, LEN_FIELD};
+use crate::file::fsutil::read_at;
 use crate::file::fsutil::{atomic_write, fsync_dir, remove_if_exists};
 use crate::file::segment::{
     create_segment_file, encode_index, header_bytes, idx_path, load_meta, meta_path,
     parse_seg_name, read_header, save_meta, scan_segment, seg_path, valid_frame_after, FrameError,
-    FrameIter, IndexEntry, Segment, SegmentMeta, SegmentStats, INDEX_ENTRY_LEN, SEGMENT_HEADER_LEN,
+    FrameIter, IndexEntry, Segment, SegmentMeta, SegmentStats, INDEX_ENTRY_LEN,
+    INDEX_INTERVAL_BYTES, SEGMENT_HEADER_LEN,
 };
 
 /// Name of the truncation intent marker inside a partition directory.
@@ -214,10 +218,45 @@ impl PartitionShared {
         *self.config.lock().unwrap() = Some(cfg);
     }
 
+    /// Run a read and retry it if a truncation raced with it: the epoch
+    /// moved, or the high watermark dropped below the one the read used. A
+    /// raced read may have returned records that `truncate_from` was
+    /// removing, or new records appended at the same offsets afterwards.
+    fn read_consistent<T>(
+        &self,
+        mut read: impl FnMut() -> Result<T, StorageError>,
+        hwm_of: impl Fn(&T) -> u64,
+    ) -> Result<T, StorageError> {
+        for _ in 0..8 {
+            let epoch = self.truncation_epoch();
+            let r = read()?;
+            if self.truncation_epoch() == epoch && self.high_watermark() >= hwm_of(&r) {
+                return Ok(r);
+            }
+        }
+        Err(StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            format!("{}: read kept racing a truncation; retry", self.stream),
+        )))
+    }
+
     /// Read records at offsets `>= from`, below the high watermark. `strict`
     /// reports `from` below the earliest retained offset as
     /// [`StorageError::OffsetOutOfRange`]; otherwise `from` is clamped.
     pub fn read(
+        &self,
+        from: u64,
+        max_records: usize,
+        max_bytes: usize,
+        strict: bool,
+    ) -> Result<ReadBatch, StorageError> {
+        self.read_consistent(
+            || self.read_once(from, max_records, max_bytes, strict),
+            |b| b.high_watermark.0,
+        )
+    }
+
+    fn read_once(
         &self,
         from: u64,
         max_records: usize,
@@ -279,15 +318,14 @@ impl PartitionShared {
                     if f.offset < from {
                         continue;
                     }
-                    let rec = decode_payload(&f.payload).map_err(|reason| {
-                        StorageError::CorruptedRecord {
+                    let rec =
+                        decode_frame(&f.raw).map_err(|reason| StorageError::CorruptedRecord {
                             offset: f.offset,
                             reason,
-                        }
-                    })?;
-                    let size = rec.value.len()
-                        + rec.subject.len()
-                        + rec.key.as_ref().map_or(0, |k| k.len());
+                        })?;
+                    // The stored frame is the wire encoding: budget its full
+                    // size (headers and framing included), like `read_raw`.
+                    let size = f.raw.len();
                     if !out.is_empty() && bytes + size > max_bytes {
                         break 'segments;
                     }
@@ -307,6 +345,69 @@ impl PartitionShared {
             next_offset: Offset(next_offset),
             high_watermark: Offset(hwm),
         })
+    }
+
+    /// Read records at offsets `>= from` (clamped to the earliest retained
+    /// offset), below the high watermark, as raw wire-encoded bytes: no
+    /// decoding and no per-record allocation. Each segment touched costs one
+    /// `pread` sized from the limits and the segment's average record size
+    /// (plus a second one only when that estimate was too small). The batch
+    /// never spans two segments once it holds a record, so the result is a
+    /// view of one read buffer. CRCs are verified.
+    pub fn read_raw(
+        &self,
+        from: u64,
+        max_records: usize,
+        max_bytes: usize,
+    ) -> Result<RawBatch, StorageError> {
+        self.read_consistent(
+            || self.read_raw_once(from, max_records, max_bytes),
+            |b| b.high_watermark.0,
+        )
+    }
+
+    fn read_raw_once(
+        &self,
+        from: u64,
+        max_records: usize,
+        max_bytes: usize,
+    ) -> Result<RawBatch, StorageError> {
+        let hwm = self.high_watermark();
+        let list = self.segments();
+        let earliest = list.first().map_or(hwm, |s| s.base_offset).min(hwm);
+        let from = from.max(earliest);
+        let empty = |next: u64| RawBatch {
+            bytes: BytesMut::new(),
+            count: 0,
+            next_offset: Offset(next),
+            high_watermark: Offset(hwm),
+        };
+        if from >= hwm || max_records == 0 {
+            return Ok(empty(from.max(hwm)));
+        }
+        let start = list
+            .partition_point(|s| s.base_offset <= from)
+            .saturating_sub(1);
+        for seg in &list[start..] {
+            if seg.base_offset >= hwm {
+                break;
+            }
+            let end = seg.len();
+            let pos = if from > seg.base_offset {
+                seg.position_for_offset(from)?.min(end)
+            } else {
+                SEGMENT_HEADER_LEN
+            };
+            if pos >= end {
+                continue;
+            }
+            if let Some(batch) = read_raw_segment(seg, pos, end, from, hwm, max_records, max_bytes)?
+            {
+                return Ok(batch);
+            }
+        }
+        // Every offset in `[from, hwm)` is a gap (compaction); skip past it.
+        Ok(empty(hwm))
     }
 
     /// Offset of the first record with timestamp `>= ts`, or the high
@@ -348,6 +449,112 @@ impl PartitionShared {
         Ok(hwm)
     }
 }
+
+/// One segment's part of [`PartitionShared::read_raw`]: scan `[pos, end)`
+/// for records in `[from, hwm)`. `None` when the segment has none.
+fn read_raw_segment(
+    seg: &Segment,
+    pos: u64,
+    end: u64,
+    from: u64,
+    hwm: u64,
+    max_records: usize,
+    max_bytes: usize,
+) -> Result<Option<RawBatch>, StorageError> {
+    let corrupt = |at: u64, reason: String| StorageError::CorruptedRecord {
+        offset: from,
+        reason: format!(
+            "{}: corrupt record at byte {at}: {reason}",
+            seg.path.display()
+        ),
+    };
+    // Size the read: the records asked for at the segment's average size,
+    // plus the index gap we may have to skip, capped by the byte limit.
+    let stats = seg.stats();
+    let avg = (stats.len - SEGMENT_HEADER_LEN)
+        .checked_div(stats.records)
+        .map_or(256, |a| a as usize);
+    let want = avg
+        .saturating_mul(max_records)
+        .min(max_bytes)
+        .saturating_add(avg + INDEX_INTERVAL_BYTES as usize);
+    let avail = (end - pos) as usize;
+    let mut buf = BytesMut::zeroed(want.clamp(LEN_FIELD, MAX_RAW_READ).min(avail));
+    let mut filled = read_at(seg.file(), &mut buf, pos).map_err(StorageError::Io)?;
+    // A short read means the file was truncated underneath us
+    // (`truncate_from`); treat the end of what we got as the end.
+    let mut eof = filled < buf.len() || filled == avail;
+
+    let mut cur = 0usize;
+    let mut first: Option<usize> = None;
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    let mut last = 0u64;
+    loop {
+        if cur >= filled && eof {
+            break;
+        }
+        // Make sure the whole next record is in the buffer.
+        let need = if filled - cur >= LEN_FIELD {
+            frame_size(&buf[cur..cur + LEN_FIELD]).map_err(|r| corrupt(pos + cur as u64, r))?
+        } else {
+            LEN_FIELD
+        };
+        if filled - cur < need {
+            if eof {
+                break; // torn by a concurrent truncation; stop here
+            }
+            if count > 0 && (bytes + need > max_bytes || need > MAX_RAW_READ) {
+                break;
+            }
+            // Grow the buffer and read the rest (rare: the estimate was low).
+            let target = (cur + need)
+                .max(filled + (filled / 2).max(64 * 1024))
+                .min(avail);
+            buf.resize(target, 0);
+            let n = read_at(seg.file(), &mut buf[filled..], pos + filled as u64)
+                .map_err(StorageError::Io)?;
+            filled += n;
+            eof = filled < buf.len() || filled == avail;
+            continue;
+        }
+        let rec = &buf[cur..cur + need];
+        check_crc(rec).map_err(|r| corrupt(pos + cur as u64, r))?;
+        let off = record_format::offset(rec);
+        if off >= hwm {
+            break;
+        }
+        if off < from {
+            cur += need;
+            continue;
+        }
+        if count > 0 && (bytes + need > max_bytes || off <= last) {
+            break;
+        }
+        first.get_or_insert(cur);
+        count += 1;
+        bytes += need;
+        last = off;
+        cur += need;
+        if count >= max_records {
+            break;
+        }
+    }
+    let Some(first) = first else {
+        return Ok(None);
+    };
+    buf.truncate(cur);
+    let _ = buf.split_to(first);
+    Ok(Some(RawBatch {
+        bytes: buf,
+        count,
+        next_offset: Offset(last + 1),
+        high_watermark: Offset(hwm),
+    }))
+}
+
+/// Upper bound for one raw read buffer.
+const MAX_RAW_READ: usize = 16 * 1024 * 1024;
 
 /// Durability mode of a partition writer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -468,6 +675,32 @@ fn open_sealed(dir: &Path, base: u64) -> io::Result<Segment> {
     atomic_write(&idx_path(dir, base), &encode_index(&scan.entries))?;
     save_meta(&meta_path(dir, base), &meta)?;
     Segment::new_sealed(dir, &meta)
+}
+
+/// Best-effort read-only view of a partition whose [`recover`] failed: the
+/// leading run of sealed segments that open cleanly, and the offset one past
+/// their last record. Never truncates, deletes or seals anything (the active
+/// segment is left out), so an operator can still repair the directory.
+pub fn readable_prefix(dir: &Path) -> (Vec<Arc<Segment>>, u64) {
+    let bases = match list_segment_bases(dir) {
+        Ok(b) => b,
+        Err(_) => return (Vec::new(), 0),
+    };
+    let mut segments: Vec<Arc<Segment>> = Vec::new();
+    let mut end = bases.first().copied().unwrap_or(0);
+    for &base in bases.iter().take(bases.len().saturating_sub(1)) {
+        if base < end && !segments.is_empty() {
+            break; // overlap: stop before the inconsistency
+        }
+        match open_sealed(dir, base) {
+            Ok(seg) => {
+                end = seg.end_offset();
+                segments.push(Arc::new(seg));
+            }
+            Err(_) => break,
+        }
+    }
+    (segments, end)
 }
 
 /// Recover a partition directory: finish an interrupted truncation, clean
@@ -653,4 +886,79 @@ pub fn apply_truncation(dir: &Path, drop_from: u64) -> io::Result<()> {
         drop(create_segment_file(dir, drop_from)?);
     }
     fsync_dir(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn shared(next: u64) -> PartitionShared {
+        PartitionShared::new("t", Path::new("/nonexistent"), Vec::new(), next, None)
+    }
+
+    /// §3.1 #10: a read that raced a truncation (epoch moved) is retried
+    /// instead of returning records `truncate_from` was removing.
+    #[test]
+    fn read_racing_a_truncation_is_retried() {
+        let s = shared(100);
+        let calls = Cell::new(0);
+        let got = s
+            .read_consistent(
+                || {
+                    calls.set(calls.get() + 1);
+                    let hwm = s.high_watermark();
+                    if calls.get() == 1 {
+                        // A truncation starts while this read runs.
+                        s.begin_truncation();
+                        s.publish_committed(40);
+                    }
+                    Ok(hwm)
+                },
+                |hwm| *hwm,
+            )
+            .unwrap();
+        assert_eq!(calls.get(), 2, "the raced read is retried");
+        assert_eq!(got, 40, "the retry sees the truncated log");
+    }
+
+    /// A read that used a high watermark which then dropped (the window
+    /// between `begin_truncation` and hiding the records) is retried too.
+    #[test]
+    fn read_that_used_a_dropped_high_watermark_is_retried() {
+        let s = shared(100);
+        s.begin_truncation(); // the epoch moved before the read started
+        let calls = Cell::new(0);
+        let got = s
+            .read_consistent(
+                || {
+                    calls.set(calls.get() + 1);
+                    let hwm = s.high_watermark();
+                    if calls.get() == 1 {
+                        s.publish_committed(10);
+                    }
+                    Ok(hwm)
+                },
+                |hwm| *hwm,
+            )
+            .unwrap();
+        assert_eq!((calls.get(), got), (2, 10));
+    }
+
+    #[test]
+    fn read_that_keeps_racing_fails_retryably() {
+        let s = shared(100);
+        let err = s
+            .read_consistent(
+                || {
+                    s.begin_truncation();
+                    Ok(0u64)
+                },
+                |_| 0,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, StorageError::Io(ref e) if e.kind() == std::io::ErrorKind::Interrupted)
+        );
+    }
 }

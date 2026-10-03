@@ -79,7 +79,7 @@ fn spec(name: &str, stream: &str) -> ConsumerSpec {
 
 async fn next_batch(sub: &mut super::Subscription) -> Vec<WireRecord> {
     match timeout(Duration::from_secs(5), sub.events.recv()).await {
-        Ok(Some(SubEvent::Deliver(r))) => r,
+        Ok(Some(SubEvent::Deliver(r))) => r.decode().unwrap(),
         other => panic!("expected a delivery, got {other:?}"),
     }
 }
@@ -153,8 +153,8 @@ async fn subscribers_on_one_consumer_share_the_work() {
     let mut from_b = 0;
     while seen.len() < 100 {
         tokio::select! {
-            Some(SubEvent::Deliver(r)) = a.events.recv() => { from_a += r.len(); seen.extend(r); }
-            Some(SubEvent::Deliver(r)) = b.events.recv() => { from_b += r.len(); seen.extend(r); }
+            Some(SubEvent::Deliver(r)) = a.events.recv() => { let r = r.decode().unwrap(); from_a += r.len(); seen.extend(r); }
+            Some(SubEvent::Deliver(r)) = b.events.recv() => { let r = r.decode().unwrap(); from_b += r.len(); seen.extend(r); }
             _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("timed out at {}", seen.len()),
         }
     }
@@ -296,6 +296,8 @@ async fn pull_long_polls_until_data_arrives() {
     let empty = m
         .pull("c", 10, 0, Duration::from_millis(150))
         .await
+        .unwrap()
+        .decode()
         .unwrap();
     assert!(empty.is_empty());
     assert!(t0.elapsed() >= Duration::from_millis(140));
@@ -309,6 +311,8 @@ async fn pull_long_polls_until_data_arrives() {
         .await
         .unwrap()
         .unwrap()
+        .unwrap()
+        .decode()
         .unwrap();
     assert!(!got.is_empty());
     assert_eq!(got[0].offset, 0);
@@ -328,6 +332,8 @@ async fn subject_filters_skip_other_records() {
     let got = m
         .pull("c", 100, 0, Duration::from_millis(200))
         .await
+        .unwrap()
+        .decode()
         .unwrap();
     assert_eq!(got.len(), 6);
     assert!(got.iter().all(|r| r.subject.starts_with("orders.")));
@@ -402,7 +408,12 @@ async fn state_survives_restart_and_unacked_records_come_back() {
     {
         let (m, token) = e.manager().await;
         m.create(spec("c", "s")).await.unwrap();
-        let got = m.pull("c", 5, 0, Duration::from_millis(200)).await.unwrap();
+        let got = m
+            .pull("c", 5, 0, Duration::from_millis(200))
+            .await
+            .unwrap()
+            .decode()
+            .unwrap();
         assert_eq!(got.len(), 5);
         m.ack("c", vec![0, 1, 3]).await.unwrap();
         // Let the debounced persist run, then "crash".
@@ -417,6 +428,8 @@ async fn state_survives_restart_and_unacked_records_come_back() {
     let again = m
         .pull("c", 10, 0, Duration::from_millis(200))
         .await
+        .unwrap()
+        .decode()
         .unwrap();
     let offsets: Vec<u64> = again.iter().map(|r| r.offset).collect();
     assert_eq!(
@@ -458,6 +471,8 @@ async fn seek_repositions() {
     let got = m
         .pull("c", 10, 0, Duration::from_millis(200))
         .await
+        .unwrap()
+        .decode()
         .unwrap();
     assert_eq!(got.first().unwrap().offset, 7);
     m.seek("c", SeekTo::Latest).await.unwrap();
@@ -562,7 +577,12 @@ async fn consumer_state_stream_is_compacted() {
         m.create(spec("c", "s")).await.unwrap();
         // Ack one record at a time, letting each snapshot persist.
         for o in 0..30u64 {
-            let got = m.pull("c", 1, 0, Duration::from_millis(200)).await.unwrap();
+            let got = m
+                .pull("c", 1, 0, Duration::from_millis(200))
+                .await
+                .unwrap()
+                .decode()
+                .unwrap();
             assert_eq!(got[0].offset, o);
             m.ack("c", vec![o]).await.unwrap();
             tokio::time::sleep(Duration::from_millis(110)).await;
@@ -613,4 +633,116 @@ async fn consumer_state_stream_is_compacted() {
 
     let (m, _t) = e.manager().await;
     assert_eq!(m.info("c").await.unwrap().ack_floor, 30);
+}
+
+/// Graceful shutdown resigns leadership; consumer actors write their final
+/// state after the leader token is cancelled, so writes must stay open
+/// until they have stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_persist_survives_resign() {
+    let e = env();
+    let leadership = Arc::new(
+        crate::leadership::ClusterLeadership::spawn(
+            Arc::new(crate::lease::NoopLeaderLease::new()),
+            e.metrics.clone(),
+            None,
+        )
+        .await,
+    );
+    let mut rx = leadership.is_leader.clone();
+    rx.wait_for(|&v| v).await.unwrap();
+    e.log.set_write_gate(leadership.clone());
+    e.stream("s").await;
+    e.publish("s", "x", 5).await;
+    let m = ConsumerManager::new(e.log.clone(), e.metrics.clone());
+    m.start(leadership.current_child_token().await)
+        .await
+        .unwrap();
+    m.create(spec("c", "s")).await.unwrap();
+    let got = m
+        .pull("c", 5, 0, Duration::from_secs(1))
+        .await
+        .unwrap()
+        .decode()
+        .unwrap();
+    assert_eq!(got.len(), 5);
+    m.ack("c", got.iter().map(|r| r.offset).collect())
+        .await
+        .unwrap();
+    assert_eq!(m.info("c").await.unwrap().ack_floor, 5);
+    // Same order as run_with_shutdown.
+    leadership
+        .resign_after(async { assert!(m.wait_stopped(Duration::from_secs(5)).await) })
+        .await;
+    assert!(!leadership.is_currently_leader());
+    let snaps = super::store::ConsumerStore::new(e.log.clone())
+        .load_all()
+        .await
+        .unwrap();
+    let s = &snaps["c"];
+    assert!(
+        s.next_read == 5 && s.pending.is_empty(),
+        "final persist lost: next_read={} pending={:?}",
+        s.next_read,
+        s.pending
+    );
+}
+
+#[tokio::test]
+async fn dead_letters_survive_source_stream_recreation() {
+    // The DLQ keeps its dedup entries when the source stream is deleted and
+    // recreated; a different record at the same offset must still be
+    // dead-lettered (it used to collide on the deterministic key and retry
+    // forever).
+    let e = env();
+    let (m, _t) = e.manager().await;
+    let dlq_records = || async {
+        e.log
+            .storage()
+            .read_batch(&sn("dead"), Offset(0), ReadLimits::default())
+            .await
+            .map(|b| b.records)
+            .unwrap_or_default()
+    };
+    for (round, value) in ["first", "second"].into_iter().enumerate() {
+        e.stream("s").await;
+        e.log
+            .append(
+                &sn("s"),
+                Record {
+                    key: None,
+                    value: Bytes::from(value),
+                    subject: "x".into(),
+                    headers: vec![],
+                    timestamp_ns: None,
+                },
+            )
+            .await
+            .unwrap();
+        let mut s = spec("c", "s");
+        s.dlq_stream = Some("dead".into());
+        m.create(s).await.unwrap();
+        let mut sub = m.subscribe("c", 10).await.unwrap();
+        assert_eq!(collect(&mut sub, 1).await[0].offset, 0);
+        m.term("c", 0, "bad".into()).await.unwrap();
+        let want = round + 1;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while dlq_records().await.len() < want {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "round {round}: record not dead-lettered"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(m.info("c").await.unwrap().ack_floor, 1);
+        drop(sub);
+        m.delete("c").await.unwrap();
+        e.log.delete_stream(&sn("s")).await.unwrap();
+    }
+    let values: Vec<_> = dlq_records()
+        .await
+        .into_iter()
+        .map(|r| String::from_utf8(r.value.to_vec()).unwrap())
+        .collect();
+    assert_eq!(values, vec!["first", "second"]);
 }

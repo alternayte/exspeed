@@ -44,21 +44,27 @@ impl WindowSpec {
     /// The windows `[start, end)` containing event time `t` (ms).
     pub fn assign(&self, t: i64) -> Vec<(i64, i64)> {
         match *self {
+            // Saturating: event times are clamped upstream, but a window
+            // computation must never panic on an extreme value.
             WindowSpec::Tumbling { size_ms } => {
-                let s = t.div_euclid(size_ms) * size_ms;
-                vec![(s, s + size_ms)]
+                let s = t.div_euclid(size_ms).saturating_mul(size_ms);
+                vec![(s, s.saturating_add(size_ms))]
             }
             WindowSpec::Hopping {
                 size_ms,
                 advance_ms,
             } => {
                 // Every start s = k*advance with s <= t < s + size.
-                let last = t.div_euclid(advance_ms) * advance_ms;
+                let last = t.div_euclid(advance_ms).saturating_mul(advance_ms);
                 let mut out = Vec::new();
                 let mut s = last;
-                while s > t - size_ms {
-                    out.push((s, s + size_ms));
-                    s -= advance_ms;
+                let lo = t.saturating_sub(size_ms);
+                while s > lo {
+                    out.push((s, s.saturating_add(size_ms)));
+                    match s.checked_sub(advance_ms) {
+                        Some(n) => s = n,
+                        None => break,
+                    }
                 }
                 out.reverse();
                 out
@@ -1013,6 +1019,20 @@ fn index_unsupported() -> ExqlError {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn window_assignment_never_overflows() {
+        let t = WindowSpec::Tumbling { size_ms: 10_000 };
+        assert_eq!(t.assign(i64::MAX).len(), 1);
+        assert_eq!(t.assign(i64::MIN).len(), 1);
+        let h = WindowSpec::Hopping {
+            size_ms: 10_000,
+            advance_ms: 5_000,
+        };
+        assert!(!h.assign(i64::MAX).is_empty());
+        let _ = h.assign(i64::MIN); // must not panic
+        assert_eq!(h.assign(12_000), vec![(5_000, 15_000), (10_000, 20_000)]);
+    }
     use super::*;
 
     #[test]

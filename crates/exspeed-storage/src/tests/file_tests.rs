@@ -410,6 +410,96 @@ async fn truncate_from_is_crash_safe() {
     assert_eq!(o, Offset(9));
 }
 
+/// Crash points inside `apply_truncation`'s rewrite of the segment that
+/// holds `drop_from`, reproduced on disk: (1) right after the cut (the file
+/// is shortened, its `.meta`/`.idx` still describe the old length and the
+/// new active segment doesn't exist yet), (2) right after the sidecars are
+/// rewritten (`.meta` removed or rewritten, fresh `.idx`). With the intent
+/// marker present, recovery finishes the job either way.
+#[tokio::test]
+async fn truncate_from_crash_after_cut_and_after_meta_write() {
+    for after_meta in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let name = if after_meta { "tmeta" } else { "tcut" };
+        let s = stream(name);
+        {
+            let storage = small_segments(dir.path(), 128);
+            storage.create_stream(&s, 0, 0).await.unwrap();
+            append_n(&storage, &s, 0, 40).await;
+        }
+        let part = dir.path().join(format!("streams/{name}/partitions/0"));
+        let bases = crate::file::partition::list_segment_bases(&part).unwrap();
+        // An offset strictly inside a sealed segment (not a segment base).
+        let drop_from = (1..bases[bases.len() - 1])
+            .rev()
+            .find(|o| !bases.contains(o))
+            .unwrap();
+        let base = *bases.iter().rev().find(|&&b| b < drop_from).unwrap();
+
+        // What a complete truncation produces, on a copy.
+        let reference = TempDir::new().unwrap();
+        for e in std::fs::read_dir(&part).unwrap() {
+            let e = e.unwrap();
+            std::fs::copy(e.path(), reference.path().join(e.file_name())).unwrap();
+        }
+        crate::file::partition::apply_truncation(reference.path(), drop_from).unwrap();
+        let file = |d: &std::path::Path, ext: &str| d.join(format!("{base:020}.{ext}"));
+        let cut_len = std::fs::metadata(file(reference.path(), "seg"))
+            .unwrap()
+            .len();
+
+        // The crashed state.
+        crate::file::partition::write_truncate_marker(&part, drop_from).unwrap();
+        for &b in bases.iter().filter(|&&b| b >= drop_from) {
+            for ext in ["seg", "idx", "meta"] {
+                let _ = std::fs::remove_file(part.join(format!("{b:020}.{ext}")));
+            }
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(file(&part, "seg"))
+            .unwrap()
+            .set_len(cut_len)
+            .unwrap();
+        if after_meta {
+            // The sidecars as the finished truncation leaves them (with
+            // contiguous offsets the cut segment ends at `drop_from` and
+            // becomes the active one: no `.meta`, fresh `.idx`).
+            for ext in ["meta", "idx"] {
+                let want = file(reference.path(), ext);
+                if want.exists() {
+                    std::fs::copy(want, file(&part, ext)).unwrap();
+                } else {
+                    let _ = std::fs::remove_file(file(&part, ext));
+                }
+            }
+        }
+
+        let storage = small_segments(dir.path(), 128);
+        assert!(!part.join("truncate.json").exists(), "{name}");
+        assert_eq!(
+            storage.stream_bounds(&s).await.unwrap().1,
+            Offset(drop_from),
+            "{name}"
+        );
+        assert_eq!(
+            offsets(&storage, &s, 0).await,
+            (0..drop_from).collect::<Vec<_>>(),
+            "{name}"
+        );
+        let (o, _) = storage.append(&s, &plain(drop_from)).await.unwrap();
+        assert_eq!(o, Offset(drop_from), "{name}");
+        drop(storage);
+        // And it survives another restart.
+        let storage = small_segments(dir.path(), 128);
+        assert_eq!(
+            storage.stream_bounds(&s).await.unwrap().1,
+            Offset(drop_from + 1),
+            "{name}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn delete_and_recreate_stream() {
     let dir = TempDir::new().unwrap();

@@ -1,43 +1,3 @@
-/// Match a subject string against a pattern.
-///
-/// Pattern syntax (NATS-style):
-/// - `*` matches exactly one token (tokens separated by `.`)
-/// - `>` matches one or more tokens (must be the last token in pattern)
-/// - Empty pattern matches everything
-/// - Literal tokens match exactly
-pub fn subject_matches(subject: &str, pattern: &str) -> bool {
-    if pattern.is_empty() {
-        return true;
-    }
-
-    let subject_tokens: Vec<&str> = subject.split('.').collect();
-    let pattern_tokens: Vec<&str> = pattern.split('.').collect();
-
-    let mut si = 0;
-    let mut pi = 0;
-
-    while pi < pattern_tokens.len() {
-        let pt = pattern_tokens[pi];
-
-        if pt == ">" {
-            return si < subject_tokens.len();
-        }
-
-        if si >= subject_tokens.len() {
-            return false;
-        }
-
-        if pt == "*" || pt == subject_tokens[si] {
-            si += 1;
-            pi += 1;
-        } else {
-            return false;
-        }
-    }
-
-    si == subject_tokens.len()
-}
-
 /// A parsed, validated subject filter. Parse once (e.g. per consumer) and
 /// call [`SubjectFilter::matches`] per record without allocating.
 ///
@@ -138,11 +98,20 @@ impl SubjectFilters {
     pub fn matches(&self, subject: &str) -> bool {
         self.0.is_empty() || self.0.iter().any(|f| f.matches(subject))
     }
+
+    /// True when every subject matches (no filters).
+    pub fn is_all(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn subject_matches(subject: &str, pattern: &str) -> bool {
+        SubjectFilter::parse(pattern).unwrap().matches(subject)
+    }
 
     #[test]
     fn empty_pattern_matches_all() {
@@ -202,44 +171,19 @@ mod tests {
     }
 
     #[test]
-    fn compiled_filter_agrees_with_subject_matches() {
-        let subjects = [
-            "",
-            "a",
-            "a.b",
-            "a.b.c",
-            "orders.eu.created",
-            "orders.created",
-            "x.y",
-        ];
-        let patterns = [
-            "",
-            "a",
-            "a.*",
-            "a.>",
-            "*.b",
-            "orders.*.created",
-            "orders.>",
-            "*",
-        ];
-        for p in patterns {
-            let f = SubjectFilter::parse(p).unwrap();
-            for s in subjects {
-                assert_eq!(
-                    f.matches(s),
-                    subject_matches(s, p),
-                    "pattern {p:?} subject {s:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn filter_validation() {
         assert!(SubjectFilter::parse("a.>.c").is_err());
         assert!(SubjectFilter::parse("a..b").is_err());
         assert!(SubjectFilter::parse("a.b*").is_err());
+        assert!(SubjectFilter::parse("a.*b").is_err());
+        assert!(SubjectFilter::parse("a. b").is_err());
+        assert!(SubjectFilter::parse(".a").is_err());
+        assert!(SubjectFilter::parse("a.").is_err());
         assert!(SubjectFilter::parse("a.>").is_ok());
+        // A subject with an empty token (never publishable) still matches
+        // a wildcard filter sensibly.
+        assert!(subject_matches("a..b", "a.*.b"));
+        assert!(subject_matches("a.", "a.>"));
     }
 
     #[test]

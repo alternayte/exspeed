@@ -15,4 +15,16 @@ spec:
     - port: http
       path: /metrics
       interval: {{ .Values.serviceMonitor.interval }}
+      {{- if .Values.tls.secretName }}
+      scheme: https
+      tlsConfig:
+        insecureSkipVerify: true
+      {{- end }}
+      {{- if .Values.metricsTokenSecret }}
+      authorization:
+        type: Bearer
+        credentials:
+          name: {{ .Values.metricsTokenSecret }}
+          key: token
+      {{- end }}
 {{- end }}

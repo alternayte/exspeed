@@ -76,12 +76,16 @@ async fn tls_enabled_tcp_handshakes_with_rustls() {
 
     let (cert_path, key_path, _certs_tmp) = generate_self_signed();
     let data_tmp = tempfile::tempdir().unwrap();
-    let port = exspeed_testkit::pick_unused_port().unwrap();
-    let api_port = exspeed_testkit::pick_unused_port().unwrap();
+    let port_l = exspeed_testkit::bind_local();
+    let port = port_l.local_addr().unwrap().port();
+    let api_port_l = exspeed_testkit::bind_local();
+    let api_port = api_port_l.local_addr().unwrap().port();
 
     let args = exspeed::cli::server::ServerArgs {
         bind: format!("127.0.0.1:{port}"),
+        tcp_listener: Some(std::sync::Arc::new(port_l)),
         api_bind: format!("127.0.0.1:{api_port}"),
+        api_listener: Some(std::sync::Arc::new(api_port_l)),
         data_dir: data_tmp.path().to_path_buf(),
         auth_token: None,
         credentials_file: None,
@@ -147,12 +151,16 @@ async fn wait_for_port(port: u16) {
 async fn tls_enabled_http_responds_to_rustls_request() {
     let (cert_path, key_path, _certs_tmp) = generate_self_signed();
     let data_tmp = tempfile::tempdir().unwrap();
-    let port = exspeed_testkit::pick_unused_port().unwrap();
-    let api_port = exspeed_testkit::pick_unused_port().unwrap();
+    let port_l = exspeed_testkit::bind_local();
+    let port = port_l.local_addr().unwrap().port();
+    let api_port_l = exspeed_testkit::bind_local();
+    let api_port = api_port_l.local_addr().unwrap().port();
 
     let args = exspeed::cli::server::ServerArgs {
         bind: format!("127.0.0.1:{port}"),
+        tcp_listener: Some(std::sync::Arc::new(port_l)),
         api_bind: format!("127.0.0.1:{api_port}"),
+        api_listener: Some(std::sync::Arc::new(api_port_l)),
         data_dir: data_tmp.path().to_path_buf(),
         auth_token: None,
         credentials_file: None,
@@ -185,12 +193,16 @@ async fn tls_enabled_http_responds_to_rustls_request() {
 async fn auth_and_tls_together_end_to_end() {
     let (cert_path, key_path, _certs_tmp) = generate_self_signed();
     let data_tmp = tempfile::tempdir().unwrap();
-    let port = exspeed_testkit::pick_unused_port().unwrap();
-    let api_port = exspeed_testkit::pick_unused_port().unwrap();
+    let port_l = exspeed_testkit::bind_local();
+    let port = port_l.local_addr().unwrap().port();
+    let api_port_l = exspeed_testkit::bind_local();
+    let api_port = api_port_l.local_addr().unwrap().port();
 
     let args = exspeed::cli::server::ServerArgs {
         bind: format!("127.0.0.1:{port}"),
+        tcp_listener: Some(std::sync::Arc::new(port_l)),
         api_bind: format!("127.0.0.1:{api_port}"),
+        api_listener: Some(std::sync::Arc::new(api_port_l)),
         data_dir: data_tmp.path().to_path_buf(),
         auth_token: Some("e2e-secret".into()),
         credentials_file: None,

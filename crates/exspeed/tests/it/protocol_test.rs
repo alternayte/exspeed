@@ -125,7 +125,11 @@ async fn publish_then_read_with_filter() {
     assert_eq!(first.key.as_deref(), Some(&b"k1"[..]));
     assert_eq!(first.value.as_ref(), b"a");
     assert!(first.headers.contains(&("h".to_string(), "1".to_string())));
-    assert!(first.timestamp_ms > 1_600_000_000_000, "timestamp is in ms");
+    assert!(
+        first.timestamp_ns > 1_600_000_000_000_000_000,
+        "timestamp is in ns"
+    );
+    assert_eq!(first.timestamp_ms(), first.timestamp_ns / 1_000_000);
 
     let placed = c
         .read("orders", 0, 100, Duration::ZERO, "orders.placed")
@@ -346,4 +350,131 @@ async fn many_concurrent_requests_on_one_connection() {
     offsets.sort();
     assert_eq!(offsets, (0..50).collect::<Vec<_>>());
     wait.abort();
+}
+
+/// Reads frames until the server closes the connection; returns how long
+/// that took.
+async fn until_closed(
+    r: &mut FramedRead<tokio::net::tcp::OwnedReadHalf, ExspeedCodec>,
+) -> Duration {
+    let start = std::time::Instant::now();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), r.next()).await {
+            Err(_) => panic!("connection still open after 10 s"),
+            Ok(None) | Ok(Some(Err(_))) => return start.elapsed(),
+            Ok(Some(Ok(_))) => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn silent_and_idle_connections_are_closed() {
+    let server = TestServer::builder()
+        .with(|a| {
+            a.handshake_timeout_secs = 1;
+            a.idle_timeout_secs = 1;
+        })
+        .start()
+        .await;
+
+    // No Connect at all: closed after the handshake timeout.
+    let (mut r, _w) = raw(&server.addr).await;
+    let t = until_closed(&mut r).await;
+    assert!(t >= Duration::from_millis(800), "closed too early: {t:?}");
+
+    // Connected, then silent: closed after the idle timeout.
+    let (mut r, mut w) = raw(&server.addr).await;
+    w.send(
+        Request::Connect {
+            client_id: "idle".into(),
+            token: None,
+        }
+        .into_frame(1),
+    )
+    .await
+    .unwrap();
+    let t = until_closed(&mut r).await;
+    assert!(t >= Duration::from_millis(800), "closed too early: {t:?}");
+
+    // A client that keeps sending stays connected past the idle timeout.
+    let (mut r, mut w) = raw(&server.addr).await;
+    w.send(
+        Request::Connect {
+            client_id: "busy".into(),
+            token: None,
+        }
+        .into_frame(1),
+    )
+    .await
+    .unwrap();
+    recv(&mut r).await.expect("ConnectOk");
+    for i in 0..6u32 {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        w.send(Request::Ping.into_frame(10 + i)).await.unwrap();
+        recv(&mut r).await.expect("pong");
+    }
+}
+
+/// Publishes pipelined on one connection are applied in the order they
+/// were sent (they are coalesced into shared storage batches, never
+/// reordered), including a mix of single and batch publishes.
+#[tokio::test]
+async fn pipelined_publishes_keep_their_order() {
+    let server = TestServer::start().await;
+    let client = server.client().await;
+    create_stream(&client, "pipe").await;
+    let (mut r, mut w) = raw(&server.addr).await;
+    w.send(
+        Request::Connect {
+            client_id: "pipe".into(),
+            token: None,
+        }
+        .into_frame(1),
+    )
+    .await
+    .unwrap();
+    recv(&mut r).await.expect("ConnectOk");
+    // corr 2..=401: every 10th request is a 3-record batch.
+    let mut expected = Vec::new();
+    let mut next = 0u64;
+    for corr in 2..=401u32 {
+        let rec = |i: u32| PublishRecord::new("p", format!("{corr}-{i}"));
+        let req = if corr % 10 == 0 {
+            expected.push((corr, (next..next + 3).collect::<Vec<_>>()));
+            next += 3;
+            Request::PublishBatch {
+                stream: "pipe".into(),
+                records: vec![rec(0), rec(1), rec(2)],
+            }
+        } else {
+            expected.push((corr, vec![next]));
+            next += 1;
+            Request::Publish {
+                stream: "pipe".into(),
+                record: rec(0),
+            }
+        };
+        w.send(req.into_frame(corr)).await.unwrap();
+    }
+    let mut got = std::collections::HashMap::new();
+    while got.len() < expected.len() {
+        let f = recv(&mut r).await.expect("reply");
+        let offsets = match Response::from_frame(&f).unwrap() {
+            Response::PublishOk { offset, .. } => vec![offset],
+            Response::PublishBatchOk { results } => results.into_iter().map(|(o, _)| o).collect(),
+            other => panic!("unexpected {other:?}"),
+        };
+        got.insert(f.correlation_id, offsets);
+    }
+    for (corr, want) in expected {
+        assert_eq!(got[&corr], want, "request {corr}");
+    }
+    // And the stored values are in send order.
+    let recs = client
+        .read("pipe", 0, 1000, Duration::ZERO, "")
+        .await
+        .unwrap();
+    assert_eq!(recs.records.len() as u64, next);
+    assert_eq!(recs.records[0].value, Bytes::from("2-0"));
+    assert_eq!(recs.records[next as usize - 1].value, Bytes::from("401-0"));
 }

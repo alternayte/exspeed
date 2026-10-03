@@ -218,6 +218,16 @@ async fn time_filters() {
     .await
     .unwrap();
     assert_eq!(res.rows, vec![vec![json!(0)]]);
+    // The time bound is pushed into the scan (an empty offset range), not
+    // only filtered after reading every record.
+    let plan = run(
+        &r,
+        "EXPLAIN SELECT offset FROM orders WHERE timestamp < now() - INTERVAL '1 hour'",
+    )
+    .await
+    .unwrap();
+    let text = serde_json::to_string(&plan.rows).unwrap();
+    assert!(text.contains("offsets=[0, 0)"), "{text}");
 }
 
 #[tokio::test]
@@ -350,6 +360,58 @@ async fn external_postgres_join() {
     .await
     .unwrap_err();
     assert_eq!(e.code(), "PLAN_ERROR", "{e}");
+
+    // Projection and filters reach Postgres; numeric(p, s) is a decimal.
+    sqlx::query("ALTER TABLE exql_regions ADD COLUMN rate NUMERIC(10, 2)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE exql_regions SET rate = CASE code WHEN 'eu' THEN 12.34 ELSE 0.5 END")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Column lists are cached with the snapshot TTL; a schema change is
+    // seen after it expires or when the connection is re-registered.
+    r.external.invalidate("wh");
+    let res = run(
+        &r,
+        "SELECT name, rate FROM wh.exql_regions WHERE code = 'eu' AND \"we\"\"ird\" >= 1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(res.rows, vec![vec![json!("Europe"), json!(12.34)]]);
+    let plan = run(
+        &r,
+        "EXPLAIN SELECT name FROM wh.exql_regions WHERE code IN ('eu', 'xx')",
+    )
+    .await
+    .unwrap();
+    let text = serde_json::to_string(&plan.rows).unwrap();
+    assert!(text.contains("ExternalSnapshotExec"), "{text}");
+    // A filter that can't be pushed is still applied locally.
+    let res = run(
+        &r,
+        "SELECT code FROM wh.exql_regions WHERE upper(name) LIKE 'UNITED%'",
+    )
+    .await
+    .unwrap();
+    assert_eq!(res.rows, vec![vec![json!("us")]]);
+    // A memory pool smaller than the snapshot refuses the scan.
+    let cfg = ExqlConfig {
+        memory_limit_bytes: 1,
+        ..ExqlConfig::default()
+    };
+    let r2 = r.clone();
+    let state = build_state(&cfg, runtime_env(&cfg).unwrap(), r2).unwrap();
+    let e = execute(
+        state,
+        "SELECT name FROM wh.exql_regions WHERE code = 'us'",
+        &cfg,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(e.code(), "RESOURCES_EXHAUSTED", "{e}");
+
     sqlx::query("DROP TABLE exql_regions")
         .execute(&pool)
         .await
@@ -399,4 +461,101 @@ async fn timeout_and_memory_limit() {
     .await
     .unwrap_err();
     assert_eq!(e.code(), "RESOURCES_EXHAUSTED", "{e}");
+}
+
+#[tokio::test]
+async fn order_by_offset_honours_limit_and_offset() {
+    let (_s, r, _d) = setup(&amounts()).await;
+    for (sql, want) in [
+        (
+            "SELECT offset FROM orders ORDER BY offset LIMIT 2",
+            vec![0, 1],
+        ),
+        (
+            "SELECT offset FROM orders ORDER BY offset ASC LIMIT 2",
+            vec![0, 1],
+        ),
+        (
+            "SELECT offset FROM orders ORDER BY offset LIMIT 2 OFFSET 1",
+            vec![1, 2],
+        ),
+        (
+            "SELECT offset FROM orders ORDER BY offset DESC LIMIT 2",
+            vec![4, 3],
+        ),
+        ("SELECT offset FROM orders LIMIT 3", vec![0, 1, 2]),
+        (
+            "SELECT offset FROM (SELECT offset FROM orders ORDER BY offset LIMIT 2) t",
+            vec![0, 1],
+        ),
+        (
+            "SELECT offset, (SELECT COUNT(*) FROM orders) AS n FROM orders ORDER BY offset LIMIT 2",
+            vec![0, 1],
+        ),
+    ] {
+        let res = run(&r, sql).await.unwrap();
+        let got: Vec<_> = res.rows.iter().map(|r| r[0].as_u64().unwrap()).collect();
+        assert_eq!(got, want, "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn json_arrow_and_big_integers_compare_numerically() {
+    let (_s, r, _d) = setup(&amounts()).await;
+    // `->` (a JSON value) in a numeric context behaves like `->>`.
+    let res = run(
+        &r,
+        "SELECT offset FROM orders WHERE payload->'amount' > 250 ORDER BY offset",
+    )
+    .await
+    .unwrap();
+    assert_eq!(res.rows, vec![vec![json!(1)], vec![json!(3)]]);
+    let res = run(
+        &r,
+        "SELECT offset FROM orders WHERE payload->'amount' IS NOT NULL ORDER BY payload->'amount'",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        res.rows,
+        vec![
+            vec![json!(2)],
+            vec![json!(0)],
+            vec![json!(1)],
+            vec![json!(3)]
+        ]
+    );
+
+    // Integers above 2^53 compare exactly against integers.
+    let (_s, r, _d) = setup(&[
+        ("q", r#"{"qty": 9007199254740993}"#),
+        ("q", r#"{"qty": 9007199254740992}"#),
+        ("q", r#"{"qty": 1.5}"#),
+    ])
+    .await;
+    let res = run(
+        &r,
+        "SELECT offset FROM orders WHERE payload->>'qty' = 9007199254740992",
+    )
+    .await
+    .unwrap();
+    assert_eq!(res.rows, vec![vec![json!(1)]]);
+    let res = run(&r, "SELECT offset FROM orders WHERE payload->>'qty' < 2")
+        .await
+        .unwrap();
+    assert_eq!(res.rows, vec![vec![json!(2)]]);
+
+    // MIN/MAX are numeric; the text maximum is an explicit CAST away.
+    let (_s, r, _d) = setup(&amounts()).await;
+    let res = run(
+        &r,
+        "SELECT MAX(payload->>'amount'), MIN(payload->>'amount'), \
+         MAX(CAST(payload->>'region' AS VARCHAR)) FROM orders",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        res.rows,
+        vec![vec![json!(1000.0), json!(25.5), json!("us")]]
+    );
 }

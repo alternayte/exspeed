@@ -1,501 +1,583 @@
-use opentelemetry::metrics::{Counter, Gauge, Histogram, MeterProvider, UpDownCounter};
-use opentelemetry::KeyValue;
-use opentelemetry_sdk::metrics::SdkMeterProvider;
+//! Server-wide Prometheus metrics.
+//!
+//! Every series is named `exspeed_*`; counters end in `_total` exactly once.
+//! Instruments keep the `add` / `record` shape of OpenTelemetry instruments
+//! (attributes as [`KeyValue`]s) so call sites stay terse, but they are plain
+//! `prometheus` vectors underneath. That gives exact names and lets the
+//! server drop series when the stream, consumer, connector or query they
+//! describe is deleted ([`Metrics::forget_stream`] and friends).
 
-/// Server-wide metrics backed by OpenTelemetry instruments and exported via
-/// Prometheus.
-///
-/// Create with [`Metrics::new`], which returns the struct together with a
-/// [`prometheus::Registry`] that should be wired into the HTTP `/metrics`
-/// endpoint.
+use std::borrow::Cow;
+use std::collections::HashMap;
+
+use prometheus::core::{Collector, MetricVec, MetricVecBuilder};
+use prometheus::{
+    GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry,
+};
+
+pub use opentelemetry::KeyValue;
+
+/// Label values in `names` order; a label missing from `attrs` is empty.
+fn label_values<'a>(names: &[&str], attrs: &'a [KeyValue]) -> Vec<Cow<'a, str>> {
+    names
+        .iter()
+        .map(|n| {
+            attrs
+                .iter()
+                .find(|kv| kv.key.as_str() == *n)
+                .map(|kv| kv.value.as_str())
+                .unwrap_or(Cow::Borrowed(""))
+        })
+        .collect()
+}
+
+/// Remove every series of `vec` for which `keep` returns false.
+fn retain_series<T: MetricVecBuilder>(
+    vec: &MetricVec<T>,
+    names: &[&str],
+    keep: impl Fn(&HashMap<&str, &str>) -> bool,
+) {
+    for family in vec.collect() {
+        for m in family.get_metric() {
+            let labels: HashMap<&str, &str> = m
+                .get_label()
+                .iter()
+                .map(|l| (l.get_name(), l.get_value()))
+                .collect();
+            if !keep(&labels) {
+                let values: Vec<&str> = names
+                    .iter()
+                    .map(|n| labels.get(n).copied().unwrap_or(""))
+                    .collect();
+                let _ = vec.remove_label_values(&values);
+            }
+        }
+    }
+}
+
+macro_rules! instrument {
+    ($(#[$doc:meta])* $name:ident, $vec:ty, $method:ident($v:ty) => $apply:ident) => {
+        $(#[$doc])*
+        pub struct $name {
+            vec: $vec,
+            labels: &'static [&'static str],
+        }
+
+        impl $name {
+            pub fn $method(&self, value: $v, attrs: &[KeyValue]) {
+                let values = label_values(self.labels, attrs);
+                let refs: Vec<&str> = values.iter().map(|v| v.as_ref()).collect();
+                self.vec.with_label_values(&refs).$apply(value);
+            }
+
+            /// Drop every series whose `label` equals `value`.
+            pub fn forget(&self, label: &str, value: &str) {
+                if self.labels.contains(&label) {
+                    retain_series(&self.vec, self.labels, |l| l.get(label) != Some(&value));
+                }
+            }
+
+            /// Keep only the series for which `keep` returns true.
+            pub fn retain(&self, keep: impl Fn(&HashMap<&str, &str>) -> bool) {
+                retain_series(&self.vec, self.labels, keep);
+            }
+        }
+    };
+}
+
+instrument!(
+    /// A monotonic counter.
+    Counter, IntCounterVec, add(u64) => inc_by
+);
+instrument!(
+    /// An integer gauge set to a value.
+    Gauge, IntGaugeVec, record(i64) => set
+);
+instrument!(
+    /// A floating-point gauge set to a value.
+    FloatGauge, GaugeVec, record(f64) => set
+);
+instrument!(
+    /// An integer gauge moved up and down.
+    UpDownCounter, IntGaugeVec, add(i64) => add
+);
+instrument!(
+    /// A histogram (seconds; Prometheus default buckets).
+    Histogram, HistogramVec, record(f64) => observe
+);
+
+struct Builder {
+    registry: Registry,
+}
+
+impl Builder {
+    fn opts(name: &str, help: &str) -> Opts {
+        debug_assert!(name.starts_with("exspeed_"), "{name}");
+        Opts::new(name, help)
+    }
+
+    fn register<C: Collector + Clone + 'static>(&self, c: C) -> C {
+        self.registry
+            .register(Box::new(c.clone()))
+            .expect("metric names are unique");
+        c
+    }
+
+    fn counter(&self, name: &str, help: &str, labels: &'static [&'static str]) -> Counter {
+        debug_assert!(name.ends_with("_total") && !name.ends_with("_total_total"));
+        let vec = IntCounterVec::new(Self::opts(name, help), labels).expect("valid counter");
+        Counter {
+            vec: self.register(vec),
+            labels,
+        }
+    }
+
+    fn gauge(&self, name: &str, help: &str, labels: &'static [&'static str]) -> Gauge {
+        let vec = IntGaugeVec::new(Self::opts(name, help), labels).expect("valid gauge");
+        Gauge {
+            vec: self.register(vec),
+            labels,
+        }
+    }
+
+    fn float_gauge(&self, name: &str, help: &str, labels: &'static [&'static str]) -> FloatGauge {
+        let vec = GaugeVec::new(Self::opts(name, help), labels).expect("valid gauge");
+        FloatGauge {
+            vec: self.register(vec),
+            labels,
+        }
+    }
+
+    fn up_down(&self, name: &str, help: &str, labels: &'static [&'static str]) -> UpDownCounter {
+        let vec = IntGaugeVec::new(Self::opts(name, help), labels).expect("valid gauge");
+        UpDownCounter {
+            vec: self.register(vec),
+            labels,
+        }
+    }
+
+    fn histogram(&self, name: &str, help: &str, labels: &'static [&'static str]) -> Histogram {
+        debug_assert!(name.starts_with("exspeed_"), "{name}");
+        let vec =
+            HistogramVec::new(HistogramOpts::new(name, help), labels).expect("valid histogram");
+        Histogram {
+            vec: self.register(vec),
+            labels,
+        }
+    }
+}
+
+/// Server-wide metrics. Create with [`Metrics::new`], which also returns
+/// the [`prometheus::Registry`] the HTTP `/metrics` endpoint renders.
 pub struct Metrics {
-    pub records_published: Counter<u64>,
-    pub records_consumed: Counter<u64>,
-    pub consumer_lag: Gauge<i64>,
-    pub storage_bytes: Gauge<i64>,
-    pub connections_active: UpDownCounter<i64>,
-    /// Counts every TCP connection rejected because the per-process
-    /// `EXSPEED_MAX_CONNS` cap was reached at accept time. Operators can
-    /// alert on the rate of this counter to detect saturation.
-    pub connections_rejected: Counter<u64>,
-    pub uptime_seconds: Gauge<f64>,
-    /// Whether this pod currently holds the named lease. Gauge value is 1
-    /// when held, 0 when released/lost. Labeled by `name` (e.g.
-    /// `connector:orders-source` or `query:abc123`).
-    pub lease_held: Gauge<i64>,
-    /// Counts every `try_acquire` attempt this pod made. Labeled by `name`
-    /// and `result`, where `result` is one of `"acquired"`, `"rejected"`
-    /// (another pod holds the lease), or `"error"` (backend failure).
-    pub lease_acquire_total: Counter<u64>,
-    /// Counts every lease lost involuntarily (heartbeat failure, TTL
-    /// expiry). Labeled by `name`. Does not fire on clean release/shutdown.
-    pub lease_lost_total: Counter<u64>,
-    /// Whether this pod currently holds the cluster leader lease.
-    /// `1` = leader, `0` = standby. Exactly one pod in a cluster should
-    /// observe `1` at any given time.
-    pub is_leader: Gauge<i64>,
-    /// Counts every promotion / demotion event this pod has observed,
-    /// labeled `direction = "acquired" | "lost"`.
-    pub leader_transitions_total: Counter<u64>,
-    /// End-to-end latency of a successful publish, in seconds. Labeled by
-    /// `stream`.
-    pub publish_latency_seconds: Histogram<f64>,
-    /// Time from a record's write timestamp to its delivery to a subscriber,
-    /// in seconds. Labeled by `stream` and `consumer`.
-    pub consume_latency_seconds: Histogram<f64>,
-    /// Storage write failures. Labeled by `stream` and `kind`
-    /// (`"storage_full"` or `"other"`).
-    pub storage_write_errors: Counter<u64>,
+    /// `exspeed_records_published_total{stream}`: records written through
+    /// the log (duplicates not counted).
+    pub records_published: Counter,
+    /// `exspeed_consumer_lag{stream,consumer}`: records the consumer has
+    /// not yet acknowledged (stream end minus ack floor). Set on scrape.
+    pub consumer_lag: Gauge,
+    /// `exspeed_storage_bytes{stream}`: bytes on disk. Set on scrape.
+    pub storage_bytes: Gauge,
+    /// `exspeed_partition_failed{stream}`: 1 while the stream's partition
+    /// is fenced read-only after an IO error it could not roll back (until
+    /// a restart runs recovery). Set on scrape.
+    pub partition_failed: Gauge,
+    /// `exspeed_connections_active`: open client (TCP) connections.
+    pub connections_active: UpDownCounter,
+    /// `exspeed_connections_rejected_total`: connections refused because
+    /// `max_connections` was reached.
+    pub connections_rejected: Counter,
+    /// `exspeed_uptime_seconds`.
+    pub uptime_seconds: FloatGauge,
+    /// `exspeed_lease_held{name}`: 1 while this node holds the lease.
+    pub lease_held: Gauge,
+    /// `exspeed_lease_acquire_total{name,result}`: `result` is `acquired`,
+    /// `rejected` (another node holds it) or `error` (backend failure).
+    pub lease_acquire_total: Counter,
+    /// `exspeed_lease_lost_total{name}`: involuntary losses (another holder,
+    /// or the heartbeat missed its local deadline).
+    pub lease_lost_total: Counter,
+    /// `exspeed_is_leader`: 1 on the leader, 0 elsewhere.
+    pub is_leader: Gauge,
+    /// `exspeed_leader_transitions_total{direction}`: `acquired`, `lost`,
+    /// `stepped_down` or `resigned`.
+    pub leader_transitions_total: Counter,
+    /// `exspeed_publish_latency_seconds{stream}`: successful publishes.
+    pub publish_latency_seconds: Histogram,
+    /// `exspeed_storage_write_errors_total{stream,kind}`: `kind` is
+    /// `storage_full` or `other`.
+    pub storage_write_errors: Counter,
 
-    // -- connector sink observability -----------------------------------------
-    /// Counts records dropped by a sink connector before any SQL was executed.
-    /// Labels: `connector`, `stream`, `reason` (one of `non_json_object`,
-    /// `type_mismatch`, `missing_required_field`, `timestamp_parse`).
-    pub connector_records_skipped_total: Counter<u64>,
-    /// Counts SQL-side write errors (DB rejected the statement). Labels:
-    /// `connector`, `stream`, `sqlstate` (best-effort; empty when the driver
-    /// didn't give one).
-    pub connector_write_errors_total: Counter<u64>,
-    /// Counts connector start failures (e.g. CREATE TABLE failed, connection
-    /// refused). Labels: `connector`, `stream`.
-    pub connector_start_errors_total: Counter<u64>,
-    /// Counts successful DLQ writes for a connector. Labels: `connector`,
-    /// `reason` (`PoisonReason::label()`).
-    pub connector_dlq_total: Counter<u64>,
-    /// Counts DLQ append failures (the poison record could not be written to
-    /// its DLQ stream). Labels: `connector`.
-    pub connector_dlq_failures_total: Counter<u64>,
-    /// Counts retry attempt outcomes on transient sink/source failures.
-    /// Labels: `connector`, `outcome` (`retried` | `exhausted`).
-    pub connector_retry_attempts_total: Counter<u64>,
-    /// Counts transient-exhaustion events and the action the manager took.
-    /// Labels: `connector`, `action` (`restart` | `fail` | `dlq_batch`).
-    pub connector_transient_exhausted_total: Counter<u64>,
-    /// Records a consumer gave up on after `max_deliver` attempts or a term.
-    /// Labels: `consumer`, `outcome` (`dlq` | `dropped`).
-    pub consumer_dead_letters_total: Counter<u64>,
-    /// Supervisor state per connector: 1 for the current state, 0 for the
-    /// others. Labels: `connector`, `state` (`starting` | `running` |
-    /// `backoff` | `failed` | `stopped`).
-    pub connector_state: Gauge<i64>,
-    /// Supervisor restarts (stop + start after a failure). Labels: `connector`.
-    pub connector_restarts_total: Counter<u64>,
-    /// Connector lag. Labels: `connector`, `unit` (`records` for sinks:
-    /// stream high watermark minus committed offset; `bytes` for Postgres
-    /// CDC/outbox: server WAL end minus the confirmed LSN).
-    pub connector_lag: Gauge<i64>,
-    /// Unix time (seconds) of the last successful batch. Labels: `connector`.
-    pub connector_last_success_timestamp_seconds: Gauge<f64>,
-    /// Records moved by a connector. Labels: `connector`, `direction`
-    /// (`in` = appended by a source, `out` = committed by a sink).
-    pub connector_records_total: Counter<u64>,
-    /// Fill ratio (0.0–1.0) of the per-subscription delivery mpsc channel.
-    /// Labeled by `consumer` and `subscriber`.
-    pub subscription_queue_fill_ratio: Gauge<f64>,
+    // -- connectors ----------------------------------------------------------
+    /// `exspeed_connector_records_skipped_total{connector,stream,reason}`.
+    pub connector_records_skipped_total: Counter,
+    /// `exspeed_connector_write_errors_total{connector,stream,sqlstate}`.
+    pub connector_write_errors_total: Counter,
+    /// `exspeed_connector_start_errors_total{connector,stream}`.
+    pub connector_start_errors_total: Counter,
+    /// `exspeed_connector_dlq_total{connector,reason}`.
+    pub connector_dlq_total: Counter,
+    /// `exspeed_connector_dlq_failures_total{connector}`.
+    pub connector_dlq_failures_total: Counter,
+    /// `exspeed_connector_retry_attempts_total{connector,outcome}`.
+    pub connector_retry_attempts_total: Counter,
+    /// `exspeed_connector_transient_exhausted_total{connector,action}`.
+    pub connector_transient_exhausted_total: Counter,
+    /// `exspeed_consumer_dead_letters_total{consumer,outcome}`: `outcome`
+    /// is `dlq` or `dropped`.
+    pub consumer_dead_letters_total: Counter,
+    /// `exspeed_connector_state{connector,state}`: 1 for the current state.
+    pub connector_state: Gauge,
+    /// `exspeed_connector_restarts_total{connector}`.
+    pub connector_restarts_total: Counter,
+    /// `exspeed_connector_lag{connector,unit}`.
+    pub connector_lag: Gauge,
+    /// `exspeed_connector_last_success_timestamp_seconds{connector}`.
+    pub connector_last_success_timestamp_seconds: FloatGauge,
+    /// `exspeed_connector_records_total{connector,direction}`.
+    pub connector_records_total: Counter,
 
-    // -- dedup observability ------------------------------------------------
-    /// Current number of live dedup entries per stream. Labeled by `stream`.
-    pub dedup_map_entries: Gauge<i64>,
-    /// Counts idempotent publish outcomes. Labeled by `stream` and `result`
-    /// (`"written"` | `"duplicate"`).
-    pub dedup_writes_total: Counter<u64>,
-    /// Counts key-collision events (same msg_id, different body) per stream.
-    /// Labeled by `stream`.
-    pub dedup_collisions_total: Counter<u64>,
-    /// Counts events where the dedup map was full and a publish was rejected.
-    /// Labeled by `stream`.
-    pub dedup_map_full_total: Counter<u64>,
-    /// Histogram of time spent writing a dedup snapshot to disk, in seconds.
-    pub dedup_snapshot_write_duration_seconds: Histogram<f64>,
-    /// Histogram of dedup map rebuild duration per stream. Labeled by
-    /// `stream` and `source` (`"snapshot"` | `"full_scan"`).
-    pub dedup_rebuild_duration_seconds: Histogram<f64>,
-    /// Configured dedup window in seconds per stream. Labeled by `stream`.
-    pub dedup_window_secs: Gauge<i64>,
+    // -- dedup ---------------------------------------------------------------
+    /// `exspeed_dedup_map_entries{stream}`.
+    pub dedup_map_entries: Gauge,
+    /// `exspeed_dedup_writes_total{stream,result}`.
+    pub dedup_writes_total: Counter,
+    /// `exspeed_dedup_collisions_total{stream}`.
+    pub dedup_collisions_total: Counter,
+    /// `exspeed_dedup_map_full_total{stream}`.
+    pub dedup_map_full_total: Counter,
+    /// `exspeed_dedup_snapshot_write_duration_seconds`.
+    pub dedup_snapshot_write_duration_seconds: Histogram,
+    /// `exspeed_dedup_rebuild_duration_seconds{stream,source}`.
+    pub dedup_rebuild_duration_seconds: Histogram,
+    /// `exspeed_dedup_window_secs{stream}`.
+    pub dedup_window_secs: Gauge,
 
-    // -- auth observability --------------------------------------------------
-    /// Counts every auth denial. Labeled by:
-    /// - `reason`: `"unauthorized"` (no/invalid credential) | `"forbidden"`
-    ///   (authenticated identity lacked the required permission).
-    /// - `transport`: `"tcp"` | `"http"`.
-    /// - `op`: opcode name on TCP (e.g. `"Publish"`) or request path on HTTP
-    ///   (e.g. `"/api/v1/streams"`).
-    pub auth_denied_total: Counter<u64>,
+    // -- auth ----------------------------------------------------------------
+    /// `exspeed_auth_denied_total{reason,transport,op}`: `op` is the opcode
+    /// (TCP) or the route template (HTTP, e.g. `/api/v1/streams/{name}`).
+    pub auth_denied_total: Counter,
 
-    // -- replication observability ------------------------------------------
-    /// Labeled {role=leader|follower|standalone}. Exactly one label is 1 at
-    /// a time.
-    pub replication_role: Gauge<i64>,
-    /// Leader-only: number of followers currently holding live replication
-    /// connections.
-    pub replication_connected_followers: Gauge<i64>,
-    /// Wall-clock lag observed by each follower, labeled by `follower_id`.
-    pub replication_lag_seconds: Gauge<f64>,
-    /// Offset lag observed by each follower, labeled by `follower_id`.
-    pub replication_lag_records: Gauge<i64>,
-    /// Follower-side: records successfully applied to local storage.
-    pub replication_records_applied_total: Counter<u64>,
-    /// Records an ExQL continuous query dropped because they arrived after
-    /// the watermark (later than the query's GRACE PERIOD). Labeled `query`.
-    pub exql_late_records_total: Counter<u64>,
-    /// Replication wire bytes, labeled `direction=in|out`.
-    pub replication_bytes_total: Counter<u64>,
-    /// Records truncated on a follower due to divergent-history recovery,
-    /// labeled by `stream`.
-    pub replication_truncated_records_total: Counter<u64>,
-    /// Stream-reseed events (follower cursor earlier than leader's
-    /// `earliest_offset`), labeled by `stream`.
-    pub replication_reseed_total: Counter<u64>,
-    /// Leader-side: followers dropped because their send queue overflowed,
-    /// labeled by `follower_id`.
-    pub replication_follower_queue_drops_total: Counter<u64>,
-    /// Replication protocol / decode errors.
-    pub replication_protocol_errors_total: Counter<u64>,
-    /// Follower-side errors applying a replicated record to storage.
-    pub replication_apply_errors_total: Counter<u64>,
-    /// Follower dial attempts to the leader's cluster port, labeled
-    /// `result=ok|err`.
-    pub replication_connect_attempts_total: Counter<u64>,
+    // -- replication ---------------------------------------------------------
+    /// `exspeed_replication_role{role}`: 1 for this node's role.
+    pub replication_role: Gauge,
+    /// `exspeed_replication_lag_records{follower_id}` (follower side).
+    pub replication_lag_records: Gauge,
+    /// `exspeed_replication_records_applied_total{stream}` (follower side).
+    pub replication_records_applied_total: Counter,
+    /// `exspeed_replication_bytes_total{direction}`.
+    pub replication_bytes_total: Counter,
+    /// `exspeed_replication_truncated_records_total{stream}`.
+    pub replication_truncated_records_total: Counter,
+    /// `exspeed_replication_reseed_total{stream}`: a follower behind the
+    /// leader's earliest offset dropped its copy and re-replicated.
+    pub replication_reseed_total: Counter,
+    /// `exspeed_replication_apply_errors_total` (follower side).
+    pub replication_apply_errors_total: Counter,
+    /// `exspeed_replication_connect_attempts_total{result}`.
+    pub replication_connect_attempts_total: Counter,
+    /// `exspeed_exql_late_records_total{query}`.
+    pub exql_late_records_total: Counter,
 }
 
 impl Metrics {
-    /// Build all OTel instruments and a Prometheus registry that can serve
-    /// them over HTTP.
-    pub fn new() -> (Self, prometheus::Registry) {
-        let registry = prometheus::Registry::new();
-
-        let exporter = opentelemetry_prometheus::exporter()
-            .with_registry(registry.clone())
-            .build()
-            .expect("prometheus exporter should build");
-
-        let provider = SdkMeterProvider::builder().with_reader(exporter).build();
-
-        let meter = provider.meter("exspeed");
-
-        let records_published = meter.u64_counter("records_published").build();
-        let records_consumed = meter.u64_counter("records_consumed").build();
-        let consumer_lag = meter.i64_gauge("consumer_lag").build();
-        let storage_bytes = meter.i64_gauge("storage_bytes").build();
-        let connections_active = meter.i64_up_down_counter("connections_active").build();
-        let connections_rejected = meter
-            .u64_counter("connections_rejected_total")
-            .with_description("Connections rejected because EXSPEED_MAX_CONNS was reached")
-            .build();
-        let uptime_seconds = meter.f64_gauge("uptime_seconds").build();
-        let lease_held = meter.i64_gauge("exspeed_lease_held").build();
-        let lease_acquire_total = meter.u64_counter("exspeed_lease_acquire_total").build();
-        let lease_lost_total = meter.u64_counter("exspeed_lease_lost_total").build();
-
-        // Zero-initialize the lease metrics so the descriptor shows up in
-        // /metrics output even before any acquire attempt (e.g., on pods
-        // with no connectors/queries configured). Operator dashboards can
-        // then alert on absence; we don't want the metric to vanish simply
-        // because nothing has fired yet. The `__init__` label is a sentinel
-        // distinct from any real lease name.
-        let init_label = [KeyValue::new("name", "__init__")];
-        lease_held.record(0, &init_label);
-        lease_acquire_total.add(
-            0,
-            &[
-                KeyValue::new("name", "__init__"),
-                KeyValue::new("result", "acquired"),
-            ],
-        );
-        lease_lost_total.add(0, &init_label);
-
-        let is_leader = meter.i64_gauge("exspeed_is_leader").build();
-        let leader_transitions_total = meter
-            .u64_counter("exspeed_leader_transitions_total")
-            .build();
-
-        // Zero-initialize so the descriptor appears in /metrics before any
-        // transition fires.
-        is_leader.record(0, &[]);
-        leader_transitions_total.add(0, &[KeyValue::new("direction", "acquired")]);
-        leader_transitions_total.add(0, &[KeyValue::new("direction", "lost")]);
-
-        let publish_latency_seconds = meter
-            .f64_histogram("publish_latency_seconds")
-            .with_description("End-to-end latency of a successful publish in seconds")
-            .build();
-        let consume_latency_seconds = meter
-            .f64_histogram("consume_latency_seconds")
-            .with_description("Time from record write to delivery to a subscriber, in seconds")
-            .build();
-        let storage_write_errors = meter
-            .u64_counter("storage_write_errors_total")
-            .with_description("Storage write failures (kind label: storage_full, other)")
-            .build();
-        let subscription_queue_fill_ratio = meter
-            .f64_gauge("subscription_queue_fill_ratio")
-            .with_description("Fill ratio (0.0–1.0) of the per-subscription delivery channel")
-            .build();
-
-        // -- dedup instruments -----------------------------------------------
-
-        let dedup_map_entries = meter
-            .i64_gauge("exspeed_dedup_map_entries")
-            .with_description("Current number of live dedup entries per stream")
-            .build();
-        let dedup_writes_total = meter
-            .u64_counter("exspeed_dedup_writes_total")
-            .with_description("Idempotent publish outcomes (written or duplicate) per stream")
-            .build();
-        let dedup_collisions_total = meter
-            .u64_counter("exspeed_dedup_collisions_total")
-            .with_description("Key-collision events (same msg_id, different body) per stream")
-            .build();
-        let dedup_map_full_total = meter
-            .u64_counter("exspeed_dedup_map_full_total")
-            .with_description("Publishes rejected because the dedup map was full, per stream")
-            .build();
-        let dedup_snapshot_write_duration_seconds = meter
-            .f64_histogram("exspeed_dedup_snapshot_write_duration_seconds")
-            .with_description("Time spent writing a dedup snapshot to disk, in seconds")
-            .build();
-        let dedup_rebuild_duration_seconds = meter
-            .f64_histogram("exspeed_dedup_rebuild_duration_seconds")
-            .with_description("Dedup map rebuild duration per stream, in seconds")
-            .build();
-        let dedup_window_secs = meter
-            .i64_gauge("exspeed_dedup_window_secs")
-            .with_description("Configured dedup window in seconds per stream")
-            .build();
-
-        // -- auth instruments ------------------------------------------------
-
-        let auth_denied_total = meter
-            .u64_counter("exspeed_auth_denied_total")
-            .with_description(
-                "Auth denials. Labels: reason=unauthorized|forbidden, transport=tcp|http, op=<opcode or path>",
-            )
-            .build();
-
-        // Zero-initialize a representative label set so the descriptor is
-        // visible in /metrics before any denial fires. Operators alerting on
-        // `rate(exspeed_auth_denied_total[...]) > 0` want the series to exist.
-        auth_denied_total.add(
-            0,
-            &[
-                KeyValue::new("reason", "unauthorized"),
-                KeyValue::new("transport", "tcp"),
-                KeyValue::new("op", "__init__"),
-            ],
-        );
-
-        // -- replication instruments -----------------------------------------
-
-        let replication_role = meter.i64_gauge("exspeed_replication_role").build();
-        let replication_connected_followers = meter
-            .i64_gauge("exspeed_replication_connected_followers")
-            .build();
-        let replication_lag_seconds = meter.f64_gauge("exspeed_replication_lag_seconds").build();
-        let replication_lag_records = meter.i64_gauge("exspeed_replication_lag_records").build();
-        let replication_records_applied_total = meter
-            .u64_counter("exspeed_replication_records_applied_total")
-            .build();
-        let replication_bytes_total = meter.u64_counter("exspeed_replication_bytes_total").build();
-        let exql_late_records_total = meter
-            .u64_counter("exspeed_exql_late_records_total")
-            .with_description(
+    /// Build every instrument and the registry `/metrics` renders.
+    pub fn new() -> (Self, Registry) {
+        let b = Builder {
+            registry: Registry::new(),
+        };
+        let m = Metrics {
+            records_published: b.counter(
+                "exspeed_records_published_total",
+                "Records written through the log",
+                &["stream"],
+            ),
+            consumer_lag: b.gauge(
+                "exspeed_consumer_lag",
+                "Records a consumer has not acknowledged yet (stream end minus ack floor)",
+                &["stream", "consumer"],
+            ),
+            storage_bytes: b.gauge("exspeed_storage_bytes", "Bytes on disk per stream", &["stream"]),
+            partition_failed: b.gauge(
+                "exspeed_partition_failed",
+                "1 while the stream's partition is fenced read-only after an unrecoverable IO error",
+                &["stream"],
+            ),
+            connections_active: b.up_down(
+                "exspeed_connections_active",
+                "Open client connections",
+                &[],
+            ),
+            connections_rejected: b.counter(
+                "exspeed_connections_rejected_total",
+                "Connections rejected because max_connections was reached",
+                &[],
+            ),
+            uptime_seconds: b.float_gauge("exspeed_uptime_seconds", "Server uptime", &[]),
+            lease_held: b.gauge(
+                "exspeed_lease_held",
+                "1 while this node holds the lease",
+                &["name"],
+            ),
+            lease_acquire_total: b.counter(
+                "exspeed_lease_acquire_total",
+                "Lease acquire attempts (result: acquired, rejected, error)",
+                &["name", "result"],
+            ),
+            lease_lost_total: b.counter(
+                "exspeed_lease_lost_total",
+                "Leases lost involuntarily",
+                &["name"],
+            ),
+            is_leader: b.gauge("exspeed_is_leader", "1 on the cluster leader", &[]),
+            leader_transitions_total: b.counter(
+                "exspeed_leader_transitions_total",
+                "Leadership transitions (direction: acquired, lost, stepped_down, resigned)",
+                &["direction"],
+            ),
+            publish_latency_seconds: b.histogram(
+                "exspeed_publish_latency_seconds",
+                "Latency of a successful publish",
+                &["stream"],
+            ),
+            storage_write_errors: b.counter(
+                "exspeed_storage_write_errors_total",
+                "Storage write failures (kind: storage_full, other)",
+                &["stream", "kind"],
+            ),
+            connector_records_skipped_total: b.counter(
+                "exspeed_connector_records_skipped_total",
+                "Records dropped by a sink connector (by reason)",
+                &["connector", "stream", "reason"],
+            ),
+            connector_write_errors_total: b.counter(
+                "exspeed_connector_write_errors_total",
+                "SQL-side write errors from sink connectors",
+                &["connector", "stream", "sqlstate"],
+            ),
+            connector_start_errors_total: b.counter(
+                "exspeed_connector_start_errors_total",
+                "Connector start failures (connect or CREATE TABLE)",
+                &["connector", "stream"],
+            ),
+            connector_dlq_total: b.counter(
+                "exspeed_connector_dlq_total",
+                "Records routed to a connector DLQ stream",
+                &["connector", "reason"],
+            ),
+            connector_dlq_failures_total: b.counter(
+                "exspeed_connector_dlq_failures_total",
+                "DLQ append failures (record lost)",
+                &["connector"],
+            ),
+            connector_retry_attempts_total: b.counter(
+                "exspeed_connector_retry_attempts_total",
+                "Retry attempt outcomes on transient failures",
+                &["connector", "outcome"],
+            ),
+            connector_transient_exhausted_total: b.counter(
+                "exspeed_connector_transient_exhausted_total",
+                "Transient-exhaustion events and the action taken",
+                &["connector", "action"],
+            ),
+            consumer_dead_letters_total: b.counter(
+                "exspeed_consumer_dead_letters_total",
+                "Records dead-lettered (or dropped) by consumers",
+                &["consumer", "outcome"],
+            ),
+            connector_state: b.gauge(
+                "exspeed_connector_state",
+                "Connector supervisor state (1 = current)",
+                &["connector", "state"],
+            ),
+            connector_restarts_total: b.counter(
+                "exspeed_connector_restarts_total",
+                "Connector restarts by the supervisor",
+                &["connector"],
+            ),
+            connector_lag: b.gauge(
+                "exspeed_connector_lag",
+                "Connector lag (unit: records, bytes or rows)",
+                &["connector", "unit"],
+            ),
+            connector_last_success_timestamp_seconds: b.float_gauge(
+                "exspeed_connector_last_success_timestamp_seconds",
+                "Unix time of the connector's last successful batch",
+                &["connector"],
+            ),
+            connector_records_total: b.counter(
+                "exspeed_connector_records_total",
+                "Records appended by sources (in) or committed by sinks (out)",
+                &["connector", "direction"],
+            ),
+            dedup_map_entries: b.gauge(
+                "exspeed_dedup_map_entries",
+                "Live dedup entries per stream",
+                &["stream"],
+            ),
+            dedup_writes_total: b.counter(
+                "exspeed_dedup_writes_total",
+                "Idempotent publish outcomes (result: written, duplicate)",
+                &["stream", "result"],
+            ),
+            dedup_collisions_total: b.counter(
+                "exspeed_dedup_collisions_total",
+                "msg_id reused with a different body",
+                &["stream"],
+            ),
+            dedup_map_full_total: b.counter(
+                "exspeed_dedup_map_full_total",
+                "Publishes rejected because the dedup map was full",
+                &["stream"],
+            ),
+            dedup_snapshot_write_duration_seconds: b.histogram(
+                "exspeed_dedup_snapshot_write_duration_seconds",
+                "Time spent writing a dedup snapshot",
+                &[],
+            ),
+            dedup_rebuild_duration_seconds: b.histogram(
+                "exspeed_dedup_rebuild_duration_seconds",
+                "Dedup map rebuild duration (source: snapshot, full_scan)",
+                &["stream", "source"],
+            ),
+            dedup_window_secs: b.gauge(
+                "exspeed_dedup_window_secs",
+                "Configured dedup window per stream",
+                &["stream"],
+            ),
+            auth_denied_total: b.counter(
+                "exspeed_auth_denied_total",
+                "Auth denials (reason: unauthorized, forbidden; transport: tcp, http; op: opcode or route)",
+                &["reason", "transport", "op"],
+            ),
+            replication_role: b.gauge(
+                "exspeed_replication_role",
+                "1 for this node's replication role",
+                &["role"],
+            ),
+            replication_lag_records: b.gauge(
+                "exspeed_replication_lag_records",
+                "Records this follower is behind the leader",
+                &["follower_id"],
+            ),
+            replication_records_applied_total: b.counter(
+                "exspeed_replication_records_applied_total",
+                "Records a follower applied to its log",
+                &["stream"],
+            ),
+            replication_bytes_total: b.counter(
+                "exspeed_replication_bytes_total",
+                "Replication wire bytes (direction: in, out)",
+                &["direction"],
+            ),
+            replication_truncated_records_total: b.counter(
+                "exspeed_replication_truncated_records_total",
+                "Records a follower truncated because they diverged from the leader",
+                &["stream"],
+            ),
+            replication_reseed_total: b.counter(
+                "exspeed_replication_reseed_total",
+                "Streams a follower re-replicated because it was behind the leader's earliest offset",
+                &["stream"],
+            ),
+            replication_apply_errors_total: b.counter(
+                "exspeed_replication_apply_errors_total",
+                "Follower errors applying replicated records",
+                &[],
+            ),
+            replication_connect_attempts_total: b.counter(
+                "exspeed_replication_connect_attempts_total",
+                "Follower dials to the leader's cluster port (result: ok, err)",
+                &["result"],
+            ),
+            exql_late_records_total: b.counter(
+                "exspeed_exql_late_records_total",
                 "Records dropped by continuous queries for arriving after the watermark",
-            )
-            .build();
-        let replication_truncated_records_total = meter
-            .u64_counter("exspeed_replication_truncated_records_total")
-            .build();
-        let replication_reseed_total = meter
-            .u64_counter("exspeed_replication_reseed_total")
-            .build();
-        let replication_follower_queue_drops_total = meter
-            .u64_counter("exspeed_replication_follower_queue_drops_total")
-            .build();
-        let replication_protocol_errors_total = meter
-            .u64_counter("exspeed_replication_protocol_errors_total")
-            .build();
-        let replication_apply_errors_total = meter
-            .u64_counter("exspeed_replication_apply_errors_total")
-            .build();
-        let replication_connect_attempts_total = meter
-            .u64_counter("exspeed_replication_connect_attempts_total")
-            .build();
-
-        // Descriptor-visibility zero-init: ensures `/metrics` always lists each
-        // series even before any replication events.
-        replication_role.record(1, &[KeyValue::new("role", "standalone")]);
-        replication_role.record(0, &[KeyValue::new("role", "leader")]);
-        replication_role.record(0, &[KeyValue::new("role", "follower")]);
-        replication_connected_followers.record(0, &[]);
-        replication_bytes_total.add(0, &[KeyValue::new("direction", "in")]);
-        replication_bytes_total.add(0, &[KeyValue::new("direction", "out")]);
-        replication_connect_attempts_total.add(0, &[KeyValue::new("result", "ok")]);
-        replication_connect_attempts_total.add(0, &[KeyValue::new("result", "err")]);
-
-        // -- connector sink instruments --------------------------------------
-        let connector_records_skipped_total = meter
-            .u64_counter("exspeed_connector_records_skipped_total")
-            .with_description("Records dropped by a sink connector (by reason)")
-            .build();
-        let connector_write_errors_total = meter
-            .u64_counter("exspeed_connector_write_errors_total")
-            .with_description("SQL-side write errors from sink connectors")
-            .build();
-        let connector_start_errors_total = meter
-            .u64_counter("exspeed_connector_start_errors_total")
-            .with_description("Connector start failures (connect or CREATE TABLE)")
-            .build();
-        let consumer_dead_letters_total = meter
-            .u64_counter("exspeed_consumer_dead_letters")
-            .with_description("Records dead-lettered (or dropped) by consumers")
-            .build();
-        let connector_dlq_total = meter
-            .u64_counter("exspeed_connector_dlq_total")
-            .with_description("Records routed to a connector DLQ stream")
-            .build();
-        let connector_dlq_failures_total = meter
-            .u64_counter("exspeed_connector_dlq_failures_total")
-            .with_description("DLQ append failures (record lost)")
-            .build();
-        let connector_retry_attempts_total = meter
-            .u64_counter("exspeed_connector_retry_attempts_total")
-            .with_description("Retry attempt outcomes on transient failures")
-            .build();
-        let connector_transient_exhausted_total = meter
-            .u64_counter("exspeed_connector_transient_exhausted_total")
-            .with_description("Transient-exhaustion events and action taken")
-            .build();
-
-        let connector_state = meter
-            .i64_gauge("exspeed_connector_state")
-            .with_description("Connector supervisor state (1 = current)")
-            .build();
-        let connector_restarts_total = meter
-            .u64_counter("exspeed_connector_restarts_total")
-            .with_description("Connector restarts by the supervisor")
-            .build();
-        let connector_lag = meter
-            .i64_gauge("exspeed_connector_lag")
-            .with_description("Connector lag (unit label: records, bytes or rows)")
-            .build();
-        let connector_last_success_timestamp_seconds = meter
-            .f64_gauge("exspeed_connector_last_success_timestamp_seconds")
-            .with_description("Unix time of the connector's last successful batch")
-            .build();
-        let connector_records_total = meter
-            .u64_counter("exspeed_connector_records_total")
-            .with_description("Records appended by sources (in) or committed by sinks (out)")
-            .build();
-        connector_restarts_total.add(0, &[KeyValue::new("connector", "__init__")]);
-
-        connector_records_skipped_total.add(
-            0,
-            &[
-                KeyValue::new("connector", "__init__"),
-                KeyValue::new("stream", "__init__"),
-                KeyValue::new("reason", "non_json_object"),
-            ],
-        );
-        connector_write_errors_total.add(
-            0,
-            &[
-                KeyValue::new("connector", "__init__"),
-                KeyValue::new("stream", "__init__"),
-                KeyValue::new("sqlstate", ""),
-            ],
-        );
-        connector_start_errors_total.add(
-            0,
-            &[
-                KeyValue::new("connector", "__init__"),
-                KeyValue::new("stream", "__init__"),
-            ],
-        );
-        connector_dlq_total.add(
-            0,
-            &[
-                KeyValue::new("connector", "__init__"),
-                KeyValue::new("reason", "sink_rejected"),
-            ],
-        );
-        connector_dlq_failures_total.add(0, &[KeyValue::new("connector", "__init__")]);
-        connector_retry_attempts_total.add(
-            0,
-            &[
-                KeyValue::new("connector", "__init__"),
-                KeyValue::new("outcome", "retried"),
-            ],
-        );
-        connector_transient_exhausted_total.add(
-            0,
-            &[
-                KeyValue::new("connector", "__init__"),
-                KeyValue::new("action", "loop_forever"),
-            ],
-        );
-
-        // Keep the provider alive — dropping it shuts down the metrics pipeline.
-        std::mem::forget(provider);
-
-        let metrics = Metrics {
-            records_published,
-            records_consumed,
-            consumer_lag,
-            storage_bytes,
-            connections_active,
-            connections_rejected,
-            uptime_seconds,
-            lease_held,
-            lease_acquire_total,
-            lease_lost_total,
-            is_leader,
-            leader_transitions_total,
-            publish_latency_seconds,
-            consume_latency_seconds,
-            storage_write_errors,
-            connector_records_skipped_total,
-            connector_write_errors_total,
-            connector_start_errors_total,
-            connector_dlq_total,
-            connector_dlq_failures_total,
-            connector_retry_attempts_total,
-            connector_transient_exhausted_total,
-            consumer_dead_letters_total,
-            connector_state,
-            connector_restarts_total,
-            connector_lag,
-            connector_last_success_timestamp_seconds,
-            connector_records_total,
-            subscription_queue_fill_ratio,
-            dedup_map_entries,
-            dedup_writes_total,
-            dedup_collisions_total,
-            dedup_map_full_total,
-            dedup_snapshot_write_duration_seconds,
-            dedup_rebuild_duration_seconds,
-            dedup_window_secs,
-            auth_denied_total,
-            replication_role,
-            replication_connected_followers,
-            replication_lag_seconds,
-            replication_lag_records,
-            replication_records_applied_total,
-            exql_late_records_total,
-            replication_bytes_total,
-            replication_truncated_records_total,
-            replication_reseed_total,
-            replication_follower_queue_drops_total,
-            replication_protocol_errors_total,
-            replication_apply_errors_total,
-            replication_connect_attempts_total,
+                &["query"],
+            ),
         };
 
-        (metrics, registry)
+        // Zero-initialize series operators alert on, so they exist before
+        // the first event (alerting on absence or `rate() > 0` works).
+        m.connections_active.add(0, &[]);
+        m.connections_rejected.add(0, &[]);
+        m.is_leader.record(0, &[]);
+        for d in ["acquired", "lost"] {
+            m.leader_transitions_total
+                .add(0, &[KeyValue::new("direction", d)]);
+        }
+        for r in ["leader", "follower", "standalone"] {
+            m.replication_role
+                .record(i64::from(r == "standalone"), &[KeyValue::new("role", r)]);
+        }
+        for d in ["in", "out"] {
+            m.replication_bytes_total
+                .add(0, &[KeyValue::new("direction", d)]);
+        }
+        for r in ["ok", "err"] {
+            m.replication_connect_attempts_total
+                .add(0, &[KeyValue::new("result", r)]);
+        }
+        m.replication_apply_errors_total.add(0, &[]);
+
+        let registry = b.registry;
+        (m, registry)
     }
 
-    // -- helper methods -----------------------------------------------------
+    // -- forgetting deleted objects -------------------------------------------
 
-    /// Increment `records_published` by 1 for the given stream.
+    /// Drop every series labelled with a deleted stream.
+    pub fn forget_stream(&self, stream: &str) {
+        let s = ("stream", stream);
+        self.records_published.forget(s.0, s.1);
+        self.consumer_lag.forget(s.0, s.1);
+        self.storage_bytes.forget(s.0, s.1);
+        self.partition_failed.forget(s.0, s.1);
+        self.publish_latency_seconds.forget(s.0, s.1);
+        self.storage_write_errors.forget(s.0, s.1);
+        self.dedup_map_entries.forget(s.0, s.1);
+        self.dedup_writes_total.forget(s.0, s.1);
+        self.dedup_collisions_total.forget(s.0, s.1);
+        self.dedup_map_full_total.forget(s.0, s.1);
+        self.dedup_rebuild_duration_seconds.forget(s.0, s.1);
+        self.dedup_window_secs.forget(s.0, s.1);
+        self.replication_records_applied_total.forget(s.0, s.1);
+        self.replication_truncated_records_total.forget(s.0, s.1);
+        self.replication_reseed_total.forget(s.0, s.1);
+    }
+
+    /// Drop every series labelled with a deleted consumer.
+    pub fn forget_consumer(&self, consumer: &str) {
+        self.consumer_lag.forget("consumer", consumer);
+        self.consumer_dead_letters_total
+            .forget("consumer", consumer);
+    }
+
+    /// Drop every series labelled with a deleted connector.
+    pub fn forget_connector(&self, connector: &str) {
+        let c = ("connector", connector);
+        self.connector_records_skipped_total.forget(c.0, c.1);
+        self.connector_write_errors_total.forget(c.0, c.1);
+        self.connector_start_errors_total.forget(c.0, c.1);
+        self.connector_dlq_total.forget(c.0, c.1);
+        self.connector_dlq_failures_total.forget(c.0, c.1);
+        self.connector_retry_attempts_total.forget(c.0, c.1);
+        self.connector_transient_exhausted_total.forget(c.0, c.1);
+        self.connector_state.forget(c.0, c.1);
+        self.connector_restarts_total.forget(c.0, c.1);
+        self.connector_lag.forget(c.0, c.1);
+        self.connector_last_success_timestamp_seconds
+            .forget(c.0, c.1);
+        self.connector_records_total.forget(c.0, c.1);
+    }
+
+    /// Drop every series labelled with a deleted continuous query.
+    pub fn forget_query(&self, query: &str) {
+        self.exql_late_records_total.forget("query", query);
+    }
+
+    // -- helper methods -------------------------------------------------------
+
     /// Count a record a consumer dead-lettered (`outcome` = `dlq`) or dropped.
     pub fn record_consumer_dead_letter(&self, consumer: &str, outcome: &'static str) {
         self.consumer_dead_letters_total.add(
@@ -507,23 +589,13 @@ impl Metrics {
         );
     }
 
+    /// Count one record written to `stream`.
     pub fn record_publish(&self, stream: &str) {
         self.records_published
             .add(1, &[KeyValue::new("stream", stream.to_owned())]);
     }
 
-    /// Increment `records_consumed` by 1 for the given stream and consumer.
-    pub fn record_consume(&self, stream: &str, consumer: &str) {
-        self.records_consumed.add(
-            1,
-            &[
-                KeyValue::new("stream", stream.to_owned()),
-                KeyValue::new("consumer", consumer.to_owned()),
-            ],
-        );
-    }
-
-    /// Record the current consumer lag for a stream/consumer pair.
+    /// Set a consumer's lag.
     pub fn set_consumer_lag(&self, stream: &str, consumer: &str, lag: i64) {
         self.consumer_lag.record(
             lag,
@@ -534,46 +606,44 @@ impl Metrics {
         );
     }
 
-    /// Record the current storage size in bytes for a stream.
+    /// Set a stream's size on disk.
     pub fn set_storage_bytes(&self, stream: &str, bytes: i64) {
         self.storage_bytes
             .record(bytes, &[KeyValue::new("stream", stream.to_owned())]);
     }
 
-    /// Increment the active-connections gauge by 1.
+    /// Set whether a stream's partition is fenced.
+    pub fn set_partition_failed(&self, stream: &str, failed: bool) {
+        self.partition_failed.record(
+            i64::from(failed),
+            &[KeyValue::new("stream", stream.to_owned())],
+        );
+    }
+
     pub fn connection_opened(&self) {
         self.connections_active.add(1, &[]);
     }
 
-    /// Decrement the active-connections gauge by 1.
     pub fn connection_closed(&self) {
         self.connections_active.add(-1, &[]);
     }
 
-    /// Increment `connections_rejected_total` by 1. Called from the TCP
-    /// accept loop when a new connection is dropped because the
-    /// `EXSPEED_MAX_CONNS` semaphore is exhausted.
+    /// A connection was refused at accept time (`max_connections` reached).
     pub fn connection_rejected(&self) {
         self.connections_rejected.add(1, &[]);
     }
 
-    /// Record the server uptime in seconds.
     pub fn set_uptime(&self, seconds: f64) {
         self.uptime_seconds.record(seconds, &[]);
     }
 
-    /// Flip the `exspeed_lease_held` gauge for the named lease. Call with
-    /// `held=true` on successful acquire and `held=false` on release or loss.
+    /// `held = true` on acquire, `false` on release or loss.
     pub fn set_lease_held(&self, name: &str, held: bool) {
-        self.lease_held.record(
-            if held { 1 } else { 0 },
-            &[KeyValue::new("name", name.to_owned())],
-        );
+        self.lease_held
+            .record(i64::from(held), &[KeyValue::new("name", name.to_owned())]);
     }
 
-    /// Increment `exspeed_lease_acquire_total` with a `result` label. The
-    /// accepted values are exactly `"acquired"`, `"rejected"`, or `"error"`
-    /// — keep these stable as operator dashboards depend on them.
+    /// `result` is `acquired`, `rejected` or `error`.
     pub fn record_lease_acquire_attempt(&self, name: &str, result: &'static str) {
         self.lease_acquire_total.add(
             1,
@@ -584,47 +654,28 @@ impl Metrics {
         );
     }
 
-    /// Increment `exspeed_lease_lost_total` — fired only on involuntary
-    /// lease loss (heartbeat failure / TTL expiry). Clean release must not
-    /// call this.
+    /// Involuntary lease loss only; a clean release must not call this.
     pub fn record_lease_lost(&self, name: &str) {
         self.lease_lost_total
             .add(1, &[KeyValue::new("name", name.to_owned())]);
     }
 
-    /// Flip the `exspeed_is_leader` gauge. `true` on promotion, `false` on
-    /// demotion.
     pub fn set_is_leader(&self, leader: bool) {
-        self.is_leader.record(if leader { 1 } else { 0 }, &[]);
+        self.is_leader.record(i64::from(leader), &[]);
     }
 
-    /// Record a leadership transition. `direction` must be either
-    /// `"acquired"` or `"lost"` — operator dashboards depend on these labels.
+    /// `direction`: `acquired`, `lost`, `stepped_down` or `resigned`.
     pub fn record_leader_transition(&self, direction: &'static str) {
         self.leader_transitions_total
             .add(1, &[KeyValue::new("direction", direction)]);
     }
 
-    /// Record the latency of a successful publish, in seconds.
     pub fn record_publish_latency(&self, stream: &str, secs: f64) {
         self.publish_latency_seconds
             .record(secs, &[KeyValue::new("stream", stream.to_owned())]);
     }
 
-    /// Record the time from a record's write timestamp to when it was
-    /// delivered to a consumer, in seconds.
-    pub fn record_consume_latency(&self, stream: &str, consumer: &str, secs: f64) {
-        self.consume_latency_seconds.record(
-            secs,
-            &[
-                KeyValue::new("stream", stream.to_owned()),
-                KeyValue::new("consumer", consumer.to_owned()),
-            ],
-        );
-    }
-
-    /// Increment the storage_write_errors counter. `kind` is one of
-    /// `"storage_full"` or `"other"`.
+    /// `kind` is `storage_full` or `other`.
     pub fn record_storage_write_error(&self, stream: &str, kind: &'static str) {
         self.storage_write_errors.add(
             1,
@@ -635,21 +686,9 @@ impl Metrics {
         );
     }
 
-    /// Set the fill ratio (0.0–1.0) of a subscription's delivery channel.
-    pub fn set_subscription_queue_fill(&self, consumer: &str, subscriber: &str, ratio: f64) {
-        self.subscription_queue_fill_ratio.record(
-            ratio,
-            &[
-                KeyValue::new("consumer", consumer.to_owned()),
-                KeyValue::new("subscriber", subscriber.to_owned()),
-            ],
-        );
-    }
+    // -- dedup helpers --------------------------------------------------------
 
-    // -- dedup helpers -------------------------------------------------------
-
-    /// Increment `exspeed_dedup_writes_total`. `result` is `"written"` or
-    /// `"duplicate"`.
+    /// `result` is `written` or `duplicate`.
     pub fn record_dedup_write(&self, stream: &str, result: &str) {
         self.dedup_writes_total.add(
             1,
@@ -660,31 +699,26 @@ impl Metrics {
         );
     }
 
-    /// Increment `exspeed_dedup_collisions_total` for the given stream.
     pub fn record_dedup_collision(&self, stream: &str) {
         self.dedup_collisions_total
             .add(1, &[KeyValue::new("stream", stream.to_owned())]);
     }
 
-    /// Increment `exspeed_dedup_map_full_total` for the given stream.
     pub fn record_dedup_map_full(&self, stream: &str) {
         self.dedup_map_full_total
             .add(1, &[KeyValue::new("stream", stream.to_owned())]);
     }
 
-    /// Set the current live dedup entry count for a stream.
     pub fn set_dedup_map_entries(&self, stream: &str, n: i64) {
         self.dedup_map_entries
             .record(n, &[KeyValue::new("stream", stream.to_owned())]);
     }
 
-    /// Record the duration of a dedup snapshot write, in seconds.
     pub fn observe_dedup_snapshot_write_duration(&self, secs: f64) {
         self.dedup_snapshot_write_duration_seconds.record(secs, &[]);
     }
 
-    /// Record the duration of a dedup map rebuild, in seconds. `source` is
-    /// `"snapshot"` or `"full_scan"`.
+    /// `source` is `snapshot` or `full_scan`.
     pub fn observe_dedup_rebuild_duration(&self, stream: &str, source: &str, secs: f64) {
         self.dedup_rebuild_duration_seconds.record(
             secs,
@@ -695,18 +729,16 @@ impl Metrics {
         );
     }
 
-    /// Set the configured dedup window in seconds for a stream.
     pub fn set_dedup_window_secs(&self, stream: &str, secs: i64) {
         self.dedup_window_secs
             .record(secs, &[KeyValue::new("stream", stream.to_owned())]);
     }
 
-    // -- auth helpers --------------------------------------------------------
+    // -- auth helpers ---------------------------------------------------------
 
-    /// Increment `exspeed_auth_denied_total`. `reason` must be
-    /// `"unauthorized"` or `"forbidden"`; `transport` is `"tcp"` or `"http"`;
-    /// `op` is the opcode name (TCP) or request path (HTTP). Operator
-    /// dashboards depend on this label set — keep it stable.
+    /// `reason`: `unauthorized` or `forbidden`; `transport`: `tcp` or `http`;
+    /// `op`: the opcode (TCP) or the route template (HTTP). Never pass a raw
+    /// request path: it would make the label set unbounded.
     pub fn auth_denied(&self, reason: &str, transport: &str, op: &str) {
         self.auth_denied_total.add(
             1,
@@ -718,22 +750,16 @@ impl Metrics {
         );
     }
 
-    // -- replication helpers ------------------------------------------------
+    // -- replication helpers --------------------------------------------------
 
-    /// Set the current replication role. Exactly one label is 1 at a time;
-    /// the previous two are reset to 0.
+    /// Exactly one role is 1 at a time.
     pub fn set_replication_role(&self, role: &'static str) {
         for candidate in ["leader", "follower", "standalone"] {
             self.replication_role.record(
-                if candidate == role { 1 } else { 0 },
+                i64::from(candidate == role),
                 &[KeyValue::new("role", candidate)],
             );
         }
-    }
-
-    pub fn inc_replication_follower_queue_drop(&self, follower_id: &str) {
-        self.replication_follower_queue_drops_total
-            .add(1, &[KeyValue::new("follower_id", follower_id.to_string())]);
     }
 
     pub fn inc_replication_truncated_records(&self, stream: &str, count: u64) {
@@ -751,41 +777,98 @@ impl Metrics {
             .add(1, &[KeyValue::new("result", if ok { "ok" } else { "err" })]);
     }
 
-    /// Increment `exspeed_replication_records_applied_total` by `count` for
-    /// the given stream. Called from the follower's apply path after each
-    /// successful `storage.append`. Label cardinality is bounded by the
-    /// number of streams (same precedent as `truncated_records_total` and
-    /// `reseed_total`).
     pub fn inc_replication_records_applied(&self, stream: &str, count: u64) {
         self.replication_records_applied_total
             .add(count, &[KeyValue::new("stream", stream.to_string())]);
-    }
-
-    /// Set the follower's observed wall-clock lag, in seconds, for a stream.
-    /// Computed as `now_ms - last_applied_record_ms`. Negative inputs can
-    /// arise from clock skew between leader and follower — clamp to 0 so
-    /// the README recipe `rate(exspeed_replication_lag_seconds[...]) > 10`
-    /// behaves the way operators expect.
-    pub fn set_replication_lag_seconds(&self, stream: &str, secs: f64) {
-        self.replication_lag_seconds.record(
-            secs.max(0.0),
-            &[KeyValue::new("stream", stream.to_string())],
-        );
-    }
-
-    /// Set the follower's observed offset-lag (`leader_latest - follower_next`)
-    /// for a stream. This is a best-effort signal derived from the leader's
-    /// manifest + batch deltas — it reflects offset-lag at the moment of the
-    /// last applied batch, not the live tail. See `lag_seconds` for the
-    /// primary indicator.
-    pub fn set_replication_lag_records(&self, stream: &str, records: i64) {
-        self.replication_lag_records
-            .record(records, &[KeyValue::new("stream", stream.to_string())]);
     }
 
     /// Count records a continuous query dropped as late.
     pub fn record_exql_late(&self, query: &str, n: u64) {
         self.exql_late_records_total
             .add(n, &[KeyValue::new("query", query.to_string())]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prometheus::{Encoder, TextEncoder};
+
+    fn render(r: &Registry) -> String {
+        let mut buf = Vec::new();
+        TextEncoder::new().encode(&r.gather(), &mut buf).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn every_series_is_prefixed_and_counters_end_in_total_once() {
+        let (m, r) = Metrics::new();
+        m.record_publish("s");
+        m.record_publish_latency("s", 0.01);
+        m.set_consumer_lag("s", "c", 3);
+        let text = render(&r);
+        for line in text
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+        {
+            assert!(line.starts_with("exspeed_"), "unprefixed series: {line}");
+            assert!(!line.contains("_total_total"), "doubled suffix: {line}");
+        }
+        for line in text.lines().filter(|l| l.starts_with("# TYPE ")) {
+            let mut parts = line.split_whitespace().skip(2);
+            let (name, kind) = (parts.next().unwrap(), parts.next().unwrap());
+            if kind == "counter" {
+                assert!(name.ends_with("_total"), "{name}");
+            }
+        }
+        assert!(text.contains("exspeed_records_published_total{stream=\"s\"} 1"));
+        assert!(text.contains("exspeed_consumer_lag{consumer=\"c\",stream=\"s\"} 3"));
+    }
+
+    #[test]
+    fn forgetting_a_stream_drops_its_series_only() {
+        let (m, r) = Metrics::new();
+        for s in ["gone", "kept"] {
+            m.record_publish(s);
+            m.record_storage_write_error(s, "other");
+            m.set_consumer_lag(s, "c", 1);
+            m.set_storage_bytes(s, 10);
+        }
+        m.forget_stream("gone");
+        let text = render(&r);
+        assert!(!text.contains("\"gone\""), "{text}");
+        assert!(text.contains("exspeed_records_published_total{stream=\"kept\"} 1"));
+        assert!(
+            text.contains("exspeed_storage_write_errors_total{kind=\"other\",stream=\"kept\"} 1")
+        );
+    }
+
+    #[test]
+    fn forgetting_consumers_and_connectors() {
+        let (m, r) = Metrics::new();
+        m.set_consumer_lag("s", "c1", 1);
+        m.set_consumer_lag("s", "c2", 2);
+        m.record_consumer_dead_letter("c1", "dlq");
+        m.connector_state.record(
+            1,
+            &[
+                KeyValue::new("connector", "k"),
+                KeyValue::new("state", "running"),
+            ],
+        );
+        m.forget_consumer("c1");
+        m.forget_connector("k");
+        let text = render(&r);
+        assert!(!text.contains("\"c1\""), "{text}");
+        assert!(text.contains("consumer=\"c2\""));
+        assert!(!text.contains("connector=\"k\""), "{text}");
+    }
+
+    #[test]
+    fn missing_labels_are_empty() {
+        let (m, r) = Metrics::new();
+        m.connector_dlq_total
+            .add(1, &[KeyValue::new("connector", "x")]);
+        assert!(render(&r).contains("exspeed_connector_dlq_total{connector=\"x\",reason=\"\"} 1"));
     }
 }

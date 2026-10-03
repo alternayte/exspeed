@@ -12,7 +12,9 @@
 //!
 //! Losing the lease (the heartbeat found another holder or missed its local
 //! deadline) cancels the leader token, closes writes and hands the node back
-//! to the follower.
+//! to the follower. [`ClusterLeadership::step_down`] does the same on
+//! purpose (leader work could not start) and also releases the lease and
+//! keeps the node out of the election for a while, so a peer can lead.
 //!
 //! Standbys poll the lease record every heartbeat interval, so they know the
 //! current leader's endpoints (for client redirects) and take over as soon
@@ -20,7 +22,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::sync::{watch, Mutex};
@@ -100,6 +102,9 @@ struct Inner {
     /// Our epoch while leader; 0 otherwise.
     epoch: AtomicU64,
     resigned: AtomicBool,
+    /// After [`ClusterLeadership::step_down`]: don't compete for the lease
+    /// before this instant.
+    hold_off_until: parking_lot::Mutex<Option<Instant>>,
     /// Serializes promotion, demotion and resignation.
     transition: Mutex<()>,
 }
@@ -142,6 +147,7 @@ impl ClusterLeadership {
             }),
             epoch: AtomicU64::new(0),
             resigned: AtomicBool::new(false),
+            hold_off_until: parking_lot::Mutex::new(None),
             transition: Mutex::new(()),
         });
         tokio::spawn(run_loop(inner.clone()));
@@ -156,9 +162,21 @@ impl ClusterLeadership {
     /// leader token, close writes and release the lease so a peer can take
     /// over at once instead of waiting out the TTL.
     pub async fn resign(&self) {
+        self.resign_after(async {}).await
+    }
+
+    /// Like [`resign`](Self::resign), but between cancelling the leader
+    /// token and closing writes it awaits `drain`: leader work that persists
+    /// state on the way out (consumer actors' final save) still has an open
+    /// write path. If the lease is lost meanwhile, writes close at once.
+    pub async fn resign_after<F: std::future::Future<Output = ()>>(&self, drain: F) {
         self.inner.resigned.store(true, Ordering::SeqCst);
+        {
+            let _t = self.inner.transition.lock().await;
+            self.inner.current_token.lock().await.cancel();
+        }
+        drain.await;
         let _t = self.inner.transition.lock().await;
-        self.inner.current_token.lock().await.cancel();
         let had = self.inner.guard.lock().await.take().is_some();
         let _ = self.inner.is_leader_tx.send(false);
         self.inner.epoch.store(0, Ordering::SeqCst);
@@ -168,6 +186,22 @@ impl ClusterLeadership {
             self.inner.metrics.record_leader_transition("resigned");
             info!(node = %self.node_id, "cluster:leader released (shutdown)");
         }
+    }
+
+    /// Give up the current tenure because this node can't do the leader's
+    /// work (its catalogs failed to load, consumers didn't start, ...):
+    /// cancel the leader token, close writes, release the lease and go back
+    /// to following. The node doesn't compete for the lease again for
+    /// `hold_off`, so a healthy peer can take over; a single node simply
+    /// retries after the hold-off. A no-op when not leading.
+    pub async fn step_down(&self, hold_off: Duration) {
+        let epoch = self.epoch();
+        if epoch == 0 {
+            return;
+        }
+        *self.inner.hold_off_until.lock() = Some(Instant::now() + hold_off);
+        warn!(node = %self.node_id, epoch, ?hold_off, "stepping down from leadership");
+        demote(self.inner.clone(), epoch, Demotion::SteppedDown).await;
     }
 
     /// Whether this node is currently the leader (writes open).
@@ -241,6 +275,17 @@ async fn run_loop(inner: Arc<Inner>) {
         if inner.guard.lock().await.is_some() {
             continue; // leading; the guard's heartbeat keeps the lease
         }
+        let holding_off = {
+            let mut h = inner.hold_off_until.lock();
+            match *h {
+                Some(t) if Instant::now() < t => true,
+                Some(_) => {
+                    *h = None;
+                    false
+                }
+                None => false,
+            }
+        };
         // Standby: look at the record first so we know the leader, and only
         // try to acquire when it looks free (or is ours from before a
         // restart).
@@ -251,6 +296,9 @@ async fn run_loop(inner: Arc<Inner>) {
                         .as_ref()
                         .is_none_or(|r| !r.is_live() || r.holder == inner.opts.node_id);
                     inner.known_tx.send_replace(rec);
+                    if holding_off {
+                        continue;
+                    }
                     if !free {
                         inner
                             .metrics
@@ -263,6 +311,9 @@ async fn run_loop(inner: Arc<Inner>) {
                     continue;
                 }
             }
+        }
+        if holding_off {
+            continue;
         }
         let req = AcquireRequest {
             name: LEASE_NAME.to_string(),
@@ -328,25 +379,46 @@ async fn promote(inner: &Arc<Inner>, guard: LeaseGuard) {
 
     let inner2 = inner.clone();
     tokio::spawn(async move {
+        // `Err` (the guard was dropped: resigned or stepped down) is handled
+        // by `demote`'s epoch check.
         let _ = on_lost.wait_for(|&l| l).await;
-        demote(inner2, record.epoch).await;
+        demote(inner2, record.epoch, Demotion::Lost).await;
     });
 }
 
-async fn demote(inner: Arc<Inner>, epoch: u64) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Demotion {
+    /// The lease was lost (another holder, or the local deadline passed).
+    Lost,
+    /// [`ClusterLeadership::step_down`]: the lease is released.
+    SteppedDown,
+}
+
+async fn demote(inner: Arc<Inner>, epoch: u64, why: Demotion) {
     let _t = inner.transition.lock().await;
-    if inner.resigned.load(Ordering::SeqCst) || inner.epoch.load(Ordering::SeqCst) != epoch {
+    if inner.epoch.load(Ordering::SeqCst) != epoch {
         return;
     }
     inner.current_token.lock().await.cancel();
     let _ = inner.is_leader_tx.send(false);
     inner.epoch.store(0, Ordering::SeqCst);
+    // Dropping the guard stops its heartbeat and releases the lease (a no-op
+    // when it was already lost).
     *inner.guard.lock().await = None;
     inner.metrics.set_is_leader(false);
     inner.metrics.set_lease_held(LEASE_NAME, false);
-    inner.metrics.record_leader_transition("lost");
-    inner.metrics.record_lease_lost(LEASE_NAME);
-    warn!(node = %inner.opts.node_id, epoch, role = "follower", "cluster:leader lost; this node is now a follower");
+    match why {
+        Demotion::Lost => {
+            inner.metrics.record_leader_transition("lost");
+            inner.metrics.record_lease_lost(LEASE_NAME);
+        }
+        Demotion::SteppedDown => inner.metrics.record_leader_transition("stepped_down"),
+    }
+    if inner.resigned.load(Ordering::SeqCst) {
+        // Lost while resigning: writes are closed; don't start following.
+        return;
+    }
+    warn!(node = %inner.opts.node_id, epoch, role = "follower", "cluster:leader given up; this node is now a follower");
     if let Some(h) = &inner.hooks {
         h.demoted().await;
         h.follow().await;

@@ -1,19 +1,38 @@
 //! Test helpers for DB-backed integration tests.
 //!
-//! Tests gate on env vars: `EXSPEED_POSTGRES_URL` / `EXSPEED_MYSQL_URL`.
-//! When unset, `postgres_url()` / `mysql_url()` return `None`; callers should
-//! skip with a log via the `require_postgres!` / `require_mysql!` macros.
+//! Tests gate on env vars: `EXSPEED_POSTGRES_URL` / `EXSPEED_MYSQL_URL` /
+//! `EXSPEED_MSSQL_URL`. Such tests are `#[ignore]`d (CI's service job runs
+//! them with `--include-ignored`) and start with `require_postgres!` /
+//! `require_mysql!` / `require_mssql!`: without the variable the test skips
+//! with a log, except under `CI=true`, where it fails instead of silently
+//! passing.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static TABLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// The service URL in `var`, or `None` (skip). Panics when unset under
+/// `CI=true` / `CI=1`, so a misconfigured service job can't pass silently.
+pub fn service_url(var: &str) -> Option<String> {
+    match std::env::var(var) {
+        Ok(v) if !v.is_empty() => Some(v),
+        _ => {
+            let ci = std::env::var("CI").unwrap_or_default();
+            if ci == "true" || ci == "1" {
+                panic!("{var} must be set when CI=true (the service test would silently pass)");
+            }
+            eprintln!("SKIP: {var} not set");
+            None
+        }
+    }
+}
+
 pub fn postgres_url() -> Option<String> {
-    std::env::var("EXSPEED_POSTGRES_URL").ok()
+    service_url("EXSPEED_POSTGRES_URL")
 }
 
 pub fn mysql_url() -> Option<String> {
-    std::env::var("EXSPEED_MYSQL_URL").ok()
+    service_url("EXSPEED_MYSQL_URL")
 }
 
 /// Generate a unique test-scoped identifier (prefix + process-id + monotonic
@@ -28,10 +47,7 @@ macro_rules! require_postgres {
     () => {
         match $crate::common::db::postgres_url() {
             Some(u) => u,
-            None => {
-                eprintln!("SKIP: EXSPEED_POSTGRES_URL not set");
-                return;
-            }
+            None => return,
         }
     };
 }
@@ -41,10 +57,7 @@ macro_rules! require_mysql {
     () => {
         match $crate::common::db::mysql_url() {
             Some(u) => u,
-            None => {
-                eprintln!("SKIP: EXSPEED_MYSQL_URL not set");
-                return;
-            }
+            None => return,
         }
     };
 }
@@ -68,7 +81,7 @@ pub async fn drop_table_mysql(url: &str, table: &str) {
 }
 
 pub fn mssql_url() -> Option<String> {
-    std::env::var("EXSPEED_MSSQL_URL").ok()
+    service_url("EXSPEED_MSSQL_URL")
 }
 
 pub async fn drop_table_mssql(url: &str, table: &str) {
@@ -122,10 +135,7 @@ macro_rules! require_mssql {
     () => {
         match $crate::common::db::mssql_url() {
             Some(u) => u,
-            None => {
-                eprintln!("SKIP: EXSPEED_MSSQL_URL not set");
-                return;
-            }
+            None => return,
         }
     };
 }

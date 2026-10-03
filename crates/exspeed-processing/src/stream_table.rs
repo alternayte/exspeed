@@ -507,8 +507,12 @@ impl ExecutionPlan for StreamScanExec {
         Ok(self)
     }
 
+    // `supports_limit_pushdown` means "push a parent's limit through me to
+    // my children". A leaf has none, so returning `true` made DataFusion's
+    // LimitPushdown drop the limit (`ORDER BY offset LIMIT n` returned
+    // every row). The limit is absorbed by `with_fetch` instead.
     fn supports_limit_pushdown(&self) -> bool {
-        true
+        false
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {

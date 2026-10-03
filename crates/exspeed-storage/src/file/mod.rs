@@ -36,7 +36,8 @@ use crossbeam_channel::{RecvTimeoutError, Sender};
 use dashmap::DashMap;
 use exspeed_common::{Offset, StreamName};
 use exspeed_streams::{
-    ReadBatch, ReadLimits, Record, StorageEngine, StorageError, StoredRecord, StreamConfig,
+    RawBatch, ReadBatch, ReadLimits, Record, StorageEngine, StorageError, StoredRecord,
+    StreamConfig,
 };
 use tracing::{error, info, warn};
 
@@ -126,6 +127,15 @@ pub(crate) struct PartitionHandle {
 }
 
 impl PartitionHandle {
+    /// Why a command could not reach the writer: the partition failure if it
+    /// is fenced (a partition that failed recovery has no writer at all),
+    /// otherwise the writer has shut down.
+    fn closed_error(&self) -> StorageError {
+        self.shared
+            .failed_error()
+            .unwrap_or(StorageError::ChannelClosed)
+    }
+
     async fn call<T: Send + 'static>(
         &self,
         make: impl FnOnce(Reply<T>) -> Cmd,
@@ -133,7 +143,7 @@ impl PartitionHandle {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(make(Reply::Async(tx)))
-            .map_err(|_| StorageError::ChannelClosed)?;
+            .map_err(|_| self.closed_error())?;
         rx.await.map_err(|_| StorageError::ChannelClosed)
     }
 
@@ -141,7 +151,7 @@ impl PartitionHandle {
         let (tx, rx) = crossbeam_channel::bounded(1);
         self.tx
             .send(make(Reply::Sync(tx)))
-            .map_err(|_| StorageError::ChannelClosed)?;
+            .map_err(|_| self.closed_error())?;
         rx.recv().map_err(|_| StorageError::ChannelClosed)
     }
 
@@ -286,7 +296,12 @@ impl FileStorage {
                 continue;
             }
             let config = load_config(&name, &path);
-            let handle = start_partition(&opts, &name, &part_dir, config)?;
+            // One damaged partition must not keep every other stream down:
+            // fence it read-only and carry on.
+            let handle = match start_partition(&opts, &name, &part_dir, config.clone()) {
+                Ok(h) => h,
+                Err(e) => fenced_partition(&name, &part_dir, config, &e),
+            };
             partitions.insert(name, handle);
         }
 
@@ -366,6 +381,21 @@ impl FileStorage {
             .collect();
         v.sort();
         v
+    }
+
+    /// Fence a stream's partition read-only, exactly as an IO error that
+    /// can't be rolled back does (a restart runs recovery and lifts it). For
+    /// fault-injection tests of the layers above storage. Returns `false` if
+    /// the stream is unknown.
+    #[doc(hidden)]
+    pub fn fence_stream(&self, stream: &str, reason: &str) -> bool {
+        match self.handle_by_name(stream) {
+            Some(h) => {
+                h.shared.fail(reason.to_string());
+                true
+            }
+            None => false,
+        }
     }
 
     /// Hold a stream's high watermark at or below `floor` (replication
@@ -560,6 +590,39 @@ fn start_partition(
     }))
 }
 
+/// A partition whose recovery failed: no writer thread, fenced (every write,
+/// retention, trim, truncation or compaction fails with `PartitionFailed`),
+/// readable up to the first damaged segment. Nothing on disk is changed, so
+/// the operator can restore or remove the damaged files and restart.
+fn fenced_partition(
+    stream: &str,
+    dir: &Path,
+    config: Option<StreamConfig>,
+    err: &io::Error,
+) -> Arc<PartitionHandle> {
+    let (segments, next) = partition::readable_prefix(dir);
+    error!(
+        stream,
+        dir = %dir.display(),
+        error = %err,
+        readable_up_to = next,
+        "PARTITION RECOVERY FAILED: stream is fenced read-only (writes fail with \
+         PartitionFailed); other streams are unaffected. Restore or remove the damaged \
+         segment and restart"
+    );
+    let shared = Arc::new(PartitionShared::new(stream, dir, segments, next, config));
+    shared.fail(format!("recovery failed: {err}"));
+    // No writer: the receiver is dropped, so every command fails to send and
+    // `call` reports the partition failure.
+    let (tx, _) = crossbeam_channel::unbounded();
+    Arc::new(PartitionHandle {
+        shared,
+        tx,
+        thread: Mutex::new(None),
+        compaction_lock: Mutex::new(()),
+    })
+}
+
 fn compact_all(inner: &Inner) -> CompactionStats {
     let handles: Vec<Arc<PartitionHandle>> =
         inner.partitions.iter().map(|e| e.value().clone()).collect();
@@ -723,6 +786,20 @@ impl StorageEngine for FileStorage {
         blocking(move || {
             h.shared
                 .read(from.0, limits.max_records.max(1), limits.max_bytes, false)
+        })
+        .await
+    }
+
+    async fn read_raw(
+        &self,
+        stream: &StreamName,
+        from: Offset,
+        limits: ReadLimits,
+    ) -> Result<RawBatch, StorageError> {
+        let h = self.handle(stream)?;
+        blocking(move || {
+            h.shared
+                .read_raw(from.0, limits.max_records.max(1), limits.max_bytes)
         })
         .await
     }

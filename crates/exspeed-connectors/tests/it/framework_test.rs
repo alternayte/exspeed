@@ -59,6 +59,111 @@ async fn crash_before_checkpoint_replays_only_that_batch() {
     assert_eq!(state.snapshot().restart_count, 1);
 }
 
+/// Closed (not the leader) for the next `n` write checks, then open.
+struct FlakyGate(std::sync::atomic::AtomicU32);
+
+impl exspeed_broker::log::WriteGate for FlakyGate {
+    fn can_write(&self) -> bool {
+        !take_atomic(&self.0)
+    }
+}
+
+/// Offsets that record whether the gate was already open at every save.
+struct GateCheckedOffsets {
+    inner: MemOffsets,
+    gate: Arc<FlakyGate>,
+    saves_while_closed: std::sync::atomic::AtomicU32,
+}
+
+#[async_trait::async_trait]
+impl OffsetStore for GateCheckedOffsets {
+    async fn load(
+        &self,
+        c: &str,
+    ) -> Result<
+        Option<exspeed_connectors::offset_store::StoredOffset>,
+        exspeed_connectors::offset_store::OffsetStoreError,
+    > {
+        self.inner.load(c).await
+    }
+    async fn save(
+        &self,
+        c: &str,
+        o: &exspeed_connectors::offset_store::StoredOffset,
+    ) -> Result<(), exspeed_connectors::offset_store::OffsetStoreError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.gate.0.load(SeqCst) > 0 {
+            self.saves_while_closed.fetch_add(1, SeqCst);
+        }
+        self.inner.save(c, o).await
+    }
+    async fn delete(
+        &self,
+        c: &str,
+    ) -> Result<(), exspeed_connectors::offset_store::OffsetStoreError> {
+        self.inner.delete(c).await
+    }
+}
+
+/// REVIEW §3.6 #6: a retryable `LogError` (here `NotLeader` from the write
+/// gate, twice) during a source append is retried in place: nothing goes to
+/// the DLQ, the checkpoint isn't saved while the append is failing, no
+/// restart, and the batch then lands exactly once.
+#[tokio::test]
+async fn retryable_append_error_is_retried_without_dlq_or_checkpoint() {
+    let env = Env::new();
+    let out = exspeed_common::StreamName::try_from("out").unwrap();
+    let dlq = exspeed_common::StreamName::try_from("out_dlq").unwrap();
+    env.log.ensure_stream(&out).await.unwrap();
+    env.log.ensure_stream(&dlq).await.unwrap();
+    let gate = Arc::new(FlakyGate(std::sync::atomic::AtomicU32::new(2)));
+    env.log.set_write_gate(gate.clone());
+
+    let ext = source_ext(5);
+    let offsets = Arc::new(GateCheckedOffsets {
+        inner: MemOffsets::default(),
+        gate: gate.clone(),
+        saves_while_closed: Default::default(),
+    });
+    let mut cfg = source_config("retry-append");
+    cfg.dlq_stream = Some("out_dlq".into());
+    let (h, state) = env.run(&source_registry(&ext), cfg, offsets.clone());
+    eventually(10, "all rows acked", || async {
+        ext.lock().unwrap().acked == Some(5)
+    })
+    .await;
+    h.stop(Duration::from_secs(5)).await;
+
+    assert_eq!(
+        gate.0.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "gate was hit"
+    );
+    assert_eq!(values(&env.read_all("out").await), rows(5), "exactly once");
+    assert!(
+        env.read_all("out_dlq").await.is_empty(),
+        "nothing dead-lettered"
+    );
+    assert_eq!(
+        offsets
+            .saves_while_closed
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "checkpoint saved only after the append succeeded"
+    );
+    assert_eq!(
+        offsets
+            .load_source("retry-append")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("5")
+    );
+    let snap = state.snapshot();
+    assert_eq!(snap.restart_count, 0, "retried in place, no restart");
+    assert_eq!(ext.lock().unwrap().starts, vec![None]);
+}
+
 /// With idempotency keys the broker drops the replayed batch: exactly once.
 #[tokio::test]
 async fn crash_before_checkpoint_with_idempotency_keys_is_exactly_once() {
@@ -649,6 +754,74 @@ async fn invalid_toml_connector_is_registered_failed_and_secrets_stay_unresolved
         mgr.update(cfg).await,
         Err(ManagerError::FileManaged { .. })
     ));
+}
+
+/// REVIEW §3.6 #3 / blocker 15: editing the `connectors.d` TOML of a running
+/// connector restarts it with the new config but keeps its committed
+/// offsets — nothing already delivered is replayed.
+#[tokio::test]
+async fn editing_a_toml_connector_keeps_its_offsets() {
+    let env = Env::new();
+    let ext = shared::<SinkExt>();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().join("connectors.d");
+    std::fs::create_dir_all(&d).unwrap();
+    let toml = |batch: u32| {
+        format!(
+            "[connector]\nname = \"tomlsink\"\ntype = \"sink\"\nplugin = \"fake\"\n\
+             stream = \"s\"\nbatch_size = {batch}\npoll_interval_ms = 10\n"
+        )
+    };
+    std::fs::write(d.join("sink.toml"), toml(10)).unwrap();
+    env.publish("s", &["0"; 20]).await;
+
+    let offsets: Arc<dyn OffsetStore> = Arc::new(MemOffsets::default());
+    let lease: Arc<dyn exspeed_broker::LeaderLease> =
+        Arc::new(exspeed_broker::lease::NoopLeaderLease::new());
+    let leadership = Arc::new(
+        exspeed_broker::leadership::ClusterLeadership::spawn(lease, env.metrics.clone(), None)
+            .await,
+    );
+    let mgr = Arc::new(
+        ConnectorManager::new(
+            env.storage.clone(),
+            env.log.clone(),
+            dir.path().to_path_buf(),
+            env.metrics.clone(),
+            offsets.clone(),
+            leadership,
+        )
+        .with_registry(sink_registry(&ext)),
+    );
+    mgr.load_all().await.unwrap();
+    let token = tokio_util::sync::CancellationToken::new();
+    let runner = {
+        let (mgr, token) = (mgr.clone(), token.clone());
+        tokio::spawn(async move { mgr.run_all(token).await })
+    };
+    wait_committed(&offsets, "tomlsink", 20).await;
+
+    // Edit the file and reconcile, as the watcher does on a change event.
+    std::fs::write(d.join("sink.toml"), toml(5)).unwrap();
+    exspeed_connectors::file_watcher::sync_connectors(&mgr, &d).await;
+    assert_eq!(mgr.get_config("tomlsink").await.unwrap().batch_size, 5);
+    assert_eq!(
+        offsets.load_sink("tomlsink").await.unwrap(),
+        Some(20),
+        "the edit must not reset the committed offset"
+    );
+
+    env.publish("s", &["1"; 5]).await;
+    wait_committed(&offsets, "tomlsink", 25).await;
+    token.cancel();
+    runner.await.unwrap();
+
+    let durable = ext.lock().unwrap().durable.clone();
+    assert_eq!(
+        durable,
+        (0..25).collect::<Vec<u64>>(),
+        "every record delivered exactly once: no replay after the edit"
+    );
 }
 
 #[tokio::test]

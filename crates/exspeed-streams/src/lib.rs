@@ -6,4 +6,4 @@ pub mod traits;
 pub use config::StreamConfig;
 pub use error::StorageError;
 pub use record::{Record, StoredRecord};
-pub use traits::{ReadBatch, ReadLimits, StorageEngine};
+pub use traits::{RawBatch, ReadBatch, ReadLimits, StorageEngine};

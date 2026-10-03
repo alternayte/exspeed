@@ -54,18 +54,23 @@ pub struct RecordLimits {
     pub max_headers: usize,
     pub max_header_key_bytes: usize,
     pub max_header_value_bytes: usize,
+    /// Sum of every header key and value length.
+    pub max_total_header_bytes: usize,
 }
 
 impl Default for RecordLimits {
     fn default() -> Self {
         Self {
+            // Together these bound one record's wire size to ~8.2 MiB, so a
+            // record always fits in a 16 MiB response frame next to a batch
+            // that stopped at the 8 MiB per-frame records budget.
             max_subject_bytes: 1024,
             max_key_bytes: 64 * 1024,
-            // Frames are capped at 16 MiB; leave room for framing/headers.
             max_value_bytes: 8 * 1024 * 1024,
             max_headers: 256,
             max_header_key_bytes: 1024,
             max_header_value_bytes: 32 * 1024,
+            max_total_header_bytes: 64 * 1024,
         }
     }
 }
@@ -88,10 +93,16 @@ impl RecordLimits {
                 if token.is_empty() {
                     return Err(format!("subject '{subject}' has an empty token"));
                 }
-                if token == "*" || token == ">" || token.contains(char::is_whitespace) {
+                // Any '*' or '>' (not just whole-token wildcards): a subject
+                // like `a.b*` could never be matched by a filter, which
+                // rejects partial wildcards.
+                if token.contains(['*', '>'])
+                    || token.contains(|c: char| c.is_whitespace() || c.is_control())
+                {
                     return Err(format!(
-                        "subject '{subject}' contains a wildcard or whitespace; \
-                         wildcards are only valid in filters"
+                        "subject '{}' contains a wildcard, whitespace or a control \
+                         character; wildcards are only valid in filters",
+                        subject.escape_debug()
                     ));
                 }
             }
@@ -117,6 +128,13 @@ impl RecordLimits {
                 "{} headers; the limit is {}",
                 record.headers.len(),
                 self.max_headers
+            ));
+        }
+        let total: usize = record.headers.iter().map(|(k, v)| k.len() + v.len()).sum();
+        if total > self.max_total_header_bytes {
+            return Err(format!(
+                "headers total {total} bytes; the limit is {}",
+                self.max_total_header_bytes
             ));
         }
         for (k, v) in &record.headers {
@@ -520,6 +538,15 @@ impl StorageEngine for LogBackedStorage {
         self.log.storage.read_batch(stream, from, limits).await
     }
 
+    async fn read_raw(
+        &self,
+        stream: &StreamName,
+        from: exspeed_common::Offset,
+        limits: exspeed_streams::ReadLimits,
+    ) -> Result<exspeed_streams::RawBatch, StorageError> {
+        self.log.storage.read_raw(stream, from, limits).await
+    }
+
     async fn read_with_hints(
         &self,
         stream: &StreamName,
@@ -664,7 +691,57 @@ mod tests {
         assert!(l.check(&rec("orders.*", "x")).is_err());
         assert!(l.check(&rec("orders.>", "x")).is_err());
         assert!(l.check(&rec("orders eu", "x")).is_err());
+        // Partial wildcards and control characters.
+        assert!(l.check(&rec("orders.b*", "x")).is_err());
+        assert!(l.check(&rec("orders.>x", "x")).is_err());
+        assert!(l.check(&rec("orders.e\u{0}u", "x")).is_err());
+        assert!(l.check(&rec("orders.e\u{7f}u", "x")).is_err());
+        assert!(l.check(&rec("orders.eü-1_2", "x")).is_ok());
         assert!(l.check(&rec(&"a".repeat(2000), "x")).is_err());
+    }
+
+    #[test]
+    fn largest_valid_record_fits_in_a_frame() {
+        let l = RecordLimits::default();
+        // Two headers at exactly the 64 KiB total limit.
+        let half = l.max_total_header_bytes / 2;
+        let headers = vec![
+            ("a".to_string(), "v".repeat(half - 1)),
+            ("b".to_string(), "v".repeat(half - 1)),
+        ];
+        let r = Record {
+            subject: "s".repeat(l.max_subject_bytes),
+            key: Some(Bytes::from(vec![0u8; l.max_key_bytes])),
+            value: Bytes::from(vec![0u8; l.max_value_bytes]),
+            headers,
+            timestamp_ns: None,
+        };
+        l.check(&r).unwrap();
+        let wire =
+            exspeed_common::record_format::encoded_len(&exspeed_common::record_format::Fields {
+                offset: 0,
+                timestamp_ns: 0,
+                delivery_count: 0,
+                subject: &r.subject,
+                key: r.key.as_deref(),
+                value: &r.value,
+                headers: &r.headers,
+            })
+            .unwrap();
+        // ReadResult adds 20 bytes (next offset, high watermark, count).
+        assert!(
+            wire + 20 <= exspeed_common::MAX_PAYLOAD_SIZE as usize,
+            "{wire}"
+        );
+        assert!(
+            exspeed_common::MAX_RECORDS_BYTES_PER_FRAME + 20
+                <= exspeed_common::MAX_PAYLOAD_SIZE as usize
+        );
+
+        // One byte more of headers is rejected.
+        let mut over = r.clone();
+        over.headers.push(("x".into(), String::new()));
+        assert!(l.check(&over).unwrap_err().contains("headers total"));
     }
 
     #[tokio::test]

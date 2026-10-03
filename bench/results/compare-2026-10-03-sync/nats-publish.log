@@ -1,0 +1,8 @@
+
+Pub stats: 2,324 msgs/sec ~ 2.27 MB/sec
+ [1] 581 msgs/sec ~ 581.43 KB/sec (250000 msgs)
+ [2] 581 msgs/sec ~ 581.34 KB/sec (250000 msgs)
+ [3] 581 msgs/sec ~ 581.22 KB/sec (250000 msgs)
+ [4] 581 msgs/sec ~ 581.21 KB/sec (250000 msgs)
+ min 581 | avg 581 | max 581 | stddev 0 msgs
+

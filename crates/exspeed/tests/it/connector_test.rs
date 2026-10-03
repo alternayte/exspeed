@@ -7,8 +7,10 @@ use serde_json::Value;
 // ---------------------------------------------------------------------------
 
 async fn start_server() -> (String, String) {
-    let tcp_port = exspeed_testkit::pick_unused_port().unwrap();
-    let http_port = exspeed_testkit::pick_unused_port().unwrap();
+    let tcp_port_l = exspeed_testkit::bind_local();
+    let tcp_port = tcp_port_l.local_addr().unwrap().port();
+    let http_port_l = exspeed_testkit::bind_local();
+    let http_port = http_port_l.local_addr().unwrap().port();
     let tcp_addr = format!("127.0.0.1:{}", tcp_port);
     let http_addr = format!("127.0.0.1:{}", http_port);
 
@@ -21,7 +23,9 @@ async fn start_server() -> (String, String) {
         let _keep = dir;
         exspeed::cli::server::run(exspeed::cli::server::ServerArgs {
             bind: tcp_addr_clone,
+            tcp_listener: Some(std::sync::Arc::new(tcp_port_l)),
             api_bind: http_addr_clone,
+            api_listener: Some(std::sync::Arc::new(http_port_l)),
             data_dir,
             auth_token: None,
             credentials_file: None,
@@ -98,6 +102,51 @@ async fn create_webhook_and_receive() {
     // The offset should be a non-negative number (first record = offset 0)
     let offset = body["offset"].as_u64().expect("offset should be a u64");
     assert_eq!(offset, 0, "first record should have offset 0");
+}
+
+/// A webhook connector whose stream doesn't exist yet creates it on start
+/// (webhooks have no runtime that would), instead of answering 500 to every
+/// POST while reporting `running`.
+#[tokio::test]
+async fn webhook_creates_its_missing_stream() {
+    let (_tcp, http) = start_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/api/v1/connectors", http))
+        .json(&serde_json::json!({
+            "name": "orphan-hook",
+            "type": "source",
+            "plugin": "http_webhook",
+            "stream": "hook-created",
+            "settings": {"path": "/webhooks/orphan", "auth_type": "none"}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "{:?}", resp.text().await);
+
+    let resp = client
+        .get(format!("{}/api/v1/streams/hook-created", http))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "the stream must exist once started");
+
+    let resp = client
+        .post(format!("{}/webhooks/orphan", http))
+        .json(&serde_json::json!({"hello": "world"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+    let resp = client
+        .get(format!("{}/api/v1/connectors/orphan-hook", http))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "running", "{body}");
 }
 
 #[tokio::test]
@@ -277,12 +326,16 @@ async fn connector_status() {
 }
 
 async fn start_server_in(data_dir: std::path::PathBuf) -> String {
-    let tcp_port = exspeed_testkit::pick_unused_port().unwrap();
-    let http_port = exspeed_testkit::pick_unused_port().unwrap();
+    let tcp_port_l = exspeed_testkit::bind_local();
+    let tcp_port = tcp_port_l.local_addr().unwrap().port();
+    let http_port_l = exspeed_testkit::bind_local();
+    let http_port = http_port_l.local_addr().unwrap().port();
     tokio::spawn(async move {
         exspeed::cli::server::run(exspeed::cli::server::ServerArgs {
             bind: format!("127.0.0.1:{tcp_port}"),
+            tcp_listener: Some(std::sync::Arc::new(tcp_port_l)),
             api_bind: format!("127.0.0.1:{http_port}"),
+            api_listener: Some(std::sync::Arc::new(http_port_l)),
             data_dir,
             auth_token: None,
             credentials_file: None,

@@ -114,7 +114,15 @@ async fn main() -> anyhow::Result<()> {
         cli::Command::Snapshot(a) => cli::snapshot::run(a).await,
         cli::Command::Backup(a) => cli::backup::backup(a, &server_url).await,
         cli::Command::Restore(a) => cli::backup::restore(a).await,
-        cli::Command::Healthcheck { url, timeout } => healthcheck(&url, timeout).await,
+        cli::Command::Healthcheck { url, timeout } => {
+            let url = match url {
+                Some(u) => u,
+                None => exspeed::config::probe_url(&exspeed::config::resolve(
+                    &exspeed::config::ServeArgs::default(),
+                )?),
+            };
+            healthcheck(&url, timeout).await
+        }
         cli::Command::Auth { cmd } => cli::auth::run(cmd, &client).await,
     }
 }

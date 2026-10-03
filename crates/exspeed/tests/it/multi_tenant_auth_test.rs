@@ -56,8 +56,10 @@ struct TestServer {
 /// Start a server with the given credentials file + env token.
 /// Either or both may be `None`. Blocks until `/readyz` returns 200.
 async fn start_server(credentials_file: Option<PathBuf>, auth_token: Option<String>) -> TestServer {
-    let tcp_port = exspeed_testkit::pick_unused_port().unwrap();
-    let http_port = exspeed_testkit::pick_unused_port().unwrap();
+    let tcp_port_l = exspeed_testkit::bind_local();
+    let tcp_port = tcp_port_l.local_addr().unwrap().port();
+    let http_port_l = exspeed_testkit::bind_local();
+    let http_port = http_port_l.local_addr().unwrap().port();
     let tcp_addr = format!("127.0.0.1:{tcp_port}");
     let http_addr = format!("127.0.0.1:{http_port}");
     let tmp = tempfile::tempdir().unwrap();
@@ -66,7 +68,9 @@ async fn start_server(credentials_file: Option<PathBuf>, auth_token: Option<Stri
     let cancel = CancellationToken::new();
     let args = exspeed::cli::server::ServerArgs {
         bind: tcp_addr.clone(),
+        tcp_listener: Some(std::sync::Arc::new(tcp_port_l)),
         api_bind: http_addr.clone(),
+        api_listener: Some(std::sync::Arc::new(http_port_l)),
         data_dir,
         auth_token,
         credentials_file,
@@ -1079,4 +1083,145 @@ permissions = [{{ streams = "*", actions = ["admin", "publish", "subscribe"] }}]
         .await,
         403,
     );
+}
+
+#[tokio::test]
+async fn http_list_streams_is_scoped_to_the_caller() {
+    let creds = write_creds(&format!(
+        r#"
+[[credentials]]
+name = "root"
+token_sha256 = "{}"
+permissions = [{{ streams = "*", actions = ["admin"] }}]
+
+[[credentials]]
+name = "tenant-a"
+token_sha256 = "{}"
+permissions = [{{ streams = "a-*", actions = ["admin"] }}, {{ streams = "shared", actions = ["subscribe"] }}]
+"#,
+        sha256_hex("root-token"),
+        sha256_hex("a-token"),
+    ));
+    let srv = start_server(Some(creds.path().to_path_buf()), None).await;
+    let root = try_client(&srv.tcp_addr, Some("root-token")).await.unwrap();
+    for s in ["a-1", "b-1", "shared"] {
+        root.create_stream(StreamSpec::named(s)).await.unwrap();
+    }
+    // Creates the internal `__consumers` stream.
+    root.create_consumer(ConsumerSpec::new("w", "b-1"))
+        .await
+        .unwrap();
+    let list = |token: &'static str, query: &'static str| {
+        let url = format!("http://{}/api/v1/streams{query}", srv.http_addr);
+        async move {
+            let v: serde_json::Value = reqwest::Client::new()
+                .get(url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s["name"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(list("a-token", "").await, vec!["a-1", "shared"]);
+    assert_eq!(
+        list("a-token", "?internal=true").await,
+        vec!["a-1", "shared"],
+        "internal streams are for global admins only"
+    );
+    assert_eq!(list("root-token", "").await, vec!["a-1", "b-1", "shared"]);
+    let all = list("root-token", "?internal=true").await;
+    assert!(all.iter().any(|n| n.starts_with("__")), "{all:?}");
+}
+
+#[tokio::test]
+async fn http_records_long_poll_works_for_subscribe_only_credentials() {
+    let creds = write_creds(&format!(
+        r#"
+[[credentials]]
+name = "root"
+token_sha256 = "{}"
+permissions = [{{ streams = "*", actions = ["admin", "publish"] }}]
+
+[[credentials]]
+name = "reader"
+token_sha256 = "{}"
+permissions = [{{ streams = "logs", actions = ["subscribe"] }}]
+"#,
+        sha256_hex("root-token"),
+        sha256_hex("reader-token"),
+    ));
+    let srv = start_server(Some(creds.path().to_path_buf()), None).await;
+    let root = try_client(&srv.tcp_addr, Some("root-token")).await.unwrap();
+    root.create_stream(StreamSpec::named("logs")).await.unwrap();
+    root.create_stream(StreamSpec::named("secret"))
+        .await
+        .unwrap();
+    let http = reqwest::Client::new();
+    let url = |p: &str| format!("http://{}{p}", srv.http_addr);
+
+    // No permission on `secret`; and the admin routes stay closed.
+    let r = http
+        .get(url("/api/v1/streams/secret/records"))
+        .bearer_auth("reader-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    let r = http
+        .get(url("/api/v1/streams/logs"))
+        .bearer_auth("reader-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+
+    // A caught-up read waits for the next record instead of returning empty.
+    let started = std::time::Instant::now();
+    let req = http
+        .get(url("/api/v1/streams/logs/records?from=0&wait_ms=10000"))
+        .bearer_auth("reader-token")
+        .send();
+    let publish = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        root.publish("logs", PublishRecord::new("logs.x", r#"{"n":1}"#))
+            .await
+            .unwrap();
+    };
+    let (resp, ()) = tokio::join!(req, publish);
+    let resp = resp.unwrap();
+    assert_eq!(resp.status(), 200);
+    let page: serde_json::Value = resp.json().await.unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(page["records"].as_array().unwrap().len(), 1, "{page}");
+    assert_eq!(page["next_offset"], 1);
+    assert!(
+        elapsed >= Duration::from_millis(250),
+        "returned before the publish: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "waited past the publish: {elapsed:?}"
+    );
+
+    // With nothing new, the wait ends at wait_ms with an empty page.
+    let started = std::time::Instant::now();
+    let page: serde_json::Value = http
+        .get(url("/api/v1/streams/logs/records?from=1&wait_ms=300"))
+        .bearer_auth("reader-token")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(page["records"].as_array().unwrap().is_empty());
+    assert!(started.elapsed() >= Duration::from_millis(250));
 }

@@ -152,10 +152,17 @@ numeric**, so the common cases need no casts:
 | `a.payload->>'x' < b.payload->>'y'` (both JSON) | Numeric if both are numbers, text otherwise |
 | `a.payload->>'id' = b.payload->>'id'` (both JSON) | **Text** equality, so it stays usable as a join key |
 | `payload->>'flag' = true` | Boolean |
+| `payload->>'qty' = 9007199254740993` (integer vs integer) | Exact, as BIGINT, when the JSON text is an integer (no precision loss above 2^53); as a number otherwise |
+| `payload->'amount' > 250`, `ORDER BY payload->'amount'` | `->` (a JSON value) behaves like `->>` in numeric contexts and ORDER BY |
 
 Non-numeric text in a numeric context becomes NULL, as `TRY_CAST` does.
 JSON numbers stored as strings (`"amount": "1000"`) work the same as plain
-numbers. `CAST(payload->>'x' AS VARCHAR)` opts out. These rules are covered
+numbers. `CAST(payload->>'x' AS VARCHAR)` opts out: since `MIN`/`MAX` of
+JSON text are numeric, the text maximum of a non-numeric field is
+`MAX(CAST(payload->>'name' AS VARCHAR))` (plain `MAX(payload->>'name')`
+gives NULL). Arithmetic on JSON numbers uses DOUBLE, so sums of integers
+above 2^53 are approximate. `CAST(x AS VARCHAR(n))` does not truncate to
+`n` characters (the length is ignored, as in DataFusion). These rules are covered
 by a differential test suite that runs the same queries on SQLite.
 
 ## Continuous queries
@@ -218,7 +225,11 @@ FROM <stream> [[AS] a] [TIMESTAMP BY <expr>]
   `TIMESTAMP BY <expr>`. The expression may give a timestamp, epoch
   milliseconds (number or numeric text), or RFC 3339 /
   `YYYY-MM-DD HH:MM:SS[.fff]` text (taken as UTC). If it is NULL or can't be
-  parsed, the record timestamp is used.
+  parsed, the record timestamp is used. So is an **out-of-range** value: one
+  before 1970 or more than `EXSPEED_EXQL_MAX_EVENT_TIME_SKEW_MS` (default
+  1 day) ahead of the record's own timestamp. One bad record therefore
+  can't push the watermark years ahead and make everything after it late.
+  Replacements are counted in the query's `stats.invalid_event_times`.
 - **Watermark** = min over sources of (max event time seen in that source)
   − `GRACE PERIOD`. The grace period defaults to **0**
   (`EXSPEED_EXQL_DEFAULT_GRACE_MS`). A source that has produced no records
@@ -385,7 +396,7 @@ What is implemented and tested:
   query from its checkpoint with backoff. They don't mark it failed.
 - Queries run only on the leader, and stop when leadership is lost.
 - `GET /api/v1/queries/<id>` reports `stats`: `records_in`, `records_out`,
-  `late_records_dropped`, `checkpoints`, `watermark`, `last_checkpoint`.
+  `late_records_dropped`, `invalid_event_times`, `checkpoints`, `watermark`, `last_checkpoint`.
 
 ## External databases
 
@@ -404,13 +415,21 @@ SELECT * FROM warehouse.sales.targets;                                          
 ```
 
 - The column list comes from `information_schema` through a parameterized
-  query. The snapshot is fetched with quoted identifiers, so names are
-  never interpolated raw.
-- Snapshots are cached per table (TTL 30 s, LRU of 64 tables), and pools
-  are reused per connection. A table larger than 1,000,000 rows is an
-  error.
-- Postgres column types map to Int64, Float64, Boolean, text, JSON text,
-  `Timestamp(ms, UTC)` and Date32.
+  query. Identifiers are quoted, so names are never interpolated raw.
+- Each scan fetches **only the columns the query uses**, and simple filters
+  on the table's columns (`col = literal`, `<>`, numeric `<`/`<=`/`>`/`>=`,
+  `IN (…)`, `IS [NOT] NULL`, combined with `AND`) are pushed into the
+  remote `WHERE` as bind parameters. ExQL re-applies every filter, so
+  pushdown only narrows the fetch. Joins and other predicates are evaluated
+  locally.
+- Fetches are cached per (table, columns, filters) for 30 s in an LRU of 64
+  entries, and pools are reused per connection. A fetch of more than
+  1,000,000 rows is an error, and each fetched snapshot is counted against
+  the query memory pool while the query runs (`RESOURCES_EXHAUSTED` when it
+  doesn't fit).
+- Postgres column types map to Int64, Float64, `Decimal128(p, s)` (for
+  `numeric(p, s)` with `p <= 38`; unconstrained `numeric` is Float64),
+  Boolean, text, JSON text, `Timestamp(ms, UTC)` and Date32.
 - **Bounded queries only**: continuous queries can't read external tables.
   The inline `postgres('url', 'table')` form has been removed.
 - Connections created through the API are stored in the compacted internal
@@ -436,7 +455,7 @@ math, dates and times (`date_trunc`, `date_bin`, `to_timestamp`,
 | Function | Notes |
 |----------|-------|
 | `subject_part(subject, n)` | n-th dot-delimited token (1-based; negative counts from the end) |
-| `subject_matches(subject, 'orders.>')` | NATS-style wildcard match (`*` one token, `>` the rest) |
+| `subject_matches(subject, 'orders.>')` | NATS-style wildcard match (`*` one token, `>` the rest), same rules as consumer filters; an invalid pattern is an error |
 | `json_get_*`, `->`, `->>`, `json_contains`, … | From `datafusion-functions-json` |
 | `window_start`, `window_end` | In windowed continuous queries |
 
@@ -450,6 +469,7 @@ math, dates and times (`date_trunc`, `date_bin`, `to_timestamp`,
 | DataFusion partitions | 1 | `EXSPEED_QUERY_PARTITIONS` |
 | Continuous checkpoint interval | 5 s | `EXSPEED_EXQL_CHECKPOINT_MS` |
 | Default grace period | 0 | `EXSPEED_EXQL_DEFAULT_GRACE_MS` |
+| Max `TIMESTAMP BY` value ahead of the record timestamp | 1 day | `EXSPEED_EXQL_MAX_EVENT_TIME_SKEW_MS` |
 
 When a client disconnects, its bounded query is cancelled: over HTTP the
 request future is dropped, and over TCP the session cancels every waiting
@@ -470,4 +490,3 @@ with your key cardinality in mind.
 | Continuous: external databases | Rejected (bounded-only) |
 | Session windows | Rejected |
 | Idle-source watermark advancement | Not implemented. An idle source holds the watermark |
-| Query registry replicated to followers | Not yet. Definitions are local files, while checkpoints and outputs are in replicated streams |

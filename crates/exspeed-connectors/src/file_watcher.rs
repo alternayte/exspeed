@@ -21,7 +21,7 @@ use crate::manager::{ConnectorManager, ManagerError, Origin, TomlFile};
 /// - File removed → delete the connector it defined.
 ///
 /// Connectors created through the HTTP API are never touched.
-pub(crate) async fn sync_connectors(manager: &Arc<ConnectorManager>, connectors_dir: &PathBuf) {
+pub async fn sync_connectors(manager: &Arc<ConnectorManager>, connectors_dir: &PathBuf) {
     if !connectors_dir.exists() {
         return;
     }

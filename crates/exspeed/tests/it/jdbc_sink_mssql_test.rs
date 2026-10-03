@@ -2,8 +2,10 @@ use crate::common;
 use std::time::Duration;
 
 async fn start_server() -> (String, String) {
-    let tcp_port = exspeed_testkit::pick_unused_port().unwrap();
-    let http_port = exspeed_testkit::pick_unused_port().unwrap();
+    let tcp_port_l = exspeed_testkit::bind_local();
+    let tcp_port = tcp_port_l.local_addr().unwrap().port();
+    let http_port_l = exspeed_testkit::bind_local();
+    let http_port = http_port_l.local_addr().unwrap().port();
     let tcp_addr = format!("127.0.0.1:{}", tcp_port);
     let http_addr = format!("127.0.0.1:{}", http_port);
 
@@ -16,7 +18,9 @@ async fn start_server() -> (String, String) {
         let _keep = dir;
         exspeed::cli::server::run(exspeed::cli::server::ServerArgs {
             bind: tcp_addr_clone,
+            tcp_listener: Some(std::sync::Arc::new(tcp_port_l)),
             api_bind: http_addr_clone,
+            api_listener: Some(std::sync::Arc::new(http_port_l)),
             data_dir,
             auth_token: None,
             credentials_file: None,
@@ -93,6 +97,7 @@ async fn count_rows_mssql(url: &str, table: &str, want: i64, deadline_secs: u64)
 }
 
 #[tokio::test]
+#[ignore = "needs EXSPEED_MSSQL_URL (CI runs it with --include-ignored)"]
 async fn blob_mode_creates_table_and_writes() {
     let ms_url = crate::require_mssql!();
     let (_tcp, http) = start_server().await;
@@ -146,6 +151,7 @@ async fn blob_mode_creates_table_and_writes() {
 }
 
 #[tokio::test]
+#[ignore = "needs EXSPEED_MSSQL_URL (CI runs it with --include-ignored)"]
 async fn blob_mode_upsert_is_idempotent_on_offset() {
     let ms_url = crate::require_mssql!();
     let (_tcp, http) = start_server().await;
@@ -223,6 +229,7 @@ async fn blob_mode_upsert_is_idempotent_on_offset() {
 }
 
 #[tokio::test]
+#[ignore = "needs EXSPEED_MSSQL_URL (CI runs it with --include-ignored)"]
 async fn typed_schema_binds_correct_types() {
     let ms_url = crate::require_mssql!();
     let (_tcp, http) = start_server().await;
@@ -316,6 +323,7 @@ async fn typed_schema_binds_correct_types() {
 }
 
 #[tokio::test]
+#[ignore = "needs EXSPEED_MSSQL_URL (CI runs it with --include-ignored)"]
 async fn typed_schema_rejects_mismatched_json_type() {
     let ms_url = crate::require_mssql!();
     let (_tcp, http) = start_server().await;
@@ -405,6 +413,7 @@ async fn typed_schema_rejects_mismatched_json_type() {
 }
 
 #[tokio::test]
+#[ignore = "needs EXSPEED_MSSQL_URL (CI runs it with --include-ignored)"]
 async fn table_name_injection_rejected_at_create() {
     let ms_url = crate::require_mssql!();
     let (_tcp, http) = start_server().await;
@@ -441,6 +450,7 @@ async fn table_name_injection_rejected_at_create() {
 }
 
 #[tokio::test]
+#[ignore = "needs EXSPEED_MSSQL_URL (CI runs it with --include-ignored)"]
 async fn concurrent_upserts_no_duplicate_keys() {
     let ms_url = crate::require_mssql!();
     let table = common::db::unique_table("concurrent_ms");

@@ -355,7 +355,13 @@ impl AggOp {
                     let mask = mask.as_boolean_opt().cloned().ok_or_else(|| {
                         ExqlError::Plan("aggregate FILTER must be boolean".into())
                     })?;
-                    let mask = prep_null_mask_filter(&mask);
+                    // NULL counts as false; `prep_null_mask_filter` needs a
+                    // null buffer, so only call it when there are nulls.
+                    let mask = if mask.null_count() > 0 {
+                        prep_null_mask_filter(&mask)
+                    } else {
+                        mask
+                    };
                     vals = vals
                         .iter()
                         .map(|v| filter(v.as_ref(), &mask))

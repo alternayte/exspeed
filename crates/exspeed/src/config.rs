@@ -41,7 +41,21 @@ pub struct FileConfig {
     #[serde(default)]
     pub connectors: ConnectorsSection,
     #[serde(default)]
+    pub exql: ExqlSection,
+    #[serde(default)]
     pub log: LogSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExqlSection {
+    pub query_timeout_secs: Option<u64>,
+    pub query_max_rows: Option<usize>,
+    pub query_memory_mb: Option<usize>,
+    pub query_partitions: Option<usize>,
+    pub checkpoint_ms: Option<u64>,
+    pub default_grace_ms: Option<u64>,
+    pub max_event_time_skew_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -52,6 +66,10 @@ pub struct ServerSection {
     pub data_dir: Option<PathBuf>,
     pub max_connections: Option<usize>,
     pub drain_timeout_secs: Option<u64>,
+    pub stop_timeout_secs: Option<u64>,
+    pub handshake_timeout_secs: Option<u64>,
+    pub idle_timeout_secs: Option<u64>,
+    pub metrics_token: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -225,6 +243,10 @@ struct Layer {
     data_dir: Option<PathBuf>,
     max_connections: Option<usize>,
     drain_timeout_secs: Option<u64>,
+    stop_timeout_secs: Option<u64>,
+    handshake_timeout_secs: Option<u64>,
+    idle_timeout_secs: Option<u64>,
+    metrics_token: Option<String>,
     auth_token: Option<String>,
     credentials_file: Option<PathBuf>,
     tls_cert: Option<PathBuf>,
@@ -257,6 +279,13 @@ struct Layer {
     cluster_tls: Option<bool>,
     cluster_tls_ca: Option<PathBuf>,
     connector_offset_store: Option<String>,
+    exql_query_timeout_secs: Option<u64>,
+    exql_query_max_rows: Option<usize>,
+    exql_query_memory_mb: Option<usize>,
+    exql_query_partitions: Option<usize>,
+    exql_checkpoint_ms: Option<u64>,
+    exql_default_grace_ms: Option<u64>,
+    exql_max_event_time_skew_ms: Option<u64>,
     log_format: Option<String>,
     log_level: Option<String>,
 }
@@ -277,6 +306,10 @@ impl Layer {
             data_dir: f.server.data_dir,
             max_connections: f.server.max_connections,
             drain_timeout_secs: f.server.drain_timeout_secs,
+            stop_timeout_secs: f.server.stop_timeout_secs,
+            handshake_timeout_secs: f.server.handshake_timeout_secs,
+            idle_timeout_secs: f.server.idle_timeout_secs,
+            metrics_token: f.server.metrics_token,
             auth_token: f.auth.token,
             credentials_file: f.auth.credentials_file,
             tls_cert: f.tls.cert,
@@ -309,6 +342,13 @@ impl Layer {
             cluster_tls: f.cluster.tls,
             cluster_tls_ca: f.cluster.tls_ca,
             connector_offset_store: f.connectors.offset_store,
+            exql_query_timeout_secs: f.exql.query_timeout_secs,
+            exql_query_max_rows: f.exql.query_max_rows,
+            exql_query_memory_mb: f.exql.query_memory_mb,
+            exql_query_partitions: f.exql.query_partitions,
+            exql_checkpoint_ms: f.exql.checkpoint_ms,
+            exql_default_grace_ms: f.exql.default_grace_ms,
+            exql_max_event_time_skew_ms: f.exql.max_event_time_skew_ms,
             log_format: f.log.format,
             log_level: f.log.level,
         })
@@ -335,6 +375,13 @@ impl Layer {
                 "EXSPEED_DRAIN_TIMEOUT_SECS",
                 s("EXSPEED_DRAIN_TIMEOUT_SECS"),
             )?,
+            stop_timeout_secs: num("EXSPEED_STOP_TIMEOUT_SECS", s("EXSPEED_STOP_TIMEOUT_SECS"))?,
+            handshake_timeout_secs: num(
+                "EXSPEED_HANDSHAKE_TIMEOUT_SECS",
+                s("EXSPEED_HANDSHAKE_TIMEOUT_SECS"),
+            )?,
+            idle_timeout_secs: num("EXSPEED_IDLE_TIMEOUT_SECS", s("EXSPEED_IDLE_TIMEOUT_SECS"))?,
+            metrics_token: s("EXSPEED_METRICS_TOKEN"),
             auth_token: s("EXSPEED_AUTH_TOKEN"),
             credentials_file: s("EXSPEED_CREDENTIALS_FILE").map(PathBuf::from),
             tls_cert: s("EXSPEED_TLS_CERT").map(PathBuf::from),
@@ -394,6 +441,25 @@ impl Layer {
             cluster_tls: num("EXSPEED_CLUSTER_TLS", s("EXSPEED_CLUSTER_TLS"))?,
             cluster_tls_ca: s("EXSPEED_CLUSTER_TLS_CA").map(PathBuf::from),
             connector_offset_store: s("EXSPEED_CONNECTOR_OFFSET_STORE"),
+            exql_query_timeout_secs: num(
+                "EXSPEED_QUERY_TIMEOUT_SECS",
+                s("EXSPEED_QUERY_TIMEOUT_SECS"),
+            )?,
+            exql_query_max_rows: num("EXSPEED_QUERY_MAX_ROWS", s("EXSPEED_QUERY_MAX_ROWS"))?,
+            exql_query_memory_mb: num("EXSPEED_QUERY_MEMORY_MB", s("EXSPEED_QUERY_MEMORY_MB"))?,
+            exql_query_partitions: num("EXSPEED_QUERY_PARTITIONS", s("EXSPEED_QUERY_PARTITIONS"))?,
+            exql_checkpoint_ms: num(
+                "EXSPEED_EXQL_CHECKPOINT_MS",
+                s("EXSPEED_EXQL_CHECKPOINT_MS"),
+            )?,
+            exql_default_grace_ms: num(
+                "EXSPEED_EXQL_DEFAULT_GRACE_MS",
+                s("EXSPEED_EXQL_DEFAULT_GRACE_MS"),
+            )?,
+            exql_max_event_time_skew_ms: num(
+                "EXSPEED_EXQL_MAX_EVENT_TIME_SKEW_MS",
+                s("EXSPEED_EXQL_MAX_EVENT_TIME_SKEW_MS"),
+            )?,
             log_format: s("LOG_FORMAT"),
             log_level: s("RUST_LOG"),
         })
@@ -432,6 +498,12 @@ impl Layer {
         set!(data_dir => data_dir);
         set!(max_connections => max_connections);
         set!(drain_timeout_secs => drain_timeout_secs);
+        set!(stop_timeout_secs => stop_timeout_secs);
+        set!(handshake_timeout_secs => handshake_timeout_secs);
+        set!(idle_timeout_secs => idle_timeout_secs);
+        if self.metrics_token.is_some() {
+            t.metrics_token = self.metrics_token;
+        }
         if self.auth_token.is_some() {
             t.auth_token = self.auth_token;
         }
@@ -488,6 +560,13 @@ impl Layer {
             t.cluster.tls_ca = self.cluster_tls_ca;
         }
         set!(connector_offset_store => connector_offset_store);
+        set!(exql_query_timeout_secs => exql.query_timeout_secs);
+        set!(exql_query_max_rows => exql.query_max_rows);
+        set!(exql_query_memory_mb => exql.query_memory_mb);
+        set!(exql_query_partitions => exql.query_partitions);
+        set!(exql_checkpoint_ms => exql.checkpoint_ms);
+        set!(exql_default_grace_ms => exql.default_grace_ms);
+        set!(exql_max_event_time_skew_ms => exql.max_event_time_skew_ms);
         if self.log_format.is_some() {
             t.log_format = self.log_format;
         }
@@ -516,7 +595,33 @@ fn resolve_with(flags: &ServeArgs, env: &dyn Fn(&str) -> Option<String>) -> Resu
     Layer::from_flags(flags).apply(&mut args);
     // Normalize: empty token = unset.
     args.auth_token = args.auth_token.filter(|t| !t.is_empty());
+    args.metrics_token = args.metrics_token.filter(|t| !t.is_empty());
     Ok(args)
+}
+
+/// The local `/readyz` URL of a server with these settings: the
+/// `api_bind` port on loopback (or on `api_bind`'s address when it names
+/// one), `https` when TLS is configured. Used by `exspeed healthcheck`.
+pub fn probe_url(a: &ServerArgs) -> String {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    let scheme = if a.tls_cert.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    let addr = match a.api_bind.parse::<SocketAddr>() {
+        Ok(mut s) => {
+            if s.ip().is_unspecified() {
+                s.set_ip(match s.ip() {
+                    IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+                });
+            }
+            s.to_string()
+        }
+        Err(_) => a.api_bind.clone(),
+    };
+    format!("{scheme}://{addr}/readyz")
 }
 
 /// Static checks that don't need the network.
@@ -640,6 +745,10 @@ api_bind = {api_bind:?}
 data_dir = {data_dir:?}
 max_connections = {maxc}
 drain_timeout_secs = {drain}
+stop_timeout_secs = {stop}
+handshake_timeout_secs = {hs}
+idle_timeout_secs = {idle}
+metrics_token = {mtoken}
 
 [auth]
 token = {token}
@@ -683,6 +792,15 @@ tls_ca = {ctlsca}
 [connectors]
 offset_store = {os:?}
 
+[exql]
+query_timeout_secs = {xqt}
+query_max_rows = {xqr}
+query_memory_mb = {xqm}
+query_partitions = {xqp}
+checkpoint_ms = {xck}
+default_grace_ms = {xgr}
+max_event_time_skew_ms = {xsk}
+
 [log]
 format = {lf}
 level = {ll}
@@ -697,6 +815,10 @@ level = {ll}
         data_dir = a.data_dir.display().to_string(),
         maxc = a.max_connections,
         drain = a.drain_timeout_secs,
+        stop = a.stop_timeout_secs,
+        hs = a.handshake_timeout_secs,
+        idle = a.idle_timeout_secs,
+        mtoken = secret(&a.metrics_token),
         token = secret(&a.auth_token),
         creds = opt_path(&a.credentials_file),
         cert = opt_path(&a.tls_cert),
@@ -731,6 +853,13 @@ level = {ll}
         ctls = a.cluster.tls,
         ctlsca = opt_path(&a.cluster.tls_ca),
         os = a.connector_offset_store,
+        xqt = a.exql.query_timeout_secs,
+        xqr = a.exql.query_max_rows,
+        xqm = a.exql.query_memory_mb,
+        xqp = a.exql.query_partitions,
+        xck = a.exql.checkpoint_ms,
+        xgr = a.exql.default_grace_ms,
+        xsk = a.exql.max_event_time_skew_ms,
         lf = opt(&a.log_format),
         ll = opt(&a.log_level),
     )
@@ -746,7 +875,11 @@ bind = "0.0.0.0:5933"            # client protocol (EXSPEED_BIND, --bind)
 api_bind = "0.0.0.0:8080"        # HTTP API, probes, metrics (EXSPEED_API_BIND, --api-bind)
 data_dir = "./exspeed-data"      # (EXSPEED_DATA_DIR, --data-dir)
 max_connections = 1024           # (EXSPEED_MAX_CONNS, --max-connections)
-drain_timeout_secs = 10          # time given to open connections on shutdown (EXSPEED_DRAIN_TIMEOUT_SECS)
+drain_timeout_secs = 10          # time given to open connections and HTTP requests on shutdown (EXSPEED_DRAIN_TIMEOUT_SECS)
+stop_timeout_secs = 30           # budget for stopping connectors, queries and consumers after the drain (EXSPEED_STOP_TIMEOUT_SECS)
+handshake_timeout_secs = 10      # TCP clients must send Connect (and finish TLS) within this (EXSPEED_HANDSHAKE_TIMEOUT_SECS)
+idle_timeout_secs = 120          # TCP connections with no frame for this long are closed (EXSPEED_IDLE_TIMEOUT_SECS)
+# metrics_token = "..."          # when set, GET /metrics requires `Authorization: Bearer <token>` (EXSPEED_METRICS_TOKEN)
 
 [auth]
 # credentials_file = "/etc/exspeed/credentials.toml"   # (EXSPEED_CREDENTIALS_FILE)
@@ -791,6 +924,15 @@ tls = false                      # serve and require TLS on the cluster port, wi
 [connectors]
 offset_store = "log"             # "log" (__connector_offsets stream) or "file" (EXSPEED_CONNECTOR_OFFSET_STORE)
 
+[exql]
+query_timeout_secs = 30          # bounded query timeout (EXSPEED_QUERY_TIMEOUT_SECS)
+query_max_rows = 10000           # rows returned before a result is marked truncated (EXSPEED_QUERY_MAX_ROWS)
+query_memory_mb = 512            # memory pool shared by bounded queries, min 16 (EXSPEED_QUERY_MEMORY_MB)
+query_partitions = 1             # DataFusion target partitions, 1-64 (EXSPEED_QUERY_PARTITIONS)
+checkpoint_ms = 5000             # continuous-query checkpoint interval, min 100 (EXSPEED_EXQL_CHECKPOINT_MS)
+default_grace_ms = 0             # allowed lateness when a query names no GRACE PERIOD (EXSPEED_EXQL_DEFAULT_GRACE_MS)
+max_event_time_skew_ms = 86400000  # TIMESTAMP BY values further than this ahead of the record timestamp fall back to it (EXSPEED_EXQL_MAX_EVENT_TIME_SKEW_MS)
+
 [log]
 format = "text"                  # "text" or "json" (LOG_FORMAT)
 level = "info"                   # tracing filter, e.g. "exspeed=debug,warn" (RUST_LOG)
@@ -799,6 +941,7 @@ level = "info"                   # tracing filter, e.g. "exspeed=debug,warn" (RU
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::server::ExqlArgs;
     use std::collections::HashMap;
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
@@ -821,6 +964,56 @@ mod tests {
         assert_eq!(a.cluster.lease_ttl_secs, d.cluster.lease_ttl_secs);
         assert_eq!(a.storage_sync_bytes, d.storage_sync_bytes);
         assert_eq!(a.connector_offset_store, d.connector_offset_store);
+        assert_eq!(a.drain_timeout_secs, d.drain_timeout_secs);
+        assert_eq!(a.stop_timeout_secs, d.stop_timeout_secs);
+        assert_eq!(a.handshake_timeout_secs, d.handshake_timeout_secs);
+        assert_eq!(a.idle_timeout_secs, d.idle_timeout_secs);
+        assert_eq!(a.exql.query_timeout_secs, d.exql.query_timeout_secs);
+        assert_eq!(a.exql.query_memory_mb, d.exql.query_memory_mb);
+        assert_eq!(a.exql.checkpoint_ms, d.exql.checkpoint_ms);
+        assert_eq!(a.exql.max_event_time_skew_ms, d.exql.max_event_time_skew_ms);
+    }
+
+    #[test]
+    fn exql_section_resolves_and_reaches_the_engine_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exspeed.toml");
+        std::fs::write(
+            &path,
+            "[exql]\nquery_timeout_secs = 5\nquery_max_rows = 50\nquery_memory_mb = 64\n\
+             query_partitions = 4\ncheckpoint_ms = 250\ndefault_grace_ms = 1000\n",
+        )
+        .unwrap();
+        let flags = ServeArgs {
+            config: Some(path),
+            ..Default::default()
+        };
+        let a = resolve_with(&flags, &env(&[("EXSPEED_QUERY_MAX_ROWS", "77")])).unwrap();
+        assert_eq!(a.exql.query_timeout_secs, 5, "file");
+        assert_eq!(a.exql.query_max_rows, 77, "env beats file");
+        let c = a.exql.engine_config();
+        assert_eq!(c.query_timeout, std::time::Duration::from_secs(5));
+        assert_eq!(c.max_result_rows, 77);
+        assert_eq!(c.memory_limit_bytes, 64 * 1024 * 1024);
+        assert_eq!(c.target_partitions, 4);
+        assert_eq!(c.checkpoint_interval, std::time::Duration::from_millis(250));
+        assert_eq!(c.default_grace_ms, 1000);
+        // Same lower bounds as the env-only parsing had.
+        let tiny = ExqlArgs {
+            query_timeout_secs: 0,
+            query_memory_mb: 1,
+            query_partitions: 1000,
+            checkpoint_ms: 1,
+            ..Default::default()
+        }
+        .engine_config();
+        assert_eq!(tiny.query_timeout, std::time::Duration::from_secs(1));
+        assert_eq!(tiny.memory_limit_bytes, 16 * 1024 * 1024);
+        assert_eq!(tiny.target_partitions, 64);
+        assert_eq!(
+            tiny.checkpoint_interval,
+            std::time::Duration::from_millis(100)
+        );
     }
 
     #[test]
@@ -928,6 +1121,30 @@ dedup_window_secs = 60
             &env(&[("EXSPEED_MAX_CONNS", "lots")]),
         );
         assert!(bad_num.is_err());
+    }
+
+    #[test]
+    fn probe_url_follows_api_bind_and_tls() {
+        let mut a = ServerArgs::default();
+        assert_eq!(probe_url(&a), "http://127.0.0.1:8080/readyz");
+        a.api_bind = "0.0.0.0:9443".into();
+        a.tls_cert = Some("/c.pem".into());
+        assert_eq!(probe_url(&a), "https://127.0.0.1:9443/readyz");
+        a.api_bind = "[::]:9000".into();
+        a.tls_cert = None;
+        assert_eq!(probe_url(&a), "http://[::1]:9000/readyz");
+        a.api_bind = "10.1.2.3:8081".into();
+        assert_eq!(probe_url(&a), "http://10.1.2.3:8081/readyz");
+        // Resolved like the server: env beats the defaults.
+        let r = resolve_with(
+            &ServeArgs::default(),
+            &env(&[
+                ("EXSPEED_API_BIND", "0.0.0.0:7000"),
+                ("EXSPEED_TLS_CERT", "/x"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(probe_url(&r), "https://127.0.0.1:7000/readyz");
     }
 
     #[test]

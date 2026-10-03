@@ -125,8 +125,6 @@ sysinfo = "0.37"
 
 # Observability / Metrics
 opentelemetry = "0.28"
-opentelemetry_sdk = { version = "0.28", features = ["metrics"] }
-opentelemetry-prometheus = "0.28"
 prometheus = "0.13"
 
 [profile.dev]

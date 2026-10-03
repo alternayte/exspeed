@@ -7,10 +7,10 @@ subjects, SQL over streams, and built-in connectors.**
 exspeed server        # that's the whole deployment
 ```
 
-> **Status: pre-1.0, not production-ready.** The core ideas work end to end,
-> but a deep review found correctness gaps in delivery, HA, ExQL and the
-> connectors. Read [docs/REVIEW.md](docs/REVIEW.md) for the findings and the
-> rebuild plan before you depend on Exspeed.
+> **Status: pre-1.0.** An October 2026 deep review found correctness gaps in
+> delivery, HA, ExQL and the connectors; the rebuild that followed fixed
+> them. [docs/REVIEW.md](docs/REVIEW.md) lists every finding with its
+> status and the test that proves the fix.
 
 ## Why Exspeed
 
@@ -54,15 +54,15 @@ or the Rust [`exspeed-client`](crates/exspeed-client) on TCP port 5933
 | Durable streams, subjects, retention, compaction, publish, read | ✅ rewritten storage engine (crash-safe, lock-free reads) |
 | Consumers: push + pull, ack/nack/term, ack timeout, redelivery, backoff, DLQ | ✅ JetStream-style, state in the log |
 | Work sharing across app instances (one consumer, many subscribers) | ✅ |
-| Idempotent publish (`msg_id`) | ✅ single node · ⚠️ gaps in batches and on failover |
+| Idempotent publish (`msg_id`) | ✅ on every write path, within batches, enforced from startup, rebuilt on failover ([idempotent-publish.md](docs/idempotent-publish.md)) |
 | Auth (scoped tokens) and TLS | ✅ |
 | ExQL bounded queries | ✅ full SQL on DataFusion (joins, HAVING, window functions, subqueries), JSON numerics, pushdown, timeouts/limits ([exql.md](docs/exql.md)) |
-| ExQL continuous queries, windows, joins, tables | ✅ event-time windows, stream-stream/stream-table joins, durable tables, checkpointed state, effectively-once output · ⚠️ query registry not replicated ([exql.md](docs/exql.md#state-recovery-and-delivery-guarantees)) |
+| ExQL continuous queries, windows, joins, tables | ✅ event-time windows, stream-stream/stream-table joins, durable tables, checkpointed state, effectively-once output; query and connection definitions live in the replicated `__exql_queries` / `__exql_connections` streams ([exql.md](docs/exql.md#state-recovery-and-delivery-guarantees)) |
 | Connectors: framework (checkpoint protocol, supervisor, typed settings, DLQ, replicated offsets) | ✅ tested with fault injection |
 | Connectors: Postgres CDC, outbox, poll; JDBC sink; HTTP poll/sink/webhook | ✅ at-least-once or effectively-once, tested against real services ([guarantees](docs/connectors.md#delivery-guarantees)) |
-| Connectors: RabbitMQ, S3, SQL Server CDC | ⚠️ implemented to the same protocol; unit-tested only, no service tests in CI yet |
+| Connectors: RabbitMQ, S3, MySQL / SQL Server (JDBC sink, `jdbc_poll`, `mssql_cdc`) | ✅ same guarantees, crash/resume tests against real services in CI |
 | Operations: config file, Helm chart, graceful shutdown, online backup + restore, OpenAPI spec | ✅ ([operations.md](docs/operations.md), [http-api.md](docs/http-api.md)) |
-| Multi-pod HA with replication | ❌ not safe yet ([§3.4](docs/REVIEW.md#34-ha-leadership--replication)) |
+| Multi-pod HA with replication | ✅ epoch-fenced lease, pull replication with divergence truncation, `acks = all`/`quorum`, TLS between nodes; partition and kill -9 tests ([high-availability.md](docs/high-availability.md)) |
 
 ## Performance
 
@@ -76,10 +76,13 @@ disk, ext4), default durable mode (fsync before every acknowledgement):
 | Drain a 1M-record backlog | ~354k msg/s with reads, ~285k msg/s with a push consumer |
 | End-to-end latency at 5k msg/s | p50 5.3 ms, p99 11.2 ms |
 
-Machine details, all results and the exact commands are in
-[BENCHMARKS.md](BENCHMARKS.md). No Kafka or NATS numbers are published; the
-[comparison kit](bench/README.md#reproduce-a-comparison-with-kafka-and-nats-jetstream)
-runs all three on your hardware.
+On the same VM, with every broker fsyncing before it acknowledges, Exspeed
+published 51.7k msg/s against Kafka's 11.4k and drained a backlog at 411k
+msg/s against Kafka's 117k; Kafka's one-at-a-time end-to-end latency (p50
+1 ms) beat Exspeed's (p50 6 ms). The tools and their caveats (JetStream's
+numbers are for synchronous one-at-a-time publishing) are in
+[BENCHMARKS.md](BENCHMARKS.md#comparison-with-kafka-and-nats-jetstream),
+with machine details, all results and the exact commands.
 
 ## Documentation
 

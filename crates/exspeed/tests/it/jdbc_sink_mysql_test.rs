@@ -2,8 +2,10 @@ use crate::common;
 use std::time::Duration;
 
 async fn start_server() -> (String, String) {
-    let tcp_port = exspeed_testkit::pick_unused_port().unwrap();
-    let http_port = exspeed_testkit::pick_unused_port().unwrap();
+    let tcp_port_l = exspeed_testkit::bind_local();
+    let tcp_port = tcp_port_l.local_addr().unwrap().port();
+    let http_port_l = exspeed_testkit::bind_local();
+    let http_port = http_port_l.local_addr().unwrap().port();
     let tcp_addr = format!("127.0.0.1:{}", tcp_port);
     let http_addr = format!("127.0.0.1:{}", http_port);
     let dir = tempfile::TempDir::new().unwrap();
@@ -15,7 +17,9 @@ async fn start_server() -> (String, String) {
         let _keep = dir;
         exspeed::cli::server::run(exspeed::cli::server::ServerArgs {
             bind: tcp_addr_clone,
+            tcp_listener: Some(std::sync::Arc::new(tcp_port_l)),
             api_bind: http_addr_clone,
+            api_listener: Some(std::sync::Arc::new(http_port_l)),
             data_dir,
             auth_token: None,
             credentials_file: None,
@@ -48,6 +52,7 @@ async fn wait_for_rows(
 }
 
 #[tokio::test]
+#[ignore = "needs EXSPEED_MYSQL_URL (CI runs it with --include-ignored)"]
 async fn mysql_blob_mode_writes() {
     let url = crate::require_mysql!();
     let (_tcp, http) = start_server().await;
@@ -95,6 +100,7 @@ async fn mysql_blob_mode_writes() {
 }
 
 #[tokio::test]
+#[ignore = "needs EXSPEED_MYSQL_URL (CI runs it with --include-ignored)"]
 async fn mysql_typed_binds_correct_types() {
     let url = crate::require_mysql!();
     let (_tcp, http) = start_server().await;

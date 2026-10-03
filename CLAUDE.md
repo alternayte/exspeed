@@ -85,7 +85,7 @@ exspeed-common          Shared types (StreamName, Offset), subject filters, auth
     ↓
 exspeed-streams         StorageEngine trait, Record/StoredRecord, StreamConfig
     ↓
-exspeed-protocol        Wire protocol: Frame codec, opcodes, client protocol v2 (client.rs), replication messages
+exspeed-protocol        Wire protocol: Frame codec, opcodes, client protocol v2 (client.rs)
 exspeed-storage         FileStorage: writer thread per partition, lock-free readers, sparse indexes, retention, compaction
     ↓
 exspeed-broker          Log (single write path), dedup, consumers, leases/leadership, replication
@@ -129,7 +129,7 @@ User docs live in `docs/` (index: `docs/README.md`); the root README is a short 
 
 ## Integration Tests
 
-Integration tests live in `crates/exspeed/tests/`. They spin up a real server (FileStorage + Broker + API) on random ports (`exspeed_testkit::pick_unused_port`) with a temp data dir; most files are modules of the single `it` binary (`tests/it/main.rs`). Test files:
+Integration tests live in `crates/exspeed/tests/`. They spin up a real server (FileStorage + Broker + API) on pre-bound listeners (`exspeed_testkit::bind_local()` passed as `ServerArgs::tcp_listener`/`api_listener`; `pick_unused_port` only where a child process must restart on the same port) with a temp data dir; most files are modules of the single `it` binary (`tests/it/main.rs`). Test files:
 - `common/mod.rs` — `TestServer` harness (in-process server, `client()`, `restart()`)
 - `protocol_test` / `consumer_test` / `dedup_test` — client protocol and consumer semantics via `exspeed-client`
 - `exql_test` / `exql_windows_test` — query engine tests

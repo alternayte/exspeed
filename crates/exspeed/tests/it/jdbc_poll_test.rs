@@ -159,6 +159,7 @@ async fn mssql_connect(
 }
 
 #[tokio::test]
+#[ignore = "needs EXSPEED_MSSQL_URL (CI runs it with --include-ignored)"]
 async fn mssql_poll_source_emits_new_rows() {
     let ms_url = crate::require_mssql!();
     let table = common::db::unique_table("poll_ms");

@@ -38,6 +38,13 @@ Decoders reject truncated payloads and trailing bytes.
 - A request carries a non-zero correlation id, and its response echoes it.
   Responses can arrive **out of order**: a long pull or long-poll read does not
   block the requests behind it.
+- `Publish` and `PublishBatch` requests on one connection are applied **in the
+  order they were sent**, and the connection keeps reading while they are
+  written. Publishes already queued for the same stream are appended
+  together (one storage batch, one fsync), so a client that pipelines
+  publishes without waiting for each reply shares fsyncs instead of paying
+  one per record. Each request still gets its own reply. A request that
+  depends on a publish (a read of it, say) should wait for its reply.
 - The server sends pushes (`Deliver`, `SubscriptionEnded`) with correlation id
   `0`.
 - A request sent with correlation id `0` is **fire-and-forget**: no reply on
@@ -54,6 +61,9 @@ Decoders reject truncated payloads and trailing bytes.
    should `Ping` every 15–30 seconds.
 4. A frame that can't be decoded (bad version, unknown opcode, oversize
    length) gets `Error 400` with correlation id 0, and the connection closes.
+   This applies to the very first frame too: a client speaking another
+   version gets a v2 `Error 400` "unsupported protocol version N; this server
+   speaks 2" before the close.
    A request whose *payload* is malformed gets `Error 400` with its own
    correlation id, and the connection stays open.
 5. When the connection closes, the server ends its subscriptions and deletes
@@ -65,11 +75,34 @@ Decoders reject truncated payloads and trailing bytes.
 : `str subject`, `opt<bytes> key`, `bytes value`, `headers`, `opt<str> msg_id`
 
 **WireRecord**
-: `u64 offset`, `u64 timestamp_ms`, `u16 delivery_count`, `str subject`,
-  `opt<bytes> key`, `bytes value`, `headers`
+: `u32 len`, `u32 crc`, `u16 delivery_count`, `u64 offset`,
+  `u64 timestamp_ns`, `str subject`, `opt<bytes> key`, `bytes value`,
+  `headers`
 
-`delivery_count` is 1 on first delivery and goes up on each redelivery. It is
-0 for stateless reads.
+| Bytes | Field | Notes |
+|-------|-------|-------|
+| 0–3 | `len` | Bytes after this field (record size − 4). A record is at least 35 bytes, so `len` ≥ 31. |
+| 4–7 | `crc` | CRC32C (Castagnoli) of bytes 10..end: everything after `delivery_count`. |
+| 8–9 | `delivery_count` | 1 on first delivery, +1 on each redelivery, 0 for stateless reads. Not covered by the CRC. |
+| 10–17 | `offset` | |
+| 18–25 | `timestamp_ns` | Append time, **nanoseconds** since the Unix epoch. |
+| 26– | `subject`, `key`, `value`, `headers` | Encoded as in `PublishRecord`. |
+
+This is byte for byte how the server stores records in its segment files,
+so it can answer `Read`, `Pull` and push deliveries by copying records out
+of the file: the length prefix gives record boundaries without parsing, and
+`delivery_count` sits at a fixed position outside the CRC so the server can
+set it in place. Decoders must check that `len` matches the fields it
+contains. Clients should verify the CRC (the Rust client does; the
+TypeScript SDK exposes `verifyRecordCrc` but doesn't call it by default,
+since a JavaScript CRC costs more than the rest of decoding). Records in a
+`vec<WireRecord>` follow each other with no padding.
+
+> **Changed during the rebuild, without a version bump.** Earlier builds of
+> protocol v2 encoded a `WireRecord` as `u64 offset, u64 timestamp_ms,
+> u16 delivery_count, …` with no length or CRC. The version byte stays `2`
+> because nothing is deployed yet, so there is no negotiation: clients and
+> servers from before and after this change can't talk to each other.
 
 **StreamSpec**
 : `str name`, `u64 max_age_secs`, `u64 max_bytes`, `u64 dedup_window_secs`,
@@ -150,6 +183,25 @@ Only `name` and `stream` are required.
 | 0x89 | SubscribeOk | `u32 sub_id` |
 | 0x8A | SubscriptionEnded | `u32 sub_id`, `u16 code`, `str message` (push, corr 0) |
 | 0xF1 | Pong | — |
+
+### Size limits
+
+Every frame payload is at most 16 MiB; a decoder that sees a larger length
+rejects the frame and closes the connection, and the server never sends
+one. To guarantee that, batches are budgeted by each record's full
+`WireRecord` size (headers and framing included):
+
+| What | Limit |
+|------|-------|
+| One published record | subject ≤ 1024 bytes, key ≤ 64 KiB, value ≤ 8 MiB, ≤ 256 headers with keys ≤ 1 KiB, values ≤ 32 KiB and **all header keys + values ≤ 64 KiB**, so one `WireRecord` is under ~8.2 MiB |
+| `Read` `max_bytes` | 0 = 1 MiB, capped at 8 MiB |
+| `Pull` `max_bytes` | 0 = 4 MiB, capped at 8 MiB |
+| `Deliver` | sent once a subscriber's pending records reach 4 MiB; never grown past 8 MiB |
+
+A response stops adding records before the next one would exceed its byte
+budget, except that the first record is always included (so a large record
+can't stall a reader). Records larger than the budget therefore arrive one
+per frame, which always fits.
 
 Opcodes 0x30, 0x31 and 0xA0–0xA6 are reserved. Replication between
 servers uses its own protocol on the cluster port (see

@@ -56,6 +56,9 @@ struct Inner {
     since: Instant,
     checkpoint: Option<String>,
     records: u64,
+    /// Sink: the first offset of a write that exhausted its in-place retries,
+    /// and how many times in a row that happened (across restarts).
+    stuck: Option<(u64, u32)>,
 }
 
 /// Snapshot of a connector's status.
@@ -96,6 +99,7 @@ impl ConnectorState {
                 since: Instant::now(),
                 checkpoint: None,
                 records: 0,
+                stuck: None,
             }),
         });
         s.publish_status(Status::Stopped);
@@ -164,6 +168,23 @@ impl ConnectorState {
         self.metrics
             .connector_retry_attempts_total
             .add(1, &[self.label(), KeyValue::new("outcome", "retried")]);
+    }
+
+    /// Sink: a write starting at `offset` exhausted its retries. Returns how
+    /// many consecutive exhaustions started at that same offset.
+    pub fn note_stuck(&self, offset: u64) -> u32 {
+        let mut g = self.inner.lock().unwrap();
+        let n = match g.stuck {
+            Some((o, n)) if o == offset => n.saturating_add(1),
+            _ => 1,
+        };
+        g.stuck = Some((offset, n));
+        n
+    }
+
+    /// Sink: the stuck write got past its first record.
+    pub fn clear_stuck(&self) {
+        self.inner.lock().unwrap().stuck = None;
     }
 
     pub fn record_restart(&self) {
@@ -243,12 +264,8 @@ impl ConnectorState {
         }
     }
 
-    /// Zero the per-connector gauges (connector deleted).
+    /// Drop the connector's metric series (connector deleted).
     pub fn retire(&self) {
-        for s in Status::ALL {
-            self.metrics
-                .connector_state
-                .record(0, &[self.label(), KeyValue::new("state", s.as_str())]);
-        }
+        self.metrics.forget_connector(&self.name);
     }
 }

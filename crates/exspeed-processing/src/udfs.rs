@@ -7,6 +7,8 @@ use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{exec_err, ScalarValue};
 use datafusion::logical_expr::{create_udf, ColumnarValue, ScalarUDF, Volatility};
 
+use exspeed_common::SubjectFilter;
+
 use crate::convert::ts_type;
 
 /// Internal marker for `window_start` in windowed continuous queries.
@@ -76,34 +78,47 @@ pub fn subject_part() -> ScalarUDF {
 }
 
 /// `subject_matches(subject, pattern)`: NATS-style wildcard match
-/// (`*` one token, `>` one or more trailing tokens).
+/// (`*` one token, `>` one or more trailing tokens), with exactly the
+/// semantics of consumer and connector subject filters. The pattern is
+/// parsed once per batch when it is a constant (and once per distinct value
+/// otherwise); an invalid pattern (`a.>.c`, `a..b`, `a.b*`) is an error.
 pub fn subject_matches() -> ScalarUDF {
     create_udf(
         "subject_matches",
         vec![DataType::Utf8, DataType::Utf8],
         DataType::Boolean,
         Volatility::Immutable,
-        Arc::new(|args: &[ColumnarValue]| {
-            let n = rows(args);
-            let s = to_array(&args[0], n)?;
-            let p = to_array(&args[1], n)?;
-            let s = s.as_string::<i32>();
-            let p = p.as_string::<i32>();
-            let out: BooleanArray = (0..n)
-                .map(|r| {
-                    if s.is_null(r) || p.is_null(r) {
-                        None
-                    } else {
-                        Some(exspeed_common::subject::subject_matches(
-                            s.value(r),
-                            p.value(r),
-                        ))
-                    }
-                })
-                .collect();
-            finish(Arc::new(out), all_scalar(args))
-        }),
+        Arc::new(subject_matches_impl),
     )
+}
+
+fn subject_matches_impl(args: &[ColumnarValue]) -> datafusion::common::Result<ColumnarValue> {
+    let n = rows(args);
+    let s = to_array(&args[0], n)?;
+    let s = s.as_string::<i32>();
+    let constant = matches!(args[1], ColumnarValue::Scalar(_));
+    let p = to_array(&args[1], if constant { 1 } else { n })?;
+    let p = p.as_string::<i32>();
+    let parse =
+        |pat: &str| SubjectFilter::parse(pat).or_else(|e| exec_err!("subject_matches: {e}"));
+    let mut cached: Option<(usize, SubjectFilter)> = None;
+    let mut out = Vec::with_capacity(n);
+    for r in 0..n {
+        let pr = if constant { 0 } else { r };
+        if s.is_null(r) || p.is_null(pr) {
+            out.push(None);
+            continue;
+        }
+        let same = cached
+            .as_ref()
+            .is_some_and(|(i, _)| *i == pr || p.value(*i) == p.value(pr));
+        if !same {
+            cached = Some((pr, parse(p.value(pr))?));
+        }
+        let f = &cached.as_ref().expect("cached above").1;
+        out.push(Some(f.matches(s.value(r))));
+    }
+    finish(Arc::new(BooleanArray::from(out)), all_scalar(args))
 }
 
 /// Name of the numeric sort key used for ORDER BY on JSON text.
@@ -169,4 +184,57 @@ pub fn all() -> Vec<ScalarUDF> {
         window_start_marker(),
         window_end_marker(),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(v: &str) -> ColumnarValue {
+        ColumnarValue::Scalar(ScalarValue::Utf8(Some(v.to_string())))
+    }
+
+    fn col(v: &[&str]) -> ColumnarValue {
+        ColumnarValue::Array(Arc::new(StringArray::from(v.to_vec())))
+    }
+
+    fn bools(v: ColumnarValue) -> Vec<Option<bool>> {
+        let a = v.into_array(1).unwrap();
+        a.as_boolean().iter().collect()
+    }
+
+    /// Same semantics as `SubjectFilter`: no partial or non-final
+    /// wildcards, no empty tokens.
+    #[test]
+    fn subject_matches_uses_subject_filter_semantics() {
+        let subjects = col(&["a.b.c", "a.x", "a.x.y.z", "a.b"]);
+        let out = subject_matches_impl(&[subjects.clone(), s("a.>")]).unwrap();
+        assert_eq!(bools(out), vec![Some(true); 4]);
+        let out = subject_matches_impl(&[subjects.clone(), s("a.*.c")]).unwrap();
+        assert_eq!(
+            bools(out),
+            vec![Some(true), Some(false), Some(false), Some(false)]
+        );
+        // Per-row patterns (parsed once per distinct value).
+        let per_row = col(&["a.*.c", "a.*.c", "a.>", "x"]);
+        let out = subject_matches_impl(&[subjects.clone(), per_row]).unwrap();
+        assert_eq!(
+            bools(out),
+            vec![Some(true), Some(false), Some(true), Some(false)]
+        );
+        // The legacy matcher accepted these and treated `a.>.c` as `a.>`.
+        for bad in ["a.>.c", "a..b", "a.b*"] {
+            let err = subject_matches_impl(&[subjects.clone(), s(bad)]).unwrap_err();
+            assert!(err.to_string().contains("subject_matches"), "{err}");
+        }
+        // Scalar in, scalar out; a NULL pattern gives NULL.
+        let out = subject_matches_impl(&[s("a.b"), s("a.*")]).unwrap();
+        assert!(matches!(
+            out,
+            ColumnarValue::Scalar(ScalarValue::Boolean(Some(true)))
+        ));
+        let null = ColumnarValue::Scalar(ScalarValue::Utf8(None));
+        let out = subject_matches_impl(&[subjects, null]).unwrap();
+        assert_eq!(bools(out), vec![None; 4]);
+    }
 }

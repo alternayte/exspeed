@@ -1,0 +1,31 @@
+[2m2026-10-03T15:33:48.677863Z[0m [33m WARN[0m [2mexspeed::cli::server[0m[2m:[0m auth disabled — do not expose broker ports to the public internet
+[2m2026-10-03T15:33:48.677988Z[0m [33m WARN[0m [2mexspeed::cli::server[0m[2m:[0m TLS disabled — do not expose broker ports to the public internet
+[2m2026-10-03T15:33:48.679180Z[0m [32m INFO[0m [2mexspeed::cli::server[0m[2m:[0m single-node mode (no cluster.lease backend): this node is always the leader
+[2m2026-10-03T15:33:48.680672Z[0m [32m INFO[0m [2mexspeed_broker::leadership[0m[2m:[0m cluster:leader acquired; promoting [3mnode[0m[2m=[0mf5a2a894-74a1-4b4b-b9c5-5975358f789a [3mepoch[0m[2m=[0m0
+[2m2026-10-03T15:33:48.680750Z[0m [32m INFO[0m [2mexspeed_broker::leadership[0m[2m:[0m this node is now the leader [3mnode[0m[2m=[0mf5a2a894-74a1-4b4b-b9c5-5975358f789a [3mepoch[0m[2m=[0m0 [3mrole[0m[2m=[0m"leader"
+[2m2026-10-03T15:33:48.680812Z[0m [32m INFO[0m [2mexspeed::cli::server[0m[2m:[0m exspeed server starting [3mauth[0m[2m=[0m"off" [3mtls[0m[2m=[0m"off" [3mlease[0m[2m=[0mnone [3mnode_id[0m[2m=[0mf5a2a894-74a1-4b4b-b9c5-5975358f789a [3mrole[0m[2m=[0m"standalone" [3mbind[0m[2m=[0m0.0.0.0:5933 [3mapi_bind[0m[2m=[0m0.0.0.0:8080 [3mreplication_endpoint[0m[2m=[0mNone [3mclient_endpoint[0m[2m=[0mNone [3macks[0m[2m=[0mall [3mcredentials[0m[2m=[0m0 [3mcred_file[0m[2m=[0m0 [3mcred_legacy_admin[0m[2m=[0m0
+[2m2026-10-03T15:33:48.680917Z[0m [32m INFO[0m [2mexspeed::cli::server[0m[2m:[0m connector offset store initialized [3mbackend[0m[2m=[0m"log"
+[2m2026-10-03T15:33:48.680939Z[0m [32m INFO[0m [2mexspeed::cli::server[0m[2m:[0m all dedup maps ready
+[2m2026-10-03T15:33:48.681383Z[0m [32m INFO[0m [2mexspeed_connectors::file_watcher[0m[2m:[0m file_watcher: native OS watcher active [3mdir[0m[2m=[0m"/tmp/tmp.ASNNpeHu7I/x/connectors.d"
+[2m2026-10-03T15:33:48.681836Z[0m [32m INFO[0m [2mexspeed::cli::server[0m[2m:[0m leader supervisor: assuming leadership; starting work
+[2m2026-10-03T15:33:48.682064Z[0m [32m INFO[0m [2mexspeed::cli::server[0m[2m:[0m exspeed TCP listening on 0.0.0.0:5933
+[2m2026-10-03T15:33:48.682092Z[0m [32m INFO[0m [2mexspeed::cli::server[0m[2m:[0m exspeed HTTP API listening on 0.0.0.0:8080
+[2m2026-10-03T15:33:48.682099Z[0m [32m INFO[0m [2mexspeed::cli::server[0m[2m:[0m connection cap configured [3mmax_conns[0m[2m=[0m1024
+[2m2026-10-03T15:33:48.682136Z[0m [32m INFO[0m [2mexspeed_api[0m[2m:[0m HTTP API listening on 0.0.0.0:8080
+[2m2026-10-03T15:33:48.728071Z[0m [32m INFO[0m [2mexspeed::cli::server[0m[2m:[0m new connection [3mpeer[0m[2m=[0m127.0.0.1:52142
+[2m2026-10-03T15:33:48.728292Z[0m [32m INFO[0m [1mconnection[0m[1m{[0m[3mpeer[0m[2m=[0m127.0.0.1:52142 [3midentity[0m[2m=[0m"anonymous"[1m}[0m[2m:[0m [2mexspeed::session[0m[2m:[0m CONNECT authenticated [3mpeer[0m[2m=[0m127.0.0.1:52142 [3mclient_id[0m[2m=[0mexspeed-bench [3midentity[0m[2m=[0manonymous
+[2m2026-10-03T15:33:48.735178Z[0m [32m INFO[0m [1mconnection[0m[1m{[0m[3mpeer[0m[2m=[0m127.0.0.1:52142 [3midentity[0m[2m=[0m"anonymous"[1m}[0m[2m:[0m [2mexspeed::cli::server[0m[2m:[0m connection closed [3mpeer[0m[2m=[0m127.0.0.1:52142
+[2m2026-10-03T15:33:48.735297Z[0m [32m INFO[0m [2mexspeed::cli::server[0m[2m:[0m new connection [3mpeer[0m[2m=[0m127.0.0.1:52150
+[2m2026-10-03T15:33:48.735401Z[0m [32m INFO[0m [1mconnection[0m[1m{[0m[3mpeer[0m[2m=[0m127.0.0.1:52150 [3midentity[0m[2m=[0m"anonymous"[1m}[0m[2m:[0m [2mexspeed::session[0m[2m:[0m CONNECT authenticated [3mpeer[0m[2m=[0m127.0.0.1:52150 [3mclient_id[0m[2m=[0mexspeed-bench [3midentity[0m[2m=[0manonymous
+[2m2026-10-03T15:33:48.987193Z[0m [32m INFO[0m [2mexspeed::cli::server[0m[2m:[0m new connection [3mpeer[0m[2m=[0m127.0.0.1:52162
+[2m2026-10-03T15:33:48.987442Z[0m [32m INFO[0m [1mconnection[0m[1m{[0m[3mpeer[0m[2m=[0m127.0.0.1:52162 [3midentity[0m[2m=[0m"anonymous"[1m}[0m[2m:[0m [2mexspeed::session[0m[2m:[0m CONNECT authenticated [3mpeer[0m[2m=[0m127.0.0.1:52162 [3mclient_id[0m[2m=[0mexspeed-bench [3midentity[0m[2m=[0manonymous
+[2m2026-10-03T15:34:19.031022Z[0m [32m INFO[0m [1mconnection[0m[1m{[0m[3mpeer[0m[2m=[0m127.0.0.1:52162 [3midentity[0m[2m=[0m"anonymous"[1m}[0m[2m:[0m [2mexspeed::cli::server[0m[2m:[0m connection closed [3mpeer[0m[2m=[0m127.0.0.1:52162
+[2m2026-10-03T15:34:19.242083Z[0m [32m INFO[0m [1mconnection[0m[1m{[0m[3mpeer[0m[2m=[0m127.0.0.1:52150 [3midentity[0m[2m=[0m"anonymous"[1m}[0m[2m:[0m [2mexspeed::cli::server[0m[2m:[0m connection closed [3mpeer[0m[2m=[0m127.0.0.1:52150
+[2m2026-10-03T15:34:19.244413Z[0m [32m INFO[0m [2mexspeed::cli::server[0m[2m:[0m received SIGTERM, shutting down
+[2m2026-10-03T15:34:19.244666Z[0m [32m INFO[0m [2mexspeed::cli::server[0m[2m:[0m shutdown signal received; stopping accept loop
+[2m2026-10-03T15:34:19.244737Z[0m [32m INFO[0m [2mexspeed::cli::server[0m[2m:[0m waiting up to 10s for active connections to drain [3mactive[0m[2m=[0m0
+[2m2026-10-03T15:34:19.244957Z[0m [32m INFO[0m [2mexspeed_processing::engine[0m[2m:[0m ExQL leader tenure ended
+[2m2026-10-03T15:34:19.245006Z[0m [32m INFO[0m [2mexspeed::cli::server[0m[2m:[0m leader supervisor: tenure ended; awaiting re-promotion
+[2m2026-10-03T15:34:19.245014Z[0m [32m INFO[0m [2mexspeed::cli::server[0m[2m:[0m leader supervisor: shutdown while awaiting re-promotion
+[2m2026-10-03T15:34:19.245052Z[0m [32m INFO[0m [2mexspeed_broker::leadership[0m[2m:[0m cluster:leader released (shutdown) [3mnode[0m[2m=[0mf5a2a894-74a1-4b4b-b9c5-5975358f789a
+[2m2026-10-03T15:34:19.347474Z[0m [32m INFO[0m [2mexspeed::cli::server[0m[2m:[0m server stopped

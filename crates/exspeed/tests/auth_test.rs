@@ -68,8 +68,10 @@ async fn auth_enabled_blocks_ops_before_connect() {
 }
 
 async fn start_server_with_api(auth_token: Option<String>) -> (String, u16, TempDir) {
-    let port = exspeed_testkit::pick_unused_port().unwrap();
-    let api_port = exspeed_testkit::pick_unused_port().unwrap();
+    let port_l = exspeed_testkit::bind_local();
+    let port = port_l.local_addr().unwrap().port();
+    let api_port_l = exspeed_testkit::bind_local();
+    let api_port = api_port_l.local_addr().unwrap().port();
     let bind = format!("127.0.0.1:{port}");
     let api_bind = format!("127.0.0.1:{api_port}");
     let tmp = tempfile::tempdir().unwrap();
@@ -77,7 +79,9 @@ async fn start_server_with_api(auth_token: Option<String>) -> (String, u16, Temp
 
     let args = exspeed::cli::server::ServerArgs {
         bind: bind.clone(),
+        tcp_listener: Some(std::sync::Arc::new(port_l)),
         api_bind,
+        api_listener: Some(std::sync::Arc::new(api_port_l)),
         data_dir,
         auth_token,
         credentials_file: None,

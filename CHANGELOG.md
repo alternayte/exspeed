@@ -20,12 +20,27 @@ connector config and SDK API all change.
 - Compaction (`compaction = true` per stream): keeps the latest record per
   key; tombstones delete keys.
 - Removed: bloom filters, secondary indexes (`.sidx`), S3 tiering and its
-  `EXSPEED_STORAGE_S3_*` variables. The segment format is now version 2, and
-  old data dirs are refused.
+  `EXSPEED_STORAGE_S3_*` variables.
+- Records are stored in the client protocol's `WireRecord` encoding
+  (segment format version 3; older data dirs are refused). `Read`, consumer
+  push (`Deliver`) and pull (`Messages`) build their replies from the raw
+  segment bytes: one `pread`, the delivery count patched in place, subjects
+  parsed in place for filtering, no decoding or per-record allocation. New
+  `StorageEngine::read_raw` returning a `RawBatch`. Each record keeps its own
+  length and CRC32C, so torn-write detection, recovery, compaction, backup
+  and truncation work as before. The connection writer flushes once per
+  burst of queued frames instead of once per frame.
 
 ### Consumers and client protocol v2 (Phase 2)
 
 - New binary protocol ([docs/protocol.md](docs/protocol.md)), version byte 2.
+  A `WireRecord` is the stored record: `u32 len`, `u32 crc` (CRC32C, which
+  the Rust client verifies), `u16 delivery_count`, `u64 offset`,
+  `u64 timestamp_ns` (nanoseconds; was milliseconds), then the fields.
+  `WireRecord::timestamp_ms` became `timestamp_ns` (with a `timestamp_ms()`
+  helper) in the Rust client; the TypeScript SDK adds
+  `StreamRecord.timestampNs` (a `bigint`) next to `timestamp` (ms) and
+  exports `verifyRecordCrc`.
   It adds out-of-order replies, fire-and-forget acks and credits,
   `SubscriptionEnded` pushes, JSON admin replies, structured errors with
   details, and handshake and idle timeouts.
@@ -193,6 +208,72 @@ connector config and SDK API all change.
   than a majority of nodes in sync.
 - Jepsen-style randomized partition and restart test, and a kill -9 test
   of a real three-process cluster on a Postgres lease.
+
+### Re-audit fixes
+
+Every finding in `docs/REVIEW.md` was re-checked; §7 there lists each one
+with the test that proves it.
+
+**Breaking**
+
+- Metrics: every series is now `exspeed_`-prefixed and counters end in
+  `_total` exactly once (for example `consumer_lag` →
+  `exspeed_consumer_lag`, `exspeed_auth_denied_total_total` →
+  `exspeed_auth_denied_total`). Dead series are removed. See
+  `docs/operations.md`.
+- A record may carry at most 64 KiB of header keys and values in total, so
+  every reply fits in a 16 MiB frame. Published subjects may not contain
+  `*`, `>` or control characters.
+- ExQL `subject_matches` with an invalid pattern is a query error.
+- `postgres_outbox` idempotency keys are `pgoutbox:<schema.table>:<id>`;
+  CDC-only settings are rejected in poll mode.
+- `GET /api/v1/streams` lists only streams the caller has a permission on,
+  and internal `__` streams only with `?internal=true` for global admins.
+  HTTP writes to internal streams answer `403`.
+
+**Fixed**
+
+- Graceful shutdown keeps writes open until consumers have saved their
+  final state; the HTTP task is joined.
+- Startup fails on a port already in use, an unreadable catalog or bad TLS
+  files, and `/readyz` only reports ready after both listeners are bound. A
+  tenure whose catalog reload fails steps down for real.
+- A corrupt sealed segment fences only its partition instead of stopping
+  startup; fenced partitions show in `/readyz` (`degraded`), the
+  `exspeed_partition_failed` gauge and stream info.
+- An undecodable first frame is answered with Error 400.
+- Followers behind the leader's earliest offset re-replicate instead of
+  keeping records the leader dropped.
+- DLQ writes no longer collide after the source stream is recreated.
+- ExQL: `ORDER BY offset LIMIT n` honours the limit; continuous `FILTER`,
+  `COALESCE` and `NVL` work; out-of-range `TIMESTAMP BY` values fall back
+  to the record timestamp; `->` works in numeric contexts; big JSON
+  integers compare exactly.
+- Connectors: pgoutput errors restart from the saved LSN; webhooks create
+  their stream; a JDBC record stuck on an unclassified error is
+  dead-lettered; http_poll keeps validators only after a readable body.
+- The `examples/order-processing` configs load, and CI validates every
+  example config.
+- Publishes on one TCP connection were applied one at a time, each waiting
+  for its own fsync before the next request was read, so a pipelining
+  client got about one record per fsync (under 100/s on a busy host). The
+  connection now feeds an ordered publish pipeline that appends queued
+  publishes together and keeps reading.
+
+**Added**
+
+- `[exql]` config section (all ExQL settings, plus
+  `max_event_time_skew_ms`), `[server] handshake_timeout_secs`,
+  `idle_timeout_secs`, `stop_timeout_secs` and `metrics_token`.
+- External Postgres tables push projection and filters into the remote
+  query, count snapshots against the memory pool and map `numeric(p, s)` to
+  decimals.
+- `GET /api/v1/streams/{name}/records?wait_ms=` long-polls; `exspeed tail`
+  uses it, works on followers and needs only subscribe permission.
+- `exspeed healthcheck` derives its URL from the server config
+  (`EXSPEED_HEALTHCHECK_URL` overrides).
+- In-process servers accept pre-bound listeners
+  (`ServerArgs::tcp_listener` / `api_listener`).
 
 ## [0.5.0] — 2026-04-24
 

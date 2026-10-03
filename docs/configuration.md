@@ -19,7 +19,7 @@ exspeed server -c exspeed.toml
 ```
 
 The file has these sections: `[server]`, `[auth]`, `[tls]`, `[storage]`,
-`[cluster]`, `[connectors]` and `[log]`. The tables below give each setting
+`[cluster]`, `[connectors]`, `[exql]` and `[log]`. The tables below give each setting
 as **file key / env var / flag**.
 
 ## Server
@@ -32,7 +32,15 @@ as **file key / env var / flag**.
 | `server.api_bind` | `EXSPEED_API_BIND` | `--api-bind` | `0.0.0.0:8080` | HTTP listener |
 | `server.data_dir` | `EXSPEED_DATA_DIR` | `--data-dir` | `./exspeed-data` | Data directory. The server takes an exclusive `flock` on it. |
 | `server.max_connections` | `EXSPEED_MAX_CONNS` | `--max-connections` | `1024` | Concurrent client connections. Extra connections are refused and counted. |
-| `server.drain_timeout_secs` | `EXSPEED_DRAIN_TIMEOUT_SECS` | — | `10` | Time open connections get on shutdown |
+| `server.drain_timeout_secs` | `EXSPEED_DRAIN_TIMEOUT_SECS` | — | `10` | Time open connections and in-flight HTTP requests get on shutdown |
+| `server.handshake_timeout_secs` | `EXSPEED_HANDSHAKE_TIMEOUT_SECS` | — | `10` | A TCP client must finish TLS and send `Connect` within this, or the connection is closed |
+| `server.idle_timeout_secs` | `EXSPEED_IDLE_TIMEOUT_SECS` | — | `120` | A TCP connection that sends no frame (clients ping) for this long is closed |
+| `server.stop_timeout_secs` | `EXSPEED_STOP_TIMEOUT_SECS` | — | `30` | Total budget, after the drain, for stopping connectors, continuous queries and consumers (final state) and writing the dedup snapshot. Shutdown takes at most `drain_timeout_secs + stop_timeout_secs`. |
+| `server.metrics_token` | `EXSPEED_METRICS_TOKEN` | — | — | When set, `GET /metrics` requires `Authorization: Bearer <token>` ([security.md](security.md#metrics-token)) |
+
+Both listeners are bound before anything else starts: a port that is already
+in use (or a bad TLS file, or a connector/ExQL catalog that can't be read)
+makes `exspeed server` exit with an error instead of running half-started.
 
 ### Auth and TLS
 
@@ -102,13 +110,17 @@ None of this is needed for a single node. See [high-availability.md](high-availa
 Consumer state needs no backend: it lives in the internal `__consumers`
 stream.
 
-**Replication tuning** (environment only; reworked in Phase 6):
+### ExQL (`[exql]`)
 
-| Variable | Default |
-|----------|---------|
-| `EXSPEED_REPLICATION_BATCH_RECORDS` | `1000` |
-| `EXSPEED_REPLICATION_HEARTBEAT_SECS` | `5` |
-| `EXSPEED_REPLICATION_IDLE_TIMEOUT_SECS` | `30` |
+| File key | Env | Default | Description |
+|----------|-----|---------|-------------|
+| `exql.query_timeout_secs` | `EXSPEED_QUERY_TIMEOUT_SECS` | `30` | Bounded query timeout (min 1) |
+| `exql.query_max_rows` | `EXSPEED_QUERY_MAX_ROWS` | `10000` | Rows a bounded query returns before the result is marked `truncated` |
+| `exql.query_memory_mb` | `EXSPEED_QUERY_MEMORY_MB` | `512` | Memory pool shared by all bounded queries, in MiB (min 16); a query that needs more fails instead of spilling |
+| `exql.query_partitions` | `EXSPEED_QUERY_PARTITIONS` | `1` | DataFusion target partitions for bounded queries (1–64) |
+| `exql.checkpoint_ms` | `EXSPEED_EXQL_CHECKPOINT_MS` | `5000` | How often continuous queries checkpoint their state (min 100) |
+| `exql.default_grace_ms` | `EXSPEED_EXQL_DEFAULT_GRACE_MS` | `0` | Allowed lateness for continuous queries that name no `GRACE PERIOD` |
+| `exql.max_event_time_skew_ms` | `EXSPEED_EXQL_MAX_EVENT_TIME_SKEW_MS` | `86400000` | A `TIMESTAMP BY` value further than this ahead of the record timestamp (or before 1970) is replaced by the record timestamp |
 
 ### External database connections (ExQL)
 
@@ -134,7 +146,7 @@ stream.
 | Dedup window | `5m` | `--dedup-window`, or `dedup_window_secs` |
 | Dedup max entries | `500000` | `--dedup-max-entries`, or `dedup_max_entries` |
 | Segment size | 256 MB | not configurable |
-| Compaction | off | `compaction` in `StreamConfig` only; not exposed over HTTP or the CLI yet |
+| Compaction | off | `compaction: true` when creating a stream over HTTP or TCP (`StreamSpec`); not in the CLI yet |
 | Tombstone retention | `24h` | `tombstone_retention_secs` in `StreamConfig` |
 
 A background task enforces retention every 60 s by deleting whole sealed

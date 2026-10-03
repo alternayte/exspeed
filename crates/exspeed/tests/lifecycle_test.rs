@@ -24,8 +24,10 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
 async fn start_test_server(max_conns: u32) -> (String, tempfile::TempDir) {
-    let port = exspeed_testkit::pick_unused_port().unwrap();
-    let api_port = exspeed_testkit::pick_unused_port().unwrap();
+    let port_l = exspeed_testkit::bind_local();
+    let port = port_l.local_addr().unwrap().port();
+    let api_port_l = exspeed_testkit::bind_local();
+    let api_port = api_port_l.local_addr().unwrap().port();
     let bind = format!("127.0.0.1:{port}");
     let api_bind = format!("127.0.0.1:{api_port}");
     let tmp = tempfile::tempdir().unwrap();
@@ -37,7 +39,9 @@ async fn start_test_server(max_conns: u32) -> (String, tempfile::TempDir) {
     tokio::spawn(async move {
         exspeed::cli::server::run(exspeed::cli::server::ServerArgs {
             bind: bind_clone,
+            tcp_listener: Some(std::sync::Arc::new(port_l)),
             api_bind: api_clone,
+            api_listener: Some(std::sync::Arc::new(api_port_l)),
             data_dir: data_clone,
             auth_token: None,
             credentials_file: None,
@@ -81,8 +85,10 @@ use tokio::sync::oneshot;
 
 #[tokio::test]
 async fn sigterm_signal_token_stops_accept_loop() {
-    let port = exspeed_testkit::pick_unused_port().unwrap();
-    let api_port = exspeed_testkit::pick_unused_port().unwrap();
+    let port_l = exspeed_testkit::bind_local();
+    let port = port_l.local_addr().unwrap().port();
+    let api_port_l = exspeed_testkit::bind_local();
+    let api_port = api_port_l.local_addr().unwrap().port();
     let bind = format!("127.0.0.1:{port}");
     let api_bind = format!("127.0.0.1:{api_port}");
     let tmp = tempfile::tempdir().unwrap();
@@ -93,7 +99,9 @@ async fn sigterm_signal_token_stops_accept_loop() {
         exspeed::cli::server::run_with_shutdown(
             exspeed::cli::server::ServerArgs {
                 bind,
+                tcp_listener: Some(std::sync::Arc::new(port_l)),
                 api_bind,
+                api_listener: Some(std::sync::Arc::new(api_port_l)),
                 data_dir,
                 auth_token: None,
                 credentials_file: None,
@@ -134,8 +142,10 @@ async fn sigterm_signal_token_stops_accept_loop() {
 
 #[tokio::test]
 async fn readyz_returns_503_when_data_dir_unwritable() {
-    let port = exspeed_testkit::pick_unused_port().unwrap();
-    let api_port = exspeed_testkit::pick_unused_port().unwrap();
+    let port_l = exspeed_testkit::bind_local();
+    let port = port_l.local_addr().unwrap().port();
+    let api_port_l = exspeed_testkit::bind_local();
+    let api_port = api_port_l.local_addr().unwrap().port();
     let bind = format!("127.0.0.1:{port}");
     let api_bind = format!("127.0.0.1:{api_port}");
     let tmp = tempfile::tempdir().unwrap();
@@ -145,7 +155,9 @@ async fn readyz_returns_503_when_data_dir_unwritable() {
     tokio::spawn(async move {
         exspeed::cli::server::run(exspeed::cli::server::ServerArgs {
             bind,
+            tcp_listener: Some(std::sync::Arc::new(port_l)),
             api_bind,
+            api_listener: Some(std::sync::Arc::new(api_port_l)),
             data_dir,
             auth_token: None,
             credentials_file: None,
@@ -186,4 +198,244 @@ async fn readyz_returns_503_when_data_dir_unwritable() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&data_for_chmod, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Startup failures are returned, not swallowed
+// ---------------------------------------------------------------------------
+
+fn bound() -> std::sync::Arc<std::net::TcpListener> {
+    std::sync::Arc::new(std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+}
+
+/// Run a server that is expected to fail at startup; returns the error.
+/// Meanwhile polls `/readyz` on `api_addr` and asserts it never says ready.
+async fn expect_startup_error(
+    args: exspeed::cli::server::ServerArgs,
+    api_addr: Option<std::net::SocketAddr>,
+) -> String {
+    let server = tokio::spawn(exspeed::cli::server::run_with_shutdown(
+        args,
+        std::future::pending(),
+    ));
+    let poll = async {
+        if let Some(addr) = api_addr {
+            let http = reqwest::Client::new();
+            loop {
+                if let Ok(r) = http.get(format!("http://{addr}/readyz")).send().await {
+                    assert_ne!(
+                        r.status(),
+                        200,
+                        "/readyz said ready during a failed startup"
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        } else {
+            std::future::pending::<()>().await
+        }
+    };
+    let res = tokio::select! {
+        r = server => r,
+        _ = poll => unreachable!(),
+    };
+    let err = res
+        .expect("server task panicked")
+        .expect_err("startup should fail");
+    format!("{err:#}")
+}
+
+#[tokio::test]
+async fn occupied_api_port_fails_startup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let args = exspeed::cli::server::ServerArgs {
+        tcp_listener: Some(bound()),
+        api_bind: busy.local_addr().unwrap().to_string(),
+        ..exspeed::cli::server::ServerArgs::new(tmp.path())
+    };
+    let msg = tokio::time::timeout(Duration::from_secs(10), expect_startup_error(args, None))
+        .await
+        .expect("startup error is returned promptly");
+    assert!(msg.contains("HTTP API"), "{msg}");
+
+    // Nothing was left holding the data dir: a server with free ports starts.
+    let api = bound();
+    let api_addr = api.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    let args = exspeed::cli::server::ServerArgs {
+        tcp_listener: Some(bound()),
+        api_listener: Some(api),
+        ..exspeed::cli::server::ServerArgs::new(tmp.path())
+    };
+    let h = tokio::spawn(exspeed::cli::server::run_with_shutdown(args, async {
+        let _ = rx.await;
+    }));
+    let url = format!("http://{api_addr}/readyz");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if matches!(reqwest::get(&url).await, Ok(r) if r.status() == 200) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "second start never got ready"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let _ = tx.send(());
+    h.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn occupied_tcp_port_fails_startup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let args = exspeed::cli::server::ServerArgs {
+        bind: busy.local_addr().unwrap().to_string(),
+        api_listener: Some(bound()),
+        ..exspeed::cli::server::ServerArgs::new(tmp.path())
+    };
+    let msg = tokio::time::timeout(Duration::from_secs(10), expect_startup_error(args, None))
+        .await
+        .expect("startup error is returned promptly");
+    assert!(msg.contains("client (TCP)"), "{msg}");
+}
+
+#[tokio::test]
+async fn unreadable_connector_catalog_fails_startup_and_never_reports_ready() {
+    let tmp = tempfile::tempdir().unwrap();
+    // `connectors.d` is a file, so the catalog can't be read.
+    std::fs::write(tmp.path().join("connectors.d"), b"not a directory").unwrap();
+    let api = bound();
+    let api_addr = api.local_addr().unwrap();
+    let args = exspeed::cli::server::ServerArgs {
+        tcp_listener: Some(bound()),
+        api_listener: Some(api),
+        ..exspeed::cli::server::ServerArgs::new(tmp.path())
+    };
+    let msg = tokio::time::timeout(
+        Duration::from_secs(10),
+        expect_startup_error(args, Some(api_addr)),
+    )
+    .await
+    .expect("startup error is returned promptly");
+    assert!(msg.contains("connector"), "{msg}");
+}
+
+#[tokio::test]
+async fn bad_tls_files_fail_startup_and_never_report_ready() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cert = tmp.path().join("tls.crt");
+    let key = tmp.path().join("tls.key");
+    std::fs::write(&cert, b"not a certificate").unwrap();
+    std::fs::write(&key, b"not a key").unwrap();
+    let api = bound();
+    let api_addr = api.local_addr().unwrap();
+    let args = exspeed::cli::server::ServerArgs {
+        tcp_listener: Some(bound()),
+        api_listener: Some(api),
+        tls_cert: Some(cert),
+        tls_key: Some(key),
+        ..exspeed::cli::server::ServerArgs::new(tmp.path().join("data"))
+    };
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        expect_startup_error(args, Some(api_addr)),
+    )
+    .await
+    .expect("startup error is returned promptly");
+}
+
+#[tokio::test]
+async fn shutdown_waits_for_the_http_api() {
+    let tmp = tempfile::tempdir().unwrap();
+    let api = bound();
+    let api_addr = api.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    let args = exspeed::cli::server::ServerArgs {
+        tcp_listener: Some(bound()),
+        api_listener: Some(api),
+        drain_timeout_secs: 2,
+        ..exspeed::cli::server::ServerArgs::new(tmp.path())
+    };
+    let h = tokio::spawn(exspeed::cli::server::run_with_shutdown(args, async {
+        let _ = rx.await;
+    }));
+    let url = format!("http://{api_addr}/readyz");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !matches!(reqwest::get(&url).await, Ok(r) if r.status() == 200) {
+        assert!(tokio::time::Instant::now() < deadline, "never ready");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let _ = tx.send(());
+    tokio::time::timeout(Duration::from_secs(15), h)
+        .await
+        .expect("server stops")
+        .unwrap()
+        .unwrap();
+    // Once run_with_shutdown has returned, the HTTP API is gone too.
+    assert!(
+        tokio::net::TcpStream::connect(api_addr).await.is_err(),
+        "the HTTP listener is closed when the server returns"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_respects_drain_and_stop_timeouts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tcp = bound();
+    let tcp_addr = tcp.local_addr().unwrap();
+    let api = bound();
+    let api_addr = api.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    let args = exspeed::cli::server::ServerArgs {
+        tcp_listener: Some(tcp),
+        api_listener: Some(api),
+        drain_timeout_secs: 1,
+        stop_timeout_secs: 1,
+        ..exspeed::cli::server::ServerArgs::new(tmp.path())
+    };
+    let h = tokio::spawn(exspeed::cli::server::run_with_shutdown(args, async {
+        let _ = rx.await;
+    }));
+    let url = format!("http://{api_addr}/readyz");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !matches!(reqwest::get(&url).await, Ok(r) if r.status() == 200) {
+        assert!(tokio::time::Instant::now() < deadline, "never ready");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // A client with a live subscription and a pending long poll.
+    let c = exspeed_client::Client::connect(
+        &tcp_addr.to_string(),
+        exspeed_client::ConnectOptions::default(),
+    )
+    .await
+    .unwrap();
+    c.create_stream(exspeed_client::StreamSpec::named("s"))
+        .await
+        .unwrap();
+    c.create_consumer(exspeed_client::ConsumerSpec::new("w", "s"))
+        .await
+        .unwrap();
+    let _sub = c.subscribe("w", 10).await.unwrap();
+    let poll = {
+        let c = c.clone();
+        tokio::spawn(async move { c.read("s", 0, 10, Duration::from_secs(30), "").await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let started = std::time::Instant::now();
+    let _ = tx.send(());
+    tokio::time::timeout(Duration::from_secs(10), h)
+        .await
+        .expect("server stops")
+        .unwrap()
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "shutdown took {:?}",
+        started.elapsed()
+    );
+    poll.abort();
 }

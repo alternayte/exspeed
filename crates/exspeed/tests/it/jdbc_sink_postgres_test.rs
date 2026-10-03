@@ -2,8 +2,10 @@ use crate::common;
 use std::time::Duration;
 
 async fn start_server() -> (String, String) {
-    let tcp_port = exspeed_testkit::pick_unused_port().unwrap();
-    let http_port = exspeed_testkit::pick_unused_port().unwrap();
+    let tcp_port_l = exspeed_testkit::bind_local();
+    let tcp_port = tcp_port_l.local_addr().unwrap().port();
+    let http_port_l = exspeed_testkit::bind_local();
+    let http_port = http_port_l.local_addr().unwrap().port();
     let tcp_addr = format!("127.0.0.1:{}", tcp_port);
     let http_addr = format!("127.0.0.1:{}", http_port);
 
@@ -16,7 +18,9 @@ async fn start_server() -> (String, String) {
         let _keep = dir;
         exspeed::cli::server::run(exspeed::cli::server::ServerArgs {
             bind: tcp_addr_clone,
+            tcp_listener: Some(std::sync::Arc::new(tcp_port_l)),
             api_bind: http_addr_clone,
+            api_listener: Some(std::sync::Arc::new(http_port_l)),
             data_dir,
             auth_token: None,
             credentials_file: None,
@@ -50,6 +54,7 @@ async fn wait_for_rows(
 }
 
 #[tokio::test]
+#[ignore = "needs EXSPEED_POSTGRES_URL (CI runs it with --include-ignored)"]
 async fn blob_mode_creates_table_and_writes() {
     let pg_url = crate::require_postgres!();
     let (_tcp, http) = start_server().await;
@@ -116,6 +121,7 @@ async fn blob_mode_creates_table_and_writes() {
 }
 
 #[tokio::test]
+#[ignore = "needs EXSPEED_POSTGRES_URL (CI runs it with --include-ignored)"]
 async fn typed_schema_binds_correct_types() {
     let pg_url = crate::require_postgres!();
     let (_tcp, http) = start_server().await;
@@ -221,6 +227,7 @@ async fn typed_schema_binds_correct_types() {
 }
 
 #[tokio::test]
+#[ignore = "needs EXSPEED_POSTGRES_URL (CI runs it with --include-ignored)"]
 async fn typed_schema_rejects_mismatched_json_type() {
     let pg_url = crate::require_postgres!();
     let (_tcp, http) = start_server().await;
@@ -302,6 +309,7 @@ async fn typed_schema_rejects_mismatched_json_type() {
 }
 
 #[tokio::test]
+#[ignore = "needs EXSPEED_POSTGRES_URL (CI runs it with --include-ignored)"]
 async fn table_name_injection_rejected_at_create() {
     let pg_url = crate::require_postgres!();
     let (_tcp, http) = start_server().await;
@@ -338,6 +346,7 @@ async fn table_name_injection_rejected_at_create() {
 }
 
 #[tokio::test]
+#[ignore = "needs EXSPEED_POSTGRES_URL (CI runs it with --include-ignored)"]
 async fn blob_mode_upsert_is_idempotent_on_offset() {
     let pg_url = crate::require_postgres!();
     let (_tcp, http) = start_server().await;

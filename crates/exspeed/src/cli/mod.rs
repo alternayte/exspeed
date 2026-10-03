@@ -162,9 +162,11 @@ pub enum Command {
     /// Exit 0 if the server's readiness probe answers 200 (for Docker
     /// HEALTHCHECK and other probes that can only run a command)
     Healthcheck {
-        /// Probe URL
-        #[arg(long, default_value = "http://127.0.0.1:8080/readyz")]
-        url: String,
+        /// Probe URL [default: /readyz on the server's api_bind port, https
+        /// when TLS is configured, resolved from $EXSPEED_CONFIG and the
+        /// environment like `exspeed server` does]
+        #[arg(long, env = "EXSPEED_HEALTHCHECK_URL")]
+        url: Option<String>,
         /// Timeout in seconds
         #[arg(long, default_value_t = 3)]
         timeout: u64,

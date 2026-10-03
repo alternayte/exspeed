@@ -25,3 +25,20 @@ pub struct StoredRecord {
     pub value: Bytes,
     pub headers: Vec<(String, String)>,
 }
+
+impl StoredRecord {
+    /// Size of this record in its wire (= stored) encoding, see
+    /// [`exspeed_common::record_format`]. Read byte budgets count this, so
+    /// headers and per-record framing are included, not just the value.
+    pub fn wire_size(&self) -> usize {
+        exspeed_common::record_format::MIN_RECORD_LEN
+            + self.subject.len()
+            + self.key.as_ref().map_or(0, |k| 4 + k.len())
+            + self.value.len()
+            + self
+                .headers
+                .iter()
+                .map(|(k, v)| 4 + k.len() + v.len())
+                .sum::<usize>()
+    }
+}

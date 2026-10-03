@@ -9,12 +9,15 @@
 
 ## Progress
 
+Every finding in §2–§4 is fixed, obsolete or kept by design; [§7](#7-status-of-every-finding)
+gives the status of each one and the test that proves it.
+
 | Phase | Status |
 |-------|--------|
 | 0. Guard rails | ✅ CI, single test binary per crate, clippy clean, blockers 1, 2, 7, 10, 14, 15 fixed, JDBC Postgres sink fixed |
-| 1. Core log | 🚧 Storage engine rewritten: per-partition writer thread with group commit, lock-free readers with a high watermark, sparse indexes, fence-on-error, crash-safe sidecars and truncation, compaction, `append_at`. Bloom, secondary-index and S3 tiering code removed. Torn-write and fault-injection tests, kill -9 loops against the real binary, real-disk ENOSPC tests (tmpfs in CI; a full disk answers 507) and seeded model-based property tests (offsets monotonic and dense across crash, restart and retention; no duplicates). Still to do: wire-format records. |
+| 1. Core log | ✅ Storage engine rewritten: per-partition writer thread with group commit, lock-free readers with a high watermark, sparse indexes, fence-on-error, crash-safe sidecars and truncation, compaction, `append_at`. Bloom, secondary-index and S3 tiering code removed. Records stored in the client wire format (segment format v3): `Read`, push and pull replies are built from raw segment bytes without decoding (see [architecture.md](architecture.md#storage-layout)). Torn-write and fault-injection tests, kill -9 loops against the real binary, real-disk ENOSPC tests (tmpfs in CI; a full disk answers 507) and seeded model-based property tests (offsets monotonic and dense across crash, restart and retention; no duplicates). |
 | 2. Consumers + protocol v2 | ✅ protocol v2 ([protocol.md](protocol.md)) with a new session layer (handshake/idle timeouts, out-of-order replies, bounded waits, cleanup on every exit path); JetStream-style consumers in the broker (push with credits + pull, ack/nack/term/in-progress, ack timeout, backoff, max_deliver, DLQ, `max_ack_pending`, work sharing across connections and instances, immediate redelivery when a subscriber leaves), state in the compacted `__consumers` stream; old consumer stores and work coordinators removed; HTTP consumer CRUD + seek and `/records` browsing; `exspeed-client` Rust crate with a coalescing publisher; integration tests and the bench rewritten on it; TypeScript SDK v2 with real-server e2e tests. |
-| 3. Ops | ✅ `exspeed.toml` (defaults < file < env < flags, `exspeed config print-default/validate/show`, one `[cluster]` section), ordered shutdown (drain → connectors → queries → resign + lease release → consumer state → dedup snapshot → fsync), TLS/handshake/idle timeouts, Helm chart (config map, probes, ServiceMonitor), cargo-chef Docker build, `exspeed healthcheck`, online backup (`GET /api/v1/backup`, `exspeed backup`: per-stream point-in-time tar with manifest) and offline `exspeed restore` (validated, staged), OpenAPI 3.1 at `/api/v1/openapi.json` (utoipa; tests keep it in sync with the router), Linux benchmark refresh ([BENCHMARKS.md](../BENCHMARKS.md)) with a Kafka/NATS comparison kit in `bench/compare/`. Kafka/NATS numbers are not published until someone runs the kit on the benchmark machine. |
+| 3. Ops | ✅ `exspeed.toml` (defaults < file < env < flags, `exspeed config print-default/validate/show`, one `[cluster]` section), ordered shutdown (drain → connectors → queries → resign + lease release → consumer state → dedup snapshot → fsync), TLS/handshake/idle timeouts, Helm chart (config map, probes, ServiceMonitor), cargo-chef Docker build, `exspeed healthcheck`, online backup (`GET /api/v1/backup`, `exspeed backup`: per-stream point-in-time tar with manifest) and offline `exspeed restore` (validated, staged), OpenAPI 3.1 at `/api/v1/openapi.json` (utoipa; tests keep it in sync with the router), Linux benchmark refresh ([BENCHMARKS.md](../BENCHMARKS.md)) with a Kafka/NATS comparison kit in `bench/compare/`. Kafka/NATS comparison published (see [BENCHMARKS.md](../BENCHMARKS.md#comparison-with-kafka-and-nats-jetstream)). |
 | 4. ExQL v2 | ✅ DataFusion bounded engine, continuous dataflow (event-time windows, joins, durable tables, checkpoints, effectively-once output), indexes removed, differential tests — see [exql.md](exql.md) |
 | 5. Connectors v2 | ✅ checkpoint protocol, supervisor, typed settings, error taxonomy, log-backed offsets, plugin fixes; tests against real services in CI: Postgres (CDC, outbox, poll), RabbitMQ (source and sink), an S3-compatible store (S3 sink; moto in CI), MySQL and SQL Server (JDBC sink, `jdbc_poll`, `mssql_cdc`); each of those plugins has a crash/resume test proving at-least-once (effectively-once for upsert/idempotent targets and dedup-keyed sources) — see [connectors.md](connectors.md#testing-against-real-services) |
 | 6. HA | ✅ Epoch-fenced lease (stable node ids, ISR in the lease, bounded heartbeat with local deadline; Postgres, Redis, in-memory backends sharing one conformance suite), pull replication of every stream with KIP-101 divergence truncation, metadata and retention mirroring, `acks = all` + `min_insync_replicas` + ISR-gated election, promotion that rebuilds dedup state, leader hints in the protocol/HTTP/SDKs, `GET /api/v1/cluster`, cluster metadata (consumers, connector configs and offsets, ExQL queries and connections) in compacted internal streams reloaded at each tenure, in-process multi-node failover tests — see [high-availability.md](high-availability.md). TLS on the cluster port, `acks = "quorum"`, a Jepsen-style randomized partition/restart test (fault-injecting proxy on replication links plus lease partitions) and a kill -9 test of a real 3-process cluster on Postgres: no acknowledged write lost, no duplicates, identical logs. Every node holds every stream by design (no per-stream replication factor, see high-availability.md). Embedded Raft in place of the external lease stays a possible later step. |
@@ -36,6 +39,7 @@
 4. [Docs vs. reality](#4-docs-vs-reality)
 5. [Proposed target architecture](#5-proposed-target-architecture)
 6. [Phased plan](#6-phased-plan)
+7. [Status of every finding](#7-status-of-every-finding)
 
 ---
 
@@ -94,6 +98,8 @@ on-disk format or APIs, so take the breaking changes now.
 
 ## 2. Top 15 blockers
 
+> **Status:** resolved, see [§7.1](#71-top-15-blockers-2).
+
 Each blocker, if left in place, makes Exspeed lose or corrupt data, or makes
 a headline feature not work at all.
 
@@ -123,10 +129,8 @@ Severity: **C** critical · **H** high · **M** medium · **L** low.
 
 ### 3.1 Storage (`exspeed-storage`)
 
-> **Status (Phase 1):** every finding in this table is addressed by the
-> storage engine rewrite (see [architecture.md](architecture.md#storage-layout)),
-> and the S3 tiering and secondary-index code is gone. The file and line
-> references below point at the old engine.
+> **Status:** resolved, see [§7.2](#72-storage-31). The file
+> and line references below point at the old engine.
 
 | Sev | Finding | Where | Fix |
 |-----|---------|-------|-----|
@@ -155,6 +159,8 @@ Severity: **C** critical · **H** high · **M** medium · **L** low.
 
 ### 3.2 Protocol & common
 
+> **Status:** resolved, see [§7.3](#73-protocol--common-32).
+
 | Sev | Finding | Where |
 |-----|---------|-------|
 | H | `Fetch.max_records` is an unbounded `u32` (×4 with a filter). `StartFrom::Latest` reads `usize::MAX` records into memory to find the tail. Response frames have no byte cap, and anything over 16 MB is rejected by the client decoder, which drops the connection. | `exspeed-broker/src/handlers.rs:183-192,297` |
@@ -166,11 +172,7 @@ Severity: **C** critical · **H** high · **M** medium · **L** low.
 
 ### 3.3 Broker: delivery, consumers, dedup
 
-> **Status (Phase 2):** the consumer and delivery findings below are
-> resolved by the rewrite: the old consumer state, delivery tasks, consumer
-> stores and work coordinators were deleted and replaced (see
-> [concepts.md](concepts.md#consumers)). Dedup findings are addressed by the
-> `Log` write path (Phase 0) except where noted.
+> **Status:** resolved, see [§7.4](#74-broker-delivery-consumers-dedup-33).
 
 | Sev | Finding | Where |
 |-----|---------|-------|
@@ -188,6 +190,8 @@ Severity: **C** critical · **H** high · **M** medium · **L** low.
 
 ### 3.4 HA: leadership & replication
 
+> **Status:** resolved, see [§7.5](#75-ha-leadership--replication-34).
+
 | Sev | Finding | Where |
 |-----|---------|-------|
 | C | Live replication covers only TCP single publish and create stream. Followers discover the other writes only as an "offset mismatch" on the next replicated record. | `handlers.rs:43,113`, `broker.rs:116` |
@@ -199,6 +203,8 @@ Severity: **C** critical · **H** high · **M** medium · **L** low.
 | M | All HA integration tests are `#[ignore]` (they need Postgres). The divergent-history test passes even if truncation never happens. The reseed test only checks a metric. | `exspeed/tests/replication_*`, `multipod_*` |
 
 ### 3.5 ExQL (`exspeed-processing`)
+
+> **Status:** resolved, see [§7.6](#76-exql-35).
 
 **Correctness**
 
@@ -268,9 +274,8 @@ Severity: **C** critical · **H** high · **M** medium · **L** low.
 
 ### 3.6 Connectors (`exspeed-connectors`)
 
-> **Status (Phase 5):** every finding below is addressed; the current
-> per-connector guarantees and their tests are in
-> [connectors.md](connectors.md#delivery-guarantees).
+> **Status:** resolved, see [§7.7](#77-connectors-36); current guarantees
+> and their tests are in [connectors.md](connectors.md#delivery-guarantees).
 
 | Sev | Finding | Where |
 |-----|---------|-------|
@@ -316,6 +321,8 @@ The JDBC E2E tests silently pass when their env var is unset.
 
 ### 3.7 Server, HTTP API, auth
 
+> **Status:** resolved, see [§7.8](#78-server-http-api-auth-37).
+
 | Sev | Finding | Where |
 |-----|---------|-------|
 | C | TCP `Query` has no authz. Over HTTP the same operation requires global admin. | `exspeed/src/cli/server.rs:1879` |
@@ -331,6 +338,8 @@ The JDBC E2E tests silently pass when their env var is unset.
 
 ### 3.8 TypeScript SDK
 
+> **Status:** resolved, see [§7.9](#79-typescript-sdk-38).
+
 - **C** — It ignores `RecordsBatch` (0x83) frames (blocker 7).
 - **H** — `Publisher` builds its own `Connection` without `auth` or `tls`, so it can't talk to a secured server. `maxInFlight` is unused.
 - **H** — The `Subscription` default is `overflowPolicy: "drop-oldest"` with `maxQueueSize: 1000`, so it drops messages silently. Combined with cumulative acks, that is committed loss.
@@ -338,6 +347,8 @@ The JDBC E2E tests silently pass when their env var is unset.
 - **M** — All 120 tests run against mock sockets. None run against a real server.
 
 ### 3.9 Build, CI, deploy, benchmarks
+
+> **Status:** resolved, see [§7.10](#710-build-ci-deploy-benchmarks-39).
 
 - **No CI runs tests, clippy or the SDK tests.** Only `release.yml` (cargo-dist, on tags) and a manual `benchmarks.yml` exist.
 - **Dockerfile:** the dependency-cache layer omits `crates/exspeed-bench/Cargo.toml`, so the dummy build always fails (hidden by `2>/dev/null || true`), and every image build recompiles everything. It builds the bench crate into the image. There is no `HEALTHCHECK`. It doesn't expose port 5934 (replication).
@@ -355,6 +366,8 @@ The JDBC E2E tests silently pass when their env var is unset.
 ---
 
 ## 4. Docs vs. reality
+
+> **Status:** resolved, see [§7.11](#711-docs-vs-reality-4).
 
 The README was 1,620 lines. It has been split into `docs/` (see
 [docs/README.md](README.md)). These are the claims that were wrong, all now
@@ -630,3 +643,209 @@ the status code.
 | **4. ExQL v2** | Correct SQL over streams | DataFusion bounded engine. Continuous dataflow with watermarks, changelog state, exactly-once outputs, `CREATE STREAM` and `CREATE TABLE`. Differential test suite. | Differential tests pass. Restart-recovery tests for windows, joins and tables. |
 | **5. Connectors v2** | Robust sources and sinks | Checkpoint protocol, supervisor, typed settings, error taxonomy, CDC envelope. Connector CI against real PG, MySQL, RabbitMQ and MinIO with crash and resume tests. | Per-connector crash/resume tests prove at-least-once (effectively-once for upsert sinks). |
 | **6. HA** | Replicated, fenced cluster | Epoch-fenced log replication, `acks=quorum`, metadata via internal streams, lease-only external dependency (then embedded Raft). Jepsen-style partition tests. | No acknowledged-write loss under `acks=quorum` in partition and kill tests. |
+
+---
+
+## 7. Status of every finding
+
+After the phases landed, every finding in §2–§4 was re-checked against the
+code by four independent audits that turned the old repros into tests, and
+each remaining gap was fixed. Statuses:
+
+- **Fixed**: the code changed and the named test proves it (tests are
+  `module::test` within the crate named, or `it::<module>` for a crate's
+  integration binary).
+- **Obsolete**: the code the finding described was deleted; its
+  replacement is tested.
+- **By design**: kept on purpose and documented where users will look.
+
+Rows of the §3 tables are numbered in order, starting at 1.
+
+### 7.1 Top 15 blockers (§2)
+
+| # | Status | Evidence |
+|---|--------|----------|
+| 1 | Fixed | `next_offset = max(end, active base, previous end)` on recovery. `exspeed-storage` `file_tests::restart_after_retention_with_empty_active_segment_keeps_offsets_monotonic`, plus the model-based `property_tests` |
+| 2 | Obsolete | Secondary indexes are gone; a roll never seals an empty segment and creates the new file before swapping the segment list |
+| 3 | Fixed | A failed write or fsync truncates back to the last good length, or fences the partition. `durability_tests::write_and_fsync_failures_roll_back_and_never_duplicate_offsets`, `failed_rollback_fences_the_partition` |
+| 4 | Fixed | Lock-free reads: high watermark, `ArcSwap` segment list, binary search, sparse index, `pread`; no fsync on reads. `read_tests::concurrent_readers_never_see_partial_or_unpublished_records` |
+| 5 | Fixed | One JetStream-style consumer model shared by every subscriber. `exspeed-broker` `consumer::tests::subscribers_on_one_consumer_share_the_work`, `max_deliver_sends_to_dlq_with_headers` |
+| 6 | Fixed | Per-offset acks, ack floor, ack timeout, redelivery. `core::tests::ack_floor_tracks_lowest_unacked`, `consumer::tests::unacked_records_are_redelivered_after_ack_wait` |
+| 7 | Fixed | Protocol v2 `Deliver` carries a batch; the SDK decodes it. SDK unit and e2e suites |
+| 8 | Fixed | Single write path plus pull replication of every stream, keys included, with KIP-101 truncation. `it::cluster_test::replicates_records_metadata_and_consumer_state`, `deposed_leader_truncates_its_divergent_records` |
+| 9 | Fixed | Epoch-fenced lease, write gate in `Log`, bounded backend calls. `leadership_test::partitioned_leader_steps_down_and_peer_takes_over`, lease `conformance::run` on memory, Postgres and Redis |
+| 10 | Fixed | `it::multi_tenant_auth_test::tcp_query_requires_global_admin`, `consumer_ops_are_scoped_to_the_consumers_stream` |
+| 11 | Fixed | `bounded_tests::json_numeric_compare_order_and_sum`, `differential_tests::exql_matches_sqlite` |
+| 12 | Fixed | DataFusion joins. `differential_tests::exql_matches_sqlite` (swapped and compound ON), `continuous_tests::stream_stream_inner_and_left_joins` |
+| 13 | Fixed | `continuous_tests::tables_group_by_global_and_having` (restart included) |
+| 14 | Fixed | Connector dedup removed; only the broker's bounded idempotency-key window. `config::tests::toml_rejects_unknown_connector_keys`, `framework_test::crash_before_checkpoint_with_idempotency_keys_is_exactly_once` |
+| 15 | Fixed | `it::connector_test::file_watcher_leaves_api_created_connectors_alone`, `framework_test::ack_follows_append_and_checkpoint`, `postgres_test::cdc_restart_resumes_without_loss`; a TOML edit keeps offsets: `exspeed-connectors` `it::framework_test::editing_a_toml_connector_keeps_its_offsets` |
+
+### 7.2 Storage (§3.1)
+
+| # | Status | Evidence |
+|---|--------|----------|
+| 1 | Fixed | Blocker 1 |
+| 2 | Fixed | A roll refuses to seal an empty segment; new file, then `Segment::new_sealed`, then the list swap; a stale file from a failed roll is removed |
+| 3 | Fixed | Blocker 3; a failed roll never fails an append |
+| 4 | Fixed | Blocker 4; the active segment is index-seeked too |
+| 5 | Obsolete | S3 tiering removed; retention unpublishes a segment before deleting it and readers keep their open fds |
+| 6 | Obsolete | S3 tiering removed; one `FileStorage` behind `Log` |
+| 7 | Fixed | `read_tests::seek_by_time_across_many_segments` (every boundary, before and after restart, brute-force oracle), `seek_by_time_with_unordered_timestamps` |
+| 8 | Fixed | Encoders return errors; `RecordLimits` validates every ingress path. `encoding::tests::oversized_fields_are_rejected_not_truncated`, `log::tests::rejects_oversized_records_before_writing` |
+| 9 | Fixed | One writer OS thread per partition, incremental index building, reads and retention on blocking threads |
+| 10 | Fixed | Crash-safe truncation marker; fresh handles after a cut. `file_tests::truncate_from_is_crash_safe`, `truncate_from_crash_after_cut_and_after_meta_write`. A read that races a truncation is retried (unit tests in `file/partition.rs`) |
+| 11 | Fixed | Directory fsyncs, atomic sidecar writes, per-stream errors (`file_tests::corrupt_stream_json_only_affects_that_stream`). The re-audit found one corrupt sealed segment stopped the whole server from starting; that partition now opens fenced (readable up to the damage, writes refused, listed as failed) and the rest start: `durability_tests::corrupt_sealed_segment_fences_only_its_stream` |
+| 12 | Fixed | Startup trusts `.meta`; sealed indexes are binary-searched on disk. `file_tests::startup_reads_sealed_metadata_not_data`. Each sealed segment keeps two open files by design (readers hold them across retention deletes); the open-file limit to set is in [operations.md](operations.md) |
+| 13 | Fixed | Frame length capped at 64 MiB, bounds-checked decoder, loud failure in sync mode. `encoding::tests::corrupt_lengths_never_overallocate`, `durability_tests::sync_mode_fails_loudly_on_mid_file_corruption` (the partition is fenced, not the server). The recovery probe reads in 1 MiB windows with a CRC budget: `file::segment` `valid_frame_after_scans_in_bounded_chunks`, `valid_frame_after_has_a_crc_budget` |
+| 14 | Fixed | Background fsync failure fences the partition (`durability_tests::async_background_fsync_failure_fences`). Fenced partitions show in `/readyz` (`"status": "degraded"`, `failed_streams`), the `exspeed_partition_failed{stream}` gauge and stream info: `exspeed-api` `it::partition_failed_test` |
+| 15 | Obsolete | Secondary indexes removed; ExQL scans through a DataFusion `TableProvider` |
+| 16 | Fixed | `threshold_bytes` drives async fsync, record counts live in `.meta`, no WAL references left |
+| Tests 1 | Fixed | Real crashes: `it::crash_test::kill_9_loop_loses_no_acknowledged_write` (kill -9 of the real binary in a loop), torn tails at random positions, model-based property tests |
+| Tests 2 | Fixed | `durability_tests::concurrent_appends_share_fsyncs` counts fsyncs through `IoHooks` |
+| Tests 3 | Fixed | Restart after retention with an empty active segment, seeks across segments with restarts; index and eviction cases are obsolete |
+
+### 7.3 Protocol & common (§3.2)
+
+| # | Status | Evidence |
+|---|--------|----------|
+| 1 | Fixed | Counts are clamped, `Latest` doesn't read, and every reply stays under the 16 MiB frame: byte budgets count headers and wire overhead, Pull and push batches are capped at 8 MiB, a pull answers before a record would overflow, records carry at most 64 KiB of headers, and encoding refuses an oversize frame. `exspeed` `it::frame_limit_test` (Read, Pull and push with 32 KB headers; `pull_answers_before_a_big_record_would_overflow_the_frame`), `read_tests::read_byte_budget_counts_headers`, `log::tests::largest_valid_record_fits_in_a_frame`, `frame::tests::encode_rejects_oversized_payload` |
+| 2 | Fixed | `Reader::count` rejects counts the payload can't hold (`client::tests::hostile_counts_are_rejected_without_allocating`); batch counts are `u32`; encoders fail instead of truncating (`client::tests::oversized_fields_fail_instead_of_truncating`) |
+| 3 | Fixed | Any undecodable frame, including the first (wrong version, unknown opcode), is answered with Error 400 before the connection closes: `it::frame_error_test`. Versioning is the frame's version byte; see [protocol.md](protocol.md) |
+| 4 | Fixed | `ReadResult` carries `next_offset` and the high watermark. `it::protocol_test::publish_then_read_with_filter`, `read_long_polls_for_new_data` |
+| 5 | Fixed | DeleteStream and StreamInfo are handled (`it::protocol_test::stream_management`); QueryCancel, Rebalance, Drain and the unused replication opcodes are gone (`opcodes::tests::reserved_opcodes_are_unknown`) |
+| 6 | Fixed | Non-allocating, validated `SubjectFilter` for consumers, reads and HTTP; published subjects are validated, with no wildcards or control characters (`log::tests::subject_validation`). The old allocating matcher is deleted; connector sinks and the ExQL `subject_matches` function parse the filter once: `udfs::tests::subject_matches_uses_subject_filter_semantics`, `config::tests::subject_filter_is_validated` |
+
+### 7.4 Broker: delivery, consumers, dedup (§3.3)
+
+| # | Status | Evidence |
+|---|--------|----------|
+| 1 | Fixed | `consumer::tests::subscribers_on_one_consumer_share_the_work`, `it::consumer_test::work_is_shared_across_instances` |
+| 2 | Obsolete | Work coordinators deleted; one actor per consumer |
+| 3 | Fixed | Cleanup on every connection exit path; `SubscriptionEnded` pushes. `it::consumer_test::resume_after_disconnect`, `deleting_consumer_ends_subscriptions`, `ephemeral_consumer_is_removed_with_its_connection` |
+| 4 | Fixed | `core::tests::timeout_redelivers_then_dead_letters`, `it::consumer_test::ack_wait_expiry_redelivers`, `nack_redelivers_and_dead_letters_after_max_deliver` |
+| 5 | Obsolete | Coordinators deleted; state keyed by consumer; retention-trimmed records are skipped |
+| 6 | Fixed | `DedupNotReady` until the rebuild finishes; in-batch duplicates; cap; delete forgets. `log::tests::dedup_not_ready_rejects_only_keyed_records`, `batch_dedups_within_the_batch`, `batch_respects_dedup_cap`, `delete_forgets_dedup_state` |
+| 7 | Fixed | Each tenure restores consumers from `__consumers`. `it::cluster_test::failover_keeps_acknowledged_writes_and_consumer_progress`, `deleted_consumer_stays_deleted_after_failover`. The re-audit also found that the final consumer save at graceful shutdown was refused by the closed write gate; `resign_after` now keeps writes open until consumers stop: `consumer::tests::final_persist_survives_resign` |
+| 8 | Obsolete | Log-backed `ConsumerStore` with tombstones written in order |
+| 9 | Fixed | `consumer::tests::seek_repositions`, `it::consumer_test::deliver_policies_and_seek` |
+| 10 | Fixed | Credits and `max_ack_pending` bound push delivery (`consumer::tests::push_respects_credits_and_acks_move_the_floor`); the dead queue-fill metric is removed |
+| 11 | Fixed | DLQ writes go through `Log` (replicated, idempotent key) to a validated `dlq_stream`; a recreated source stream no longer collides: `consumer::tests::dead_letters_survive_source_stream_recreation` |
+
+### 7.5 HA: leadership & replication (§3.4)
+
+| # | Status | Evidence |
+|---|--------|----------|
+| 1 | Fixed | Pull replication of every stream; metadata reconciled by uid. `it::cluster_test::replicates_records_metadata_and_consumer_state` |
+| 2 | Fixed | Duplicates skipped, `append_at` validates first, divergence truncated by epoch. `it::cluster_test::deposed_leader_truncates_its_divergent_records` (compares full records). A follower behind the leader's earliest offset drops its copy and re-replicates: `exspeed-broker` `replication_test::follower_behind_the_leaders_earliest_offset_recovers` |
+| 3 | Fixed | Keys replicate; the replication test compares whole records |
+| 4 | Fixed | Write gate on every path, epoch in every fetch, bounded backend calls with reconnect, step-down at 2/3 of the TTL. `leadership_test::partitioned_leader_steps_down_and_peer_takes_over`, `postgres_lease_survives_reconnect_and_rejects_bad_schema`, `it::cluster_test::randomized_partitions_and_restarts_lose_no_acknowledged_write`, `it::crash_test::kill_9_in_a_three_node_cluster_loses_no_acknowledged_write` |
+| 5 | Fixed | Config changes and retention trims mirror. `replication_test::follower_mirrors_the_leaders_trims` |
+| 6 | Fixed | Resign expires the lease. `leadership_test::resign_releases_lease_before_ttl` (60 s TTL, peer takes over at once) |
+| 7 | Fixed | Cluster tests run in-process in every CI run; lease conformance runs against Postgres and Redis in CI; dead replication metrics removed |
+
+### 7.6 ExQL (§3.5)
+
+| # | Status | Evidence |
+|---|--------|----------|
+| 1 | Fixed | `->>` numerics, ORDER BY, NULLs last (`bounded_tests::json_numeric_compare_order_and_sum`). The re-audit found `->` in numeric contexts and JSON integers above 2^53 still wrong; both fixed: `bounded_tests::json_arrow_and_big_integers_compare_numerically`. `MIN`/`MAX` of JSON text are numeric by design; the text maximum is `MAX(CAST(x AS VARCHAR))`, documented in [exql.md](exql.md#json) and tested in the same test |
+| 2 | Fixed | DataFusion joins return every column (`bounded_tests::full_sql_features`) |
+| 3 | Fixed | Swapped and compound ON, ambiguous names are errors, NULL keys never match. `differential_tests::exql_matches_sqlite`, `continuous_tests::stream_stream_inner_and_left_joins` |
+| 4 | Fixed | One accumulator per aggregate. `continuous_tests::filter_coalesce_and_counts_in_continuous_aggregates` (COUNT(x) skips NULLs, COUNT(DISTINCT), FILTER) |
+| 5 | Fixed | `continuous_tests::tables_group_by_global_and_having` |
+| 6 | Fixed | Changelog stream plus checkpointed state; same test restarts the node |
+| 7 | Fixed | Operator state checkpointed through the log with a CRC; stopped and failed queries stay stopped. `continuous_tests::crash_recovery_gives_identical_output_without_duplicates`, `pause_resume_and_stopped_queries_stay_stopped` |
+| 8 | Fixed | Bounded: `bounded_tests::full_sql_features`, `errors_for_unknown_things`. Continuous `FILTER` panicked on masks without nulls; fixed: `continuous_tests::filter_coalesce_and_counts_in_continuous_aggregates`. Continuous DISTINCT and OVER are rejected as UNSUPPORTED |
+| 9 | Fixed | Bounded and continuous expressions over aggregates. Continuous `COALESCE`/`NVL` failed the query (expressions weren't simplified); fixed and covered by the same test |
+| 10 | Fixed | ORDER BY non-projected columns and aggregates (differential templates). The re-audit found `ORDER BY offset LIMIT n` returned every row (the scan claimed limit pushdown for its non-existent children); fixed: `bounded_tests::order_by_offset_honours_limit_and_offset` |
+| 11 | Fixed | `timestamp` is `Timestamp(ms, UTC)`; INTERVAL and `now()` work. `bounded_tests::time_filters`, which also asserts the time bound is pushed into the scan |
+| 12 | Fixed | Windows close on the watermark; configurable grace; units validated (`sql::tests::durations`). Extreme `TIMESTAMP BY` values overflowed or poisoned the watermark; now clamped to the record timestamp beyond `max_event_time_skew_ms` and window math saturates: `continuous_tests::extreme_event_times_neither_fail_nor_poison_the_watermark`, `sql::tests::window_assignment_never_overflows` |
+| 13 | Fixed | LEFT joins emit NULL rows, `\|Δt\| ≤ WITHIN`, eviction on the watermark, 3-way joins rejected. `continuous_tests::stream_stream_inner_and_left_joins` |
+| 14 | Fixed | `continuous_tests::stream_table_join_sees_live_updates` |
+| 15 | Fixed | No size panics (120k-row joins and groups), zero windows rejected, Unicode-safe pre-parser (`sql::tests::unicode_and_strings_are_safe`), timeouts (`bounded_tests::timeout_and_memory_limit`), truncation reported (`truncation_is_reported`). Continuous state is in memory and not counted against the pool, as documented |
+| 16 | Fixed | `bounded_tests::errors_for_unknown_things` |
+| 17 | Obsolete | Indexes removed; `CREATE/DROP INDEX` are UNSUPPORTED |
+| 18 | Fixed | Registered connections only, parameterized metadata query, quoted identifiers, pooled connections, explicit error in continuous queries. Scans now fetch only the projected columns with simple filters pushed into the remote `WHERE`, count snapshots against the memory pool, and map `numeric(p, s)` to `Decimal128`: `bounded_tests::external_postgres_join` (runs in CI against Postgres) |
+| 19 | Fixed | NULL semantics, integer division, LIKE/ILIKE, CAST, arrays, escaped keys, `headers` (re-audit repros). Integer comparisons above 2^53 are exact (row 1). `VARCHAR(n)` is not length-enforced; documented in [exql.md](exql.md#json) |
+
+**Feature matrix.** Every row is ✅ now except the ones the docs list as
+unsupported: session windows (rejected), `WINDOW SLIDING` (use HOPPING),
+and continuous DISTINCT/OVER/ORDER BY/LIMIT (rejected with UNSUPPORTED).
+See [exql.md](exql.md#what-is-not-supported).
+
+### 7.7 Connectors (§3.6)
+
+| # | Status | Evidence |
+|---|--------|----------|
+| 1 | Fixed | Blocker 14 |
+| 2 | Fixed | The watcher reconciles only its own files, by content hash; followers only register. `it::connector_test::file_watcher_leaves_api_created_connectors_alone` |
+| 3 | Fixed | An edit calls `update_config`, keeping offsets: `it::framework_test::editing_a_toml_connector_keeps_its_offsets` |
+| 4 | Fixed | LSN confirmed only in `ack()` after the durable append. `postgres_test::cdc_restart_resumes_without_loss`. The re-audit found that a pgoutput parse error was retried in place on a stream that had moved on; such errors now restart the connector from the saved LSN: `postgres_cdc::tests::stream_errors_restart_instead_of_retrying_in_place` |
+| 5 | Fixed | Replica-identity keys, `__unchanged` for TOAST, typed values, `before` image. `postgres_test::cdc_insert_update_delete_envelope_and_keys` |
+| 6 | Fixed | Retryable errors end the run before the checkpoint; only invalid records go to the DLQ: `it::framework_test::retryable_append_error_is_retried_without_dlq_or_checkpoint` |
+| 7 | Fixed | `framework_test::sink_flush_failure_leaves_offset_uncommitted`, `sink_flushes_on_timer_and_on_stop`, `s3_test::sink_crash_before_commit_overwrites_the_same_object` |
+| 8 | Fixed | Supervisor with backoff, Failed state, panic catch. `framework_test::connection_failures_back_off_then_recover`, `gives_up_after_max_restarts`, `panic_in_plugin_is_caught_and_restarted` |
+| 9 | Fixed | Stop waits; `flush()`/`stop()` always awaited. `framework_test::sink_flushes_on_timer_and_on_stop` |
+| 10 | Fixed | `drop_slot_on_delete`, keepalive advances the LSN when idle, lag metric |
+| 11 | Fixed | `row_to_json` plus a composite cursor. `postgres_test::poll_mode_types_ties_and_resume` |
+| 12 | Fixed | Columns cast to text; default `cleanup = "delete"` needs no cursor. `postgres_test::outbox_poll_publishes_then_deletes`. Idempotency keys are namespaced `pgoutbox:<table>:<id>` and CDC-only settings are rejected in poll mode: `postgres_outbox::tests::cdc_only_settings_are_rejected_in_poll_mode` |
+| 13 | Fixed | `(lsn, seqval)` cursor. `jdbc_test::mssql_cdc_crash_and_resume_is_exactly_once` (SQL Server in CI) |
+| 14 | Fixed | Per-dialect error tables, row-by-row isolation; a record that keeps failing with an unclassified error is dead-lettered after 3 exhausted retries when `dlq_stream` is set: `it::jdbc_test::sqlite_sink_dead_letters_a_record_stuck_on_an_unclassified_error` |
+| 15 | Fixed | `http_test::http_sink_retries_transient_and_commits`, `http_sink_401_fails_the_connector`, `http_sink_4xx_is_poison_and_goes_to_dlq` |
+| 16 | Fixed | `auth_type` required, constant-time compare, writes through `Log`; a webhook creates its stream when it starts: `exspeed` `it::connector_test::webhook_creates_its_missing_stream` |
+| 17 | Fixed | Atomic file store, load error is fatal (`framework_test::offset_load_error_fails_instead_of_starting_over`), broken stores removed, log store reads backwards |
+| 18 | Fixed | One template renderer; TOML `[transform] sql` vs API `transform_sql` naming is by design and documented |
+| 19 | Fixed | `http_test::http_poll_emits_every_item_and_follows_pages`, `pgoutput::tests::never_panics_on_short_or_garbage_input`, `postgres_test::cdc_dry_run_creates_nothing`, RabbitMQ persistent delivery and `rabbitmq_test::*`; http_poll keeps ETag/Last-Modified only after a readable body: `it::http_test::http_poll_keeps_no_etag_from_an_unreadable_response` |
+| Guarantees table | Fixed | Current guarantees and the test behind each: [connectors.md](connectors.md#delivery-guarantees) |
+| "No tests" | Fixed | Postgres, RabbitMQ, S3 (moto), MySQL and SQL Server service tests in the CI `test-services` job; they fail under `CI=true` when their service is missing, including the older `exspeed` JDBC tests (now `#[ignore]`, run by the services job with `--include-ignored`) |
+
+### 7.8 Server, HTTP API, auth (§3.7)
+
+| # | Status | Evidence |
+|---|--------|----------|
+| 1 | Fixed | Blocker 10 |
+| 2 | Fixed | `it::multi_tenant_auth_test::consumer_ops_are_scoped_to_the_consumers_stream`; [security.md](security.md) describes it |
+| 3 | Fixed | Handshake (and TLS accept) and idle timeouts are `[server] handshake_timeout_secs` / `idle_timeout_secs`: `it::protocol_test::silent_and_idle_connections_are_closed` |
+| 4 | Fixed | Ordered shutdown, HTTP task joined, one stop budget. `lifecycle_test::shutdown_waits_for_the_http_api`, `shutdown_respects_drain_and_stop_timeouts`, `consumer::tests::final_persist_survives_resign` |
+| 5 | Fixed | Bind errors, catalog load errors and bad TLS fail startup; `ready` follows the binds. `lifecycle_test::occupied_api_port_fails_startup`, `occupied_tcp_port_fails_startup`, `unreadable_connector_catalog_fails_startup_and_never_reports_ready`, `bad_tls_files_fail_startup_and_never_report_ready`. A failed tenure steps down for real: `leadership_test::step_down_releases_the_lease_and_holds_off` |
+| 6 | Fixed | Listings scoped by permission over TCP and HTTP (`it::multi_tenant_auth_test::http_list_streams_is_scoped_to_the_caller`, `it::api_test::list_streams_hides_internal_streams_unless_asked`); `auth_denied` labelled with the route (`it::observability_test::auth_denials_are_labelled_with_the_route_not_the_path`); optional metrics token (`exspeed-api` `it::metrics_test`); no stale series after deletes (`it::observability_test::deleted_streams_and_consumers_leave_no_series`); HTTP writes to internal streams are 403 (`it::api_test::http_writes_to_internal_streams_are_forbidden`) |
+| 7 | Fixed | Every series is `exspeed_`-prefixed with `_total` exactly once; dead series removed. `it::observability_test::every_scraped_series_is_prefixed`; [operations.md](operations.md#metrics) |
+| 8 | Fixed | Leader check before anything is persisted. `it::cluster_test::continuous_queries_are_rejected_on_a_follower` |
+| 9 | Fixed | `tail` long-polls `/records`, works on followers and with subscribe-only credentials. `it::multi_tenant_auth_test::http_records_long_poll_works_for_subscribe_only_credentials`, `it::cluster_test::followers_serve_record_reads_and_long_polls` |
+| 10 | Fixed | No `set_var` outside tests, no no-op flags, backend init returns errors, `server.rs` split and authz helpers |
+
+### 7.9 TypeScript SDK (§3.8)
+
+| # | Status | Evidence |
+|---|--------|----------|
+| C (RecordsBatch) | Fixed | Protocol v2; `Deliver` and `Messages` decoded. SDK e2e "long-polls a pull until a message arrives" |
+| H (Publisher auth/TLS, maxInFlight) | Fixed | `client.publisher()` reuses the client's connection; `maxInFlight` enforced. `publisher.test.ts` "bounds records in flight" |
+| H (drop-oldest) | Fixed | Credit-window flow control. e2e "never pushes more than the credit window" |
+| H (reconnect) | Fixed | Any re-subscribe failure ends the subscription with the server's error. e2e "re-subscribes after the server restarts" |
+| M (mock sockets only) | Fixed | 23 e2e tests against a real server in the CI `sdk` job |
+
+### 7.10 Build, CI, deploy, benchmarks (§3.9)
+
+| Finding | Status | Evidence |
+|---------|--------|----------|
+| No CI | Fixed | `ci.yml`: fmt + clippy `-D warnings`, workspace tests (with an ENOSPC tmpfs), service tests, SDK, Helm lint/template |
+| Dockerfile | Fixed | cargo-chef cache, only the `exspeed` binary, `EXPOSE 5933 8080 5934`, `HEALTHCHECK` via `exspeed healthcheck`, which follows `api_bind` and TLS (`config::tests::probe_url_follows_api_bind_and_tls`) |
+| No Helm chart | Fixed | `deploy/helm/exspeed` |
+| `portpicker` / pick-then-bind | Fixed | `exspeed_testkit` binds IPv4; in-process servers get pre-bound listeners (`ServerArgs::tcp_listener`/`api_listener`, `exspeed_testkit::bind_local`). `pick_unused_port` remains only where a child process restarts on the same port |
+| 53 test binaries | Fixed | One `it` binary per crate |
+| ~50 env vars, no config file | Fixed | `exspeed.toml` with `[exql]` and every other section; `exspeed config print-default` (`config::tests::exql_section_resolves_and_reaches_the_engine_config`) |
+| Benchmarks | Fixed | BENCHMARKS.md re-run on Linux with results files; fan-out and latency tables corrected; Kafka and NATS JetStream comparison run on the same VM with matching durability and published with each tool's caveats ([BENCHMARKS.md](../BENCHMARKS.md#comparison-with-kafka-and-nats-jetstream)); Exspeed leads on publish and consume throughput, Kafka on one-at-a-time end-to-end latency (Exspeed's ~5 ms median is not fsync and is the open performance item) |
+
+### 7.11 Docs vs. reality (§4)
+
+Every row is corrected in `docs/`; the ExQL rows were re-run as queries
+and match the docs. Notes on rows whose advice has since changed:
+
+- *`plugin = "postgres_cdc"`*: now the real plugin name (`postgres` was
+  split into `postgres_cdc` and `postgres_poll`).
+- *`examples/order-processing`*: the configs load (outbox in CDC mode, the sink forwards a stream a continuous query fills), the README describes the real guarantee, and CI validates every example config with `exspeed connector validate`.
+- *"Exactly-once across failover"*: dedup is now enforced from startup,
+  rebuilt on promotion and applied on every write path, including within a
+  batch; [idempotent-publish.md](idempotent-publish.md) says where it
+  applies.
+- *Metric names*: renamed to `exspeed_*` (§7.8 row 7).

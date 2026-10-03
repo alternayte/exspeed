@@ -24,8 +24,14 @@ On a disk-constrained machine, build without debug info, as CI does:
 CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cargo test --workspace
 ```
 
-Pick test ports with `exspeed_testkit::pick_unused_port()`. It binds
-`127.0.0.1:0`, so it also works on IPv4-only hosts.
+In-process test servers get pre-bound listeners: bind
+`exspeed_testkit::bind_local()` (`127.0.0.1:0`) and pass it as
+`ServerArgs::tcp_listener` / `api_listener` (the `TestServer` harness does
+this), so no other test can grab the port in between. Use
+`exspeed_testkit::pick_unused_port()` only when the port must be known
+before the server exists: a child process (`crash_test`), or a node that
+restarts on the same address (`cluster_test`'s fault-proxy nodes). Both
+work on IPv4-only hosts.
 
 ## CI
 
