@@ -45,6 +45,16 @@ jobs:
           sudo mkdir -p "$EXSPEED_ENOSPC_DIR"
           sudo mount -t tmpfs -o size=16m tmpfs "$EXSPEED_ENOSPC_DIR"
           sudo chmod 777 "$EXSPEED_ENOSPC_DIR"
+      - run: cargo build -p exspeed --bin exspeed
+      - name: Validate the example connector configs
+        run: |
+          shopt -s globstar nullglob
+          files=(examples/*/**/connectors.d/*.toml)
+          if [ ${#files[@]} -eq 0 ]; then echo "no example connector configs found"; exit 1; fi
+          for f in "${files[@]}"; do
+            echo "== $f"
+            ./target/debug/exspeed connector validate "$f"
+          done
       - run: cargo test --workspace
 
   test-services:
