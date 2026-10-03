@@ -28,10 +28,13 @@ impl Default for ReadLimits {
 #[derive(Debug, Clone)]
 pub struct ReadBatch {
     pub records: Vec<StoredRecord>,
-    /// Where the next read should start: one past the last returned record,
-    /// or `from` (clamped to the earliest retained offset) when empty.
+    /// Where the next read should start: one past the last returned record.
+    /// When nothing was returned it is `from` clamped to the earliest
+    /// retained offset, or the high watermark when every offset between
+    /// `from` and the high watermark is a gap (compacted away).
     pub next_offset: Offset,
-    /// Offset the next append will get (the visible end of the log).
+    /// Offset the next append will get (the visible end of the log). Only
+    /// records below the high watermark are ever returned.
     /// `next_offset == high_watermark` means the reader is caught up.
     pub high_watermark: Offset,
 }
@@ -113,10 +116,9 @@ pub trait StorageEngine: Send + Sync {
         drop_from: Offset,
     ) -> Result<(), StorageError>;
 
-    /// Register a secondary index on the given stream's partition so that
-    /// `.sidx.{name}` files are built when segments are sealed.
-    ///
-    /// Default is a no-op for non-file-backed implementations.
+    /// **Deprecated — will be removed.** Secondary indexes were dropped from
+    /// the storage engine; this is a no-op kept only until the ExQL engine
+    /// stops calling it.
     async fn register_secondary_index(
         &self,
         _stream: &StreamName,
@@ -126,19 +128,15 @@ pub trait StorageEngine: Send + Sync {
         Ok(())
     }
 
-    /// Return the filesystem path for a given stream + partition, if the
-    /// implementation is backed by local files.
-    ///
-    /// Default returns `None` for non-file-backed implementations.
+    /// **Deprecated — will be removed.** No engine exposes its partition
+    /// directory any more; always returns `None`.
     fn partition_dir_path(&self, _stream: &str, _partition: u32) -> Option<PathBuf> {
         None
     }
 
-    /// Read records with optional hints that allow storage-level optimisations.
-    ///
-    /// When `key_filter` is `Some`, the engine MAY skip segments whose bloom
-    /// filter proves the key is absent.  The default implementation ignores
-    /// the hint and delegates to [`read`].
+    /// **Deprecated — will be removed.** Bloom filters were dropped from the
+    /// storage engine, so the hint is ignored and this is a plain
+    /// [`StorageEngine::read`].
     async fn read_with_hints(
         &self,
         stream: &StreamName,
@@ -151,7 +149,7 @@ pub trait StorageEngine: Send + Sync {
     }
 
     /// Append N records. Default implementation serializes via `append`;
-    /// FileStorage overrides this to use a single WAL batch.
+    /// FileStorage overrides this to write the batch with one group commit.
     async fn append_batch(
         &self,
         stream: &StreamName,
@@ -163,6 +161,30 @@ pub trait StorageEngine: Send + Sync {
             out.push((offset, ts));
         }
         Ok(out)
+    }
+
+    /// Append records that already carry their offsets, timestamps and keys
+    /// (the replication follower path). Rules:
+    ///
+    /// * offsets within one call must be strictly increasing;
+    /// * the first offset must be `>= next_offset`; gaps are allowed
+    ///   (compacted logs have them);
+    /// * any record with offset `< next_offset` is a
+    ///   [`StorageError::OffsetConflict`] — callers filter out records they
+    ///   already have first.
+    ///
+    /// Afterwards `next_offset` is the last record's offset + 1. Nothing is
+    /// written when the call fails validation. The default implementation
+    /// returns [`StorageError::Unsupported`].
+    async fn append_at(
+        &self,
+        stream: &StreamName,
+        records: Vec<StoredRecord>,
+    ) -> Result<(), StorageError> {
+        let _ = (stream, records);
+        Err(StorageError::Unsupported(
+            "this storage engine does not support append_at".into(),
+        ))
     }
 
     /// Create a stream with a full config (retention + dedup). The default
@@ -217,10 +239,12 @@ pub trait StorageEngine: Send + Sync {
             keep += 1;
         }
         records.truncate(keep);
+        // An empty read below the high watermark means everything in
+        // `[from, high_watermark)` is a gap; skip it so readers don't spin.
         let next_offset = records
             .last()
             .map(|r| Offset(r.offset.0 + 1))
-            .unwrap_or(from);
+            .unwrap_or(Offset(from.0.max(high_watermark.0)));
         Ok(ReadBatch {
             records,
             next_offset,

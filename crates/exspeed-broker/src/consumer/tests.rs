@@ -536,3 +536,79 @@ async fn departed_subscriber_records_are_redelivered_immediately() {
     m.unsubscribe("c", survivor.sub_id).await;
     assert_quiet(&mut third, 200).await;
 }
+
+/// Consumer snapshots go to a compacted stream: after compaction only the
+/// latest snapshot per consumer remains, and state still restores.
+#[tokio::test]
+async fn consumer_state_stream_is_compacted() {
+    use exspeed_storage::file::{FileStorage, StorageOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let fs = Arc::new(
+        FileStorage::open_with_options(
+            dir.path(),
+            StorageOptions {
+                segment_max_bytes: 4096,
+                compaction_interval: Duration::ZERO,
+                ..StorageOptions::default()
+            },
+        )
+        .unwrap(),
+    );
+    let e = env_on(fs.clone());
+    e.stream("s").await;
+    e.publish("s", "x", 60).await;
+    {
+        let (m, token) = e.manager().await;
+        m.create(spec("c", "s")).await.unwrap();
+        // Ack one record at a time, letting each snapshot persist.
+        for o in 0..30u64 {
+            let got = m.pull("c", 1, 0, Duration::from_millis(200)).await.unwrap();
+            assert_eq!(got[0].offset, o);
+            m.ack("c", vec![o]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(110)).await;
+        }
+        token.cancel();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let consumers = sn(super::store::CONSUMERS_STREAM);
+    let (lo, hi) = fs.stream_bounds(&consumers).await.unwrap();
+    let before = e
+        .log
+        .storage()
+        .read_batch(
+            &consumers,
+            lo,
+            ReadLimits {
+                max_records: 10_000,
+                max_bytes: 64 << 20,
+            },
+        )
+        .await
+        .unwrap()
+        .records
+        .len();
+    assert!(before > 10, "expected many snapshots, got {before}");
+
+    let stats = fs.compact_stream(super::store::CONSUMERS_STREAM).unwrap();
+    assert!(stats.records_removed > 0, "{stats:?}");
+    let after = fs
+        .read_batch(
+            &consumers,
+            lo,
+            ReadLimits {
+                max_records: 10_000,
+                max_bytes: 64 << 20,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        after.records.len() < before / 2,
+        "compaction kept {} of {before}",
+        after.records.len()
+    );
+    assert_eq!(after.high_watermark, hi, "offsets are preserved");
+
+    let (m, _t) = e.manager().await;
+    assert_eq!(m.info("c").await.unwrap().ack_floor, 30);
+}

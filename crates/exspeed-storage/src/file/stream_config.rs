@@ -1,13 +1,15 @@
 //! On-disk persistence of [`StreamConfig`] as `{stream_dir}/stream.json`.
 
-use std::fs::{self, File};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::Path;
 
 pub use exspeed_streams::config::{
     StreamConfig, DEFAULT_DEDUP_MAX_ENTRIES, DEFAULT_DEDUP_WINDOW_SECS, DEFAULT_MAX_AGE_SECS,
-    DEFAULT_MAX_BYTES,
+    DEFAULT_MAX_BYTES, DEFAULT_TOMBSTONE_RETENTION_SECS,
 };
+
+use crate::file::fsutil::atomic_write;
 
 /// File I/O for [`StreamConfig`]. Import this trait to call
 /// `StreamConfig::load(dir)` / `config.save(dir)`.
@@ -21,19 +23,8 @@ pub trait StreamConfigFile: Sized {
 impl StreamConfigFile for StreamConfig {
     fn save(&self, stream_dir: &Path) -> io::Result<()> {
         fs::create_dir_all(stream_dir)?;
-        let path = stream_dir.join("stream.json");
-        let tmp = stream_dir.join("stream.json.tmp");
-        let json = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
-        {
-            let mut file = File::create(&tmp)?;
-            file.write_all(json.as_bytes())?;
-            file.sync_all()?;
-        }
-        fs::rename(&tmp, &path)?;
-        if let Ok(dir) = File::open(stream_dir) {
-            let _ = dir.sync_all();
-        }
-        Ok(())
+        let json = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
+        atomic_write(&stream_dir.join("stream.json"), &json)
     }
 
     fn load(stream_dir: &Path) -> io::Result<Self> {

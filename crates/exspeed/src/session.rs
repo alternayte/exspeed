@@ -330,7 +330,7 @@ fn stream_config(s: &StreamSpec) -> StreamConfig {
         s.dedup_window_secs,
         s.dedup_max_entries,
     );
-    let _ = s.compaction; // honoured once the storage engine supports it
+    cfg.compaction = s.compaction;
     cfg.dedup_window_secs = cfg.dedup_window_secs.min(cfg.max_age_secs);
     cfg
 }

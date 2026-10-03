@@ -13,9 +13,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
-rust-s3 = { workspace = true }
-chrono = "0.4"
 dashmap = { workspace = true }
+arc-swap = "1.7"
+crossbeam-channel = "0.5"
 
 [dev-dependencies]
 tempfile = "3"

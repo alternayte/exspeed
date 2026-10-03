@@ -32,12 +32,13 @@ impl ConsumerStore {
     }
 
     /// Settings for the internal stream: never age out (an idle consumer's
-    /// only snapshot may be old); the store relies on compaction to bound
-    /// its size.
+    /// only snapshot may be old); compaction keeps only the latest snapshot
+    /// per consumer, which bounds its size.
     fn stream_config() -> StreamConfig {
         StreamConfig {
             max_age_secs: u64::MAX / 2,
             max_bytes: u64::MAX / 2,
+            compaction: true,
             ..StreamConfig::default()
         }
     }

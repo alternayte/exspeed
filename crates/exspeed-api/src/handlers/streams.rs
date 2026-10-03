@@ -25,6 +25,9 @@ pub struct CreateStreamRequest {
     pub max_bytes: u64,
     pub dedup_window_secs: Option<u64>,
     pub dedup_max_entries: Option<u64>,
+    /// Keep only the latest record per key (plus unkeyed records).
+    #[serde(default)]
+    pub compaction: bool,
 }
 
 /// Build a `StreamInfo`-shaped JSON value from a name + config.
@@ -42,6 +45,8 @@ fn stream_info_json(
         "max_bytes": config.max_bytes,
         "dedup_window_secs": config.dedup_window_secs,
         "dedup_max_entries": config.dedup_max_entries,
+        "compaction": config.compaction,
+        "internal": name.starts_with(exspeed_common::INTERNAL_STREAM_PREFIX),
     })
 }
 
@@ -87,12 +92,13 @@ pub async fn create_stream(
     }
 
     // Build a full config with defaults applied for any missing dedup fields.
-    let cfg = StreamConfig::from_request(
+    let mut cfg = StreamConfig::from_request(
         body.max_age_secs,
         body.max_bytes,
         body.dedup_window_secs.unwrap_or(0),
         body.dedup_max_entries.unwrap_or(0),
     );
+    cfg.compaction = body.compaction;
 
     // Validate before touching storage.
     if let Err(msg) = StreamConfig::validate(

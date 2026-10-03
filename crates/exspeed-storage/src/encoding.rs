@@ -1,280 +1,375 @@
-// Built in Task 2
+//! On-disk record framing.
+//!
+//! Every record is stored as one CRC32C-protected frame:
+//!
+//! ```text
+//! frame   := len u32 LE  (= 4 + payload.len())
+//!            crc u32 LE  (CRC32C of payload)
+//!            payload
+//! payload := offset      u64
+//!            timestamp   u64            (nanoseconds since the epoch)
+//!            subject_len u16, subject
+//!            flags       u8             (bit 0: has_key)
+//!            [key_len    u32, key]      (only when has_key)
+//!            value_len   u32, value
+//!            header_cnt  u16
+//!            header_cnt × (k_len u16, k, v_len u16, v)
+//! ```
+//!
+//! Encoders validate every length against its field width and return an
+//! error instead of truncating. Decoders bounds-check every length against
+//! the bytes actually present, so a corrupt length can never trigger a
+//! huge allocation.
 
-use bytes::{Buf, BufMut, Bytes};
+use bytes::{BufMut, Bytes};
 use exspeed_common::Offset;
-use exspeed_streams::record::{Record, StoredRecord};
+use exspeed_streams::{StorageError, StoredRecord};
 
-/// Encode a record into `dst`.
-///
-/// Wire layout (all integers little-endian):
-///   offset      u64
-///   timestamp   u64
-///   subject_len u16
-///   subject     [u8; subject_len]
-///   flags       u8   (bit 0: has_key)
-///   [if has_key]
-///     key_len   u32
-///     key       [u8; key_len]
-///   value_len   u32
-///   value       [u8; value_len]
-///   header_cnt  u16
-///   [for each header]
-///     k_len     u16
-///     k         [u8; k_len]
-///     v_len     u16
-///     v         [u8; v_len]
-pub fn encode_record(offset: Offset, timestamp: u64, record: &Record, dst: &mut Vec<u8>) {
-    dst.put_u64_le(offset.0);
-    dst.put_u64_le(timestamp);
+/// Size of the `len` + `crc` frame header.
+pub const FRAME_HEADER_LEN: usize = 8;
 
-    let subject_bytes = record.subject.as_bytes();
-    dst.put_u16_le(subject_bytes.len() as u16);
-    dst.put_slice(subject_bytes);
+/// Smallest possible payload: offset + timestamp + subject_len + flags +
+/// value_len + header_cnt.
+pub const MIN_PAYLOAD_LEN: usize = 8 + 8 + 2 + 1 + 4 + 2;
 
-    let has_key: u8 = if record.key.is_some() { 1 } else { 0 };
-    dst.put_u8(has_key);
+/// Largest frame (`len` field value) the engine writes or accepts. Values
+/// are limited to 8 MiB by the write path, so anything above this is
+/// corruption.
+pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 
-    if let Some(key) = &record.key {
-        dst.put_u32_le(key.len() as u32);
-        dst.put_slice(key);
-    }
+/// A record that can't be represented in the on-disk format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodeError(pub String);
 
-    dst.put_u32_le(record.value.len() as u32);
-    dst.put_slice(&record.value);
-
-    dst.put_u16_le(record.headers.len() as u16);
-    for (k, v) in &record.headers {
-        let kb = k.as_bytes();
-        let vb = v.as_bytes();
-        dst.put_u16_le(kb.len() as u16);
-        dst.put_slice(kb);
-        dst.put_u16_le(vb.len() as u16);
-        dst.put_slice(vb);
+impl std::fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "record cannot be encoded: {}", self.0)
     }
 }
 
-/// Decode a record from `src`. Returns `(StoredRecord, bytes_consumed)`.
-pub fn decode_record(src: &[u8]) -> Result<(StoredRecord, usize), String> {
-    let mut cur = src;
+impl std::error::Error for EncodeError {}
 
-    macro_rules! need {
-        ($n:expr) => {
-            if cur.remaining() < $n {
-                return Err(format!(
-                    "truncated record: need {} bytes, have {}",
-                    $n,
-                    cur.remaining()
-                ));
-            }
-        };
+impl From<EncodeError> for StorageError {
+    fn from(e: EncodeError) -> Self {
+        StorageError::InvalidRecord(e.0)
     }
+}
 
-    need!(8);
-    let offset = Offset(cur.get_u64_le());
+fn check_len(what: &str, len: usize, max: usize) -> Result<(), EncodeError> {
+    if len > max {
+        Err(EncodeError(format!(
+            "{what} is {len} bytes; the limit is {max}"
+        )))
+    } else {
+        Ok(())
+    }
+}
 
-    need!(8);
-    let timestamp = cur.get_u64_le();
+/// The fields of one record, borrowed.
+#[derive(Debug, Clone, Copy)]
+pub struct RecordRef<'a> {
+    pub offset: u64,
+    pub timestamp: u64,
+    pub subject: &'a str,
+    pub key: Option<&'a [u8]>,
+    pub value: &'a [u8],
+    pub headers: &'a [(String, String)],
+}
 
-    need!(2);
-    let subject_len = cur.get_u16_le() as usize;
-    need!(subject_len);
-    let subject_bytes = &cur[..subject_len];
-    let subject = std::str::from_utf8(subject_bytes)
-        .map_err(|e| format!("invalid subject UTF-8: {}", e))?
-        .to_string();
-    cur.advance(subject_len);
+impl<'a> RecordRef<'a> {
+    pub fn from_stored(r: &'a StoredRecord) -> Self {
+        Self {
+            offset: r.offset.0,
+            timestamp: r.timestamp,
+            subject: &r.subject,
+            key: r.key.as_deref(),
+            value: &r.value,
+            headers: &r.headers,
+        }
+    }
+}
 
-    need!(1);
-    let flags = cur.get_u8();
-    let has_key = (flags & 1) != 0;
+/// Append one complete frame for `r` to `dst`. Returns the frame size. On
+/// error `dst` is left exactly as it was.
+pub fn encode_frame(dst: &mut Vec<u8>, r: RecordRef<'_>) -> Result<usize, EncodeError> {
+    check_len("subject", r.subject.len(), u16::MAX as usize)?;
+    if let Some(k) = r.key {
+        check_len("key", k.len(), u32::MAX as usize)?;
+    }
+    check_len("value", r.value.len(), u32::MAX as usize)?;
+    if r.headers.len() > u16::MAX as usize {
+        return Err(EncodeError(format!(
+            "{} headers; the limit is {}",
+            r.headers.len(),
+            u16::MAX
+        )));
+    }
+    let mut payload_len = MIN_PAYLOAD_LEN + r.subject.len() + r.value.len();
+    if let Some(k) = r.key {
+        payload_len += 4 + k.len();
+    }
+    for (k, v) in r.headers {
+        check_len("header key", k.len(), u16::MAX as usize)?;
+        check_len("header value", v.len(), u16::MAX as usize)?;
+        payload_len += 4 + k.len() + v.len();
+    }
+    let frame_len = 4 + payload_len;
+    check_len("encoded record", frame_len, MAX_FRAME_LEN)?;
 
-    let key = if has_key {
-        need!(4);
-        let key_len = cur.get_u32_le() as usize;
-        need!(key_len);
-        let key_bytes = Bytes::copy_from_slice(&cur[..key_len]);
-        cur.advance(key_len);
-        Some(key_bytes)
+    let start = dst.len();
+    dst.reserve(4 + frame_len);
+    dst.put_u32_le(frame_len as u32);
+    dst.put_u32_le(0); // CRC placeholder
+    let payload_start = dst.len();
+    dst.put_u64_le(r.offset);
+    dst.put_u64_le(r.timestamp);
+    dst.put_u16_le(r.subject.len() as u16);
+    dst.put_slice(r.subject.as_bytes());
+    dst.put_u8(u8::from(r.key.is_some()));
+    if let Some(k) = r.key {
+        dst.put_u32_le(k.len() as u32);
+        dst.put_slice(k);
+    }
+    dst.put_u32_le(r.value.len() as u32);
+    dst.put_slice(r.value);
+    dst.put_u16_le(r.headers.len() as u16);
+    for (k, v) in r.headers {
+        dst.put_u16_le(k.len() as u16);
+        dst.put_slice(k.as_bytes());
+        dst.put_u16_le(v.len() as u16);
+        dst.put_slice(v.as_bytes());
+    }
+    debug_assert_eq!(dst.len() - payload_start, payload_len);
+    let crc = crc32c::crc32c(&dst[payload_start..]);
+    dst[start + 4..start + 8].copy_from_slice(&crc.to_le_bytes());
+    Ok(dst.len() - start)
+}
+
+/// Parse a frame header. Returns the payload length, or an error when the
+/// `len` field is out of bounds.
+pub fn frame_payload_len(header: &[u8]) -> Result<usize, String> {
+    let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+    if !(4 + MIN_PAYLOAD_LEN..=MAX_FRAME_LEN).contains(&len) {
+        return Err(format!("frame length {len} out of bounds"));
+    }
+    Ok(len - 4)
+}
+
+/// Verify the CRC of a frame whose header is `header` and payload `payload`.
+pub fn check_crc(header: &[u8], payload: &[u8]) -> Result<(), String> {
+    let stored = u32::from_le_bytes(header[4..8].try_into().unwrap());
+    let computed = crc32c::crc32c(payload);
+    if stored != computed {
+        return Err(format!(
+            "CRC mismatch: stored {stored:#010x}, computed {computed:#010x}"
+        ));
+    }
+    Ok(())
+}
+
+/// The offset and timestamp at the start of a payload.
+pub fn payload_offset_ts(payload: &[u8]) -> (u64, u64) {
+    (
+        u64::from_le_bytes(payload[0..8].try_into().unwrap()),
+        u64::from_le_bytes(payload[8..16].try_into().unwrap()),
+    )
+}
+
+/// The key and the value length of a payload, without decoding the rest.
+pub fn payload_key_value_len(payload: &[u8]) -> Result<(Option<&[u8]>, usize), String> {
+    let mut c = Cursor {
+        buf: payload,
+        pos: 16,
+    };
+    let subject_len = c.u16()?;
+    c.take(subject_len)?;
+    let flags = c.u8()?;
+    let key = if flags & 1 != 0 {
+        let n = c.u32()?;
+        Some(&payload[c.take(n)?])
     } else {
         None
     };
+    let value_len = c.u32()?;
+    Ok((key, value_len))
+}
 
-    need!(4);
-    let value_len = cur.get_u32_le() as usize;
-    need!(value_len);
-    let value = Bytes::copy_from_slice(&cur[..value_len]);
-    cur.advance(value_len);
+struct Cursor<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
 
-    need!(2);
-    let header_cnt = cur.get_u16_le() as usize;
-    let mut headers = Vec::with_capacity(header_cnt);
+impl<'a> Cursor<'a> {
+    fn take(&mut self, n: usize) -> Result<std::ops::Range<usize>, String> {
+        if self.buf.len() - self.pos < n {
+            return Err(format!(
+                "truncated record: need {n} bytes at {}, have {}",
+                self.pos,
+                self.buf.len() - self.pos
+            ));
+        }
+        let r = self.pos..self.pos + n;
+        self.pos += n;
+        Ok(r)
+    }
+    fn u8(&mut self) -> Result<u8, String> {
+        let r = self.take(1)?;
+        Ok(self.buf[r.start])
+    }
+    fn u16(&mut self) -> Result<usize, String> {
+        let r = self.take(2)?;
+        Ok(u16::from_le_bytes(self.buf[r].try_into().unwrap()) as usize)
+    }
+    fn u32(&mut self) -> Result<usize, String> {
+        let r = self.take(4)?;
+        Ok(u32::from_le_bytes(self.buf[r].try_into().unwrap()) as usize)
+    }
+    fn u64(&mut self) -> Result<u64, String> {
+        let r = self.take(8)?;
+        Ok(u64::from_le_bytes(self.buf[r].try_into().unwrap()))
+    }
+    fn str(&mut self, n: usize, what: &str) -> Result<String, String> {
+        let r = self.take(n)?;
+        std::str::from_utf8(&self.buf[r])
+            .map(str::to_owned)
+            .map_err(|e| format!("invalid {what} UTF-8: {e}"))
+    }
+}
+
+/// Decode a payload (the bytes after the frame header). Key and value are
+/// zero-copy slices of `payload`.
+pub fn decode_payload(payload: &Bytes) -> Result<StoredRecord, String> {
+    let mut c = Cursor {
+        buf: payload,
+        pos: 0,
+    };
+    let offset = c.u64()?;
+    let timestamp = c.u64()?;
+    let subject_len = c.u16()?;
+    let subject = c.str(subject_len, "subject")?;
+    let flags = c.u8()?;
+    let key = if flags & 1 != 0 {
+        let n = c.u32()?;
+        Some(payload.slice(c.take(n)?))
+    } else {
+        None
+    };
+    let value_len = c.u32()?;
+    let value = payload.slice(c.take(value_len)?);
+    let header_cnt = c.u16()?;
+    // Each header needs at least 4 bytes; never pre-allocate more than the
+    // remaining bytes could hold.
+    let mut headers = Vec::with_capacity(header_cnt.min((payload.len() - c.pos) / 4));
     for _ in 0..header_cnt {
-        need!(2);
-        let k_len = cur.get_u16_le() as usize;
-        need!(k_len);
-        let k = std::str::from_utf8(&cur[..k_len])
-            .map_err(|e| format!("invalid header key UTF-8: {}", e))?
-            .to_string();
-        cur.advance(k_len);
-
-        need!(2);
-        let v_len = cur.get_u16_le() as usize;
-        need!(v_len);
-        let v = std::str::from_utf8(&cur[..v_len])
-            .map_err(|e| format!("invalid header value UTF-8: {}", e))?
-            .to_string();
-        cur.advance(v_len);
-
+        let kl = c.u16()?;
+        let k = c.str(kl, "header key")?;
+        let vl = c.u16()?;
+        let v = c.str(vl, "header value")?;
         headers.push((k, v));
     }
-
-    let bytes_consumed = src.len() - cur.remaining();
-    Ok((
-        StoredRecord {
-            offset,
-            timestamp,
-            subject,
-            key,
-            value,
-            headers,
-        },
-        bytes_consumed,
-    ))
-}
-
-/// Wrap `record_bytes` with a length-prefixed CRC32C frame:
-///   length  u32 LE  (= 4 [CRC] + record_bytes.len())
-///   crc     u32 LE  (CRC32C of record_bytes)
-///   record_bytes
-pub fn wrap_with_crc(record_bytes: &[u8]) -> Vec<u8> {
-    let crc = crc32c::crc32c(record_bytes);
-    let length = (4u32 + record_bytes.len() as u32).to_le_bytes();
-    let crc_bytes = crc.to_le_bytes();
-
-    let mut out = Vec::with_capacity(4 + 4 + record_bytes.len());
-    out.extend_from_slice(&length);
-    out.extend_from_slice(&crc_bytes);
-    out.extend_from_slice(record_bytes);
-    out
-}
-
-/// Validate and unwrap a CRC frame. `data` is the bytes **after** the length
-/// field, i.e. `[crc (4 bytes)] ++ [record bytes]`.
-///
-/// Returns a slice of the record bytes on success.
-pub fn unwrap_crc(data: &[u8]) -> Result<&[u8], String> {
-    if data.len() < 4 {
+    if c.pos != payload.len() {
         return Err(format!(
-            "CRC frame too short: need at least 4 bytes, got {}",
-            data.len()
+            "{} trailing bytes after record",
+            payload.len() - c.pos
         ));
     }
-    let stored_crc = u32::from_le_bytes(data[..4].try_into().unwrap());
-    let record_bytes = &data[4..];
-    let computed = crc32c::crc32c(record_bytes);
-    if stored_crc != computed {
-        return Err(format!(
-            "CRC mismatch: stored {:#010x}, computed {:#010x}",
-            stored_crc, computed
-        ));
-    }
-    Ok(record_bytes)
+    Ok(StoredRecord {
+        offset: Offset(offset),
+        timestamp,
+        subject,
+        key,
+        value,
+        headers,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
-    use exspeed_streams::record::Record;
 
-    fn make_record_with_key() -> Record {
-        Record {
-            key: Some(Bytes::from_static(b"my-key")),
-            value: Bytes::from_static(b"hello world"),
-            subject: "orders.created".to_string(),
-            headers: vec![
-                ("content-type".to_string(), "application/json".to_string()),
-                ("trace-id".to_string(), "abc123".to_string()),
-            ],
-            timestamp_ns: None,
+    fn rec<'a>(headers: &'a [(String, String)], key: Option<&'a [u8]>) -> RecordRef<'a> {
+        RecordRef {
+            offset: 42,
+            timestamp: 1_700_000_000,
+            subject: "orders.created",
+            key,
+            value: b"hello world",
+            headers,
         }
     }
 
-    fn make_record_no_key() -> Record {
-        Record {
-            key: None,
-            value: Bytes::from_static(b"no key here"),
-            subject: "events.misc".to_string(),
-            headers: vec![],
-            timestamp_ns: None,
-        }
+    fn roundtrip(r: RecordRef<'_>) -> StoredRecord {
+        let mut buf = Vec::new();
+        let n = encode_frame(&mut buf, r).unwrap();
+        assert_eq!(n, buf.len());
+        let plen = frame_payload_len(&buf[..8]).unwrap();
+        assert_eq!(plen + 8, buf.len());
+        check_crc(&buf[..8], &buf[8..]).unwrap();
+        decode_payload(&Bytes::copy_from_slice(&buf[8..])).unwrap()
     }
 
     #[test]
-    fn encode_decode_roundtrip_with_key() {
-        let record = make_record_with_key();
-        let offset = Offset(42);
-        let timestamp = 1_700_000_000u64;
-
-        let mut buf = Vec::new();
-        encode_record(offset, timestamp, &record, &mut buf);
-
-        let (stored, consumed) = decode_record(&buf).expect("decode should succeed");
-        assert_eq!(consumed, buf.len());
-        assert_eq!(stored.offset, offset);
-        assert_eq!(stored.timestamp, timestamp);
-        assert_eq!(stored.subject, record.subject);
-        assert_eq!(stored.key, record.key);
-        assert_eq!(stored.value, record.value);
-        assert_eq!(stored.headers, record.headers);
+    fn roundtrip_with_key_and_headers() {
+        let headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            ("trace-id".to_string(), "abc123".to_string()),
+        ];
+        let s = roundtrip(rec(&headers, Some(b"my-key")));
+        assert_eq!(s.offset, Offset(42));
+        assert_eq!(s.timestamp, 1_700_000_000);
+        assert_eq!(s.subject, "orders.created");
+        assert_eq!(s.key.as_deref(), Some(&b"my-key"[..]));
+        assert_eq!(&s.value[..], b"hello world");
+        assert_eq!(s.headers, headers);
     }
 
     #[test]
-    fn encode_decode_roundtrip_no_key() {
-        let record = make_record_no_key();
-        let offset = Offset(0);
-        let timestamp = 999u64;
-
-        let mut buf = Vec::new();
-        encode_record(offset, timestamp, &record, &mut buf);
-
-        let (stored, consumed) = decode_record(&buf).expect("decode should succeed");
-        assert_eq!(consumed, buf.len());
-        assert_eq!(stored.offset, offset);
-        assert_eq!(stored.timestamp, timestamp);
-        assert_eq!(stored.subject, record.subject);
-        assert!(stored.key.is_none());
-        assert_eq!(stored.value, record.value);
-        assert!(stored.headers.is_empty());
-    }
-
-    #[test]
-    fn crc_wrap_unwrap_roundtrip() {
-        let record = make_record_with_key();
-        let mut buf = Vec::new();
-        encode_record(Offset(1), 12345, &record, &mut buf);
-
-        let framed = wrap_with_crc(&buf);
-        // framed = [length u32][crc u32][record bytes]
-        // unwrap_crc receives the portion after the length field
-        let after_length = &framed[4..];
-        let record_bytes = unwrap_crc(after_length).expect("CRC should be valid");
-        assert_eq!(record_bytes, buf.as_slice());
+    fn roundtrip_without_key() {
+        let s = roundtrip(rec(&[], None));
+        assert!(s.key.is_none());
+        assert!(s.headers.is_empty());
     }
 
     #[test]
     fn crc_detects_corruption() {
-        let record = make_record_no_key();
         let mut buf = Vec::new();
-        encode_record(Offset(7), 54321, &record, &mut buf);
+        encode_frame(&mut buf, rec(&[], None)).unwrap();
+        let last = buf.len() - 1;
+        buf[last] ^= 0xFF;
+        assert!(check_crc(&buf[..8], &buf[8..]).is_err());
+    }
 
-        let mut framed = wrap_with_crc(&buf);
-        // Flip a byte in the record portion (after the 4-byte length + 4-byte CRC)
-        let corrupt_idx = framed.len() - 1;
-        framed[corrupt_idx] ^= 0xFF;
+    #[test]
+    fn oversized_fields_are_rejected_not_truncated() {
+        let mut buf = vec![1, 2, 3];
+        let subject = "a".repeat(70_000);
+        let r = RecordRef {
+            subject: &subject,
+            ..rec(&[], None)
+        };
+        assert!(encode_frame(&mut buf, r).is_err());
+        assert_eq!(buf, vec![1, 2, 3], "dst must be untouched on error");
 
-        let after_length = &framed[4..];
-        let result = unwrap_crc(after_length);
-        assert!(result.is_err(), "expected CRC error but got Ok");
+        let headers = vec![("k".to_string(), "v".repeat(70_000))];
+        assert!(encode_frame(&mut buf, rec(&headers, None)).is_err());
+
+        let many: Vec<(String, String)> = (0..70_000)
+            .map(|_| (String::new(), String::new()))
+            .collect();
+        assert!(encode_frame(&mut buf, rec(&many, None)).is_err());
+    }
+
+    #[test]
+    fn corrupt_lengths_never_overallocate() {
+        let mut buf = Vec::new();
+        encode_frame(&mut buf, rec(&[], Some(b"k"))).unwrap();
+        // Claim a 4 GiB key.
+        let mut payload = buf[8..].to_vec();
+        let key_len_at = 8 + 8 + 2 + "orders.created".len() + 1;
+        payload[key_len_at..key_len_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_payload(&Bytes::from(payload)).is_err());
+        // Frame length out of bounds.
+        assert!(frame_payload_len(&u32::MAX.to_le_bytes().repeat(2)).is_err());
+        assert!(frame_payload_len(&[0u8; 8]).is_err());
     }
 }
