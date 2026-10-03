@@ -156,9 +156,21 @@ impl ClusterLeadership {
     /// leader token, close writes and release the lease so a peer can take
     /// over at once instead of waiting out the TTL.
     pub async fn resign(&self) {
+        self.resign_after(async {}).await
+    }
+
+    /// Like [`resign`](Self::resign), but between cancelling the leader
+    /// token and closing writes it awaits `drain`: leader work that persists
+    /// state on the way out (consumer actors' final save) still has an open
+    /// write path. If the lease is lost meanwhile, writes close at once.
+    pub async fn resign_after<F: std::future::Future<Output = ()>>(&self, drain: F) {
         self.inner.resigned.store(true, Ordering::SeqCst);
+        {
+            let _t = self.inner.transition.lock().await;
+            self.inner.current_token.lock().await.cancel();
+        }
+        drain.await;
         let _t = self.inner.transition.lock().await;
-        self.inner.current_token.lock().await.cancel();
         let had = self.inner.guard.lock().await.take().is_some();
         let _ = self.inner.is_leader_tx.send(false);
         self.inner.epoch.store(0, Ordering::SeqCst);
@@ -335,7 +347,7 @@ async fn promote(inner: &Arc<Inner>, guard: LeaseGuard) {
 
 async fn demote(inner: Arc<Inner>, epoch: u64) {
     let _t = inner.transition.lock().await;
-    if inner.resigned.load(Ordering::SeqCst) || inner.epoch.load(Ordering::SeqCst) != epoch {
+    if inner.epoch.load(Ordering::SeqCst) != epoch {
         return;
     }
     inner.current_token.lock().await.cancel();
@@ -346,6 +358,10 @@ async fn demote(inner: Arc<Inner>, epoch: u64) {
     inner.metrics.set_lease_held(LEASE_NAME, false);
     inner.metrics.record_leader_transition("lost");
     inner.metrics.record_lease_lost(LEASE_NAME);
+    if inner.resigned.load(Ordering::SeqCst) {
+        // Lost while resigning: writes are closed; don't start following.
+        return;
+    }
     warn!(node = %inner.opts.node_id, epoch, role = "follower", "cluster:leader lost; this node is now a follower");
     if let Some(h) = &inner.hooks {
         h.demoted().await;

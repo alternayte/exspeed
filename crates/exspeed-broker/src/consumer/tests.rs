@@ -614,3 +614,51 @@ async fn consumer_state_stream_is_compacted() {
     let (m, _t) = e.manager().await;
     assert_eq!(m.info("c").await.unwrap().ack_floor, 30);
 }
+
+/// Graceful shutdown resigns leadership; consumer actors write their final
+/// state after the leader token is cancelled, so writes must stay open
+/// until they have stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_persist_survives_resign() {
+    let e = env();
+    let leadership = Arc::new(
+        crate::leadership::ClusterLeadership::spawn(
+            Arc::new(crate::lease::NoopLeaderLease::new()),
+            e.metrics.clone(),
+            None,
+        )
+        .await,
+    );
+    let mut rx = leadership.is_leader.clone();
+    rx.wait_for(|&v| v).await.unwrap();
+    e.log.set_write_gate(leadership.clone());
+    e.stream("s").await;
+    e.publish("s", "x", 5).await;
+    let m = ConsumerManager::new(e.log.clone(), e.metrics.clone());
+    m.start(leadership.current_child_token().await)
+        .await
+        .unwrap();
+    m.create(spec("c", "s")).await.unwrap();
+    let got = m.pull("c", 5, 0, Duration::from_secs(1)).await.unwrap();
+    assert_eq!(got.len(), 5);
+    m.ack("c", got.iter().map(|r| r.offset).collect())
+        .await
+        .unwrap();
+    assert_eq!(m.info("c").await.unwrap().ack_floor, 5);
+    // Same order as run_with_shutdown.
+    leadership
+        .resign_after(async { assert!(m.wait_stopped(Duration::from_secs(5)).await) })
+        .await;
+    assert!(!leadership.is_currently_leader());
+    let snaps = super::store::ConsumerStore::new(e.log.clone())
+        .load_all()
+        .await
+        .unwrap();
+    let s = &snaps["c"];
+    assert!(
+        s.next_read == 5 && s.pending.is_empty(),
+        "final persist lost: next_read={} pending={:?}",
+        s.next_read,
+        s.pending
+    );
+}

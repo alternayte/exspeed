@@ -134,3 +134,31 @@ async fn noop_lease_leads_immediately() {
     assert_eq!(l.epoch(), 0);
     assert!(!l.current_child_token().await.is_cancelled());
 }
+
+/// Resign releases the lease (expires it in the backend) rather than leave
+/// peers waiting out the TTL.
+#[tokio::test]
+async fn resign_releases_lease_before_ttl() {
+    let lease = MemoryLeaseBackend::new();
+    let mut o = opts("a");
+    o.ttl = Duration::from_secs(60);
+    let a = ClusterLeadership::start(lease.clone(), metrics(), o, None);
+    wait_for(|| a.is_currently_leader(), "a leads").await;
+    a.resign().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let rec = lease.get(CLUSTER_LEASE).await.unwrap().unwrap();
+        if !rec.is_live() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "lease still live after resign"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut ob = opts("b");
+    ob.ttl = Duration::from_secs(60);
+    let b = ClusterLeadership::start(lease.clone(), metrics(), ob, None);
+    wait_for(|| b.is_currently_leader(), "b takes over before the TTL").await;
+}

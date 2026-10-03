@@ -930,19 +930,23 @@ where
         warn!("continuous queries did not stop within 10s");
     }
 
-    // Step down: cancels the leader token, stopping consumers, continuous
-    // queries and retention, and releases the lease so a peer can take
-    // over at once.
-    leadership.resign().await;
+    // Step down: cancel the leader token (stopping consumers, continuous
+    // queries and retention), let the consumer actors write their final
+    // state while writes are still open, then close writes and release the
+    // lease so a peer can take over at once.
+    let consumers_stop = broker.consumers.clone();
+    leadership
+        .resign_after(async move {
+            if !consumers_stop
+                .wait_stopped(std::time::Duration::from_secs(10))
+                .await
+            {
+                warn!("consumers did not stop within 10s");
+            }
+        })
+        .await;
     if let Some(c) = &cluster {
         c.shutdown().await;
-    }
-    if !broker
-        .consumers
-        .wait_stopped(std::time::Duration::from_secs(10))
-        .await
-    {
-        warn!("consumers did not stop within 10s");
     }
     let _ = tokio::time::timeout(std::time::Duration::from_secs(10), supervisor_handle).await;
 
