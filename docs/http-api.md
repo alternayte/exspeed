@@ -15,7 +15,9 @@ curl -s localhost:8080/api/v1/openapi.json | jq '.paths | keys'
 
 When auth is enabled, every `/api/v1/*` request must carry
 `Authorization: Bearer <token>`. Every `/api/v1/*` route except `whoami`
-requires an **admin** permission (`openapi.json` needs none):
+and the record browser (`GET /api/v1/streams/{name}/records`, which takes
+`subscribe` or `admin` on the stream) requires an **admin** permission
+(`openapi.json` needs none):
 
 - **Global admin** for queries, tables, connectors, connections, leases,
   cluster routes and backups.
@@ -30,8 +32,9 @@ requires an **admin** permission (`openapi.json` needs none):
 | `POST /webhooks/*` | none, unless the webhook connector sets its own |
 
 In multi-pod mode, standbys answer `503` on `/api/v1/*`. The exceptions are
-`/api/v1/leases`, `/api/v1/cluster`, `/api/v1/whoami` and
-`/api/v1/openapi.json`. See [high-availability.md](high-availability.md).
+`/api/v1/leases`, `/api/v1/cluster`, `/api/v1/whoami`,
+`/api/v1/openapi.json` and `GET /api/v1/streams/{name}/records` (followers
+serve reads from their replica). See [high-availability.md](high-availability.md).
 
 Internal streams (names starting with `__`: consumer state, catalogs,
 connector offsets) are written only by the server. Creating, updating,
@@ -57,7 +60,7 @@ publishing to or deleting one answers `403`.
 | `PATCH` | `/api/v1/streams/{name}` | `{"max_age_secs"?, "max_bytes"?, "dedup_window_secs"?, "dedup_max_entries"?}` | Update settings |
 | `DELETE` | `/api/v1/streams/{name}` | `?force=true` | Delete. Without `force`, fails if connectors, queries or consumers still reference the stream. |
 | `POST` | `/api/v1/streams/{name}/publish` | `{"subject", "data", "key"?, "msg_id"?}` | Publish one record. The `x-idempotency-key` header can be used instead of `msg_id`. |
-| `GET` | `/api/v1/streams/{name}/records?from=&limit=&filter=` | | Browse records without a consumer: `{records, next_offset, high_watermark}`. `limit` ≤ 1000; each record has `offset`, `timestamp_ms`, `subject`, `key`, `value` (JSON when it parses, else a UTF-8 string, else base64; see `encoding`), `headers`. |
+| `GET` | `/api/v1/streams/{name}/records?from=&limit=&filter=&wait_ms=` | | Browse records without a consumer: `{records, next_offset, high_watermark}`. Needs `subscribe` or `admin`; any node answers. `wait_ms` (≤ 30000) long-polls: with nothing new at `from`, the server waits for records before answering. `limit` ≤ 1000; each record has `offset`, `timestamp_ms`, `subject`, `key`, `value` (JSON when it parses, else a UTF-8 string, else base64; see `encoding`), `headers`. |
 
 ```bash
 curl -X POST localhost:8080/api/v1/streams -H 'Content-Type: application/json' \

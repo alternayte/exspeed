@@ -2,7 +2,12 @@ use crate::cli::client::CliClient;
 use crate::cli::format;
 use anyhow::Result;
 
-/// Follow a stream through `GET /api/v1/streams/{name}/records`.
+/// How long one records request waits for new data while following.
+const FOLLOW_WAIT_MS: u64 = 10_000;
+
+/// Follow a stream through `GET /api/v1/streams/{name}/records`, long-polling
+/// (`wait_ms`) once caught up. Needs only `subscribe` on the stream and works
+/// against any node, followers included.
 pub async fn run(
     client: &CliClient,
     stream: &str,
@@ -12,11 +17,12 @@ pub async fn run(
     from_beginning: bool,
     json_output: bool,
 ) -> Result<()> {
-    let info = client.get(&format!("/api/v1/streams/{stream}")).await?;
-    let head = info
-        .get("head_offset")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    // The records endpoint reports the high watermark; it only needs the
+    // subscribe permission (the stream info endpoint needs admin).
+    let probe = client
+        .get(&format!("/api/v1/streams/{stream}/records?limit=1"))
+        .await?;
+    let head = probe["high_watermark"].as_u64().unwrap_or(0);
     let mut from: u64 = if from_beginning {
         0
     } else if let Some(n) = last {
@@ -26,9 +32,17 @@ pub async fn run(
     };
     let filter = subject.unwrap_or("");
 
+    let mut caught_up = false;
     loop {
+        // Once caught up, let the server hold the request until records
+        // arrive instead of polling.
+        let wait = if caught_up && !no_follow {
+            FOLLOW_WAIT_MS
+        } else {
+            0
+        };
         let path = format!(
-            "/api/v1/streams/{stream}/records?from={from}&limit=500&filter={}",
+            "/api/v1/streams/{stream}/records?from={from}&limit=500&filter={}&wait_ms={wait}",
             encode_query(filter)
         );
         let page = client.get(&path).await?;
@@ -41,13 +55,10 @@ pub async fn run(
             }
         }
         let next = page["next_offset"].as_u64().unwrap_or(from);
-        let caught_up = next >= page["high_watermark"].as_u64().unwrap_or(next);
+        caught_up = next >= page["high_watermark"].as_u64().unwrap_or(next);
         from = next;
-        if caught_up {
-            if no_follow {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if caught_up && no_follow {
+            break;
         }
     }
     Ok(())

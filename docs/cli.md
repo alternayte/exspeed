@@ -63,8 +63,11 @@ exspeed tail <stream> --from-beginning
 exspeed tail <stream> --subject 'order.eu.*'
 ```
 
-`tail` reads through `GET /api/v1/streams/{name}/records`, page by page,
-and polls every 200 ms once caught up. It doesn't create a consumer. Output
+`tail` reads through `GET /api/v1/streams/{name}/records`, page by page.
+Once caught up it long-polls (`wait_ms`): the server holds the request
+until new records arrive. It doesn't create a consumer, needs only the
+`subscribe` permission on the stream, and works against any node of a
+cluster (followers serve reads from their replica). Output
 lines are `#offset [unix.ms] subject key=… value`; `--json` prints each
 record as JSON.
 

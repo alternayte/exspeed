@@ -1136,3 +1136,88 @@ permissions = [{{ streams = "a-*", actions = ["admin"] }}, {{ streams = "shared"
     let all = list("root-token", "?internal=true").await;
     assert!(all.iter().any(|n| n.starts_with("__")), "{all:?}");
 }
+
+#[tokio::test]
+async fn http_records_long_poll_works_for_subscribe_only_credentials() {
+    let creds = write_creds(&format!(
+        r#"
+[[credentials]]
+name = "root"
+token_sha256 = "{}"
+permissions = [{{ streams = "*", actions = ["admin", "publish"] }}]
+
+[[credentials]]
+name = "reader"
+token_sha256 = "{}"
+permissions = [{{ streams = "logs", actions = ["subscribe"] }}]
+"#,
+        sha256_hex("root-token"),
+        sha256_hex("reader-token"),
+    ));
+    let srv = start_server(Some(creds.path().to_path_buf()), None).await;
+    let root = try_client(&srv.tcp_addr, Some("root-token")).await.unwrap();
+    root.create_stream(StreamSpec::named("logs")).await.unwrap();
+    root.create_stream(StreamSpec::named("secret"))
+        .await
+        .unwrap();
+    let http = reqwest::Client::new();
+    let url = |p: &str| format!("http://{}{p}", srv.http_addr);
+
+    // No permission on `secret`; and the admin routes stay closed.
+    let r = http
+        .get(url("/api/v1/streams/secret/records"))
+        .bearer_auth("reader-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    let r = http
+        .get(url("/api/v1/streams/logs"))
+        .bearer_auth("reader-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+
+    // A caught-up read waits for the next record instead of returning empty.
+    let started = std::time::Instant::now();
+    let req = http
+        .get(url("/api/v1/streams/logs/records?from=0&wait_ms=10000"))
+        .bearer_auth("reader-token")
+        .send();
+    let publish = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        root.publish("logs", PublishRecord::new("logs.x", r#"{"n":1}"#))
+            .await
+            .unwrap();
+    };
+    let (resp, ()) = tokio::join!(req, publish);
+    let resp = resp.unwrap();
+    assert_eq!(resp.status(), 200);
+    let page: serde_json::Value = resp.json().await.unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(page["records"].as_array().unwrap().len(), 1, "{page}");
+    assert_eq!(page["next_offset"], 1);
+    assert!(
+        elapsed >= Duration::from_millis(250),
+        "returned before the publish: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "waited past the publish: {elapsed:?}"
+    );
+
+    // With nothing new, the wait ends at wait_ms with an empty page.
+    let started = std::time::Instant::now();
+    let page: serde_json::Value = http
+        .get(url("/api/v1/streams/logs/records?from=1&wait_ms=300"))
+        .bearer_auth("reader-token")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(page["records"].as_array().unwrap().is_empty());
+    assert!(started.elapsed() >= Duration::from_millis(250));
+}

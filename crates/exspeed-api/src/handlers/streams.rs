@@ -916,7 +916,14 @@ pub struct ReadParams {
     /// Subject filter (`orders.*`, `orders.>`); empty matches all.
     #[serde(default)]
     pub filter: String,
+    /// Long-poll: when nothing at or after `from` matches yet, wait up to
+    /// this many milliseconds (max 30000) for new records instead of
+    /// answering an empty page at once. Default 0.
+    pub wait_ms: Option<u64>,
 }
+
+/// Longest `wait_ms` a records request may ask for.
+const MAX_RECORDS_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Render a payload for JSON: embedded as JSON when it parses, as a string
 /// when it is UTF-8, and base64 otherwise.
@@ -963,8 +970,11 @@ pub struct RecordsPage {
     pub high_watermark: u64,
 }
 
-/// `GET /api/v1/streams/{name}/records?from=&limit=&filter=` — browse a
-/// stream without creating a consumer. Returns `next_offset` to continue.
+/// `GET /api/v1/streams/{name}/records?from=&limit=&filter=&wait_ms=` —
+/// browse a stream without creating a consumer. Returns `next_offset` to
+/// continue. Needs `subscribe` or `admin` on the stream; served by every
+/// node (followers read their replica). With `wait_ms`, a caught-up reader
+/// waits for new records instead of polling.
 #[utoipa::path(
     get,
     path = "/api/v1/streams/{name}/records",
@@ -974,7 +984,7 @@ pub struct RecordsPage {
     responses(
         (status = 200, description = "A page of records", body = RecordsPage),
         (status = 400, description = "Invalid stream name or filter", body = ErrorBody),
-        (status = 403, description = "No admin permission on the stream", body = ErrorBody),
+        (status = 403, description = "No subscribe or admin permission on the stream", body = ErrorBody),
         (status = 404, description = "No such stream", body = ErrorBody),
     )
 )]
@@ -995,8 +1005,14 @@ pub async fn read_records(
         }
     };
     if let Some(Extension(id)) = identity.as_ref() {
-        if let Some(resp) = super::require_scoped_admin(id, &stream_name) {
-            return resp;
+        use exspeed_common::auth::Action;
+        if !id.authorize(Action::Subscribe, &stream_name)
+            && !id.authorize(Action::Admin, &stream_name)
+        {
+            state
+                .metrics
+                .auth_denied("forbidden", "http", "/api/v1/streams/{name}/records");
+            return super::forbid();
         }
     }
     let filter = match exspeed_common::SubjectFilter::parse(&params.filter) {
@@ -1007,30 +1023,82 @@ pub async fn read_records(
     };
     let limit = params.limit.unwrap_or(100).clamp(1, 1000);
     let storage = &state.broker.storage;
+    // Subscribe before the first scan so an append between the scan and the
+    // wait isn't missed.
+    let mut appends = storage.watch_appends(&stream_name);
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_millis(params.wait_ms.unwrap_or(0)).min(MAX_RECORDS_WAIT);
     let (earliest, _) = match storage.stream_bounds(&stream_name).await {
         Ok(b) => b,
         Err(e) => return log_error_response(&state, &stream_name, e.into()),
     };
-    let mut cursor = exspeed_common::Offset(params.from.unwrap_or(earliest.0).max(earliest.0));
+    let mut start = exspeed_common::Offset(params.from.unwrap_or(earliest.0).max(earliest.0));
+    loop {
+        let page = match scan_records(storage.as_ref(), &stream_name, start, &filter, limit).await {
+            Ok(p) => p,
+            Err(e) => return log_error_response(&state, &stream_name, e.into()),
+        };
+        let (out, cursor, high_watermark) = page;
+        let caught_up = out.is_empty() && cursor >= high_watermark;
+        if caught_up && tokio::time::Instant::now() < deadline {
+            if let Some(rx) = appends.as_mut() {
+                // Wake when the high watermark passes the cursor (or give
+                // up at the deadline and answer the empty page).
+                let woke = tokio::time::timeout_at(deadline, rx.wait_for(|hw| *hw > cursor.0))
+                    .await
+                    .is_ok_and(|r| r.is_ok());
+                if woke {
+                    // Nothing matched up to `cursor`; scan on from there.
+                    start = cursor;
+                    continue;
+                }
+            }
+        }
+        return (
+            StatusCode::OK,
+            Json(RecordsPage {
+                stream: name,
+                records: out,
+                next_offset: cursor.0,
+                high_watermark: high_watermark.0,
+            }),
+        )
+            .into_response();
+    }
+}
+
+/// One bounded scan from `from`: the matching records (at most `limit`),
+/// the offset to continue at, and the high watermark.
+async fn scan_records(
+    storage: &dyn exspeed_streams::StorageEngine,
+    stream_name: &StreamName,
+    from: exspeed_common::Offset,
+    filter: &exspeed_common::SubjectFilter,
+    limit: usize,
+) -> Result<
+    (
+        Vec<RecordView>,
+        exspeed_common::Offset,
+        exspeed_common::Offset,
+    ),
+    StorageError,
+> {
+    let mut cursor = from;
     let mut out = Vec::new();
     let mut high_watermark = cursor;
     // Bounded scan so a selective filter can't turn one request into a
     // full-stream read.
     'scan: for _ in 0..16 {
-        let batch = match storage
+        let batch = storage
             .read_batch(
-                &stream_name,
+                stream_name,
                 cursor,
                 exspeed_streams::ReadLimits {
                     max_records: 1000,
                     max_bytes: 4 * 1024 * 1024,
                 },
             )
-            .await
-        {
-            Ok(b) => b,
-            Err(e) => return log_error_response(&state, &stream_name, e.into()),
-        };
+            .await?;
         high_watermark = batch.high_watermark;
         cursor = batch.next_offset;
         if batch.records.is_empty() {
@@ -1062,14 +1130,5 @@ pub async fn read_records(
             break;
         }
     }
-    (
-        StatusCode::OK,
-        Json(RecordsPage {
-            stream: name,
-            records: out,
-            next_offset: cursor.0,
-            high_watermark: high_watermark.0,
-        }),
-    )
-        .into_response()
+    Ok((out, cursor, high_watermark))
 }
