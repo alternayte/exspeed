@@ -28,11 +28,27 @@ upgrade).
   Prometheus metrics, health and readiness probes, a JSON log mode, token
   auth with per-stream scopes, and TLS.
 
+## Install
+
+```bash
+# Linux and macOS: prebuilt binary
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/alternayte/exspeed/releases/latest/download/exspeed-installer.sh | sh
+
+# Docker (amd64 and arm64)
+docker run -p 5933:5933 -p 8080:8080 -v exspeed-data:/var/lib/exspeed \
+  ghcr.io/alternayte/exspeed:latest
+```
+
+Windows (PowerShell): `irm https://github.com/alternayte/exspeed/releases/latest/download/exspeed-installer.ps1 | iex`.
+Every release also has plain archives on the
+[releases page](https://github.com/alternayte/exspeed/releases), and a
+[Helm chart](deploy/helm/exspeed) runs it on Kubernetes.
+
 ## Quick start
 
 ```bash
-cargo build --release -p exspeed        # or: docker run -p 5933:5933 -p 8080:8080 nayth/exspeed
-./target/release/exspeed server
+exspeed server --data-dir ./exspeed-data
 
 # in another terminal
 exspeed create orders

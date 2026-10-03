@@ -1,6 +1,7 @@
 services:
   exspeed:
-    build: ../../
+    image: ghcr.io/alternayte/exspeed:latest
+    # To run this checkout's code instead: replace `image:` with `build: ../../`
     ports:
       - "5933:5933"
       - "8080:8080"

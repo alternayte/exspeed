@@ -2247,7 +2247,7 @@ dependencies = [
 
 [[package]]
 name = "exspeed"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2293,7 +2293,7 @@ dependencies = [
 
 [[package]]
 name = "exspeed-api"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2323,7 +2323,7 @@ dependencies = [
 
 [[package]]
 name = "exspeed-bench"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2351,7 +2351,7 @@ dependencies = [
 
 [[package]]
 name = "exspeed-broker"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "bincode",
@@ -2386,7 +2386,7 @@ dependencies = [
 
 [[package]]
 name = "exspeed-client"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bytes",
  "exspeed-common",
@@ -2403,7 +2403,7 @@ dependencies = [
 
 [[package]]
 name = "exspeed-common"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bytes",
  "constant_time_eq",
@@ -2421,7 +2421,7 @@ dependencies = [
 
 [[package]]
 name = "exspeed-connectors"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2463,7 +2463,7 @@ dependencies = [
 
 [[package]]
 name = "exspeed-processing"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2489,7 +2489,7 @@ dependencies = [
 
 [[package]]
 name = "exspeed-protocol"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bincode",
  "bytes",
@@ -2504,7 +2504,7 @@ dependencies = [
 
 [[package]]
 name = "exspeed-storage"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2525,7 +2525,7 @@ dependencies = [
 
 [[package]]
 name = "exspeed-streams"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2538,7 +2538,7 @@ dependencies = [
 
 [[package]]
 name = "exspeed-testkit"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "fallible-iterator"

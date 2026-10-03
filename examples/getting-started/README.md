@@ -4,7 +4,7 @@ A minimal example showing Exspeed in action. It publishes to, reads and subscrib
 
 ## Prerequisites
 
-- **Exspeed server** running on `localhost:5933`, for example with `docker compose up -d` in this directory (it builds the server image from the repository root)
+- **Exspeed server** running on `localhost:5933`, for example with `docker compose up -d` in this directory (it runs the published `ghcr.io/alternayte/exspeed` image)
 - **Bun** installed (https://bun.sh), or Node.js 18 or later
 - The SDK built, since the example uses it from this repository: `npm ci && npm run build` in `sdks/typescript`
 

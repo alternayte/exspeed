@@ -9,13 +9,22 @@ curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/alternayte/exspeed/releases/latest/download/exspeed-installer.sh | sh
 ```
 
-**Docker:**
+On Windows (PowerShell):
+
+```powershell
+irm https://github.com/alternayte/exspeed/releases/latest/download/exspeed-installer.ps1 | iex
+```
+
+Every [release](https://github.com/alternayte/exspeed/releases) also has
+plain archives for each platform with SHA-256 checksums.
+
+**Docker** (`linux/amd64` and `linux/arm64`; `latest`, `X.Y` and `X.Y.Z` tags):
 
 ```bash
 docker run -d --name exspeed \
   -p 5933:5933 -p 8080:8080 \
   -v exspeed-data:/var/lib/exspeed \
-  nayth/exspeed:latest
+  ghcr.io/alternayte/exspeed:latest
 ```
 
 **From source** (Rust 1.94+):

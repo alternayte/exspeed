@@ -38,7 +38,7 @@ flowchart LR
 docker compose up -d
 ```
 
-This builds and starts the Exspeed server (from the repository root) and
+This starts the Exspeed server (the published `ghcr.io/alternayte/exspeed` image) and
 Postgres with the order schema pre-loaded and logical replication enabled.
 The server's `connectors.d/` and `connections.d/` directories are mounted
 from `exspeed/`, so the two connectors below start with it, and the database

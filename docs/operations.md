@@ -27,12 +27,12 @@ For every flag and environment variable, see [configuration.md](configuration.md
 ## Docker
 
 ```bash
-docker build -t exspeed .        # or use the published nayth/exspeed image
+docker build -t exspeed .        # or use the published ghcr.io/alternayte/exspeed image
 
 docker run -d --name exspeed \
   -p 5933:5933 -p 8080:8080 \
   -v exspeed-data:/var/lib/exspeed \
-  nayth/exspeed:latest
+  ghcr.io/alternayte/exspeed:latest
 ```
 
 To use a config file, mount it and point `EXSPEED_CONFIG` at it:
@@ -42,7 +42,7 @@ docker run -d --name exspeed -p 5933:5933 -p 8080:8080 \
   -v exspeed-data:/var/lib/exspeed \
   -v $PWD/exspeed.toml:/etc/exspeed/exspeed.toml:ro \
   -e EXSPEED_CONFIG=/etc/exspeed/exspeed.toml \
-  nayth/exspeed:latest
+  ghcr.io/alternayte/exspeed:latest
 ```
 
 The image runs `exspeed server --data-dir /var/lib/exspeed` and has a
@@ -218,7 +218,7 @@ spec:
     fsGroup: 1000          # so the PV is writable by uid 1000
   containers:
     - name: exspeed
-      image: nayth/exspeed:latest
+      image: ghcr.io/alternayte/exspeed:latest
       ...
 ```
 

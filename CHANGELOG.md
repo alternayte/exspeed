@@ -7,11 +7,80 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-The rebuild from the [October 2026 review](docs/history/2026-10-review.md). Breaking changes
-throughout. Nothing is compatible with 0.5.x: wire protocol, on-disk format,
-connector config and SDK API all change.
+## [0.6.0] — 2026-10-03
 
-### Storage (Phase 1)
+**TL;DR:** Exspeed 0.6 is a ground-up rebuild of the broker for correctness.
+Writes you get an acknowledgement for are never lost: not on a crash, not
+on a full disk, not on a failover. Consumers now work like NATS JetStream
+(acks, redelivery, dead letters, work shared across app instances). ExQL
+runs real SQL on Apache DataFusion, connectors are checkpointed and tested
+against the real systems they talk to, and multi-node clusters replicate
+every stream. It is also faster: on the same machine with every broker
+syncing to disk, Exspeed published about 4.5× as many messages per second as
+Kafka and drained a backlog about 3.5× faster. Nothing is compatible with
+0.5: read **Upgrading** below before you install it.
+
+### What's new
+
+- **Data you can trust.** A new storage engine with group commit, crash-safe
+  recovery and lock-free reads. A full disk returns a clean `507` instead of
+  corrupting data. Tested by killing the server mid-write in a loop and by
+  filling a real disk.
+- **Consumers that behave.** Push and pull delivery, per-message ack, nack,
+  term and in-progress, ack timeouts, redelivery with backoff, a maximum
+  delivery count and dead-letter streams. One consumer can be shared by many
+  app instances to split the work.
+- **Duplicate-free retries.** Give a message a `msg_id` and a retry within
+  the dedup window (5 minutes by default) never creates a duplicate, on
+  every write path and across failover.
+- **SQL that works.** ExQL bounded queries run on Apache DataFusion (joins,
+  aggregates, window functions, subqueries, JSON fields as numbers).
+  Continuous queries add event-time windows, stream joins, materialized
+  tables and checkpointed state; a restart never duplicates their output.
+- **Connectors you can rely on.** Postgres CDC, outbox and poll; JDBC sink
+  and poll for Postgres, MySQL and SQL Server; SQL Server CDC; RabbitMQ;
+  S3; HTTP poll, sink and webhooks. Each one checkpoints only after data is
+  safe and has a crash-and-resume test against the real service.
+- **High availability.** Run several nodes behind a Postgres or Redis lease:
+  every stream is replicated, a deposed leader can't accept writes, `acks =
+  all` or `quorum` guarantees acknowledged writes survive a failover, and
+  readers never see a record a failover could still drop. Traffic between
+  nodes can use TLS.
+- **Easier to run.** One `exspeed.toml` config file, a Helm chart, graceful
+  shutdown, online backup and restore, an OpenAPI spec, Prometheus metrics
+  with consistent `exspeed_` names, and a Docker image for amd64 and arm64
+  on `ghcr.io/alternayte/exspeed`.
+- **Clients.** The TypeScript SDK (`@exspeed/sdk`) and a Rust client speak
+  the new protocol, with automatic reconnect, leader discovery and
+  pipelined publishing.
+
+### Upgrading from 0.5
+
+0.6 changes the wire protocol, the on-disk format, connector configs, the
+SDK API and the metric names. There is no in-place upgrade:
+
+- Start 0.6 on an **empty data directory** (0.6 refuses a 0.5 one) and
+  re-create streams, consumers and connectors.
+- Update clients to `@exspeed/sdk` 0.6 or the matching `exspeed-client`.
+- Connector configs: `plugin = "postgres"` is now `postgres_cdc` or
+  `postgres_poll`, settings are typed, and unknown keys are rejected. Run
+  `exspeed connector validate <file>` on each config.
+- Dashboards and alerts: every metric is now named `exspeed_*` (see
+  `docs/operations.md`).
+- Every node of a cluster must run the same version.
+
+### Get it
+
+- Docker (amd64 and arm64): `docker pull ghcr.io/alternayte/exspeed:0.6.0`
+- Prebuilt binaries and installers: below.
+- Documentation: [`docs/`](https://github.com/alternayte/exspeed/tree/v0.6.0/docs).
+
+The detailed change list follows.
+
+<details>
+<summary>Full list of changes</summary>
+
+#### Storage
 
 - New file engine: a writer thread per partition with group commit, readers
   that take no locks, a high watermark (readers only see durable data),
@@ -31,7 +100,7 @@ connector config and SDK API all change.
   and truncation work as before. The connection writer flushes once per
   burst of queued frames instead of once per frame.
 
-### Consumers and client protocol v2 (Phase 2)
+#### Consumers and client protocol v2
 
 - New binary protocol ([docs/protocol.md](docs/protocol.md)), version byte 2.
   A `WireRecord` is the stored record: `u32 len`, `u32 crc` (CRC32C, which
@@ -64,7 +133,7 @@ connector config and SDK API all change.
 - New Rust client crate `exspeed-client`, with a coalescing publisher.
   `exspeed tail` no longer goes through SQL.
 
-### Operations (Phase 3)
+#### Operations
 
 - Online backup: `GET /api/v1/backup` (global admin, leader) streams a tar
   archive while writes continue. Each stream is a point-in-time copy of
@@ -97,7 +166,7 @@ connector config and SDK API all change.
   each system's own perf tools; no comparison numbers are published until
   they are run on the same hardware.
 
-### Connectors v2 (Phase 5)
+#### Connectors
 
 - A supervisor per connector (starting/running/backoff/failed/stopped):
   restarts with backoff, catches panics, and reports status, last error,
@@ -140,7 +209,7 @@ connector config and SDK API all change.
     once for each returned message in the batch. The rest of the batch is
     now settled from the publisher confirms that were already received.
 
-### High availability (Phase 6)
+#### High availability
 
 - Clusters are now safe to run: Kafka-style pull replication with leader
   epochs replaces the old push replication. Every stream replicates,
@@ -177,7 +246,7 @@ connector config and SDK API all change.
   acknowledged writes, divergent-leader truncation, follower restart and
   `min_insync_replicas`. A shared conformance suite runs against the
   memory, Postgres and Redis lease backends.
-### Cluster metadata in the log (Phase 6)
+#### Cluster metadata in the log
 
 - ExQL query definitions, ExQL connections and API-created connector configs
   move from node-local files into compacted internal streams written through
@@ -193,7 +262,7 @@ connector config and SDK API all change.
   be deleted through the API (`409`); unparseable `connections.d/` files are
   logged instead of silently skipped.
 
-### Crash safety and HA hardening
+#### Crash safety and HA hardening
 
 - Kill -9 loop tests against the real server binary, under concurrent
   single and batch publishes and a pulling consumer.
@@ -209,7 +278,7 @@ connector config and SDK API all change.
 - Jepsen-style randomized partition and restart test, and a kill -9 test
   of a real three-process cluster on a Postgres lease.
 
-### Re-audit fixes
+#### Fixes from the final review
 
 Every finding in `docs/history/2026-10-review.md` was re-checked; §7 there lists each one
 with the test that proves it.
@@ -292,6 +361,8 @@ with the test that proves it.
   (`EXSPEED_HEALTHCHECK_URL` overrides).
 - In-process servers accept pre-bound listeners
   (`ServerArgs::tcp_listener` / `api_listener`).
+
+</details>
 
 ## [0.5.0] — 2026-04-24
 
