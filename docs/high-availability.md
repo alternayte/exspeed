@@ -248,7 +248,7 @@ sequenceDiagram
   B->>B: stop following, stamp epoch 8, rebuild dedup
   Note over B: writes open, /healthz = 200
   A->>LB: (on return) lease held by B
-  A->>B: fetch as follower; truncate unreplicated writes
+  A->>B: fetch as follower, truncate unreplicated writes
 ```
 
 | Event | Writes unavailable for about |
