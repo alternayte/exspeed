@@ -194,8 +194,11 @@ helm install exspeed deploy/helm/exspeed \
   ([protocol.md](protocol.md)). Behind a load balancer, route to the node
   whose `/healthz` returns 200.
 
-Reads (`Read`, `StreamInfo`, `ListStreams`) work on followers and return
-replicated data. Writes and consumers need the leader.
+Client-protocol reads (`Read`, `StreamInfo`, `ListStreams`, `Query`) work on
+followers and return replicated data. Writes and consumers need the leader.
+The HTTP API answers only on the leader (503 with the leader's address
+elsewhere), except the probes, `/metrics`, `/api/v1/cluster`,
+`/api/v1/leases` and `/api/v1/whoami`.
 
 ### Failover timing
 

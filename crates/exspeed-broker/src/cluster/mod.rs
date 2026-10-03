@@ -229,7 +229,7 @@ impl Cluster {
             "node_id": self.cfg.node_id,
             "role": if is_leader { "leader" } else { "follower" },
             "epoch": lease.as_ref().map(|l| l.epoch),
-            "leader": lease.as_ref().filter(|l| l.is_live()).map(|l| serde_json::json!({
+            "leader": lease.as_ref().filter(|l| is_leader || l.is_live()).map(|l| serde_json::json!({
                 "node_id": l.holder,
                 "client_endpoint": l.client_endpoint,
                 "replication_endpoint": l.replication_endpoint,
