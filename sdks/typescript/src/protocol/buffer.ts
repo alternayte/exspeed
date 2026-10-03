@@ -169,6 +169,19 @@ export class Reader {
     return Number(v);
   }
 
+  /** A `u64` that may exceed 2^53 (e.g. nanosecond timestamps). */
+  u64big(): bigint {
+    this.need(8);
+    const v = this.buf.readBigUInt64LE(this.pos);
+    this.pos += 8;
+    return v;
+  }
+
+  /** The next `n` bytes, without a length prefix (a zero-copy view). */
+  raw(n: number): Buffer {
+    return this.take(n);
+  }
+
   private take(n: number): Buffer {
     this.need(n);
     const out = n === 0 ? EMPTY : this.buf.subarray(this.pos, this.pos + n);

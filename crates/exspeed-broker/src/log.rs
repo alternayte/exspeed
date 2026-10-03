@@ -520,6 +520,15 @@ impl StorageEngine for LogBackedStorage {
         self.log.storage.read_batch(stream, from, limits).await
     }
 
+    async fn read_raw(
+        &self,
+        stream: &StreamName,
+        from: exspeed_common::Offset,
+        limits: exspeed_streams::ReadLimits,
+    ) -> Result<exspeed_streams::RawBatch, StorageError> {
+        self.log.storage.read_raw(stream, from, limits).await
+    }
+
     async fn read_with_hints(
         &self,
         stream: &StreamName,

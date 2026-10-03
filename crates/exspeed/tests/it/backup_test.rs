@@ -31,7 +31,7 @@ fn assert_identical(a: &[WireRecord], b: &[WireRecord], stream: &str) {
     assert_eq!(a.len(), b.len(), "{stream}: record count");
     for (x, y) in a.iter().zip(b) {
         assert_eq!(x.offset, y.offset, "{stream}");
-        assert_eq!(x.timestamp_ms, y.timestamp_ms, "{stream}@{}", x.offset);
+        assert_eq!(x.timestamp_ns, y.timestamp_ns, "{stream}@{}", x.offset);
         assert_eq!(x.subject, y.subject, "{stream}@{}", x.offset);
         assert_eq!(x.key, y.key, "{stream}@{}", x.offset);
         assert_eq!(x.value, y.value, "{stream}@{}", x.offset);

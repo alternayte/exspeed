@@ -5,6 +5,8 @@ export class StreamRecord {
   readonly offset: number;
   /** Append time, ms since the Unix epoch. */
   readonly timestamp: number;
+  /** Append time, ns since the Unix epoch (full precision). */
+  readonly timestampNs: bigint;
   readonly subject: string;
   readonly key: Buffer | null;
   readonly value: Buffer;
@@ -13,7 +15,8 @@ export class StreamRecord {
 
   constructor(r: WireRecord) {
     this.offset = r.offset;
-    this.timestamp = r.timestampMs;
+    this.timestamp = Number(r.timestampNs / 1_000_000n);
+    this.timestampNs = r.timestampNs;
     this.subject = r.subject;
     this.key = r.key;
     this.value = r.value;

@@ -65,11 +65,34 @@ Decoders reject truncated payloads and trailing bytes.
 : `str subject`, `opt<bytes> key`, `bytes value`, `headers`, `opt<str> msg_id`
 
 **WireRecord**
-: `u64 offset`, `u64 timestamp_ms`, `u16 delivery_count`, `str subject`,
-  `opt<bytes> key`, `bytes value`, `headers`
+: `u32 len`, `u32 crc`, `u16 delivery_count`, `u64 offset`,
+  `u64 timestamp_ns`, `str subject`, `opt<bytes> key`, `bytes value`,
+  `headers`
 
-`delivery_count` is 1 on first delivery and goes up on each redelivery. It is
-0 for stateless reads.
+| Bytes | Field | Notes |
+|-------|-------|-------|
+| 0–3 | `len` | Bytes after this field (record size − 4). A record is at least 35 bytes, so `len` ≥ 31. |
+| 4–7 | `crc` | CRC32C (Castagnoli) of bytes 10..end: everything after `delivery_count`. |
+| 8–9 | `delivery_count` | 1 on first delivery, +1 on each redelivery, 0 for stateless reads. Not covered by the CRC. |
+| 10–17 | `offset` | |
+| 18–25 | `timestamp_ns` | Append time, **nanoseconds** since the Unix epoch. |
+| 26– | `subject`, `key`, `value`, `headers` | Encoded as in `PublishRecord`. |
+
+This is byte for byte how the server stores records in its segment files,
+so it can answer `Read`, `Pull` and push deliveries by copying records out
+of the file: the length prefix gives record boundaries without parsing, and
+`delivery_count` sits at a fixed position outside the CRC so the server can
+set it in place. Decoders must check that `len` matches the fields it
+contains. Clients should verify the CRC (the Rust client does; the
+TypeScript SDK exposes `verifyRecordCrc` but doesn't call it by default,
+since a JavaScript CRC costs more than the rest of decoding). Records in a
+`vec<WireRecord>` follow each other with no padding.
+
+> **Changed during the rebuild, without a version bump.** Earlier builds of
+> protocol v2 encoded a `WireRecord` as `u64 offset, u64 timestamp_ms,
+> u16 delivery_count, …` with no length or CRC. The version byte stays `2`
+> because nothing is deployed yet, so there is no negotiation: clients and
+> servers from before and after this change can't talk to each other.
 
 **StreamSpec**
 : `str name`, `u64 max_age_secs`, `u64 max_bytes`, `u64 dedup_window_secs`,

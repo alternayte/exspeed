@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use exspeed_common::{validate_resource_name, Metrics, StreamName, SubjectFilters};
-use exspeed_protocol::client::{ConsumerSpec, DeliverPolicy, SeekTo, WireRecord};
+use exspeed_protocol::client::{ConsumerSpec, DeliverPolicy, EncodedRecords, SeekTo};
 use exspeed_streams::StorageError;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, RwLock};
@@ -35,17 +35,13 @@ use self::core::{ConsumerStats, Core};
 use self::store::ConsumerStore;
 use crate::log::Log;
 
-pub use self::actor::to_wire;
-
 /// Event sent to a push subscriber.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubEvent {
-    Deliver(Vec<WireRecord>),
+    /// Records in wire encoding, delivery counts already set.
+    Deliver(EncodedRecords),
     /// No more deliveries for this subscription.
-    Ended {
-        code: u16,
-        message: String,
-    },
+    Ended { code: u16, message: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -416,7 +412,7 @@ impl ConsumerManager {
         max_messages: u32,
         max_bytes: u32,
         expires: Duration,
-    ) -> Result<Vec<WireRecord>, ConsumerError> {
+    ) -> Result<EncodedRecords, ConsumerError> {
         let (reply, rx) = oneshot::channel();
         self.send(
             name,

@@ -6,6 +6,7 @@
  */
 import { ProtocolError } from "../errors.js";
 import { Reader, Writer, type Headers } from "./buffer.js";
+import { crc32c } from "./crc32c.js";
 import { OpCode } from "./constants.js";
 import { encodeFrame } from "./frame.js";
 
@@ -22,10 +23,16 @@ export interface WirePublishRecord {
   msgId: string | null;
 }
 
-/** `WireRecord`: u64 offset, u64 timestamp_ms, u16 delivery_count, str subject, opt<bytes> key, bytes value, headers. */
+/**
+ * `WireRecord`: u32 len (bytes after this field), u32 crc (CRC32C of the
+ * bytes after delivery_count), u16 delivery_count, u64 offset, u64
+ * timestamp_ns, str subject, opt<bytes> key, bytes value, headers. This is
+ * also how the server stores records on disk.
+ */
 export interface WireRecord {
   offset: number;
-  timestampMs: number;
+  /** Append time, nanoseconds since the Unix epoch. */
+  timestampNs: bigint;
   deliveryCount: number;
   subject: string;
   key: Buffer | null;
@@ -437,14 +444,37 @@ export function responseOpcode(resp: Response): OpCode {
   return RESPONSE_OPCODES[resp.type];
 }
 
+/** Size of the smallest valid record. */
+export const MIN_RECORD_LEN = 35;
+const CRC_START = 10;
+
+/** Encode one record (length, CRC, delivery count, fields). */
+export function encodeRecord(r: WireRecord): Buffer {
+  const body = new Writer();
+  body.u64(r.offset);
+  body.u64(r.timestampNs);
+  body.str(r.subject);
+  body.opt(r.key, (w, k) => w.bytes(k));
+  body.bytes(r.value);
+  body.headers(r.headers);
+  const b = body.finish();
+  return new Writer(CRC_START + b.length)
+    .u32(CRC_START - 4 + b.length)
+    .u32(crc32c(b))
+    .u16(r.deliveryCount)
+    .raw(b)
+    .finish();
+}
+
+/** Whether a complete encoded record's CRC matches its contents. */
+export function verifyRecordCrc(record: Uint8Array): boolean {
+  if (record.length < MIN_RECORD_LEN) return false;
+  const view = new DataView(record.buffer, record.byteOffset, record.byteLength);
+  return view.getUint32(4, true) === crc32c(record.subarray(CRC_START));
+}
+
 function writeRecord(w: Writer, r: WireRecord): void {
-  w.u64(r.offset);
-  w.u64(r.timestampMs);
-  w.u16(r.deliveryCount);
-  w.str(r.subject);
-  w.opt(r.key, (w, k) => w.bytes(k));
-  w.bytes(r.value);
-  w.headers(r.headers);
+  w.raw(encodeRecord(r));
 }
 
 function writeRecords(w: Writer, records: WireRecord[]): void {
@@ -517,20 +547,26 @@ export function responseFrame(resp: Response, correlationId: number): Buffer {
 }
 
 function readRecord(r: Reader): WireRecord {
-  return {
-    offset: r.u64(),
-    timestampMs: r.u64(),
-    deliveryCount: r.u16(),
-    subject: r.str(),
-    key: r.opt((r) => r.bytes()),
-    value: r.bytes(),
-    headers: r.headers(),
+  const len = r.u32();
+  if (len + 4 < MIN_RECORD_LEN) throw new ProtocolError(`record length ${len + 4} too small`);
+  const rr = new Reader(r.raw(len));
+  rr.u32(); // CRC (see verifyRecordCrc)
+  const deliveryCount = rr.u16();
+  const rec: WireRecord = {
+    offset: rr.u64(),
+    timestampNs: rr.u64big(),
+    deliveryCount,
+    subject: rr.str(),
+    key: rr.opt((r) => r.bytes()),
+    value: rr.bytes(),
+    headers: rr.headers(),
   };
+  rr.finish();
+  return rec;
 }
 
 function readRecords(r: Reader): WireRecord[] {
-  // Smallest record: 8 + 8 + 2 + 2 + 1 + 4 + 2 = 27 bytes.
-  const n = r.count(27);
+  const n = r.count(MIN_RECORD_LEN);
   const out: WireRecord[] = [];
   for (let i = 0; i < n; i++) out.push(readRecord(r));
   return out;

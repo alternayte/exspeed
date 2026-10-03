@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod error;
 pub mod metrics;
+pub mod record_format;
 pub mod subject;
 pub mod types;
 
