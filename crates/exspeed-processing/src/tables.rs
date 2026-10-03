@@ -99,6 +99,21 @@ impl MaterializedTable {
         g.version += 1;
     }
 
+    /// Upsert by key string (restoring from a changelog, where only the
+    /// rendered key is known).
+    pub fn upsert_str(&self, key: String, row: Vec<ScalarValue>) {
+        let mut g = self.inner.write().unwrap();
+        g.rows.insert(key, (vec![], row));
+        g.version += 1;
+    }
+
+    pub fn delete_str(&self, key: &str) {
+        let mut g = self.inner.write().unwrap();
+        if g.rows.remove(key).is_some() {
+            g.version += 1;
+        }
+    }
+
     pub fn delete(&self, key: &[ScalarValue]) {
         let mut g = self.inner.write().unwrap();
         if g.rows.remove(&key_string(key)).is_some() {

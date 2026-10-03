@@ -311,6 +311,39 @@ pub fn scalar_to_text(v: &ScalarValue) -> Option<String> {
     }
 }
 
+/// Convert a JSON value back to a scalar of `field`'s type (used to restore
+/// table rows from changelog records). Values that don't fit become NULL.
+pub fn json_to_scalar(v: &Json, field: &Field) -> ScalarValue {
+    let ty = field.data_type();
+    let null = || ScalarValue::try_from(ty).unwrap_or(ScalarValue::Null);
+    if v.is_null() {
+        return null();
+    }
+    let text = match v {
+        Json::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let direct = match (ty, v) {
+        (DataType::Utf8, _) => Some(ScalarValue::Utf8(Some(text.clone()))),
+        (DataType::LargeUtf8, _) => Some(ScalarValue::LargeUtf8(Some(text.clone()))),
+        (DataType::Utf8View, _) => Some(ScalarValue::Utf8View(Some(text.clone()))),
+        (DataType::Boolean, Json::Bool(b)) => Some(ScalarValue::Boolean(Some(*b))),
+        (DataType::Int64, Json::Number(n)) => n.as_i64().map(|x| ScalarValue::Int64(Some(x))),
+        (DataType::UInt64, Json::Number(n)) => n.as_u64().map(|x| ScalarValue::UInt64(Some(x))),
+        (DataType::Float64, Json::Number(n)) => n.as_f64().map(|x| ScalarValue::Float64(Some(x))),
+        (DataType::Timestamp(TimeUnit::Millisecond, tz), Json::String(s)) => {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|d| ScalarValue::TimestampMillisecond(Some(d.timestamp_millis()), tz.clone()))
+        }
+        _ => None,
+    };
+    if let Some(x) = direct {
+        return x;
+    }
+    ScalarValue::Utf8(Some(text)).cast_to(ty).unwrap_or_else(|_| null())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

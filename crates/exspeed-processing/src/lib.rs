@@ -3,7 +3,9 @@
 pub mod ast;
 pub mod bounded;
 pub mod catalog;
+pub mod continuous;
 pub mod convert;
+pub mod engine;
 pub mod error;
 pub mod external;
 pub mod json_rule;
@@ -15,3 +17,10 @@ pub mod udfs;
 
 #[cfg(test)]
 mod bounded_tests;
+
+pub use bounded::QueryResult;
+pub use engine::{
+    DesiredState, ExqlEngine, QueryDef, QueryInfo, QueryKind, StatementResult, TableInfo,
+};
+pub use error::ExqlError;
+pub use session::ExqlConfig;

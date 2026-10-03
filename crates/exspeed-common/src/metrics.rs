@@ -118,6 +118,9 @@ pub struct Metrics {
     pub replication_lag_records: Gauge<i64>,
     /// Follower-side: records successfully applied to local storage.
     pub replication_records_applied_total: Counter<u64>,
+    /// Records an ExQL continuous query dropped because they arrived after
+    /// the watermark (later than the query's GRACE PERIOD). Labeled `query`.
+    pub exql_late_records_total: Counter<u64>,
     /// Replication wire bytes, labeled `direction=in|out`.
     pub replication_bytes_total: Counter<u64>,
     /// Records truncated on a follower due to divergent-history recovery,
@@ -276,6 +279,10 @@ impl Metrics {
             .u64_counter("exspeed_replication_records_applied_total")
             .build();
         let replication_bytes_total = meter.u64_counter("exspeed_replication_bytes_total").build();
+        let exql_late_records_total = meter
+            .u64_counter("exspeed_exql_late_records_total")
+            .with_description("Records dropped by continuous queries for arriving after the watermark")
+            .build();
         let replication_truncated_records_total = meter
             .u64_counter("exspeed_replication_truncated_records_total")
             .build();
@@ -422,6 +429,7 @@ impl Metrics {
             replication_lag_seconds,
             replication_lag_records,
             replication_records_applied_total,
+            exql_late_records_total,
             replication_bytes_total,
             replication_truncated_records_total,
             replication_reseed_total,
@@ -711,5 +719,11 @@ impl Metrics {
     pub fn set_replication_lag_records(&self, stream: &str, records: i64) {
         self.replication_lag_records
             .record(records, &[KeyValue::new("stream", stream.to_string())]);
+    }
+
+    /// Count records a continuous query dropped as late.
+    pub fn record_exql_late(&self, query: &str, n: u64) {
+        self.exql_late_records_total
+            .add(n, &[KeyValue::new("query", query.to_string())]);
     }
 }
