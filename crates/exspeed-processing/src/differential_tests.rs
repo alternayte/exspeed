@@ -201,7 +201,7 @@ fn expand(template: &str, exql: bool) -> String {
         let inner = &rest[i + 1..j];
         if exql {
             match inner.split_once('.') {
-                Some((a, c)) if c == "k" => out.push_str(&format!("{a}.key")),
+                Some((a, "k")) => out.push_str(&format!("{a}.key")),
                 Some((a, c)) => out.push_str(&format!("{a}.payload->>'{c}'")),
                 None if inner == "k" => out.push_str("key"),
                 None => out.push_str(&format!("payload->>'{inner}'")),

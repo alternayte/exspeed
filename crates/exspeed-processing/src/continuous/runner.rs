@@ -116,6 +116,9 @@ pub struct RunCtx {
     pub metrics: Option<Arc<Metrics>>,
 }
 
+/// A group's output: row values, payload, record key.
+type GroupRow = (Vec<ScalarValue>, Map<String, Json>, Option<String>);
+
 /// One output row (or table delete) ready to be written.
 struct OutItem {
     idem: String,
@@ -603,13 +606,7 @@ impl Runner {
     fn group_outputs(
         &mut self,
         keys: &[Vec<u8>],
-    ) -> Result<
-        Vec<(
-            Vec<ScalarValue>,
-            Option<(Vec<ScalarValue>, Map<String, Json>, Option<String>)>,
-        )>,
-        ExqlError,
-    > {
+    ) -> Result<Vec<(Vec<ScalarValue>, Option<GroupRow>)>, ExqlError> {
         let agg = self.df.agg.as_mut().expect("aggregate");
         let mut rows = vec![];
         let mut kvs = vec![];
@@ -797,12 +794,7 @@ impl Runner {
         Ok(items)
     }
 
-    fn group_item(
-        &self,
-        idem: String,
-        kv: Vec<ScalarValue>,
-        row: Option<(Vec<ScalarValue>, Map<String, Json>, Option<String>)>,
-    ) -> OutItem {
+    fn group_item(&self, idem: String, kv: Vec<ScalarValue>, row: Option<GroupRow>) -> OutItem {
         match row {
             Some((values, payload, rk)) => {
                 let subject = self

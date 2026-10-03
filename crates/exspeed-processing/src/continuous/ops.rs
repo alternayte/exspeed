@@ -638,6 +638,7 @@ impl StreamJoin {
 
     /// Join new rows of both sides (already through their side chains).
     /// Rows with event time before `late_wm` are late and dropped.
+    #[allow(clippy::needless_range_loop)]
     pub fn process(
         &mut self,
         left: Rows,
@@ -827,6 +828,7 @@ impl StreamJoin {
         ))
     }
 
+    #[allow(clippy::needless_range_loop)]
     fn side_restore(&self, side: &SideDef, batch: &RecordBatch) -> Result<SideBuf, ExqlError> {
         let nf = side.schema.fields().len();
         let n = batch.num_rows();
@@ -875,6 +877,9 @@ impl StreamJoin {
 // Stream-table join
 // ---------------------------------------------------------------------------
 
+/// Table rows by join key.
+type LookupIndex = HashMap<Vec<u8>, Vec<Vec<ScalarValue>>>;
+
 /// Lookup join of a stream against a materialized table that updates live.
 pub struct TableJoin {
     pub stream: SideDef,
@@ -889,7 +894,7 @@ pub struct TableJoin {
     pub filter: Option<Arc<dyn PhysicalExpr>>,
     pub out_schema: SchemaRef,
     keys: KeyEncoder,
-    cache: Option<(u64, HashMap<Vec<u8>, Vec<Vec<ScalarValue>>>)>,
+    cache: Option<(u64, LookupIndex)>,
 }
 
 impl TableJoin {
@@ -949,6 +954,7 @@ impl TableJoin {
         Ok(())
     }
 
+    #[allow(clippy::needless_range_loop)]
     pub fn process(&mut self, rows: Rows) -> Result<Rows, ExqlError> {
         if rows.is_empty() {
             return Ok(Rows::empty(self.out_schema.clone()));

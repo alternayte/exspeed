@@ -189,14 +189,14 @@ fn unnest(e: &Expr) -> &Expr {
 /// Whether a JSON-operator chain starts at a qualified column (`a.payload`).
 fn qualified_arrow(e: &Expr) -> bool {
     match unnest(e) {
-        Expr::BinaryOp { left, op, .. }
-            if matches!(op, BinaryOperator::Arrow | BinaryOperator::LongArrow) =>
-        {
-            match unnest(left) {
-                Expr::CompoundIdentifier(_) => true,
-                other => qualified_arrow(other),
-            }
-        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Arrow | BinaryOperator::LongArrow,
+            ..
+        } => match unnest(left) {
+            Expr::CompoundIdentifier(_) => true,
+            other => qualified_arrow(other),
+        },
         _ => false,
     }
 }

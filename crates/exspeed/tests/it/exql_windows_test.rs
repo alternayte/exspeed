@@ -96,47 +96,6 @@ fn publish_frame(stream: &str, subject: &str, value: &[u8], corr: u32) -> Frame 
     Frame::new(OpCode::Publish, corr, buf.freeze())
 }
 
-/// Create a stream via HTTP, then publish `records` via TCP.
-async fn setup_stream(stream_name: &str, records: &[(&str, &str)], tcp_addr: &str, http_url: &str) {
-    let client = reqwest::Client::new();
-
-    let resp = client
-        .post(format!("{}/api/v1/streams", http_url))
-        .json(&serde_json::json!({"name": stream_name}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        201,
-        "failed to create stream '{}'",
-        stream_name
-    );
-
-    let (mut reader, mut writer) = connect_to(tcp_addr).await;
-    let resp = send_recv(&mut writer, &mut reader, connect_frame(1)).await;
-    assert_eq!(
-        resp.opcode,
-        OpCode::ConnectOk,
-        "CONNECT should return ConnectOk"
-    );
-
-    for (i, (subject, payload)) in records.iter().enumerate() {
-        let resp = send_recv(
-            &mut writer,
-            &mut reader,
-            publish_frame(stream_name, subject, payload.as_bytes(), 10 + i as u32),
-        )
-        .await;
-        assert_eq!(
-            resp.opcode,
-            OpCode::PublishOk,
-            "PUBLISH record {} should return PublishOk",
-            i
-        );
-    }
-}
-
 /// POST a statement; return (status, body).
 async fn post_sql(http_url: &str, sql: &str) -> (u16, Value) {
     let resp = reqwest::Client::new()
