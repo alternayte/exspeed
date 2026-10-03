@@ -104,6 +104,23 @@ async fn write_frame<W: AsyncWrite + Unpin>(
     w: &mut BufWriter<W>,
     f: &OutFrame,
 ) -> std::io::Result<()> {
+    // Read/pull/push batches are budgeted so a frame never exceeds the
+    // limit; should one ever do, every decoder would drop the connection,
+    // so answer with an error instead.
+    if let Err(e) = f.check_size() {
+        tracing::error!(opcode = ?f.opcode, error = %e, "response exceeds the frame limit");
+        let err: OutFrame = Response::error(code::INTERNAL, format!("response not sent: {e}"))
+            .into_frame(f.correlation_id)
+            .into();
+        return write_frame_parts(w, &err).await;
+    }
+    write_frame_parts(w, f).await
+}
+
+async fn write_frame_parts<W: AsyncWrite + Unpin>(
+    w: &mut BufWriter<W>,
+    f: &OutFrame,
+) -> std::io::Result<()> {
     w.write_all(&f.header()).await?;
     w.write_all(&f.head).await?;
     for chunk in &f.body {
@@ -1044,7 +1061,7 @@ async fn read(
         max_bytes: if max_bytes == 0 {
             1024 * 1024
         } else {
-            (max_bytes as usize).min(8 * 1024 * 1024)
+            (max_bytes as usize).min(exspeed_common::MAX_RECORDS_BYTES_PER_FRAME)
         },
     };
     let deadline = tokio::time::Instant::now() + wait.min(Duration::from_secs(300));

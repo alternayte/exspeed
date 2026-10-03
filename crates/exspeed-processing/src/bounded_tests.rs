@@ -405,10 +405,22 @@ async fn timeout_and_memory_limit() {
 async fn order_by_offset_honours_limit_and_offset() {
     let (_s, r, _d) = setup(&amounts()).await;
     for (sql, want) in [
-        ("SELECT offset FROM orders ORDER BY offset LIMIT 2", vec![0, 1]),
-        ("SELECT offset FROM orders ORDER BY offset ASC LIMIT 2", vec![0, 1]),
-        ("SELECT offset FROM orders ORDER BY offset LIMIT 2 OFFSET 1", vec![1, 2]),
-        ("SELECT offset FROM orders ORDER BY offset DESC LIMIT 2", vec![4, 3]),
+        (
+            "SELECT offset FROM orders ORDER BY offset LIMIT 2",
+            vec![0, 1],
+        ),
+        (
+            "SELECT offset FROM orders ORDER BY offset ASC LIMIT 2",
+            vec![0, 1],
+        ),
+        (
+            "SELECT offset FROM orders ORDER BY offset LIMIT 2 OFFSET 1",
+            vec![1, 2],
+        ),
+        (
+            "SELECT offset FROM orders ORDER BY offset DESC LIMIT 2",
+            vec![4, 3],
+        ),
         ("SELECT offset FROM orders LIMIT 3", vec![0, 1, 2]),
         (
             "SELECT offset FROM (SELECT offset FROM orders ORDER BY offset LIMIT 2) t",
@@ -444,7 +456,12 @@ async fn json_arrow_and_big_integers_compare_numerically() {
     .unwrap();
     assert_eq!(
         res.rows,
-        vec![vec![json!(2)], vec![json!(0)], vec![json!(1)], vec![json!(3)]]
+        vec![
+            vec![json!(2)],
+            vec![json!(0)],
+            vec![json!(1)],
+            vec![json!(3)]
+        ]
     );
 
     // Integers above 2^53 compare exactly against integers.
@@ -475,5 +492,8 @@ async fn json_arrow_and_big_integers_compare_numerically() {
     )
     .await
     .unwrap();
-    assert_eq!(res.rows, vec![vec![json!(1000.0), json!(25.5), json!("us")]]);
+    assert_eq!(
+        res.rows,
+        vec![vec![json!(1000.0), json!(25.5), json!("us")]]
+    );
 }

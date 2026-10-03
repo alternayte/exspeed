@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use exspeed_common::record_format;
-use exspeed_common::{Metrics, Offset, StreamName, SubjectFilters};
+use exspeed_common::{Metrics, Offset, StreamName, SubjectFilters, MAX_RECORDS_BYTES_PER_FRAME};
 use exspeed_protocol::client::{code, EncodedRecords, SeekTo};
 use exspeed_streams::{ReadLimits, Record, StorageError, StoredRecord};
 use tokio::sync::{mpsc, oneshot};
@@ -89,12 +89,16 @@ struct PullWaiter {
     max_bytes: usize,
     deadline: Instant,
     records: EncodedRecords,
+    /// The next record didn't fit in the remaining byte budget: answer now
+    /// instead of waiting for the deadline.
+    stuffed: bool,
     reply: oneshot::Sender<Result<EncodedRecords, ConsumerError>>,
 }
 
 impl PullWaiter {
     fn full(&self) -> bool {
-        self.records.count() as usize >= self.max_messages
+        self.stuffed
+            || self.records.count() as usize >= self.max_messages
             || self.records.byte_len() >= self.max_bytes
     }
 }
@@ -268,13 +272,15 @@ impl Actor {
             } => {
                 self.pulls.push_back(PullWaiter {
                     max_messages: max_messages.clamp(1, 10_000) as usize,
+                    // Capped like Read so the `Messages` frame fits.
                     max_bytes: if max_bytes == 0 {
                         4 * 1024 * 1024
                     } else {
-                        (max_bytes as usize).min(8 * 1024 * 1024)
+                        (max_bytes as usize).min(MAX_RECORDS_BYTES_PER_FRAME)
                     },
                     deadline: now + expires.min(Duration::from_secs(300)),
                     records: EncodedRecords::new(),
+                    stuffed: false,
                     reply,
                 });
                 self.caught_up = false;
@@ -413,11 +419,32 @@ impl Actor {
         self.pulls = keep;
     }
 
-    /// Pick the next taker with room: pull waiters first, then push
-    /// subscribers round-robin. Returns a slot index understood by `give`.
-    fn next_taker(&mut self) -> Option<Taker> {
-        if let Some(i) = self.pulls.iter().position(|p| !p.full()) {
-            return Some(Taker::Pull(i));
+    /// Whether any taker has room for at least one more record.
+    fn has_room(&self) -> bool {
+        self.pulls.iter().any(|p| !p.full())
+            || self.subs.iter().any(|s| s.credits > 0 && !s.tx.is_closed())
+    }
+
+    /// Pick the next taker with room for a record of `size` encoded bytes:
+    /// pull waiters first, then push subscribers round-robin. Returns a slot
+    /// index understood by `give`. `pending` is the run not yet handed over
+    /// (its bytes count against its pull waiter's budget). A pull waiter
+    /// that already holds records and has no room left for this one is
+    /// marked stuffed, so it is answered instead of overflowing its
+    /// `Messages` frame; its first record always fits.
+    fn next_taker(&mut self, size: usize, pending: Option<&Run>) -> Option<Taker> {
+        for (i, p) in self.pulls.iter_mut().enumerate() {
+            if p.full() {
+                continue;
+            }
+            let run = pending
+                .filter(|r| r.taker == Taker::Pull(i))
+                .map_or(0, |r| r.end - r.start);
+            let held = p.records.byte_len() + run;
+            if held == 0 || held + size <= p.max_bytes {
+                return Some(Taker::Pull(i));
+            }
+            p.stuffed = true;
         }
         let n = self.subs.len();
         for k in 0..n {
@@ -461,11 +488,14 @@ impl Actor {
                     }
                 }
                 Due::Redeliver { offset, deliveries } => {
-                    let Some(taker) = self.next_taker() else {
+                    if !self.has_room() {
                         break;
-                    };
+                    }
                     match self.read_one_raw(offset).await {
                         Ok(Some(mut rec)) => {
+                            let Some(taker) = self.next_taker(rec.len(), None) else {
+                                break;
+                            };
                             record_format::set_delivery_count(
                                 &mut rec,
                                 deliveries.saturating_add(1),
@@ -575,7 +605,7 @@ impl Actor {
                         continue;
                     }
                 }
-                let Some(taker) = self.next_taker() else {
+                let Some(taker) = self.next_taker(p.end() - p.start, run.as_ref()) else {
                     break;
                 };
                 self.take_credit(taker);
@@ -677,6 +707,14 @@ impl Actor {
                 if self.owners.len() > 2 * self.core.capacity_hint() {
                     let core = &self.core;
                     self.owners.retain(|o, _| core.is_in_flight(*o));
+                }
+                // Never let one `Deliver` frame grow past the per-frame
+                // records budget (a lone record always goes through).
+                if !batches[i].is_empty()
+                    && batches[i].byte_len() + chunk.len() > MAX_RECORDS_BYTES_PER_FRAME
+                {
+                    let full = std::mem::take(&mut batches[i]);
+                    let _ = self.subs[i].tx.send(SubEvent::Deliver(full));
                 }
                 batches[i].push_chunk(chunk, count);
                 if batches[i].byte_len() >= PUSH_FLUSH_BYTES {
@@ -781,7 +819,19 @@ impl Actor {
             tracing::warn!(consumer = %name, error = %e, "cannot create DLQ stream; will retry");
             return false;
         }
-        match self.log.append(&dlq_name, record).await {
+        let mut result = self.log.append(&dlq_name, record.clone()).await;
+        if let Err(crate::log::LogError::InvalidRecord(why)) = &result {
+            // The DLQ headers pushed the record over the header limit: keep
+            // only the DLQ metadata rather than retrying forever.
+            tracing::warn!(consumer = %name, offset, reason = %why,
+                           "DLQ record too large; dropping its original headers");
+            let mut slim = record;
+            slim.headers.retain(|(k, _)| {
+                k.starts_with("exspeed-dlq-") || k == crate::broker_append::IDEMPOTENCY_HEADER
+            });
+            result = self.log.append(&dlq_name, slim).await;
+        }
+        match result {
             Ok(_) => {
                 self.core.stats.dead_lettered += 1;
                 self.metrics.record_consumer_dead_letter(&name, "dlq");

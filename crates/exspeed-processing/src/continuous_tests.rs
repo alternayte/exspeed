@@ -748,8 +748,22 @@ async fn filter_coalesce_and_counts_in_continuous_aggregates() {
             vec![json!("c"), json!(0.0), json!(0)],
         ]
     );
-    let vs: Vec<Json> = w.payloads("c1").await.iter().map(|p| p["v"].clone()).collect();
-    assert_eq!(vs, vec![json!("1"), json!("none"), json!("5"), json!("3"), json!("9")]);
+    let vs: Vec<Json> = w
+        .payloads("c1")
+        .await
+        .iter()
+        .map(|p| p["v"].clone())
+        .collect();
+    assert_eq!(
+        vs,
+        vec![
+            json!("1"),
+            json!("none"),
+            json!("5"),
+            json!("3"),
+            json!("9")
+        ]
+    );
     node.stop().await;
 }
 
@@ -773,12 +787,16 @@ async fn extreme_event_times_neither_fail_nor_poison_the_watermark() {
         .unwrap()
         .as_millis() as i64;
     let base = now - now.rem_euclid(10_000) + 20_000;
-    w.publish("ev", None, "e", json!({"ts": "9223372036854775807"})).await;
-    w.publish("ev", None, "e", json!({"ts": 4_102_444_800_000i64})).await; // year 2100
+    w.publish("ev", None, "e", json!({"ts": "9223372036854775807"}))
+        .await;
+    w.publish("ev", None, "e", json!({"ts": 4_102_444_800_000i64}))
+        .await; // year 2100
     w.publish("ev", None, "e", json!({"ts": -5})).await;
     w.publish("ev", None, "e", json!({"ts": base})).await;
-    w.publish("ev", None, "e", json!({"ts": base + 1_000})).await;
-    w.publish("ev", None, "e", json!({"ts": base + 20_000})).await;
+    w.publish("ev", None, "e", json!({"ts": base + 1_000}))
+        .await;
+    w.publish("ev", None, "e", json!({"ts": base + 20_000}))
+        .await;
     node.wait_input(&id, 6).await;
     let q = node.engine.get_query(&id).unwrap();
     assert!(q.error.is_none(), "{:?}", q.error);

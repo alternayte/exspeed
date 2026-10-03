@@ -190,9 +190,7 @@ fn physical_expr(
     let e = ExprSimplifier::new(ctx)
         .simplify(e.clone())
         .map_err(map_expr_err)?;
-    state
-        .create_physical_expr(e, schema)
-        .map_err(map_expr_err)
+    state.create_physical_expr(e, schema).map_err(map_expr_err)
 }
 
 /// Compile `[Projection | Filter | SubqueryAlias]*` nodes (top-down order)

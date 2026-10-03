@@ -91,6 +91,13 @@ pub const MAX_PAYLOAD_SIZE: u32 = 16 * 1024 * 1024;
 /// Frame header size in bytes.
 pub const FRAME_HEADER_SIZE: usize = 10;
 
+/// Byte budget for the records of one response frame (`ReadResult`,
+/// `Messages`; `Deliver` batches flush at half of it). A batch stops before
+/// exceeding it, except that a lone record always goes through, and the
+/// broker's record limits keep one record under ~8.2 MiB, so a response
+/// always fits in [`MAX_PAYLOAD_SIZE`].
+pub const MAX_RECORDS_BYTES_PER_FRAME: usize = 8 * 1024 * 1024;
+
 /// Maximum length, in bytes, for any user-provided resource name
 /// (stream, consumer, view, group, subject filter).
 pub const MAX_NAME_LEN: usize = 255;

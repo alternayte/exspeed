@@ -123,6 +123,21 @@ impl WireRecord {
     pub fn timestamp_ms(&self) -> u64 {
         self.timestamp_ns / 1_000_000
     }
+
+    /// Number of bytes this record takes in a record list (its wire
+    /// encoding), or an error if a field is too long to encode.
+    pub fn encoded_len(&self) -> Result<usize, ProtocolError> {
+        record_format::encoded_len(&record_format::Fields {
+            offset: self.offset,
+            timestamp_ns: self.timestamp_ns,
+            delivery_count: self.delivery_count,
+            subject: &self.subject,
+            key: self.key.as_deref(),
+            value: &self.value,
+            headers: &self.headers,
+        })
+        .map_err(|e| ProtocolError::Encode(e.0))
+    }
 }
 
 /// Records already in wire encoding, ready to be written into a
@@ -1436,6 +1451,23 @@ mod tests {
         payload[last] ^= 1;
         let err = Response::decode(OpCode::Messages, payload.freeze()).unwrap_err();
         assert!(err.to_string().contains("CRC"), "{err}");
+    }
+
+    #[test]
+    fn wire_record_encoded_len_is_exact() {
+        for r in [
+            WireRecord::default(),
+            rec(7),
+            WireRecord {
+                key: Some(Bytes::from_static(b"key")),
+                headers: vec![("a".into(), "bb".into()), ("ccc".into(), String::new())],
+                ..rec(3)
+            },
+        ] {
+            let mut w = Writer::default();
+            w.record(&r);
+            assert_eq!(w.finish().len(), r.encoded_len().unwrap(), "{r:?}");
+        }
     }
 
     #[test]

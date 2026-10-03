@@ -288,9 +288,9 @@ impl PartitionShared {
                             offset: f.offset,
                             reason,
                         })?;
-                    let size = rec.value.len()
-                        + rec.subject.len()
-                        + rec.key.as_ref().map_or(0, |k| k.len());
+                    // The stored frame is the wire encoding: budget its full
+                    // size (headers and framing included), like `read_raw`.
+                    let size = f.raw.len();
                     if !out.is_empty() && bytes + size > max_bytes {
                         break 'segments;
                     }
