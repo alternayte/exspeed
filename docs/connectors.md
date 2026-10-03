@@ -60,7 +60,7 @@ the stream's dedup window (see [idempotent publish](idempotent-publish.md)).
 | Plugin | Type | Guarantee | Tested against |
 |--------|------|-----------|----------------|
 | `postgres_cdc` | source | at-least-once; effectively-once for replays within the dedup window | real Postgres: envelope and keys, crash + restart without loss or duplicates, non-destructive dry run |
-| `postgres_outbox` | source | effectively-once within the dedup window (`x-idempotency-key` = outbox id); at-least-once beyond it | real Postgres: poll mode with delete cleanup, CDC mode, two crashes before the delete leave each event exactly once |
+| `postgres_outbox` | source | effectively-once within the dedup window (`x-idempotency-key` = `pgoutbox:<table>:<id>`); at-least-once beyond it | real Postgres: poll mode with delete cleanup, CDC mode, two crashes before the delete leave each event exactly once |
 | `postgres_poll` | source | at-least-once (a crash replays the last batch); rows committed late with an older tracking value are missed | real Postgres: timestamp/numeric/uuid/json decoding, tied tracking values, resume |
 | `jdbc_poll` | source | at-least-once (a crash replays the last batch; no idempotency key); integer cursor, so late commits below the cursor are missed | SQLite; real MySQL and SQL Server: a crash between append and checkpoint replays exactly that batch, resume after a restart |
 | `mssql_cdc` | source | at-least-once; effectively-once for replays within the dedup window | real SQL Server: two crashes + restart without loss or duplicates, update/delete/insert while stopped |
@@ -413,7 +413,11 @@ cleanup = "delete"               # "delete" (default) | "none"
 # CDC mode only: slot_name, publication_name, drop_slot_on_delete
 ```
 
-- Every record carries `x-idempotency-key` = the outbox id.
+- Every record carries `x-idempotency-key = pgoutbox:<schema.table>:<id>`
+  (namespaced by table, so two outbox tables with overlapping ids never
+  dedupe each other in one stream).
+- `slot_name`, `publication_name` and `drop_slot_on_delete` are rejected
+  in poll mode (they only apply with `mode = "cdc"`).
 - With `cleanup = "delete"`, published rows are deleted in `ack()`, after
   the records are durable. Every remaining row is unpublished, so rows from
   transactions that commit late are picked up on the next poll.
