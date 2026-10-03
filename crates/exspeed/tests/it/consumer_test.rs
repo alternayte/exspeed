@@ -542,3 +542,93 @@ async fn delivery_counts_survive_graceful_restart() {
     assert_eq!(again[0].offset, 0);
     assert_eq!(again[0].delivery_count, 2);
 }
+
+/// Throughput probe (not a pass/fail benchmark):
+/// `cargo test -p exspeed --test it -- --ignored --nocapture consumer_throughput`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn consumer_throughput() {
+    let n: usize = std::env::var("N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50_000);
+    let server = TestServer::start().await;
+    let c = server.client().await;
+    create_stream(&c, "tp").await;
+    let publisher = c.publisher().max_in_flight(8192).build();
+    let t = std::time::Instant::now();
+    let mut futs = Vec::with_capacity(n);
+    for i in 0..n {
+        let p = publisher.clone();
+        futs.push(tokio::spawn(async move {
+            p.publish(
+                "tp",
+                PublishRecord::new("x", vec![b'x'; 256]).header("i", i.to_string()),
+            )
+            .await
+            .unwrap()
+        }));
+    }
+    for f in futs {
+        f.await.unwrap();
+    }
+    let pub_secs = t.elapsed().as_secs_f64();
+    println!(
+        "publish: {n} in {pub_secs:.2}s = {:.0}/s",
+        n as f64 / pub_secs
+    );
+
+    c.create_consumer(ConsumerSpec {
+        max_ack_pending: 10_000,
+        ..ConsumerSpec::new("tp-c", "tp")
+    })
+    .await
+    .unwrap();
+    let t = std::time::Instant::now();
+    let mut sub = c.subscribe("tp-c", 2048).await.unwrap();
+    let mut acks = Vec::with_capacity(256);
+    let mut got = 0;
+    while got < n {
+        let m = sub
+            .next_timeout(Duration::from_secs(10))
+            .await
+            .expect("record");
+        acks.push(m.record.offset);
+        got += 1;
+        if acks.len() == 256 {
+            c.ack_nowait("tp-c", std::mem::take(&mut acks))
+                .await
+                .unwrap();
+        }
+    }
+    let secs = t.elapsed().as_secs_f64();
+    println!("consume+ack: {n} in {secs:.2}s = {:.0}/s", n as f64 / secs);
+
+    let t = std::time::Instant::now();
+    let mut from = 0;
+    while from < n as u64 {
+        let r = c.read("tp", from, 1000, Duration::ZERO, "").await.unwrap();
+        from = r.next_offset;
+    }
+    let secs = t.elapsed().as_secs_f64();
+    println!("read: {n} in {secs:.2}s = {:.0}/s", n as f64 / secs);
+
+    // Worst case: default max_ack_pending, one ack frame per record.
+    c.create_consumer(ConsumerSpec::new("tp-d", "tp"))
+        .await
+        .unwrap();
+    let t = std::time::Instant::now();
+    let mut sub = c.subscribe("tp-d", 256).await.unwrap();
+    for _ in 0..n {
+        let m = sub
+            .next_timeout(Duration::from_secs(10))
+            .await
+            .expect("record");
+        c.ack_nowait("tp-d", vec![m.record.offset]).await.unwrap();
+    }
+    let secs = t.elapsed().as_secs_f64();
+    println!(
+        "consume, ack per record: {n} in {secs:.2}s = {:.0}/s",
+        n as f64 / secs
+    );
+}
