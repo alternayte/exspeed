@@ -20,6 +20,23 @@ consumers, connectors, continuous queries and retention. The others are
   name the leader. The SDKs find the leader from a list of seed addresses
   and find the new one after a failover.
 
+```mermaid
+flowchart LR
+  clients["Clients / SDKs"] -->|"writes, consumers (5933)"| L
+  clients -.->|"reads; 503 + leader hint for writes"| F1
+  subgraph cluster[Cluster]
+    L["Leader<br/>node A, epoch 7"]
+    F1["Follower<br/>node B"]
+    F2["Follower<br/>node C"]
+  end
+  F1 -->|"fetch (5934)"| L
+  F2 -->|"fetch (5934)"| L
+  lease[("Lease backend<br/>Postgres or Redis<br/>holder, epoch, ISR")]
+  L -->|"heartbeat, publish ISR"| lease
+  F1 -.->|"poll"| lease
+  F2 -.->|"poll"| lease
+```
+
 ## How it works
 
 ### Leader election
@@ -76,6 +93,21 @@ Each response carries:
 - **Per stream:** records, a truncation point, or only the leader's earliest
   offset. The follower trims up to the leader's earliest offset, which is how
   retention reaches followers.
+
+```mermaid
+sequenceDiagram
+  participant F as Follower
+  participant L as Leader
+  loop continuously
+    F->>L: Fetch(epoch, metadata version, per stream: next, last epoch, earliest)
+    alt nothing new
+      Note over L: hold up to 1 s until an append or metadata change
+    end
+    L-->>F: FetchOk(metadata?, per stream: records / truncate / trim, epoch history)
+    F->>F: apply metadata, truncate or append_at, trim, adopt epochs
+    Note over L: next fetch positions = follower progress,<br/>used for the ISR and acks=all
+  end
+```
 
 **Divergence.** Each stream has an epoch history: the offset where each
 leader epoch started. A follower whose last record has epoch `e` asks, in
@@ -201,6 +233,23 @@ elsewhere), except the probes, `/metrics`, `/api/v1/cluster`,
 `/api/v1/leases` and `/api/v1/whoami`.
 
 ### Failover timing
+
+```mermaid
+sequenceDiagram
+  participant A as Leader A
+  participant LB as Lease backend
+  participant B as Follower B (in ISR)
+  A->>LB: refresh (every heartbeat)
+  Note over A: A crashes or is cut off
+  Note over A: if alive: no refresh for 2/3 TTL, so it stops leading
+  B->>LB: poll: lease still held
+  Note over LB: TTL passes, lease expires
+  B->>LB: acquire (B in ISR): epoch 8
+  B->>B: stop following, stamp epoch 8, rebuild dedup
+  Note over B: writes open, /healthz = 200
+  A->>LB: (on return) lease held by B
+  A->>B: fetch as follower; truncate unreplicated writes
+```
 
 | Event | Writes unavailable for about |
 |-------|------------------------------|

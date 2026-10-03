@@ -397,34 +397,18 @@ ergonomics. Keep the single binary, the log, subjects, SQL and connectors.
 Rebuild the internals around a few primitives that everything else composes
 on.
 
-```
-                         ┌────────────────────────────────────────────┐
-  TCP (v2 protocol) ───► │  Session layer  (auth, authz policy, flow  │
-  HTTP / webhooks  ───►  │  control, one dispatch table)              │
-                         └──────────────┬─────────────────────────────┘
-                                        │ every write
-                                        ▼
-                         ┌────────────────────────────────────────────┐
-                         │  Log::append / append_batch                │
-                         │  leader+epoch check → validate → dedup →   │
-                         │  storage → replicate → notify → metrics    │
-                         └──────────────┬─────────────────────────────┘
-                                        ▼
-   ┌───────────────┐   ┌────────────────────────────┐   ┌────────────────────┐
-   │ Consumers     │   │ Segment store              │   │ Replication        │
-   │ (ack floor +  │◄──│ writer thread / partition  │──►│ follower pull by   │
-   │ PEL, push &   │   │ lock-free readers, sparse  │   │ (stream, offset,   │
-   │ pull, groups) │   │ index, wire-format records │   │ epoch); append_at  │
-   └──────┬────────┘   └────────────────────────────┘   └────────────────────┘
-          │                         ▲
-          ▼                         │ internal compacted streams
-   ┌───────────────┐   ┌────────────┴──────────────────────────────────────┐
-   │ ExQL          │   │ __meta (streams, consumers, connectors, queries,   │
-   │ DataFusion    │   │ indexes, ACLs) · __consumer_state · __connector_   │
-   │ bounded +     │   │ offsets · __exql.<qid>.<op> changelogs · __dedup   │
-   │ dataflow      │   └───────────────────────────────────────────────────┘
-   │ continuous    │
-   └───────────────┘   Connectors: supervisor + checkpoint protocol
+```mermaid
+flowchart TB
+  tcp["TCP (protocol v2)"] --> session
+  http["HTTP / webhooks"] --> session
+  session["Session layer<br/>auth, authz policy, flow control, one dispatch table"]
+  session -->|every write| log["Log::append / append_batch<br/>leader and epoch check, validate, dedup,<br/>storage, replicate, notify, metrics"]
+  log --> store["Segment store<br/>writer thread per partition, lock-free readers,<br/>sparse index, wire-format records"]
+  store --> consumers["Consumers<br/>ack floor + PEL, push and pull, groups"]
+  store --> repl["Replication<br/>follower pull by (stream, offset, epoch); append_at"]
+  consumers --> exql["ExQL<br/>DataFusion bounded + continuous dataflow"]
+  meta["Internal compacted streams<br/>__meta (streams, consumers, connectors, queries, indexes, ACLs),<br/>__consumer_state, __connector_offsets, __exql changelogs, __dedup"] --> store
+  connectors["Connectors<br/>supervisor + checkpoint protocol"] --> log
 ```
 
 ### 5.1 One write path

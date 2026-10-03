@@ -139,11 +139,16 @@ collide once lowercased with `-` mapped to `_` (for example `Orders-CDC` and
 
 Every connector is in one of these states:
 
-```
-Starting ─► Running ── transient (retries exhausted) / lost connection / panic ─► Backoff ─► Starting …
-               │
-               ├── fatal error (config, credentials), or max_restarts reached ─► Failed
-               └── stopped, deleted, demoted or shut down ──────────────────────► Stopped
+```mermaid
+stateDiagram-v2
+  [*] --> Starting
+  Starting --> Running
+  Running --> Backoff: transient error (retries exhausted), lost connection, panic
+  Backoff --> Starting
+  Running --> Failed: fatal error (config, credentials) or max_restarts reached
+  Running --> Stopped: stopped, deleted, demoted or shut down
+  Failed --> [*]
+  Stopped --> [*]
 ```
 
 - A **restart** is an awaited `stop()` followed by `start()`, so a restarted
