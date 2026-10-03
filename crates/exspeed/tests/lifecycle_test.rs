@@ -24,8 +24,10 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
 async fn start_test_server(max_conns: u32) -> (String, tempfile::TempDir) {
-    let port = exspeed_testkit::pick_unused_port().unwrap();
-    let api_port = exspeed_testkit::pick_unused_port().unwrap();
+    let port_l = exspeed_testkit::bind_local();
+    let port = port_l.local_addr().unwrap().port();
+    let api_port_l = exspeed_testkit::bind_local();
+    let api_port = api_port_l.local_addr().unwrap().port();
     let bind = format!("127.0.0.1:{port}");
     let api_bind = format!("127.0.0.1:{api_port}");
     let tmp = tempfile::tempdir().unwrap();
@@ -37,7 +39,9 @@ async fn start_test_server(max_conns: u32) -> (String, tempfile::TempDir) {
     tokio::spawn(async move {
         exspeed::cli::server::run(exspeed::cli::server::ServerArgs {
             bind: bind_clone,
+            tcp_listener: Some(std::sync::Arc::new(port_l)),
             api_bind: api_clone,
+            api_listener: Some(std::sync::Arc::new(api_port_l)),
             data_dir: data_clone,
             auth_token: None,
             credentials_file: None,
@@ -81,8 +85,10 @@ use tokio::sync::oneshot;
 
 #[tokio::test]
 async fn sigterm_signal_token_stops_accept_loop() {
-    let port = exspeed_testkit::pick_unused_port().unwrap();
-    let api_port = exspeed_testkit::pick_unused_port().unwrap();
+    let port_l = exspeed_testkit::bind_local();
+    let port = port_l.local_addr().unwrap().port();
+    let api_port_l = exspeed_testkit::bind_local();
+    let api_port = api_port_l.local_addr().unwrap().port();
     let bind = format!("127.0.0.1:{port}");
     let api_bind = format!("127.0.0.1:{api_port}");
     let tmp = tempfile::tempdir().unwrap();
@@ -93,7 +99,9 @@ async fn sigterm_signal_token_stops_accept_loop() {
         exspeed::cli::server::run_with_shutdown(
             exspeed::cli::server::ServerArgs {
                 bind,
+                tcp_listener: Some(std::sync::Arc::new(port_l)),
                 api_bind,
+                api_listener: Some(std::sync::Arc::new(api_port_l)),
                 data_dir,
                 auth_token: None,
                 credentials_file: None,
@@ -134,8 +142,10 @@ async fn sigterm_signal_token_stops_accept_loop() {
 
 #[tokio::test]
 async fn readyz_returns_503_when_data_dir_unwritable() {
-    let port = exspeed_testkit::pick_unused_port().unwrap();
-    let api_port = exspeed_testkit::pick_unused_port().unwrap();
+    let port_l = exspeed_testkit::bind_local();
+    let port = port_l.local_addr().unwrap().port();
+    let api_port_l = exspeed_testkit::bind_local();
+    let api_port = api_port_l.local_addr().unwrap().port();
     let bind = format!("127.0.0.1:{port}");
     let api_bind = format!("127.0.0.1:{api_port}");
     let tmp = tempfile::tempdir().unwrap();
@@ -145,7 +155,9 @@ async fn readyz_returns_503_when_data_dir_unwritable() {
     tokio::spawn(async move {
         exspeed::cli::server::run(exspeed::cli::server::ServerArgs {
             bind,
+            tcp_listener: Some(std::sync::Arc::new(port_l)),
             api_bind,
+            api_listener: Some(std::sync::Arc::new(api_port_l)),
             data_dir,
             auth_token: None,
             credentials_file: None,

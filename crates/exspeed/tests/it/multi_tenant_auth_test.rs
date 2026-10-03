@@ -56,8 +56,10 @@ struct TestServer {
 /// Start a server with the given credentials file + env token.
 /// Either or both may be `None`. Blocks until `/readyz` returns 200.
 async fn start_server(credentials_file: Option<PathBuf>, auth_token: Option<String>) -> TestServer {
-    let tcp_port = exspeed_testkit::pick_unused_port().unwrap();
-    let http_port = exspeed_testkit::pick_unused_port().unwrap();
+    let tcp_port_l = exspeed_testkit::bind_local();
+    let tcp_port = tcp_port_l.local_addr().unwrap().port();
+    let http_port_l = exspeed_testkit::bind_local();
+    let http_port = http_port_l.local_addr().unwrap().port();
     let tcp_addr = format!("127.0.0.1:{tcp_port}");
     let http_addr = format!("127.0.0.1:{http_port}");
     let tmp = tempfile::tempdir().unwrap();
@@ -66,7 +68,9 @@ async fn start_server(credentials_file: Option<PathBuf>, auth_token: Option<Stri
     let cancel = CancellationToken::new();
     let args = exspeed::cli::server::ServerArgs {
         bind: tcp_addr.clone(),
+        tcp_listener: Some(std::sync::Arc::new(tcp_port_l)),
         api_bind: http_addr.clone(),
+        api_listener: Some(std::sync::Arc::new(http_port_l)),
         data_dir,
         auth_token,
         credentials_file,
