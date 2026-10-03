@@ -859,7 +859,16 @@ dedup_window_secs = 60
         let mut a = ServerArgs::default();
         a.cluster.lease = "redis".into();
         a.cluster.redis_url = Some("redis://x".into());
+        validate(&a).unwrap(); // no auth: no replicator credential needed
+        a.auth_token = Some("t".into());
         assert!(format!("{:#}", validate(&a).unwrap_err()).contains("replicator_credential"));
+        a.cluster.replicator_credential = Some("r".into());
+        validate(&a).unwrap();
+        a.cluster.acks = "some".into();
+        assert!(format!("{:#}", validate(&a).unwrap_err()).contains("acks"));
+        a.cluster.acks = "leader".into();
+        a.cluster.lease_heartbeat_secs = 10;
+        assert!(format!("{:#}", validate(&a).unwrap_err()).contains("heartbeat"));
 
         let a = ServerArgs {
             bind: "nonsense".into(),

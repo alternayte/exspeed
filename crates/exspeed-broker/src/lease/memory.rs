@@ -34,7 +34,7 @@ impl MemoryLeaseBackend {
         registry()
             .lock()
             .entry(namespace.to_string())
-            .or_insert_with(Self::new)
+            .or_default()
             .clone()
     }
 
