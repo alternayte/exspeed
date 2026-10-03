@@ -436,7 +436,7 @@ math, dates and times (`date_trunc`, `date_bin`, `to_timestamp`,
 | Function | Notes |
 |----------|-------|
 | `subject_part(subject, n)` | n-th dot-delimited token (1-based; negative counts from the end) |
-| `subject_matches(subject, 'orders.>')` | NATS-style wildcard match (`*` one token, `>` the rest) |
+| `subject_matches(subject, 'orders.>')` | NATS-style wildcard match (`*` one token, `>` the rest), same rules as consumer filters; an invalid pattern is an error |
 | `json_get_*`, `->`, `->>`, `json_contains`, … | From `datafusion-functions-json` |
 | `window_start`, `window_end` | In windowed continuous queries |
 

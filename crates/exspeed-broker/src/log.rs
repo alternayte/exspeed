@@ -88,10 +88,16 @@ impl RecordLimits {
                 if token.is_empty() {
                     return Err(format!("subject '{subject}' has an empty token"));
                 }
-                if token == "*" || token == ">" || token.contains(char::is_whitespace) {
+                // Any '*' or '>' (not just whole-token wildcards): a subject
+                // like `a.b*` could never be matched by a filter, which
+                // rejects partial wildcards.
+                if token.contains(['*', '>'])
+                    || token.contains(|c: char| c.is_whitespace() || c.is_control())
+                {
                     return Err(format!(
-                        "subject '{subject}' contains a wildcard or whitespace; \
-                         wildcards are only valid in filters"
+                        "subject '{}' contains a wildcard, whitespace or a control \
+                         character; wildcards are only valid in filters",
+                        subject.escape_debug()
                     ));
                 }
             }
@@ -664,6 +670,12 @@ mod tests {
         assert!(l.check(&rec("orders.*", "x")).is_err());
         assert!(l.check(&rec("orders.>", "x")).is_err());
         assert!(l.check(&rec("orders eu", "x")).is_err());
+        // Partial wildcards and control characters.
+        assert!(l.check(&rec("orders.b*", "x")).is_err());
+        assert!(l.check(&rec("orders.>x", "x")).is_err());
+        assert!(l.check(&rec("orders.e\u{0}u", "x")).is_err());
+        assert!(l.check(&rec("orders.e\u{7f}u", "x")).is_err());
+        assert!(l.check(&rec("orders.eü-1_2", "x")).is_ok());
         assert!(l.check(&rec(&"a".repeat(2000), "x")).is_err());
     }
 

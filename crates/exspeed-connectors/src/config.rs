@@ -209,6 +209,8 @@ impl ConnectorConfig {
         if self.batch_size == 0 {
             return Err("batch_size must be at least 1".into());
         }
+        exspeed_common::SubjectFilter::parse(&self.subject_filter)
+            .map_err(|e| format!("invalid subject_filter: {e}"))?;
         if !self.transform_sql.is_empty() {
             if self.connector_type == ConnectorType::Sink {
                 return Err("transforms are only supported on sources".into());
@@ -443,6 +445,22 @@ mod tests {
         config.save_json(&path).unwrap();
         let loaded = ConnectorConfig::load_json(&path).unwrap();
         assert_eq!(loaded, config);
+    }
+
+    /// A sink's `subject_filter` is validated with the same parser the
+    /// consumers use (the legacy matcher silently read `a.>.c` as `a.>`).
+    #[test]
+    fn subject_filter_is_validated() {
+        let mut c = ConnectorConfig::new("s", ConnectorType::Sink, "jdbc", "events");
+        for ok in ["", "orders.>", "orders.*.created"] {
+            c.subject_filter = ok.into();
+            c.validate_common().unwrap();
+        }
+        for bad in ["a.>.c", "a..b", "a.b*", "a b"] {
+            c.subject_filter = bad.into();
+            let err = c.validate_common().unwrap_err();
+            assert!(err.contains("subject_filter"), "{bad}: {err}");
+        }
     }
 
     #[test]

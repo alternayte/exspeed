@@ -720,6 +720,8 @@ async fn sink_loop(
     let name = ctx.name().to_string();
     let stream = StreamName::try_from(ctx.config.stream.as_str())
         .map_err(|e| RunEnd::Fatal(format!("invalid stream: {e}")))?;
+    let filter = exspeed_common::SubjectFilter::parse(&ctx.config.subject_filter)
+        .map_err(|e| RunEnd::Fatal(format!("invalid subject_filter: {e}")))?;
     let dlq = dlq_writer(ctx)?;
 
     let start = ctx
@@ -816,9 +818,7 @@ async fn sink_loop(
         let records: Vec<SinkRecord> = batch
             .records
             .into_iter()
-            .filter(|r| {
-                exspeed_common::subject::subject_matches(&r.subject, &ctx.config.subject_filter)
-            })
+            .filter(|r| filter.matches(&r.subject))
             .map(|r| SinkRecord {
                 offset: r.offset.0,
                 timestamp: r.timestamp,
