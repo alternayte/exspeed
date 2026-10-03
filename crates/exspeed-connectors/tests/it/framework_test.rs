@@ -676,5 +676,111 @@ async fn connector_names_are_validated_and_collisions_rejected() {
         mgr.create(hook("orders-cdc")).await,
         Err(ManagerError::AlreadyExists(_))
     ));
-    assert!(dir.path().join("connectors/orders-cdc.json").exists());
+    assert!(catalog(&env).await.contains_key("orders-cdc"));
+    assert!(!dir.path().join("connectors").exists(), "no config files");
+}
+
+// ---------------------------------------------------------------------------
+// The API connector catalog lives in `__connectors`
+// ---------------------------------------------------------------------------
+
+async fn catalog(env: &Env) -> std::collections::BTreeMap<String, bytes::Bytes> {
+    exspeed_broker::catalog::CatalogStore::new(
+        env.log.clone(),
+        exspeed_connectors::manager::CONNECTORS_STREAM,
+        "connector.config",
+    )
+    .load()
+    .await
+    .unwrap()
+}
+
+fn webhook(name: &str, path: &str) -> ConnectorConfig {
+    ConnectorConfig::new(name, Source, "http_webhook", "s")
+        .with_setting("path", path)
+        .with_setting("auth_type", "none")
+}
+
+#[tokio::test]
+async fn api_connectors_are_stored_in_the_log_and_reloaded() {
+    let env = Env::new();
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = manager(dir.path(), &env).await;
+    mgr.load_all().await.unwrap();
+    mgr.create(webhook("a", "pa")).await.unwrap();
+    mgr.create(webhook("b", "pb")).await.unwrap();
+
+    // Another node (or a restart) reading the same log sees both.
+    let other = manager(dir.path(), &env).await;
+    other.load_all().await.unwrap();
+    let names: Vec<String> = other.list().await.into_iter().map(|c| c.name).collect();
+    assert_eq!(names, vec!["a", "b"]);
+    assert!(other.list().await.iter().all(|c| c.origin == "api"));
+
+    // Delete one, change the other; a reload (next leader tenure) follows.
+    mgr.delete("a").await.unwrap();
+    mgr.update(webhook("b", "pb2")).await.unwrap();
+    other.reload_api_configs().await.unwrap();
+    let names: Vec<String> = other.list().await.into_iter().map(|c| c.name).collect();
+    assert_eq!(names, vec!["b"]);
+    assert_eq!(other.get_config("b").await.unwrap().settings["path"], "pb2");
+    assert!(other.find_webhook("pa").await.is_none());
+    // Reloading again is a no-op.
+    other.reload_api_configs().await.unwrap();
+    assert_eq!(other.list().await.len(), 1);
+    assert_eq!(catalog(&env).await.len(), 1);
+}
+
+#[tokio::test]
+async fn legacy_json_configs_are_migrated_into_the_log() {
+    let env = Env::new();
+    let dir = tempfile::tempdir().unwrap();
+    let legacy = dir.path().join("connectors");
+    std::fs::create_dir_all(&legacy).unwrap();
+    webhook("old-hook", "old")
+        .save_json(&legacy.join("old-hook.json"))
+        .unwrap();
+    std::fs::write(legacy.join("garbage.json"), "{").unwrap();
+
+    let mgr = manager(dir.path(), &env).await;
+    mgr.load_all().await.unwrap();
+    let info = mgr.get_status("old-hook").await.expect("migrated");
+    assert_eq!(info.origin, "api");
+    assert!(!legacy.exists());
+    assert!(dir
+        .path()
+        .join("connectors.migrated/old-hook.json")
+        .exists());
+    assert!(catalog(&env).await.contains_key("old-hook"));
+
+    // A fresh manager finds it in the log, without the files.
+    let other = manager(dir.path(), &env).await;
+    other.load_all().await.unwrap();
+    assert!(other.get_status("old-hook").await.is_some());
+}
+
+#[tokio::test]
+async fn file_definition_replaces_the_api_copy() {
+    let env = Env::new();
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = manager(dir.path(), &env).await;
+    mgr.create(webhook("x", "px")).await.unwrap();
+    let d = dir.path().join("connectors.d");
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(
+        d.join("x.toml"),
+        "[connector]\nname = \"x\"\ntype = \"source\"\nplugin = \"http_webhook\"\nstream = \"s\"\n\n\
+         [settings]\npath = \"from-file\"\nauth_type = \"none\"\n",
+    )
+    .unwrap();
+    let other = manager(dir.path(), &env).await;
+    other.load_all().await.unwrap();
+    let info = other.get_status("x").await.unwrap();
+    assert_eq!(info.origin, "file");
+    assert!(
+        !catalog(&env).await.contains_key("x"),
+        "API copy tombstoned"
+    );
+    other.reload_api_configs().await.unwrap();
+    assert_eq!(other.get_status("x").await.unwrap().origin, "file");
 }

@@ -368,9 +368,14 @@ What is implemented and tested:
 - A query is validated (parsed, planned, names checked) before anything is
   persisted. Names follow stream-name rules (`[A-Za-z0-9_-]`); names that
   start with `__` are reserved. A query may not read its own output.
-- Definitions and desired state are persisted atomically in
-  `{data_dir}/exql/queries/<id>.json`. Desired state is `running`, `paused`
-  or `stopped`.
+- Definitions and desired state are stored in the compacted internal
+  stream `__exql_queries` (key = query id, value = the definition as JSON;
+  `DROP` writes a tombstone). They replicate with the log, and every leader
+  tenure starts by reloading them, so a promoted follower resumes the same
+  queries. Creating, pausing, resuming or dropping a query needs the leader.
+  Desired state is `running`, `paused` or `stopped`. Older versions kept
+  definitions in `{data_dir}/exql/queries/<id>.json`; the first leader to
+  start imports them and renames the directory to `exql/queries.migrated/`.
 - Status is `running`, `paused`, `pending` (wants to run but this node
   isn't the leader, or it is starting), or `failed` with the error. A
   failure (including a panic, which is caught) sets the desired state to
@@ -408,8 +413,17 @@ SELECT * FROM warehouse.sales.targets;                                          
   `Timestamp(ms, UTC)` and Date32.
 - **Bounded queries only**: continuous queries can't read external tables.
   The inline `postgres('url', 'table')` form has been removed.
-- Connections can also be declared with `EXSPEED_CONNECTION_<NAME>_DRIVER`
-  and `EXSPEED_CONNECTION_<NAME>_URL`.
+- Connections created through the API are stored in the compacted internal
+  stream `__exql_connections` (key = name), so they replicate with the log.
+  The URL is stored as written: use `${VAR}` references (resolved from the
+  server's environment) to keep passwords out of the log. Older versions
+  kept them under `{data_dir}/connections/`; that directory is imported once
+  and renamed to `connections.migrated/`.
+- Connections can also be declared in `{data_dir}/connections.d/*.toml`
+  (`[connection]` with `name`, `driver`, `url`) or with
+  `EXSPEED_CONNECTION_<NAME>_DRIVER` and `EXSPEED_CONNECTION_<NAME>_URL`.
+  Environment variables override files, which override API connections.
+  These can't be deleted through the API (`409`).
 
 ## Functions
 

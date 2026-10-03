@@ -7,13 +7,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use serde::Serialize;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+use exspeed_broker::catalog::{CatalogStore, Migration};
 use exspeed_broker::leadership::ClusterLeadership;
-use exspeed_broker::log::Log;
+use exspeed_broker::log::{Log, LogError};
 use exspeed_common::metrics::Metrics;
 use exspeed_common::StreamName;
 use exspeed_streams::traits::StorageEngine;
@@ -25,14 +27,19 @@ use crate::registry::Registry;
 use crate::runtime::{self, RunContext, RunHandle};
 use crate::status::{ConnectorState, Status, StatusSnapshot};
 
+/// Internal stream holding API-created connector configs (key = connector
+/// name, value = [`ConnectorConfig`] JSON with `${VAR}` unresolved; a delete
+/// is a tombstone).
+pub const CONNECTORS_STREAM: &str = "__connectors";
+
 /// How long `stop` waits for a connector (final flush included).
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Where a connector's definition lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Origin {
-    /// Created through the HTTP API; persisted as JSON under
-    /// `{data_dir}/connectors/`.
+    /// Created through the HTTP API; stored in the replicated internal
+    /// stream `__connectors`.
     Api,
     /// Defined by `{data_dir}/connectors.d/<file>`; the file is the source
     /// of truth and nothing is persisted.
@@ -99,6 +106,8 @@ pub struct ConnectorManager {
     pub toml_files: RwLock<HashMap<String, TomlFile>>,
     pub leadership: Arc<ClusterLeadership>,
     registry: Registry,
+    /// API-created configs in `__connectors`.
+    store: CatalogStore,
     entries: RwLock<HashMap<String, Entry>>,
     /// Serialises lifecycle operations (create/update/delete/restart).
     lifecycle: Mutex<()>,
@@ -115,9 +124,11 @@ impl ConnectorManager {
         offset_store: Arc<dyn OffsetStore>,
         leadership: Arc<ClusterLeadership>,
     ) -> Self {
+        let store = CatalogStore::new(log.clone(), CONNECTORS_STREAM, "connector.config");
         Self {
             storage,
             log,
+            store,
             data_dir,
             metrics,
             offset_store,
@@ -148,12 +159,10 @@ impl ConnectorManager {
         Some(hasher.finish())
     }
 
-    fn configs_dir(&self) -> PathBuf {
+    /// Where older versions kept API-created configs; imported into
+    /// `__connectors` once by [`Self::reload_api_configs`].
+    pub fn legacy_configs_dir(&self) -> PathBuf {
         self.data_dir.join("connectors")
-    }
-
-    fn config_path(&self, name: &str) -> PathBuf {
-        self.configs_dir().join(format!("{name}.json"))
     }
 
     fn connectors_d_dir(&self) -> PathBuf {
@@ -189,9 +198,46 @@ impl ConnectorManager {
         Ok(())
     }
 
+    // -- catalog ----------------------------------------------------------------
+
+    /// Store an API connector's config in `__connectors` (leader only).
+    async fn persist(&self, config: &ConnectorConfig) -> Result<(), ManagerError> {
+        let value = serde_json::to_vec(config)
+            .map_err(|e| ManagerError::Internal(format!("serialize config: {e}")))?;
+        self.store
+            .put(&config.name, Bytes::from(value))
+            .await
+            .map_err(Self::catalog_err)
+    }
+
+    /// Tombstone an API connector's config in `__connectors` (leader only).
+    async fn unpersist(&self, name: &str) -> Result<(), ManagerError> {
+        self.store.delete(name).await.map_err(Self::catalog_err)
+    }
+
+    /// Drop the API copy of a connector now defined by a file. Best effort:
+    /// a node that can't write leaves it, and the next leader's reload
+    /// drops it.
+    async fn drop_api_copy(&self, name: &str) {
+        if !self.log.can_write() {
+            return;
+        }
+        if let Err(e) = self.unpersist(name).await {
+            warn!(connector = name, error = %e, "could not drop the API copy of a file-defined connector");
+        }
+    }
+
+    fn catalog_err(e: LogError) -> ManagerError {
+        match e {
+            LogError::NotLeader => ManagerError::NotLeader,
+            e => ManagerError::Internal(format!("connector catalog: {e}")),
+        }
+    }
+
     // -- public API -------------------------------------------------------------
 
-    /// Create a connector through the API: validate, persist, start.
+    /// Create a connector through the API: validate, store in
+    /// `__connectors` (leader only), start.
     pub async fn create(&self, config: ConnectorConfig) -> Result<(), ManagerError> {
         let _g = self.lifecycle.lock().await;
         self.validate(&config, &Origin::Api)?;
@@ -202,9 +248,7 @@ impl ConnectorManager {
             }
             Self::check_collision(&entries, &config.name)?;
         }
-        config
-            .save_json(&self.config_path(&config.name))
-            .map_err(|e| ManagerError::Internal(format!("failed to save config: {e}")))?;
+        self.persist(&config).await?;
         self.insert_and_start(config, Origin::Api).await;
         Ok(())
     }
@@ -264,27 +308,24 @@ impl ConnectorManager {
     ) -> Result<(), ManagerError> {
         let _g = self.lifecycle.lock().await;
         let name = config.name.clone();
-        let old = self.take_handle(&name).await;
-        if let Some(h) = old {
-            h.stop(STOP_TIMEOUT).await;
-        }
-        {
+        let previous_origin = {
             let entries = self.entries.read().await;
             Self::check_collision(&entries, &name)?;
-        }
+            entries.get(&name).map(|e| e.origin.clone())
+        };
         let invalid = self.validate(&config, &origin).err();
         match &origin {
-            Origin::Api => {
-                if invalid.is_none() {
-                    config.save_json(&self.config_path(&name)).map_err(|e| {
-                        ManagerError::Internal(format!("failed to save config: {e}"))
-                    })?;
-                }
+            // Store first: on a node that can't write, nothing changes.
+            Origin::Api if invalid.is_none() => self.persist(&config).await?,
+            Origin::Api => {}
+            // The file is now the definition; drop any API copy.
+            Origin::File(_) if previous_origin == Some(Origin::Api) => {
+                self.drop_api_copy(&name).await
             }
-            Origin::File(_) => {
-                // The file is now the definition; drop any API copy.
-                let _ = std::fs::remove_file(self.config_path(&name));
-            }
+            Origin::File(_) => {}
+        }
+        if let Some(h) = self.take_handle(&name).await {
+            h.stop(STOP_TIMEOUT).await;
         }
         self.insert_and_start(config, origin).await;
         invalid.map_or(Ok(()), Err)
@@ -294,6 +335,17 @@ impl ConnectorManager {
     /// Plugin cleanup (e.g. `drop_slot_on_delete`) runs on the leader.
     pub async fn delete(&self, name: &str) -> Result<(), ManagerError> {
         let _g = self.lifecycle.lock().await;
+        let origin = self
+            .entries
+            .read()
+            .await
+            .get(name)
+            .map(|e| e.origin.clone())
+            .ok_or_else(|| ManagerError::NotFound(name.to_string()))?;
+        if origin == Origin::Api {
+            // Tombstone first: on a node that can't write, nothing changes.
+            self.unpersist(name).await?;
+        }
         let entry = {
             let mut entries = self.entries.write().await;
             entries
@@ -306,12 +358,6 @@ impl ConnectorManager {
         entry.state.set_status(Status::Stopped);
         entry.state.retire();
 
-        let path = self.config_path(name);
-        if path.exists() {
-            std::fs::remove_file(&path).map_err(|e| {
-                ManagerError::Internal(format!("failed to remove config file: {e}"))
-            })?;
-        }
         if self.log.can_write() {
             if let Err(e) = self.offset_store.delete(name).await {
                 warn!(connector = name, error = %e, "failed to delete offset");
@@ -423,11 +469,104 @@ impl ConnectorManager {
 
     // -- startup / leadership -------------------------------------------------------
 
-    /// Load persisted API configs and `connectors.d/*.toml`. Registers
-    /// only; `run_all` starts them on the leader.
+    /// Load API configs from `__connectors` and `connectors.d/*.toml`.
+    /// Registers only; `run_all` starts them on the leader. Call
+    /// [`Self::reload_api_configs`] at the start of every leader tenure.
     pub async fn load_all(&self) -> Result<(), String> {
-        self.load_json_configs().await?;
+        self.reload_api_configs().await?;
         self.load_toml_configs().await?;
+        Ok(())
+    }
+
+    /// (Re)load the API-created connectors from `__connectors` (importing
+    /// legacy `connectors/*.json` files first when the stream is empty and
+    /// this node can write). Registers only.
+    ///
+    /// Safe to call repeatedly, and meant to be called at the start of every
+    /// leader tenure, before [`Self::run_all`]: a follower's copy of
+    /// `__connectors` changes as it replicates. API connectors missing from
+    /// the stream are stopped and dropped, changed ones are replaced, and a
+    /// connector also defined by a `connectors.d/` file keeps the file's
+    /// definition (the API copy is tombstoned when this node can write).
+    pub async fn reload_api_configs(&self) -> Result<(), String> {
+        let _g = self.lifecycle.lock().await;
+        match self
+            .store
+            .migrate_dir(&self.legacy_configs_dir(), |path, _| {
+                let config = ConnectorConfig::load_json(path).map_err(|e| e.to_string())?;
+                crate::config::validate_name(&config.name)?;
+                let value = serde_json::to_vec(&config).map_err(|e| e.to_string())?;
+                Ok((config.name, Bytes::from(value)))
+            })
+            .await
+        {
+            Ok(Migration::Deferred) => {
+                warn!("legacy connectors/ directory found; it is imported when this node leads")
+            }
+            Ok(_) => {}
+            Err(e) => warn!("could not migrate legacy connector configs: {e}"),
+        }
+        let stored = self
+            .store
+            .load()
+            .await
+            .map_err(|e| format!("failed to read {CONNECTORS_STREAM}: {e}"))?;
+        let mut configs: HashMap<String, ConnectorConfig> = HashMap::new();
+        for (name, value) in stored {
+            match serde_json::from_slice::<ConnectorConfig>(&value) {
+                Ok(c) if c.name == name => {
+                    configs.insert(name, c);
+                }
+                Ok(_) => warn!(connector = %name, "connector record name mismatch; ignored"),
+                Err(e) => {
+                    warn!(connector = %name, error = %e, "unreadable connector record; ignored")
+                }
+            }
+        }
+
+        // API connectors that are gone from the catalog.
+        let stale: Vec<Entry> = {
+            let mut entries = self.entries.write().await;
+            let names: Vec<String> = entries
+                .iter()
+                .filter(|(n, e)| e.origin == Origin::Api && !configs.contains_key(*n))
+                .map(|(n, _)| n.clone())
+                .collect();
+            names.iter().filter_map(|n| entries.remove(n)).collect()
+        };
+        for entry in stale {
+            if let Some(h) = &entry.handle {
+                h.stop(STOP_TIMEOUT).await;
+            }
+            entry.state.set_status(Status::Stopped);
+            entry.state.retire();
+            info!(connector = %entry.config.name, "connector no longer in the catalog; removed");
+        }
+
+        for (name, config) in configs {
+            let current = self
+                .entries
+                .read()
+                .await
+                .get(&name)
+                .map(|e| (e.origin.clone(), e.config == config));
+            match current {
+                Some((Origin::File(file), _)) => {
+                    warn!(connector = %name, file = %file,
+                          "connector is defined by connectors.d/ and the API; the file wins");
+                    self.drop_api_copy(&name).await;
+                }
+                Some((Origin::Api, true)) => {}
+                _ => {
+                    if let Some(h) = self.take_handle(&name).await {
+                        h.stop(STOP_TIMEOUT).await;
+                    }
+                    if let Err(e) = self.register(config, Origin::Api).await {
+                        warn!(connector = %name, error = %e, "connector config registered as failed");
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -453,8 +592,10 @@ impl ConnectorManager {
                     let name = config.name.clone();
                     // The file is the source of truth: it replaces any stale
                     // API copy.
-                    let _ = std::fs::remove_file(self.config_path(&name));
-                    self.entries.write().await.remove(&name);
+                    let previous = self.entries.write().await.remove(&name);
+                    if previous.is_some_and(|e| e.origin == Origin::Api) {
+                        self.drop_api_copy(&name).await;
+                    }
                     if let Err(e) = self.register(config, Origin::File(file_name.clone())).await {
                         warn!(file = ?path, error = %e, "connector config registered as failed");
                     }
@@ -469,30 +610,6 @@ impl ConnectorManager {
                     }
                 }
                 Err(e) => warn!(file = ?path, error = %e, "failed to parse TOML connector config"),
-            }
-        }
-        Ok(())
-    }
-
-    async fn load_json_configs(&self) -> Result<(), String> {
-        let dir = self.configs_dir();
-        if !dir.exists() {
-            return Ok(());
-        }
-        let entries =
-            std::fs::read_dir(&dir).map_err(|e| format!("failed to read connectors dir: {e}"))?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            match ConnectorConfig::load_json(&path) {
-                Ok(config) => {
-                    if let Err(e) = self.register(config, Origin::Api).await {
-                        warn!(file = ?path, error = %e, "connector config registered as failed");
-                    }
-                }
-                Err(e) => warn!(file = ?path, error = %e, "failed to parse connector config"),
             }
         }
         Ok(())

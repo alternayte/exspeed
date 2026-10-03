@@ -677,6 +677,19 @@ where
                 }
                 let token = leadership_sup.current_child_token().await;
                 info!("leader supervisor: assuming leadership; starting work");
+                // Query, connection and API-connector definitions live in
+                // replicated internal streams (`__exql_queries`,
+                // `__exql_connections`, `__connectors`); reload them for
+                // this tenure, since a promoted follower's copy changed
+                // after startup.
+                if let Err(e) = exql_sup.load().await {
+                    error!(error = %e, "failed to reload the ExQL catalog; resigning tenure");
+                    token.cancel();
+                }
+                if let Err(e) = connector_manager_sup.reload_api_configs().await {
+                    error!(error = %e, "failed to reload the connector catalog; resigning tenure");
+                    token.cancel();
+                }
                 // Consumers run only on the leader; they restore their state
                 // from `__consumers` and stop when the token is cancelled.
                 if let Err(e) = consumers_sup.start(token.clone()).await {

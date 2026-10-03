@@ -452,3 +452,104 @@ async fn min_insync_replicas_rejects_writes_without_followers() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queries_and_connectors_move_to_the_new_leader() {
+    use serde_json::{json, Value};
+    let http = reqwest::Client::new();
+    async fn post(http: &reqwest::Client, url: String, body: Value) -> (u16, Value) {
+        let r = http.post(url).json(&body).send().await.unwrap();
+        let s = r.status().as_u16();
+        (s, r.json().await.unwrap_or(Value::Null))
+    }
+    async fn count(http: &reqwest::Client, node: &TestServer, stream: &str) -> Option<i64> {
+        let r = http
+            .post(node.api_url("/api/v1/queries"))
+            .json(&json!({"sql": format!("SELECT COUNT(*) FROM {stream}")}))
+            .send()
+            .await
+            .ok()?;
+        let v: Value = r.json().await.ok()?;
+        v["rows"][0][0].as_i64()
+    }
+
+    let o = Opts::new();
+    let dirs = Dirs::new(2);
+    let a = start_node(&o, dirs.path(0)).await;
+    let b = start_node(&o, dirs.path(1)).await;
+    let (s, body) = post(&http, a.api_url("/api/v1/streams"), json!({"name": "src"})).await;
+    assert_eq!(s, 201, "{body}");
+    let (s, body) = post(
+        &http,
+        a.api_url("/api/v1/queries"),
+        json!({"sql": "CREATE STREAM copy AS SELECT payload->>'v' AS v FROM src"}),
+    )
+    .await;
+    assert_eq!(s, 201, "{body}");
+    let qid = body["query_id"].as_str().unwrap().to_string();
+    let (s, body) = post(
+        &http,
+        a.api_url("/api/v1/connectors"),
+        json!({"name": "hook", "type": "source", "plugin": "http_webhook", "stream": "src",
+               "settings": {"path": "hook", "auth_type": "none"}}),
+    )
+    .await;
+    assert_eq!(s, 201, "{body}");
+    for v in 0..3 {
+        let r = http
+            .post(a.api_url("/webhooks/hook"))
+            .json(&json!({ "v": v }))
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success());
+    }
+    eventually(Duration::from_secs(15), || async {
+        (count(&http, &a, "copy").await == Some(3)).then_some(())
+    })
+    .await;
+
+    o.backend().set_partitioned(&node_id(&a), true);
+    eventually(Duration::from_secs(20), || async {
+        is_leader(&b).await.then_some(())
+    })
+    .await;
+
+    // The new leader runs the same query and webhook connector.
+    eventually(Duration::from_secs(15), || async {
+        let q: Value = http
+            .get(b.api_url(&format!("/api/v1/queries/{qid}")))
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let c: Value = http
+            .get(b.api_url("/api/v1/connectors/hook"))
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        (q["status"] == "running" && c["status"] == "running").then_some(())
+    })
+    .await;
+    for v in 3..5 {
+        let r = http
+            .post(b.api_url("/webhooks/hook"))
+            .json(&json!({ "v": v }))
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success(), "{}", r.status());
+    }
+    // The query resumes from its replicated checkpoint: 5 rows, no repeats.
+    eventually(Duration::from_secs(15), || async {
+        (count(&http, &b, "copy").await == Some(5)).then_some(())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(count(&http, &b, "copy").await, Some(5));
+}
