@@ -33,6 +33,16 @@ docker run -d --name exspeed \
   nayth/exspeed:latest
 ```
 
+To use a config file, mount it and point `EXSPEED_CONFIG` at it:
+
+```bash
+docker run -d --name exspeed -p 5933:5933 -p 8080:8080 \
+  -v exspeed-data:/var/lib/exspeed \
+  -v $PWD/exspeed.toml:/etc/exspeed/exspeed.toml:ro \
+  -e EXSPEED_CONFIG=/etc/exspeed/exspeed.toml \
+  nayth/exspeed:latest
+```
+
 The image runs `exspeed server --data-dir /var/lib/exspeed` and has a
 `HEALTHCHECK` that runs `exspeed healthcheck`. That command exits 0 when
 `/readyz` answers 200, and you can also use it in other probes.
@@ -93,37 +103,41 @@ Do not delete the lockfile manually to "recover" — it's a TOCTOU footgun and n
 
 ## Graceful shutdown
 
-On `SIGTERM` or `SIGINT` the server stops accepting new TCP connections, waits up to **10 seconds** for in-flight connections to drain, then exits. The HTTP listener and background tasks are cancelled in the same window.
+On `SIGTERM` or `SIGINT` the server shuts down in this order:
 
-> ⚠️ **Shutdown is not fully graceful yet.**
->
-> - Continuous queries are aborted mid-batch. Their at-least-once
->   checkpoints make this safe, but they may reprocess records after
->   restart. (Connectors are stopped gracefully after the drain: sinks
->   flush and commit, sources finish their batch, for up to 30 seconds.)
-> - The final dedup snapshot may not finish writing.
-> - In multi-pod mode the leader lease is not released, so failover waits
->   the full lease TTL even on a clean shutdown.
->
-> See [REVIEW.md §3.7](REVIEW.md#37-server-http-api-auth).
+1. Stop accepting connections and end client sessions. In-flight requests
+   get up to `server.drain_timeout_secs` (10 s).
+2. Stop connectors. Sinks flush and commit, and sources finish their
+   batch, within 30 s.
+3. Resign leadership. This stops consumers, continuous queries and
+   retention, and in multi-pod mode it deletes the lease row so a standby
+   takes over at once.
+4. Wait for consumers to persist their final state: ack floors, unacked
+   records and delivery counts.
+5. Write the final dedup snapshot.
+6. Flush and fsync every partition, then release the data-dir lock.
 
-For Kubernetes, set `terminationGracePeriodSeconds: 30` (or higher) on the pod so the kubelet doesn't `SIGKILL` the process before the drain completes.
+In Kubernetes, set `terminationGracePeriodSeconds` to at least 60 so the
+kubelet doesn't `SIGKILL` the process partway through. The Helm chart does
+this.
 
 ## Consumers vs. retention
 
-If a consumer's offset falls behind the retention window (age or size), the broker returns `StorageError::OffsetOutOfRange` on its next read and **terminates the subscription** — it does not silently jump forward to the first surviving record, which would look like successful consumption of data that was actually lost.
+If retention deletes records that a consumer has not reached yet, the consumer skips ahead to the earliest record still retained. It logs a warning and counts the skipped records in its stats (`stats.skipped` in consumer info). Size retention and consumer lag together so this doesn't happen.
 
-The delivery task logs a warning with `requested` and `earliest` offsets so operators can spot it in log aggregation. To recover, the application must explicitly re-seek — typically to the earliest available offset, or to a business-meaningful point. Naïve auto-reconnect from the lost offset will hit the same error; clients should treat this signal as "your position is gone, choose where to resume."
-
-Operationally: size your retention with your slowest expected consumer in mind. Metrics of interest are `consumer_lag` and `storage_bytes`.
+Size your retention with your slowest expected consumer in mind. Metrics of interest are `consumer_lag` and `storage_bytes`.
 
 ## Consumer state durability
 
-Consumer offsets are persisted atomically (tempfile + rename + parent-dir fsync). If you see stray `*.json.tmp` files in `{data_dir}/consumers/` at startup, they're the remnants of a crashed save and are safely ignored by the loader.
+Consumer state is stored in the internal, compacted stream `__consumers`,
+with one snapshot record per consumer. It therefore gets the same
+durability as your data, and in multi-pod mode it replicates with the
+log.
 
-> ⚠️ Ack-driven saves are debounced by about 100 ms, so a crash can replay
-> recent acks. Known races can resurrect a deleted consumer or overwrite a
-> `Seek`; see [REVIEW.md §3.3](REVIEW.md#33-broker-delivery-consumers-dedup).
+Snapshots are written at most every 100 ms while state changes, and once
+more on graceful shutdown. A crash (not a clean shutdown) can lose up to
+100 ms of acks. Those records are redelivered, which the at-least-once
+contract already allows.
 
 ## `/healthz` vs `/readyz`
 

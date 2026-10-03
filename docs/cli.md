@@ -18,11 +18,16 @@ permission. A publish-only credential cannot use `exspeed pub`.
 ## Server
 
 ```bash
-exspeed server [--bind 0.0.0.0:5933] [--api-bind 0.0.0.0:8080] [--data-dir ./exspeed-data]
+exspeed server [--config exspeed.toml] [--bind 0.0.0.0:5933] [--api-bind 0.0.0.0:8080] [--data-dir ./exspeed-data]
+
+exspeed config print-default          # commented exspeed.toml with every setting
+exspeed config validate -c FILE       # resolve file + env + flags, check, exit non-zero on error
+exspeed config show -c FILE           # resolved settings, secrets redacted
+exspeed healthcheck [--url URL]       # exit 0 when /readyz answers 200 (Docker HEALTHCHECK)
 ```
 
-The full list of flags and environment variables is in
-[configuration.md](configuration.md).
+Settings come from defaults < config file < environment < flags; the full
+list is in [configuration.md](configuration.md).
 
 ## Streams
 

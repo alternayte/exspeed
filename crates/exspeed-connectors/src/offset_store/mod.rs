@@ -96,8 +96,16 @@ pub fn backend_from_env() -> String {
 /// (`log`, the default, or `file`). `EXSPEED_OFFSET_STORE` is not consulted:
 /// it selects the consumer/lease backends.
 pub fn from_env(data_dir: &Path, log: Arc<Log>) -> Result<Arc<dyn OffsetStore>, String> {
-    let backend = backend_from_env();
-    match backend.as_str() {
+    build(&backend_from_env(), data_dir, log)
+}
+
+/// Build the named offset store: `log` (default) or `file`.
+pub fn build(
+    backend: &str,
+    data_dir: &Path,
+    log: Arc<Log>,
+) -> Result<Arc<dyn OffsetStore>, String> {
+    match backend {
         "" | "log" => Ok(Arc::new(log_store::LogOffsetStore::new(log))),
         "file" => Ok(Arc::new(file::FileOffsetStore::new(data_dir.to_path_buf()))),
         other => Err(format!(

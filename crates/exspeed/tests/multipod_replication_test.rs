@@ -147,12 +147,7 @@ async fn spawn_pod() -> PodHandle {
         credentials_file: Some(cred_path.clone()),
         tls_cert: None,
         tls_key: None,
-        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-        storage_flush_window_us: 500,
-        storage_flush_threshold_records: 256,
-        storage_flush_threshold_bytes: 1_048_576,
-        storage_sync_interval_ms: 10,
-        storage_sync_bytes: 4 * 1024 * 1024,
+        ..Default::default()
     };
     let task = tokio::spawn(async move {
         let _ = exspeed::cli::server::run(args).await;
@@ -409,12 +404,7 @@ async fn multipod_e2e_bootstrap_failover_rejoin() {
         credentials_file: Some(dying_cred_path),
         tls_cert: None,
         tls_key: None,
-        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-        storage_flush_window_us: 500,
-        storage_flush_threshold_records: 256,
-        storage_flush_threshold_bytes: 1_048_576,
-        storage_sync_interval_ms: 10,
-        storage_sync_bytes: 4 * 1024 * 1024,
+        ..Default::default()
     };
     let rejoined_api_port: u16 = dying_api_bind.rsplit(':').next().unwrap().parse().unwrap();
     let _rejoined_task = tokio::spawn(async move {

@@ -96,7 +96,8 @@ Frames are capped at 16 MB.
       00000000000000000000.idx       sparse offset + time index, one entry about every 4 KiB
       00000000000000000000.meta      sealed-segment metadata (offsets, timestamps, length)
       truncate.json                  only while a truncation is in progress
-  consumers/<name>.json              consumer state (file backend)
+  streams/__consumers/               consumer state (internal compacted stream)
+  streams/__connector_offsets/       connector offsets (internal compacted stream)
   connectors.d/*.toml                connector configs (hot-reloaded)
   connectors/                        API-created connector configs (JSON)
   connector-offsets/                 connector offsets (EXSPEED_CONNECTOR_OFFSET_STORE=file only;

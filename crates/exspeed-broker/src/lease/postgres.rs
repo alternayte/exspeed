@@ -3,7 +3,6 @@
 //! state transitions are single atomic SQL statements — no application-level
 //! locking needed.
 
-use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,14 +25,23 @@ struct Inner {
 }
 
 impl PostgresLeaseBackend {
+    /// Connect using `EXSPEED_LEASE_POSTGRES_URL` (or the legacy
+    /// `EXSPEED_OFFSET_STORE_POSTGRES_URL`) and friends.
     pub async fn from_env() -> Result<Self, LeaseError> {
-        let url = env::var("EXSPEED_OFFSET_STORE_POSTGRES_URL").map_err(|_| {
-            LeaseError::Connection("EXSPEED_OFFSET_STORE_POSTGRES_URL is required".to_string())
+        let cfg = super::LeaseConfig::from_env();
+        let url = cfg.postgres_url.ok_or_else(|| {
+            LeaseError::Connection("EXSPEED_LEASE_POSTGRES_URL is required".to_string())
         })?;
-        let schema = env::var("EXSPEED_OFFSET_STORE_POSTGRES_SCHEMA")
-            .unwrap_or_else(|_| "public".to_string());
+        Self::connect(&url, &cfg.postgres_schema, cfg.heartbeat).await
+    }
 
-        let (client, connection) = tokio_postgres::connect(&url, NoTls)
+    pub async fn connect(
+        url: &str,
+        schema: &str,
+        heartbeat_interval: Duration,
+    ) -> Result<Self, LeaseError> {
+        let schema = schema.to_string();
+        let (client, connection) = tokio_postgres::connect(url, NoTls)
             .await
             .map_err(|e| LeaseError::Connection(format!("postgres connect failed: {e}")))?;
 
@@ -42,8 +50,6 @@ impl PostgresLeaseBackend {
                 error!(error = %e, "postgres lease backend connection error");
             }
         });
-
-        let heartbeat_interval = super::heartbeat_interval_from_env();
 
         let inner = Arc::new(Inner {
             client: Mutex::new(client),

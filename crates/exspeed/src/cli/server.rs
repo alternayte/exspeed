@@ -4,7 +4,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::Args;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -28,60 +27,6 @@ const TLS_ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 /// in the replication design doc and the Plan G Wave 5 contract.
 const DEFAULT_CLUSTER_BIND: &str = "0.0.0.0:5934";
 
-/// Parse `EXSPEED_CLUSTER_BIND` (default `0.0.0.0:5934`). Returns `None` on
-/// parse failure so the caller can fall back rather than panicking at startup.
-fn cluster_bind_addr() -> Option<SocketAddr> {
-    let raw =
-        std::env::var("EXSPEED_CLUSTER_BIND").unwrap_or_else(|_| DEFAULT_CLUSTER_BIND.to_string());
-    match raw.parse() {
-        Ok(a) => Some(a),
-        Err(e) => {
-            warn!(raw = %raw, error = %e, "EXSPEED_CLUSTER_BIND invalid — treating as unset");
-            None
-        }
-    }
-}
-
-/// What address followers should dial to reach this pod's cluster listener.
-/// Defaults to the bind string; set `EXSPEED_CLUSTER_ADVERTISE` when the
-/// container's bind address differs from what followers can route to
-/// (k8s service name, external LB host, etc.).
-fn cluster_advertise_addr(bind: SocketAddr) -> String {
-    std::env::var("EXSPEED_CLUSTER_ADVERTISE").unwrap_or_else(|_| bind.to_string())
-}
-
-/// The raw bearer a follower sends on the replication Connect handshake.
-/// Must resolve (after sha256) to a credential in the shared credentials
-/// store that holds `actions = ["replicate"]`. Required in multi-pod mode;
-/// startup hard-fails if missing there.
-fn replicator_credential() -> Option<String> {
-    std::env::var("EXSPEED_REPLICATOR_CREDENTIAL").ok()
-}
-
-/// True when a lease backend is configured (`EXSPEED_LEASE_BACKEND`): the
-/// single switch for "this pod is part of a multi-pod deployment" (lease,
-/// cluster listener, replication role supervisor).
-fn multi_pod_mode() -> bool {
-    exspeed_broker::lease::backend_from_env() != "none"
-}
-
-/// Per-follower mpsc capacity. 100k records is ~100MB at 1KB records —
-/// generous enough that bursty writes don't drop a healthy follower, small
-/// enough that a permanently-stuck follower doesn't balloon leader memory.
-///
-/// Defense-in-depth cap at 10_000_000: a misconfigured env var that
-/// reads `100000000` (extra zero) would otherwise reserve ~10GB of
-/// heap per follower the moment a session registers. Above that the
-/// disk-based follower-seed flow is a better answer than heap.
-fn replication_follower_queue_records() -> usize {
-    const MAX: usize = 10_000_000;
-    std::env::var("EXSPEED_REPLICATION_FOLLOWER_QUEUE_RECORDS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|v| v.min(MAX))
-        .unwrap_or(100_000)
-}
-
 /// Storage durability mode for the `--storage-sync` CLI flag.
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
 pub enum StorageSyncArg {
@@ -92,75 +37,109 @@ pub enum StorageSyncArg {
     Async,
 }
 
-#[derive(Args)]
+/// Resolved server settings. The CLI builds this from defaults, the config
+/// file, the environment and flags (see [`crate::config`]); embedders and
+/// tests construct it directly, usually as `ServerArgs { .., ..Default::default() }`.
+#[derive(Debug, Clone)]
 pub struct ServerArgs {
-    /// Address to bind to
-    #[arg(long, default_value = "0.0.0.0:5933")]
+    /// Client protocol listener.
     pub bind: String,
-
-    /// Address for the HTTP API
-    #[arg(long, default_value = "0.0.0.0:8080")]
+    /// HTTP API listener.
     pub api_bind: String,
-
-    /// Directory for persistent data
-    #[arg(long, default_value = "./exspeed-data")]
     pub data_dir: PathBuf,
-
-    /// Shared bearer token. When set, required on all TCP and HTTP connections.
-    #[arg(long, env = "EXSPEED_AUTH_TOKEN", hide_env_values = true)]
+    /// Shared admin bearer token. When set (or a credentials file exists),
+    /// every TCP and HTTP connection must authenticate.
     pub auth_token: Option<String>,
-
-    /// Path to a TOML credentials file. When unset here, falls back to
-    /// `EXSPEED_CREDENTIALS_FILE` and then to `{data_dir}/credentials.toml`.
-    /// Having a first-class field lets integration tests point at a per-test
-    /// tempfile without mutating process-global env vars.
-    #[arg(long, env = "EXSPEED_CREDENTIALS_FILE")]
+    /// Credentials file; falls back to `{data_dir}/credentials.toml` when
+    /// that exists.
     pub credentials_file: Option<PathBuf>,
-
-    /// Path to PEM-encoded server certificate (full chain). Must be set with --tls-key.
-    #[arg(long, env = "EXSPEED_TLS_CERT")]
     pub tls_cert: Option<PathBuf>,
-
-    /// Path to PEM-encoded private key. Must be set with --tls-cert.
-    #[arg(long, env = "EXSPEED_TLS_KEY")]
     pub tls_key: Option<PathBuf>,
-
-    /// Storage durability mode. `sync` = group commit + fsync per batch (safe default).
-    /// `async` = batch without fsync, periodic fsync on `--storage-sync-interval-ms`.
-    #[arg(long, value_enum, default_value = "sync", env = "EXSPEED_STORAGE_SYNC")]
     pub storage_sync: StorageSyncArg,
-
-    /// Appender flush window in microseconds. Incoming appends are coalesced
-    /// into a batch for up to this many µs before being committed to disk.
-    #[arg(long, default_value_t = 500, env = "EXSPEED_FLUSH_WINDOW_US")]
     pub storage_flush_window_us: u64,
-
-    /// Flush the appender batch early when this many records are queued.
-    #[arg(long, default_value_t = 256, env = "EXSPEED_FLUSH_THRESHOLD_RECORDS")]
     pub storage_flush_threshold_records: usize,
-
-    /// Flush the appender batch early when this many bytes are queued.
-    #[arg(
-        long,
-        default_value_t = 1_048_576,
-        env = "EXSPEED_FLUSH_THRESHOLD_BYTES"
-    )]
     pub storage_flush_threshold_bytes: usize,
-
-    /// Interval in milliseconds between periodic fsyncs in async sync mode.
-    /// Only relevant when `--storage-sync=async`.
-    #[arg(long, default_value_t = 10, env = "EXSPEED_SYNC_INTERVAL_MS")]
     pub storage_sync_interval_ms: u64,
-
-    /// Unflushed-bytes threshold to trigger an early fsync in async sync mode
-    /// (0 = timer only). Only relevant when `--storage-sync=async`.
-    #[arg(long, default_value_t = 4 * 1024 * 1024, env = "EXSPEED_SYNC_BYTES")]
     pub storage_sync_bytes: usize,
+    /// Default `msg_id` dedup window for streams that don't set one.
+    pub dedup_window_secs: u64,
+    pub max_connections: usize,
+    /// How long open connections get to finish on shutdown.
+    pub drain_timeout_secs: u64,
+    /// `log` or `file`.
+    pub connector_offset_store: String,
+    pub cluster: ClusterArgs,
+    /// `text` / `json`; `None` = the environment decides.
+    pub log_format: Option<String>,
+    pub log_level: Option<String>,
+    /// The config file these settings came from, if any.
+    pub config_file: Option<PathBuf>,
+}
+
+/// Multi-pod settings (`[cluster]`).
+#[derive(Debug, Clone)]
+pub struct ClusterArgs {
+    /// `none`, `postgres` or `redis`.
+    pub lease: String,
+    pub postgres_url: Option<String>,
+    pub postgres_schema: String,
+    pub redis_url: Option<String>,
+    pub redis_key_prefix: String,
+    pub lease_ttl_secs: u64,
+    pub lease_heartbeat_secs: u64,
+    /// Replication listener.
+    pub bind: String,
+    /// Address peers dial; defaults to `bind`.
+    pub advertise: Option<String>,
+    /// Token followers present on the replication handshake.
+    pub replicator_credential: Option<String>,
+    pub follower_queue_records: usize,
+}
+
+impl Default for ClusterArgs {
+    fn default() -> Self {
+        Self {
+            lease: "none".into(),
+            postgres_url: None,
+            postgres_schema: "public".into(),
+            redis_url: None,
+            redis_key_prefix: "exspeed:lease:".into(),
+            lease_ttl_secs: 30,
+            lease_heartbeat_secs: 10,
+            bind: DEFAULT_CLUSTER_BIND.into(),
+            advertise: None,
+            replicator_credential: None,
+            follower_queue_records: 100_000,
+        }
+    }
+}
+
+impl ClusterArgs {
+    pub fn multi_pod(&self) -> bool {
+        self.lease != "none"
+    }
+
+    pub fn lease_config(&self) -> exspeed_broker::lease::LeaseConfig {
+        exspeed_broker::lease::LeaseConfig {
+            backend: self.lease.clone(),
+            postgres_url: self.postgres_url.clone(),
+            postgres_schema: self.postgres_schema.clone(),
+            redis_url: self.redis_url.clone(),
+            redis_key_prefix: self.redis_key_prefix.clone(),
+            ttl: std::time::Duration::from_secs(self.lease_ttl_secs),
+            heartbeat: std::time::Duration::from_secs(self.lease_heartbeat_secs),
+        }
+    }
+}
+
+impl Default for ServerArgs {
+    fn default() -> Self {
+        Self::new("./exspeed-data")
+    }
 }
 
 impl ServerArgs {
-    /// Defaults identical to the CLI's, with the given data directory. Handy
-    /// for embedding the server (tests, benchmarks).
+    /// Built-in defaults with the given data directory.
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
         Self {
             bind: "0.0.0.0:5933".into(),
@@ -176,6 +155,14 @@ impl ServerArgs {
             storage_flush_threshold_bytes: 1_048_576,
             storage_sync_interval_ms: 10,
             storage_sync_bytes: 4 * 1024 * 1024,
+            dedup_window_secs: 300,
+            max_connections: 1024,
+            drain_timeout_secs: 10,
+            connector_offset_store: "log".into(),
+            cluster: ClusterArgs::default(),
+            log_format: None,
+            log_level: None,
+            config_file: None,
         }
     }
 }
@@ -333,11 +320,7 @@ where
     let (metrics, prometheus_registry) = exspeed_common::Metrics::new();
     let metrics = Arc::new(metrics);
 
-    // Create BrokerAppend with dedup window from env (default 300s)
-    let dedup_window_secs: u64 = std::env::var("EXSPEED_DEDUP_WINDOW_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(300);
+    let dedup_window_secs = args.dedup_window_secs;
     let broker_append = Arc::new(
         BrokerAppend::new(storage.clone(), dedup_window_secs).with_metrics(metrics.clone()),
     );
@@ -364,10 +347,9 @@ where
         }
     }
 
-    // Build lease backend (same env var dispatch as work coordinator).
-    let lease = exspeed_broker::lease::from_env()
+    let lease = exspeed_broker::lease::from_config(&args.cluster.lease_config())
         .await
-        .expect("failed to initialize lease backend");
+        .context("failed to initialize the lease backend")?;
     info!(
         lease_backend = if lease.supports_coordination() {
             "coordinated"
@@ -382,7 +364,7 @@ where
         warn!(
             "no lease backend — multi-pod deployment not supported; \
              all connectors and continuous queries will run on this pod. \
-             Set EXSPEED_LEASE_BACKEND=postgres|redis for multi-pod coordination."
+             Set cluster.lease (EXSPEED_LEASE_BACKEND) to postgres or redis for multi-pod."
         );
     }
 
@@ -394,28 +376,38 @@ where
     // Single-pod deployments get `None` for both and skip every multi-pod
     // branch below — no cluster listener, no follower client, no
     // role-transition supervisor, no `state.replication_coordinator`.
-    let multi_pod = multi_pod_mode();
+    let multi_pod = args.cluster.multi_pod();
     let replication_coordinator: Option<Arc<ReplicationCoordinator>> = if multi_pod {
-        let queue_cap = replication_follower_queue_records();
+        let queue_cap = args.cluster.follower_queue_records;
         Some(ReplicationCoordinator::new(metrics.clone(), queue_cap))
     } else {
         None
     };
-    let cluster_bind = cluster_bind_addr();
-    let replication_advertise: Option<String> = match (multi_pod, cluster_bind) {
-        (true, Some(bind)) => Some(cluster_advertise_addr(bind)),
-        _ => None,
-    };
+    let cluster_bind: Option<SocketAddr> =
+        if multi_pod {
+            Some(args.cluster.bind.parse().with_context(|| {
+                format!("cluster.bind `{}` is not host:port", args.cluster.bind)
+            })?)
+        } else {
+            None
+        };
+    let replication_advertise: Option<String> = cluster_bind.map(|bind| {
+        args.cluster
+            .advertise
+            .clone()
+            .unwrap_or_else(|| bind.to_string())
+    });
 
     // Spawn cluster-leader leadership state machine. The advertised
     // endpoint is written into the `cluster:leader` lease row on every
     // acquire so followers can discover the current leader via
     // `list_all()` without a separate registry.
     let leadership = Arc::new(
-        exspeed_broker::leadership::ClusterLeadership::spawn(
+        exspeed_broker::leadership::ClusterLeadership::spawn_with_ttl(
             lease.clone(),
             metrics.clone(),
             replication_advertise.clone(),
+            std::time::Duration::from_secs(args.cluster.lease_ttl_secs),
         )
         .await,
     );
@@ -423,17 +415,7 @@ where
     // Validate heartbeat vs TTL — heartbeat must be well under TTL or the
     // first heartbeat fires after the lease has already expired and the
     // cluster will thrash.
-    let lease_ttl = exspeed_broker::lease::ttl_from_env();
-    let lease_hb = exspeed_broker::lease::heartbeat_interval_from_env();
-    if lease_hb * 2 >= lease_ttl {
-        warn!(
-            ttl_secs = lease_ttl.as_secs(),
-            heartbeat_secs = lease_hb.as_secs(),
-            "EXSPEED_LEASE_HEARTBEAT_SECS should be at most TTL/2 to avoid \
-             expiring the lease before the first refresh; current config will \
-             cause leader thrashing"
-        );
-    }
+    let lease_ttl = std::time::Duration::from_secs(args.cluster.lease_ttl_secs);
 
     // Give the retry loop one full tick to race for the lease before we
     // log posture or spawn the supervisor. We wait for is_leader=true with
@@ -533,10 +515,13 @@ where
 
     // Connector offsets: the `__connector_offsets` stream (default, replicates
     // with the log) or atomic files (`EXSPEED_CONNECTOR_OFFSET_STORE=file`).
-    let offset_backend = exspeed_connectors::offset_store::backend_from_env();
-    let offset_store =
-        exspeed_connectors::offset_store::from_env(&args.data_dir, broker.log.clone())
-            .map_err(|e| anyhow::anyhow!("connector offset store: {e}"))?;
+    let offset_backend = args.connector_offset_store.clone();
+    let offset_store = exspeed_connectors::offset_store::build(
+        &offset_backend,
+        &args.data_dir,
+        broker.log.clone(),
+    )
+    .map_err(|e| anyhow::anyhow!("connector offset store: {e}"))?;
     info!(
         backend = offset_backend.as_str(),
         "connector offset store initialized"
@@ -714,15 +699,6 @@ where
             .context("failed to bind cluster listener")?;
             info!(%bind, advertise = ?replication_advertise, "cluster replication listener bound");
             Some(Arc::new(server))
-        } else if multi_pod {
-            // Multi-pod mode but cluster_bind couldn't be resolved. We
-            // warned above; coord is still useful for emit-on-append but
-            // no peer can actually dial this pod. Prefer a hard error so
-            // the operator doesn't silently run a crippled cluster.
-            anyhow::bail!(
-                "EXSPEED_LEASE_BACKEND is set but EXSPEED_CLUSTER_BIND is unparseable — \
-                 refusing to start so the misconfiguration is caught at deploy time"
-            );
         } else {
             None
         };
@@ -765,9 +741,9 @@ where
         // and the leader-side server enforces `Action::Replicate` on the
         // resulting identity. A misconfiguration here would manifest as
         // every follower session failing with 401; fail fast instead.
-        let replicator_bearer = replicator_credential().context(
-            "EXSPEED_REPLICATOR_CREDENTIAL must be set when EXSPEED_LEASE_BACKEND=postgres|redis \
-             (the bearer a follower uses to authenticate its replication session)",
+        let replicator_bearer = args.cluster.replicator_credential.clone().context(
+            "cluster.replicator_credential (EXSPEED_REPLICATOR_CREDENTIAL) must be set in \
+             multi-pod mode (the bearer a follower uses to authenticate its replication session)",
         )?;
 
         tokio::spawn(async move {
@@ -939,10 +915,7 @@ where
 
     // Bound concurrent connections. Each accepted connection holds one permit
     // for its lifetime; the OS-level accept queue absorbs short bursts.
-    let max_conns: usize = std::env::var("EXSPEED_MAX_CONNS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1024);
+    let max_conns = args.max_connections;
     let conn_sem = Arc::new(Semaphore::new(max_conns));
     info!(max_conns, "connection cap configured");
 
@@ -1028,7 +1001,7 @@ where
     // Drain: wait for active connections to finish, up to 10 seconds. Each
     // connection holds one semaphore permit for its lifetime; when permits
     // return to `max_conns` available, all connection tasks have exited.
-    let drain_deadline = std::time::Duration::from_secs(10);
+    let drain_deadline = std::time::Duration::from_secs(args.drain_timeout_secs);
     let drain_start = std::time::Instant::now();
     let active_at_start = max_conns - conn_sem.available_permits();
     info!(

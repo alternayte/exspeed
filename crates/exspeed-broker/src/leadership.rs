@@ -78,6 +78,22 @@ impl ClusterLeadership {
         metrics: Arc<Metrics>,
         replication_endpoint: Option<String>,
     ) -> Self {
+        Self::spawn_with_ttl(
+            lease,
+            metrics,
+            replication_endpoint,
+            crate::lease::ttl_from_env(),
+        )
+        .await
+    }
+
+    /// Like [`spawn`](Self::spawn) with an explicit lease TTL.
+    pub async fn spawn_with_ttl(
+        lease: Arc<dyn LeaderLease>,
+        metrics: Arc<Metrics>,
+        replication_endpoint: Option<String>,
+        ttl: Duration,
+    ) -> Self {
         let holder_id = Uuid::new_v4();
         let (is_leader_tx, is_leader_rx) = watch::channel(false);
 
@@ -101,7 +117,7 @@ impl ClusterLeadership {
         // Spawn the retry loop.
         let inner_for_task = Arc::clone(&inner);
         tokio::spawn(async move {
-            run_retry_loop(inner_for_task).await;
+            run_retry_loop(inner_for_task, ttl).await;
         });
 
         Self {
@@ -171,8 +187,7 @@ impl ClusterLeadership {
 
 /// Periodic acquire + heartbeat-observation loop. Ticks every `TTL/3`.
 /// Only spawned once per `ClusterLeadership`.
-async fn run_retry_loop(inner: Arc<Inner>) {
-    let ttl = crate::lease::ttl_from_env();
+async fn run_retry_loop(inner: Arc<Inner>, ttl: Duration) {
     let tick = std::cmp::max(ttl / 3, Duration::from_secs(1));
     let mut ticker = tokio::time::interval(tick);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -260,6 +275,11 @@ async fn run_retry_loop(inner: Arc<Inner>) {
 }
 
 async fn demote(inner: Arc<Inner>) {
+    // A deliberate `resign` already did the cleanup; dropping its guard
+    // fires `on_lost`, which is not a lost lease.
+    if inner.resigned.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
     // Cancel the current token (so background tasks exit), drop the
     // guard (so peers can acquire), flip metrics + watcher.
     let token = {

@@ -86,12 +86,7 @@ async fn spawn_broker(schema: &str) -> BrokerHandle {
             credentials_file: None,
             tls_cert: None,
             tls_key: None,
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
+            ..Default::default()
         };
         let _ = exspeed::cli::server::run(args).await;
     });

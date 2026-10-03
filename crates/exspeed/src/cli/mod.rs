@@ -38,7 +38,10 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// Start the exspeed server
-    Server(server::ServerArgs),
+    Server(crate::config::ServeArgs),
+    /// Inspect and validate server configuration (exspeed.toml)
+    #[command(subcommand)]
+    Config(crate::config::ConfigCommand),
     /// Manage and validate connector configs
     Connector(connector::ConnectorCommand),
     /// Create a new stream

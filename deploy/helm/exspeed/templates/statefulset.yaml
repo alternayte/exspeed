@@ -19,9 +19,12 @@ spec:
   template:
     metadata:
       labels: {{- include "exspeed.selectorLabels" . | nindent 8 }}
-      {{- with .Values.podAnnotations }}
-      annotations: {{- toYaml . | nindent 8 }}
-      {{- end }}
+      annotations:
+        # Roll the pods when exspeed.toml changes.
+        checksum/config: {{ .Values.config | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:
@@ -52,6 +55,10 @@ spec:
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
             - name: POD_NAMESPACE
               valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            {{- if .Values.config }}
+            - name: EXSPEED_CONFIG
+              value: /etc/exspeed/exspeed.toml
+            {{- end }}
             {{- range $k, $v := .Values.env }}
             - name: {{ $k }}
               value: {{ $v | quote }}
@@ -73,7 +80,7 @@ spec:
             {{- if $multi }}
             - name: EXSPEED_LEASE_BACKEND
               value: postgres
-            - name: EXSPEED_OFFSET_STORE_POSTGRES_URL
+            - name: EXSPEED_LEASE_POSTGRES_URL
               valueFrom: { secretKeyRef: { name: {{ .Values.cluster.postgresUrlSecret }}, key: url } }
             - name: EXSPEED_REPLICATOR_CREDENTIAL
               valueFrom: { secretKeyRef: { name: {{ .Values.cluster.replicatorTokenSecret }}, key: token } }
@@ -101,6 +108,12 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/exspeed
+            {{- if .Values.config }}
+            - name: config
+              mountPath: /etc/exspeed/exspeed.toml
+              subPath: exspeed.toml
+              readOnly: true
+            {{- end }}
             {{- if .Values.auth.credentialsSecret }}
             - name: credentials
               mountPath: /etc/exspeed/credentials.toml
@@ -113,6 +126,10 @@ spec:
               readOnly: true
             {{- end }}
       volumes:
+        {{- if .Values.config }}
+        - name: config
+          configMap: { name: {{ include "exspeed.fullname" . }}-config }
+        {{- end }}
         {{- if not .Values.persistence.enabled }}
         - name: data
           emptyDir: {}

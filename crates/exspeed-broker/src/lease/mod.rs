@@ -143,16 +143,65 @@ pub fn backend_from_env() -> String {
     }
 }
 
-/// Build a `LeaderLease` from [`backend_from_env`]. Noop when none is set.
+/// Explicit lease settings (the server's `[cluster]` config section).
+#[derive(Debug, Clone)]
+pub struct LeaseConfig {
+    /// `none`, `postgres` or `redis`.
+    pub backend: String,
+    pub postgres_url: Option<String>,
+    pub postgres_schema: String,
+    pub redis_url: Option<String>,
+    pub redis_key_prefix: String,
+    pub ttl: Duration,
+    pub heartbeat: Duration,
+}
+
+impl LeaseConfig {
+    /// Settings from the environment (used by tests and tools; the server
+    /// resolves its config file + env + flags instead).
+    pub fn from_env() -> Self {
+        Self {
+            backend: backend_from_env(),
+            postgres_url: std::env::var("EXSPEED_LEASE_POSTGRES_URL")
+                .or_else(|_| std::env::var("EXSPEED_OFFSET_STORE_POSTGRES_URL"))
+                .ok(),
+            postgres_schema: std::env::var("EXSPEED_LEASE_POSTGRES_SCHEMA")
+                .or_else(|_| std::env::var("EXSPEED_OFFSET_STORE_POSTGRES_SCHEMA"))
+                .unwrap_or_else(|_| "public".into()),
+            redis_url: std::env::var("EXSPEED_LEASE_REDIS_URL")
+                .or_else(|_| std::env::var("EXSPEED_OFFSET_STORE_REDIS_URL"))
+                .ok(),
+            redis_key_prefix: std::env::var("EXSPEED_LEASE_REDIS_KEY_PREFIX")
+                .unwrap_or_else(|_| "exspeed:lease:".into()),
+            ttl: ttl_from_env(),
+            heartbeat: heartbeat_interval_from_env(),
+        }
+    }
+}
+
+/// Build a `LeaderLease` from the environment. Noop when no backend is set.
 pub async fn from_env() -> Result<Arc<dyn LeaderLease>, LeaseError> {
-    let backend = backend_from_env();
-    match backend.as_str() {
+    from_config(&LeaseConfig::from_env()).await
+}
+
+/// Build a `LeaderLease` from explicit settings. Noop for backend `none`.
+pub async fn from_config(cfg: &LeaseConfig) -> Result<Arc<dyn LeaderLease>, LeaseError> {
+    match cfg.backend.as_str() {
         "postgres" => {
-            let b = postgres::PostgresLeaseBackend::from_env().await?;
+            let url = cfg.postgres_url.as_deref().ok_or_else(|| {
+                LeaseError::Connection("the postgres lease backend needs a URL".into())
+            })?;
+            let b =
+                postgres::PostgresLeaseBackend::connect(url, &cfg.postgres_schema, cfg.heartbeat)
+                    .await?;
             Ok(Arc::new(b))
         }
         "redis" => {
-            let b = redis::RedisLeaseBackend::from_env().await?;
+            let url = cfg.redis_url.as_deref().ok_or_else(|| {
+                LeaseError::Connection("the redis lease backend needs a URL".into())
+            })?;
+            let b = redis::RedisLeaseBackend::connect(url, &cfg.redis_key_prefix, cfg.heartbeat)
+                .await?;
             Ok(Arc::new(b))
         }
         _ => Ok(Arc::new(NoopLeaderLease::new())),

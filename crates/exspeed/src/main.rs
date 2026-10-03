@@ -5,14 +5,30 @@ use exspeed::cli::client::CliClient;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    exspeed::log_format::init_logging();
-
     let args = cli::Cli::parse();
+    // The server's log settings come from its resolved config; other
+    // commands use the environment.
+    let server_args = match &args.command {
+        cli::Command::Server(flags) => {
+            let resolved = exspeed::config::resolve(flags)?;
+            exspeed::log_format::init_logging_with(
+                resolved.log_format.as_deref(),
+                resolved.log_level.as_deref().or(Some("info")),
+            );
+            exspeed::config::validate(&resolved)?;
+            Some(resolved)
+        }
+        _ => {
+            exspeed::log_format::init_logging();
+            None
+        }
+    };
     let client = CliClient::new(&args.server);
     let json = args.json;
 
     match args.command {
-        cli::Command::Server(a) => cli::server::run(a).await,
+        cli::Command::Server(_) => cli::server::run(server_args.expect("resolved above")).await,
+        cli::Command::Config(c) => exspeed::config::run_config_command(c),
         cli::Command::Connector(c) => cli::connector::run(c).await,
         cli::Command::Create {
             name,

@@ -21,10 +21,19 @@ persistence:
   storageClass: ""          # "" = cluster default
   accessModes: [ReadWriteOnce]
 
+# Optional exspeed.toml contents (see `exspeed config print-default`),
+# mounted at /etc/exspeed/exspeed.toml. Environment variables below and the
+# chart's own settings (ports, auth, TLS, cluster) override it.
+config: ""
+#  [storage]
+#  sync = "async"
+#  [server]
+#  max_connections = 4096
+
 # Extra environment variables for the server (see docs/configuration.md).
 env:
-  RUST_LOG: info
   LOG_FORMAT: json
+  # RUST_LOG: info
   # EXSPEED_STORAGE_SYNC: sync
   # EXSPEED_MAX_CONNS: "1024"
 
@@ -61,7 +70,7 @@ resources:
 
 # Seconds the kubelet waits after SIGTERM before SIGKILL. Exspeed drains for
 # up to 10 s; leave headroom.
-terminationGracePeriodSeconds: 30
+terminationGracePeriodSeconds: 60
 
 service:
   type: ClusterIP
