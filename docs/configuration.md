@@ -56,13 +56,13 @@ JetStream's default.
 
 Single-node defaults are file-based. See [high-availability.md](high-availability.md).
 
-**Backend selection** (each takes `file`, `postgres` or `redis`; offsets also accept `s3` and `stream`):
+**Backend selection:**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `EXSPEED_CONSUMER_STORE` | `file` | Where consumer configs and offsets are stored. Also accepts `s3`. Falls back to `EXSPEED_OFFSET_STORE`. |
-| `EXSPEED_OFFSET_STORE` | `file` | Where connector offsets are stored |
+| `EXSPEED_CONSUMER_STORE` | `file` | Where consumer configs and offsets are stored: `file`, `postgres`, `redis` or `s3`. Falls back to `EXSPEED_OFFSET_STORE` (legacy name). |
 | — | — | The lease and the group work-coordinator backends follow the consumer store |
+| `EXSPEED_CONNECTOR_OFFSET_STORE` | `log` | Where connector offsets are stored: `log` (the internal `__connector_offsets` stream; replicates with the data) or `file` (`<data-dir>/connector-offsets/`). See [connectors.md](connectors.md#offsets). |
 
 **Postgres:**
 
@@ -70,7 +70,6 @@ Single-node defaults are file-based. See [high-availability.md](high-availabilit
 |----------|---------|-------------|
 | `EXSPEED_OFFSET_STORE_POSTGRES_URL` | — | Postgres URL. Every Postgres-backed component uses it. |
 | `EXSPEED_OFFSET_STORE_POSTGRES_SCHEMA` | `public` | |
-| `EXSPEED_OFFSET_STORE_POSTGRES_TABLE` | `exspeed_offsets` | Connector offset table |
 
 **Redis:**
 
@@ -78,7 +77,6 @@ Single-node defaults are file-based. See [high-availability.md](high-availabilit
 |----------|---------|-------------|
 | `EXSPEED_OFFSET_STORE_REDIS_URL` | — | Redis URL. Every Redis-backed component uses it. |
 | `EXSPEED_CONSUMER_STORE_REDIS_KEY_PREFIX` | `exspeed:consumers:` | |
-| `EXSPEED_OFFSET_STORE_REDIS_KEY_PREFIX` | `exspeed:offsets:` | |
 | `EXSPEED_LEASE_REDIS_KEY_PREFIX` | `exspeed:lease:` | |
 | `EXSPEED_WORK_COORDINATOR_REDIS_KEY_PREFIX` | `exspeed:coord:` | |
 
@@ -91,7 +89,6 @@ Single-node defaults are file-based. See [high-availability.md](high-availabilit
 | `EXSPEED_OFFSET_STORE_S3_ENDPOINT` | — | |
 | `EXSPEED_OFFSET_STORE_S3_ACCESS_KEY` | — | |
 | `EXSPEED_OFFSET_STORE_S3_SECRET_KEY` | — | |
-| `EXSPEED_OFFSET_STORE_S3_PREFIX` | `exspeed/offsets/` | |
 | `EXSPEED_CONSUMER_STORE_S3_PREFIX` | `exspeed/consumers/` | |
 
 **Lease and replication:**

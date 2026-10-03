@@ -14,7 +14,7 @@ exspeed-streams      StorageEngine trait (async), Record / StoredRecord
 exspeed-protocol     wire protocol: Frame codec, OpCodes, Client/Server messages, replication messages
 exspeed-storage      FileStorage (segments, indexes, retention), MemoryStorage, S3 tiering (experimental)
 exspeed-broker       BrokerAppend (dedup), consumers, delivery, ack/nack, DLQ, leases, replication
-exspeed-connectors   connector manager, retry/DLQ, offset stores, built-in plugins
+exspeed-connectors   connector manager, per-connector supervisor, retry/DLQ, offset stores, built-in plugins
 exspeed-processing   ExQL: parser → logical plan → physical operators → bounded / continuous runtime
 exspeed-api          Axum HTTP API, auth and leader-gate middleware, webhooks
 exspeed              binary: CLI + server bootstrap (cli/server.rs)
@@ -71,7 +71,9 @@ Every frame starts with a 10-byte header:
       00000000000000000000.sidx.<name>  secondary index (if any)
   consumers/<name>.json              consumer state (file backend)
   connectors.d/*.toml                connector configs (hot-reloaded)
-  connectors/                        persisted connector configs + file offsets
+  connectors/                        API-created connector configs (JSON)
+  connector-offsets/                 connector offsets (EXSPEED_CONNECTOR_OFFSET_STORE=file only;
+                                     the default stores them in the __connector_offsets stream)
   queries/                           continuous query registry + checkpoints
   indexes/<name>.json                secondary index definitions
 ```
@@ -109,6 +111,8 @@ scan. It is truncated at the first torn frame it finds.
 - **Subscriptions:** each one gets a delivery task that polls storage in
   batches of 100 every 50 ms. It filters by subject and sends batches over
   an mpsc channel to the connection task.
-- **Connectors:** one task each, under the leader's cancellation token.
+- **Connectors:** one supervisor task each, under the leader's cancellation
+  token. The supervisor runs the plugin, catches panics and restarts it with
+  backoff (see [connectors.md](connectors.md#status-restarts-and-metrics)).
 - **Continuous queries:** one task each, under the leader's cancellation
   token.

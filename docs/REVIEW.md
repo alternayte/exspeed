@@ -16,7 +16,7 @@
 | 2. Consumers + protocol v2 | — |
 | 3. Ops | — |
 | 4. ExQL v2 | — |
-| 5. Connectors v2 | — |
+| 5. Connectors v2 | ✅ checkpoint protocol, supervisor, typed settings, error taxonomy, log-backed offsets, plugin fixes; PG CDC/outbox/poll tested against Postgres in CI. RabbitMQ/S3/MySQL/MSSQL service tests still to do |
 | 6. HA | — |
 
 ## Contents
@@ -256,6 +256,10 @@ Severity: **C** critical · **H** high · **M** medium · **L** low.
 | Restart and state recovery | ❌ offsets only; state is lost |
 
 ### 3.6 Connectors (`exspeed-connectors`)
+
+> **Status (Phase 5):** every finding below is addressed; the current
+> per-connector guarantees and their tests are in
+> [connectors.md](connectors.md#delivery-guarantees).
 
 | Sev | Finding | Where |
 |-----|---------|-------|

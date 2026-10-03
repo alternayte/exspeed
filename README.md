@@ -56,7 +56,9 @@ on TCP port 5933. The HTTP API is on port 8080.
 | Auth (scoped tokens) and TLS | ✅ · ⚠️ scoped admins can list all streams |
 | ExQL bounded queries | ✅ filter/project · ⚠️ joins, JSON numerics, many clauses ([§3.5](docs/REVIEW.md#35-exql-exspeed-processing)) |
 | ExQL continuous queries, windows, joins, views | ⚠️ partial; state is not durable |
-| Connectors | ⚠️ see per-plugin status in [docs/connectors.md](docs/connectors.md) |
+| Connectors: framework (checkpoint protocol, supervisor, typed settings, DLQ, replicated offsets) | ✅ tested with fault injection |
+| Connectors: Postgres CDC, outbox, poll; JDBC sink; HTTP poll/sink/webhook | ✅ at-least-once or effectively-once, tested against real services ([guarantees](docs/connectors.md#delivery-guarantees)) |
+| Connectors: RabbitMQ, S3, SQL Server CDC | ⚠️ implemented to the same protocol; unit-tested only, no service tests in CI yet |
 | Multi-pod HA with replication | ❌ not safe yet ([§3.4](docs/REVIEW.md#34-ha-leadership--replication)) |
 
 ## Documentation

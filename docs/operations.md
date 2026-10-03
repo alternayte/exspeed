@@ -68,9 +68,10 @@ On `SIGTERM` or `SIGINT` the server stops accepting new TCP connections, waits u
 
 > ⚠️ **Shutdown is not fully graceful yet.**
 >
-> - Connectors and continuous queries are aborted mid-batch. Their
->   at-least-once checkpoints make this safe, but they may reprocess
->   records after restart.
+> - Continuous queries are aborted mid-batch. Their at-least-once
+>   checkpoints make this safe, but they may reprocess records after
+>   restart. (Connectors are stopped gracefully after the drain: sinks
+>   flush and commit, sources finish their batch, for up to 30 seconds.)
 > - The final dedup snapshot may not finish writing.
 > - In multi-pod mode the leader lease is not released, so failover waits
 >   the full lease TTL even on a clean shutdown.

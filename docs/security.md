@@ -9,7 +9,6 @@ environment variables (or the equivalent flags; see [configuration.md](configura
 > - **Scoped admins can list every tenant's streams and consumers.**
 > - **`/metrics` is unauthenticated** and exposes every stream and consumer
 >   name.
-> - **Webhook connectors default to `auth_type = "none"`.**
 >
 > SQL queries need a **global admin** credential, over both TCP and HTTP.
 > Ack and nack only apply to the consumer the connection subscribed to.
