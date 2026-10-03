@@ -11,8 +11,9 @@ macro_rules! opcodes {
         /// Wire protocol operation codes (protocol version 2).
         ///
         /// Client → server requests use `0x01–0x7F` (plus `Ping`); server →
-        /// client responses and pushes use `0x80–0xFF`. `0x30–0x3F` and
-        /// `0xA0–0xAF` belong to the replication protocol on the cluster port.
+        /// client responses and pushes use `0x80–0xFF`. `0x30`, `0x31` and
+        /// `0xA0–0xA6` are reserved (an earlier replication design); servers
+        /// replicate over their own protocol on the cluster port.
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         #[repr(u8)]
         pub enum OpCode {
@@ -82,8 +83,6 @@ opcodes! {
         InProgress = 0x57,
         Read = 0x60,
         Ping = 0xF0,
-        // Replication: follower -> leader.
-        ReplicateResume = 0x30,
     }
     server {
         Ok = 0x80,
@@ -98,18 +97,8 @@ opcodes! {
         SubscribeOk = 0x89,
         SubscriptionEnded = 0x8A,
         Pong = 0xF1,
-        // Replication: leader -> follower.
-        ClusterManifest = 0xA0,
-        RecordsAppended = 0xA1,
-        StreamCreatedEvent = 0xA2,
-        StreamDeletedEvent = 0xA3,
-        RetentionUpdatedEvent = 0xA4,
-        RetentionTrimmedEvent = 0xA5,
-        StreamReseedEvent = 0xA6,
     }
-    both {
-        ReplicationHeartbeat = 0x31,
-    }
+    both {}
 }
 
 #[cfg(test)]
@@ -145,7 +134,14 @@ mod tests {
         assert!(!OpCode::Ping.is_server_opcode());
         assert!(OpCode::Deliver.is_server_opcode());
         assert!(!OpCode::Deliver.is_client_opcode());
-        assert!(OpCode::ReplicationHeartbeat.is_client_opcode());
-        assert!(OpCode::ReplicationHeartbeat.is_server_opcode());
+    }
+
+    /// The replication opcodes of an earlier design are gone; they are
+    /// reserved and decode as unknown.
+    #[test]
+    fn reserved_opcodes_are_unknown() {
+        for b in [0x30u8, 0x31, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6] {
+            assert!(OpCode::try_from(b).is_err(), "0x{b:02x}");
+        }
     }
 }
