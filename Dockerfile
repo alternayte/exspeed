@@ -20,7 +20,7 @@ RUN cargo build --release -p exspeed
 # --- Runtime image ----------------------------------------------------------
 FROM debian:trixie-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates \
+ && apt-get install -y --no-install-recommends ca-certificates libssl3t64 \
  && rm -rf /var/lib/apt/lists/* \
  && groupadd --system --gid 1000 exspeed \
  && useradd --system --uid 1000 --gid 1000 --home-dir /var/lib/exspeed --shell /usr/sbin/nologin exspeed \

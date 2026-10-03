@@ -16,7 +16,8 @@ irm https://github.com/alternayte/exspeed/releases/latest/download/exspeed-insta
 ```
 
 Every [release](https://github.com/alternayte/exspeed/releases) also has
-plain archives for each platform with SHA-256 checksums.
+plain archives for each platform with SHA-256 checksums. The Linux binaries
+need glibc 2.35+ and OpenSSL 3 (Ubuntu 22.04+, Debian 12+, RHEL 9+).
 
 **Docker** (`linux/amd64` and `linux/arm64`; `latest`, `X.Y` and `X.Y.Z` tags):
 
