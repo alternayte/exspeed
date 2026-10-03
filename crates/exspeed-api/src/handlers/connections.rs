@@ -38,7 +38,7 @@ pub async fn create_connection(
         url: body.url,
     };
 
-    match state.exql.add_connection(config) {
+    match state.exql.add_connection(config).await {
         Ok(()) => (
             StatusCode::CREATED,
             Json(json!({"name": body.name, "driver": body.driver, "status": "created"})),
@@ -83,7 +83,7 @@ pub async fn delete_connection(
             return resp;
         }
     }
-    match state.exql.remove_connection(&name) {
+    match state.exql.remove_connection(&name).await {
         Ok(()) => (
             StatusCode::OK,
             Json(json!({"status": "removed", "name": name})),

@@ -578,8 +578,107 @@ async fn invalid_queries_are_rejected_before_anything_is_persisted() {
         assert_eq!(e.code(), code, "{sql}: {e}");
     }
     assert!(node.engine.list_queries().is_empty());
-    assert!(std::fs::read_dir(dir.path().join("exql").join("queries"))
-        .map(|d| d.count() == 0)
-        .unwrap_or(true));
+    assert!(!dir.path().join("exql").exists());
+    let catalog = exspeed_broker::catalog::CatalogStore::new(
+        w.log.clone(),
+        crate::engine::QUERIES_STREAM,
+        "exql.query",
+    );
+    assert!(catalog.load().await.unwrap().is_empty());
+    node.stop().await;
+}
+
+/// The query catalog lives in `__exql_queries`: another node on the same
+/// log loads it, `load()` can be repeated (each leader tenure) and follows
+/// creates, pauses and drops.
+#[tokio::test]
+async fn query_catalog_is_in_the_log_and_reloadable() {
+    let w = World::new().await;
+    clicks(&w).await;
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let a = Node::start(&w, dir_a.path(), test_config()).await;
+    let keep = qid(&a
+        .sql("CREATE STREAM kept AS SELECT payload->>'user' AS usr FROM clicks")
+        .await);
+    let gone = qid(&a
+        .sql("CREATE STREAM gone AS SELECT payload->>'user' AS usr FROM clicks")
+        .await);
+    a.sql(
+        "CREATE TABLE per_user AS SELECT payload->>'user' AS usr, COUNT(*) AS n \
+         FROM clicks GROUP BY payload->>'user'",
+    )
+    .await;
+    a.wait_input(&keep, 7).await;
+    assert!(!dir_a.path().join("exql").exists(), "no node-local files");
+
+    // A second engine on the same log (a promoted follower) sees the
+    // catalog without any files of its own.
+    let b = crate::engine::ExqlEngine::new(
+        w.log.clone(),
+        dir_b.path().to_path_buf(),
+        w.leadership.clone(),
+        w.metrics.clone(),
+        test_config(),
+    )
+    .unwrap();
+    b.load().await.unwrap();
+    let ids: HashSet<String> = b.list_queries().into_iter().map(|q| q.id).collect();
+    assert_eq!(ids.len(), 3);
+    assert!(ids.contains(&keep) && ids.contains(&gone));
+    assert_eq!(b.list_tables().len(), 1);
+
+    a.engine.drop_query(&gone).await.unwrap();
+    a.engine.pause_query(&keep).await.unwrap();
+    b.load().await.unwrap();
+    let qs = b.list_queries();
+    assert_eq!(qs.len(), 2);
+    assert!(qs.iter().all(|q| q.id != gone));
+    assert_eq!(b.info(&keep).unwrap().status, "paused");
+    // Repeating the load is idempotent.
+    b.load().await.unwrap();
+    assert_eq!(b.list_queries().len(), 2);
+    assert_eq!(b.list_tables().len(), 1);
+    a.stop().await;
+}
+
+#[tokio::test]
+async fn legacy_query_files_are_imported_once() {
+    let w = World::new().await;
+    clicks(&w).await;
+    let dir = tempfile::tempdir().unwrap();
+    let legacy = dir.path().join("exql").join("queries");
+    std::fs::create_dir_all(&legacy).unwrap();
+    let def = json!({
+        "id": "old_0000cafe",
+        "sql": "CREATE STREAM old AS SELECT payload->>'user' AS usr FROM clicks",
+        "kind": "stream",
+        "name": "old",
+        "desired": "running",
+        "error": null,
+        "created_at": "2026-01-01T00:00:00.000Z"
+    });
+    std::fs::write(legacy.join("old_0000cafe.json"), def.to_string()).unwrap();
+    std::fs::write(legacy.join("junk.json"), "not json").unwrap();
+
+    let node = Node::start(&w, dir.path(), test_config()).await;
+    node.wait_input("old_0000cafe", 7).await;
+    assert!(!legacy.exists());
+    assert!(dir
+        .path()
+        .join("exql/queries.migrated/old_0000cafe.json")
+        .exists());
+    node.stop().await;
+
+    // From the log on: a fresh engine with no files still has it.
+    let other = tempfile::tempdir().unwrap();
+    let node = Node::start(&w, other.path(), test_config()).await;
+    let ids: Vec<String> = node
+        .engine
+        .list_queries()
+        .into_iter()
+        .map(|q| q.id)
+        .collect();
+    assert_eq!(ids, vec!["old_0000cafe".to_string()]);
     node.stop().await;
 }
