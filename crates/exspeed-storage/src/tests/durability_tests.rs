@@ -140,7 +140,8 @@ fn corrupt_middle_of_active(dir: &Path, name: &str) {
 
 /// Sync mode: every acknowledged record was fsynced, so a bad frame with
 /// valid frames after it is real corruption — recovery refuses to drop the
-/// data and fails loudly.
+/// data and fences the partition loudly (the rest of the server still
+/// starts).
 #[tokio::test]
 async fn sync_mode_fails_loudly_on_mid_file_corruption() {
     let dir = TempDir::new().unwrap();
@@ -149,14 +150,86 @@ async fn sync_mode_fails_loudly_on_mid_file_corruption() {
         write_mixed(&storage, "mid", 100, &mut Rng(3)).await;
     }
     corrupt_middle_of_active(dir.path(), "mid");
-    let err = FileStorage::open_with_options(dir.path(), options(1 << 20))
-        .err()
-        .expect("open must fail");
-    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-    assert!(err.to_string().contains("corruption"), "{err}");
+    let storage = FileStorage::open_with_options(dir.path(), options(1 << 20)).unwrap();
+    let failed = storage.failed_streams();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0].0, "mid");
+    assert!(failed[0].1.contains("corruption"), "{failed:?}");
+    assert!(matches!(
+        storage.append(&stream("mid"), &plain(0)).await,
+        Err(StorageError::PartitionFailed { .. })
+    ));
+    drop(storage);
     // Nothing was truncated.
     let seg = active_segment(dir.path(), "mid");
     assert!(std::fs::metadata(&seg).unwrap().len() > 2000);
+}
+
+/// A sealed segment that is corrupt (and has no `.meta` to skip the scan)
+/// fences only its own stream: every other stream opens normally, the
+/// damaged one stays readable up to the bad segment and rejects writes with
+/// `PartitionFailed`, and nothing on disk is changed.
+#[tokio::test]
+async fn corrupt_sealed_segment_fences_only_its_stream() {
+    let dir = TempDir::new().unwrap();
+    {
+        let storage = small_segments(dir.path(), 512);
+        for name in ["healthy", "broken"] {
+            storage.create_stream(&stream(name), 0, 0).await.unwrap();
+            append_n(&storage, &stream(name), 0, 100).await;
+        }
+    }
+    let part = dir.path().join("streams/broken/partitions/0");
+    let bases = list_segment_bases(&part).unwrap();
+    assert!(bases.len() > 3, "need several sealed segments");
+    let bad = bases[1];
+    std::fs::remove_file(part.join(format!("{bad:020}.meta"))).unwrap();
+    let seg = part.join(format!("{bad:020}.seg"));
+    let mut b = std::fs::read(&seg).unwrap();
+    let mid = b.len() / 2;
+    b[mid] ^= 0xff;
+    std::fs::write(&seg, &b).unwrap();
+
+    let storage = FileStorage::open_with_options(dir.path(), options(512))
+        .expect("one bad partition must not block startup");
+
+    // The healthy stream works as usual.
+    let h = stream("healthy");
+    assert_eq!(read_all(&storage, &h, 0).await.len(), 100);
+    let (o, _) = storage.append(&h, &plain(100)).await.unwrap();
+    assert_eq!(o, Offset(100));
+
+    // The broken one is reported, fenced, and readable up to the bad segment.
+    let failed = storage.failed_streams();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0].0, "broken");
+    assert!(failed[0].1.contains("corrupt sealed segment"), "{failed:?}");
+    assert!(matches!(
+        storage.partition_status("broken"),
+        Some(PartitionStatus::Failed { .. })
+    ));
+    let br = stream("broken");
+    let recs = read_all(&storage, &br, 0).await;
+    assert_eq!(
+        recs.len() as u64,
+        bad,
+        "readable prefix = the first segment"
+    );
+    check_values(&recs);
+    assert!(matches!(
+        storage.append(&br, &plain(0)).await,
+        Err(StorageError::PartitionFailed { .. })
+    ));
+    assert!(matches!(
+        storage.trim_up_to(&br, Offset(1)).await,
+        Err(StorageError::PartitionFailed { .. })
+    ));
+    storage.enforce_all_retention().unwrap();
+    drop(storage);
+    // Nothing was repaired or deleted behind the operator's back.
+    assert_eq!(list_segment_bases(&part).unwrap(), bases);
+    assert_eq!(std::fs::read(&seg).unwrap(), b);
+    assert!(!part.join(format!("{bad:020}.meta")).exists());
 }
 
 /// Async mode: pages may reach disk out of order before a crash, so the log

@@ -192,9 +192,16 @@ Creating or deleting a segment also fsyncs the directory. `truncate_from`
 writes `truncate.json` first and is completed by recovery if the process
 dies part-way. At startup only the active segment is scanned: offsets must
 be strictly increasing and every frame must pass its CRC. A torn tail is
-truncated. Corruption with valid data after it fails startup in `sync`
+truncated. Corruption with valid data after it fails recovery in `sync`
 mode and is truncated (with a warning) in `async` mode. Sealed segments are
-opened from their `.meta` file without reading the data.
+opened from their `.meta` file without reading the data (a missing or stale
+`.meta` triggers a CRC scan). A partition whose recovery fails (mid-file
+corruption in `sync` mode, a corrupt sealed segment, overlapping segments)
+does not stop the server: it is logged at `error` level and opened fenced,
+with no writer thread, readable up to the first damaged segment, rejecting
+writes, retention and compaction with `PartitionFailed`, and listed by
+`failed_streams`. The damaged files are left untouched; restore or remove them
+and restart.
 
 **Retention** runs every 60 s on the writer thread. It deletes whole sealed
 segments from the front of the log, by age (the newest record is older than

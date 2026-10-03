@@ -470,6 +470,32 @@ fn open_sealed(dir: &Path, base: u64) -> io::Result<Segment> {
     Segment::new_sealed(dir, &meta)
 }
 
+/// Best-effort read-only view of a partition whose [`recover`] failed: the
+/// leading run of sealed segments that open cleanly, and the offset one past
+/// their last record. Never truncates, deletes or seals anything (the active
+/// segment is left out), so an operator can still repair the directory.
+pub fn readable_prefix(dir: &Path) -> (Vec<Arc<Segment>>, u64) {
+    let bases = match list_segment_bases(dir) {
+        Ok(b) => b,
+        Err(_) => return (Vec::new(), 0),
+    };
+    let mut segments: Vec<Arc<Segment>> = Vec::new();
+    let mut end = bases.first().copied().unwrap_or(0);
+    for &base in bases.iter().take(bases.len().saturating_sub(1)) {
+        if base < end && !segments.is_empty() {
+            break; // overlap: stop before the inconsistency
+        }
+        match open_sealed(dir, base) {
+            Ok(seg) => {
+                end = seg.end_offset();
+                segments.push(Arc::new(seg));
+            }
+            Err(_) => break,
+        }
+    }
+    (segments, end)
+}
+
 /// Recover a partition directory: finish an interrupted truncation, clean
 /// up leftovers, open sealed segments from their metadata and tail-scan the
 /// active segment.
