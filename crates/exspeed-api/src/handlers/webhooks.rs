@@ -19,7 +19,7 @@ use crate::state::AppState;
     path = "/webhooks/{path}",
     tag = "webhooks",
     params(("path" = String, Path, description = "Path the http_webhook connector listens on (may contain slashes)")),
-    request_body(content = Vec<u8>, description = "Raw body, stored as the record value", content_type = "application/octet-stream"),
+    request_body(content = crate::openapi::BinaryBody, description = "Raw body, stored as the record value", content_type = "application/octet-stream"),
     responses(
         (status = 200, description = "Stored: `{offset}`", body = Object),
         (status = 400, description = "Rejected by the connector", body = crate::openapi::ErrorBody),

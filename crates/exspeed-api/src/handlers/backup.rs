@@ -66,7 +66,7 @@ impl Write for BodyWriter {
     tag = "operations",
     security(("bearer" = [])),
     responses(
-        (status = 200, description = "Tar archive: the `exspeed-backup.json` manifest, then `streams/…` and the config directories", content_type = "application/x-tar", body = Vec<u8>),
+        (status = 200, description = "Tar archive: the `exspeed-backup.json` manifest, then `streams/…` and the config directories", content_type = "application/x-tar", body = crate::openapi::BinaryBody),
         (status = 403, description = "Not a global admin", body = crate::openapi::ErrorBody),
         (status = 500, description = "A snapshot could not be taken", body = crate::openapi::ErrorBody),
         (status = 503, description = "Not the leader", body = crate::openapi::ErrorBody),

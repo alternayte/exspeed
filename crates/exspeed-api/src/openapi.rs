@@ -25,6 +25,12 @@ pub struct ErrorBody {
     pub error: String,
 }
 
+/// Raw bytes (`type: string, format: binary`).
+#[derive(ToSchema)]
+#[schema(value_type = String, format = Binary)]
+#[allow(dead_code)]
+pub struct BinaryBody(Vec<u8>);
+
 /// Error body of ExQL endpoints (queries, tables, connections).
 #[derive(Serialize, ToSchema)]
 pub struct ExqlErrorBody {

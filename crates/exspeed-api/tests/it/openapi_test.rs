@@ -126,6 +126,11 @@ async fn spec_is_served_and_lists_the_main_paths() {
             "schema {schema} missing"
         );
     }
+    // The backup is documented as a binary tar download.
+    assert!(
+        spec["paths"]["/api/v1/backup"]["get"]["responses"]["200"]["content"]["application/x-tar"]
+            .is_object()
+    );
     // The publish body references the schema with its fields.
     let publish = &spec["paths"]["/api/v1/streams/{name}/publish"]["post"];
     assert_eq!(
