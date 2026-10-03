@@ -18,6 +18,8 @@ pub struct Profile {
     pub fanout_consumer_counts: Vec<usize>,
     pub exql_duration: Duration,
     pub publish_payload_sizes: Vec<usize>,
+    /// Backlog size for the catch-up (read / consume) scenario.
+    pub catchup_records: u64,
 }
 
 impl Profile {
@@ -32,6 +34,7 @@ impl Profile {
             fanout_consumer_counts: vec![1, 4, 16, 64],
             exql_duration: Duration::from_secs(60),
             publish_payload_sizes: vec![100, 1024, 10 * 1024],
+            catchup_records: 2_000_000,
         }
     }
 
@@ -46,6 +49,7 @@ impl Profile {
             fanout_consumer_counts: vec![1, 4],
             exql_duration: Duration::from_secs(10),
             publish_payload_sizes: vec![1024],
+            catchup_records: 200_000,
         }
     }
 }

@@ -50,6 +50,14 @@ fn sample() -> BenchResult {
                 sustained_input_rate: 75_000,
                 warning: None,
             }),
+            catchup: Some(CatchupResult {
+                payload_bytes: 1024,
+                records: 2_000_000,
+                read_msg_per_sec: 900_000.0,
+                read_mb_per_sec: 921.6,
+                consume_msg_per_sec: 450_000.0,
+                consume_mb_per_sec: 460.8,
+            }),
         },
     }
 }
@@ -72,6 +80,7 @@ fn benchmarks_md_renders_per_scenario_sections() {
         "## Latency",
         "## Fan-out",
         "## ExQL",
+        "## Catch-up",
         "git_sha",
         "reproduce",
     ] {

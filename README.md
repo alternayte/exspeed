@@ -61,7 +61,25 @@ or the Rust [`exspeed-client`](crates/exspeed-client) on TCP port 5933
 | Connectors: framework (checkpoint protocol, supervisor, typed settings, DLQ, replicated offsets) | ✅ tested with fault injection |
 | Connectors: Postgres CDC, outbox, poll; JDBC sink; HTTP poll/sink/webhook | ✅ at-least-once or effectively-once, tested against real services ([guarantees](docs/connectors.md#delivery-guarantees)) |
 | Connectors: RabbitMQ, S3, SQL Server CDC | ⚠️ implemented to the same protocol; unit-tested only, no service tests in CI yet |
+| Operations: config file, Helm chart, graceful shutdown, online backup + restore, OpenAPI spec | ✅ ([operations.md](docs/operations.md), [http-api.md](docs/http-api.md)) |
 | Multi-pod HA with replication | ❌ not safe yet ([§3.4](docs/REVIEW.md#34-ha-leadership--replication)) |
+
+## Performance
+
+Single node, broker and benchmark driver on one 4-vCPU cloud VM (virtio
+disk, ext4), default durable mode (fsync before every acknowledgement):
+
+| Workload | Result |
+|----------|--------|
+| Publish, 1 KiB records, 4 producers | ~62k msg/s (63 MB/s); ~67k msg/s with `--storage-sync async` |
+| Publish, 10 KiB records | ~13k msg/s (137 MB/s) |
+| Drain a 1M-record backlog | ~354k msg/s with reads, ~285k msg/s with a push consumer |
+| End-to-end latency at 5k msg/s | p50 5.3 ms, p99 11.2 ms |
+
+Machine details, all results and the exact commands are in
+[BENCHMARKS.md](BENCHMARKS.md). No Kafka or NATS numbers are published; the
+[comparison kit](bench/README.md#reproduce-a-comparison-with-kafka-and-nats-jetstream)
+runs all three on your hardware.
 
 ## Documentation
 

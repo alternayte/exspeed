@@ -13,6 +13,16 @@ use crate::state::AppState;
 /// Returns a JSON array of live lease records (`name`, `holder`, `epoch`,
 /// `expires_at`, `replication_endpoint`, `client_endpoint`, `isr`). Empty in
 /// single-node mode.
+#[utoipa::path(
+    get,
+    path = "/api/v1/leases",
+    tag = "cluster",
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "Live leases (empty in single-node mode)", body = Vec<crate::openapi::LeaseRecord>),
+        (status = 500, description = "Lease backend error", body = crate::openapi::ErrorBody),
+    )
+)]
 pub async fn list_leases(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match state.lease.list_all().await {
         Ok(leases) => (StatusCode::OK, Json(leases)).into_response(),

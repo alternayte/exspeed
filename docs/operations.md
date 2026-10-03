@@ -19,7 +19,7 @@ For every flag and environment variable, see [configuration.md](configuration.md
 - [Consumer state durability](#consumer-state-durability)
 - [`/healthz` vs `/readyz`](#healthz-vs-readyz)
 - [Non-root container](#non-root-container)
-- [Backups](#backups)
+- [Backup and restore](#backup-and-restore)
 - [Metrics](#metrics)
 
 ## Docker
@@ -166,15 +166,116 @@ spec:
 
 Without `fsGroup`, the volume mount may be owned by root and the broker will fail at startup (the `flock` and segment writes both need write access).
 
-## Backups
+## Backup and restore
+
+### Online backup
+
+`exspeed backup` downloads a backup from a running server. The server keeps
+accepting writes while the backup streams:
 
 ```bash
-# The server must be stopped: snapshot takes the same data-dir lock.
+exspeed backup --url http://exspeed:8080 --token "$ADMIN_TOKEN" \
+  --output exspeed-$(date +%F).tar
+```
+
+It calls `GET /api/v1/backup`, which needs a **global admin** credential
+when auth is on and is answered by the leader only. The response is an
+uncompressed tar archive (pipe it through `gzip` or `zstd` if you want). The
+CLI writes it to `<output>.partial`, reads the whole archive back to check
+it is complete, and only then renames it to `<output>`. If the connection
+drops, nothing is left at `<output>`.
+
+The archive holds:
+
+| Entry | Contents |
+|-------|----------|
+| `exspeed-backup.json` | Manifest, always first: `format`, `version` (1), `server_version`, `created_at`, and per stream `name`, `earliest_offset`, `next_offset`, `records`, `bytes` |
+| `streams/<name>/stream.json` | Stream settings (retention, dedup, compaction) |
+| `streams/<name>/partitions/0/*.seg`, `*.idx`, `*.meta` | Segments with their indexes and metadata |
+| `connectors/`, `connectors.d/`, `connector-offsets/`, `connections/`, `connections.d/`, `exql/` | Configuration directories, when present |
+
+It does not hold `credentials.toml`, `exspeed.toml`, the dedup snapshots
+(the dedup map is rebuilt from the restored log at startup) or replication
+state. Back up your credentials and config file separately. Connector and
+connection configs can contain database URLs and passwords, so treat backup
+files as secrets.
+
+### Consistency guarantees
+
+- **Per stream, point in time.** When the backup starts, the server reads
+  each stream's high watermark `H` (the offset the next record gets) and
+  includes exactly the records below it: every record in
+  `[earliest_offset, next_offset)` of the manifest, byte for byte. Records
+  appended after that are not in the backup. A record that was not yet
+  visible to readers (not yet fsynced in sync mode, or above the replication
+  floor in multi-pod mode) is never included.
+- **Not across streams.** Streams are snapshotted one after another, all
+  before the first byte is sent, so the snapshots are milliseconds apart.
+  There is no atomic cut across streams: if your application writes to
+  `orders` and then to `invoices`, the backup can hold the invoice without
+  the order, or the order without the invoice.
+- **Progress lags data, never leads it.** Internal streams (`__consumers`
+  with consumer ack floors, `__connector_offsets`, `__exql_ckpt_*` query
+  checkpoints) are snapshotted before the other streams. After a restore,
+  consumers, sink connectors and continuous queries can redeliver or
+  reprocess records written just before the backup, but never skip any.
+  Query output and sources that use idempotency keys are deduplicated when
+  they replay within the stream's dedup window. The legacy file-based
+  connector offset store (`connector-offsets/`) is copied after the streams
+  and has no such guarantee.
+- **Configuration directories** are copied file by file when the archive
+  reaches them, after all streams.
+- **Retention and compaction keep running.** Segments that retention deletes
+  or compaction rewrites after the snapshot are still read through open file
+  handles, so their disk space is freed only when the backup finishes.
+- A backup that collides with a truncation (`truncate_from`, which only a
+  replication follower repairing a divergent log does) fails instead of
+  producing a mixed copy; retry it.
+
+### Restore
+
+Restore is offline. Stop the server (or use a new data directory), then:
+
+```bash
+exspeed restore --input exspeed-2026-10-03.tar --data-dir /var/lib/exspeed
+exspeed server --data-dir /var/lib/exspeed
+```
+
+`restore` takes the data-directory lock, so it refuses to run while a server
+uses the directory. It refuses a non-empty data directory unless you pass
+`--force`. With `--force` it replaces `streams/`, the configuration
+directories and the replication state, and keeps other files such as
+`credentials.toml` and `exspeed.toml`. The archive is unpacked into a
+staging directory and checked before anything is replaced:
+
+- the manifest must come first, with a supported format and version;
+- the archive may contain only `streams/` and the configuration directories,
+  with no absolute paths, `..` components or links;
+- every stream must open, and its offsets must match the manifest exactly.
+
+Each restored stream continues at its manifest `next_offset`: the next
+record appended gets that offset. Segment indexes come from the archive, so
+startup does not rescan restored segments.
+
+### Offline snapshot
+
+`exspeed snapshot` archives a stopped server's data directory as-is (it
+takes the data-directory lock, so the server must be stopped):
+
+```bash
 exspeed snapshot --data-dir /var/lib/exspeed --output exspeed-$(date +%F).tar.gz
 ```
 
-To restore, extract the archive into an empty data directory and start the
-server on it. There is no online backup yet.
+To restore it, extract it into an empty data directory. Unlike `exspeed
+backup`, it includes everything in the directory, credentials included.
+
+### Clusters
+
+Back up from the leader (followers answer `GET /api/v1/backup` with 503).
+The archive holds no node identity, epoch histories or lease state. To
+rebuild a cluster from it, restore into one node's data directory, start
+that node first so it takes the lease, then start the other nodes with
+empty data directories. They replicate everything from it.
 
 ## Metrics
 

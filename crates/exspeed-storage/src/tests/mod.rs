@@ -1,5 +1,6 @@
 // Built in Task 4
 
+mod backup_tests;
 mod bench;
 mod compaction_tests;
 mod durability_tests;

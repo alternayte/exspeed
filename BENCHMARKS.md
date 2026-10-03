@@ -1,187 +1,144 @@
 # Exspeed Benchmarks
 
-> ⚠️ **These numbers are stale and partly inconsistent.**
->
-> - They were measured on v0.2.0 on macOS, with the driver and the broker on
->   the same host.
-> - The fan-out table reports the producer's achieved rate, not fan-out
->   throughput.
-> - The sync-mode latency row claims a sustained 10k/s, which is above sync
->   mode's maximum throughput.
->
-> Re-run on Linux before you quote them. See [docs/REVIEW.md §3.9](docs/REVIEW.md#39-build-ci-deploy-benchmarks).
+_Measured **2026-10-03** on exspeed 0.5.0 (unreleased rebuild), git `d8bb597`
+/ `89202d9` (same server binary; the second commit only added the bench's
+override flags)._
 
-_Last refreshed: **2026-04-21** (git `9782c1d`, exspeed 0.2.0)_
+These are single-node numbers from one run on a small cloud VM, with the
+broker and the benchmark driver on the same machine. Treat them as an order
+of magnitude for this hardware, not as a ceiling: on a dedicated host with
+local NVMe they will be higher, and on a busier VM lower.
 
-## How these numbers were produced
+## Machine
 
-- **Host:** macbook-laptop — 8 vCPU, 16 GB RAM, apfs-nvme
-- **OS / kernel:** macOS 26.2 / 25.2.0
-- **Broker + workload driver on the same box.**
-- **Profile:** `Local`.
-- **git_sha:** `9782c1d`
+| | |
+|---|---|
+| Type | Cloud VM (KVM), shared host |
+| CPU | 4 vCPU, Intel Xeon @ 2.80 GHz (`nproc` = 4) |
+| RAM | 15 GiB |
+| Disk | virtio block device, ext4. `dd` probe: 4 KiB `O_DSYNC` writes ≈ 0.65 ms each (≈ 1,500/s); 1 GiB sequential with `fdatasync` ≈ 117 MB/s |
+| OS | Ubuntu 24.04, Linux 6.18 |
+| Build | `cargo build --release -p exspeed -p exspeed-bench` (Rust 1.99.0, release profile) |
+| Load | Nothing else running during the measurements (load average < 0.1 before each mode) |
+
+## Results
+
+Records are published over the TCP protocol with `exspeed-client`'s
+coalescing publisher. **Sync** is the default durability: a batch is
+fsynced before it is acknowledged or visible to readers. **Async**
+(`--storage-sync async`) acknowledges once written and fsyncs every 10 ms or
+4 MiB, so a crash can lose up to that much acknowledged data.
+
+### Publish
+
+4 producer tasks sharing one connection, 64 publishes in flight each, as fast
+as acknowledgements come back.
+
+| Payload | Sync msg/s | Sync MB/s | Async msg/s | Async MB/s | Duration |
+|---------|-----------:|----------:|------------:|-----------:|---------:|
+| 100 B   | 74,578 | 7.5 | 78,529 | 7.9 | 30 s |
+| 1 KiB   | 61,983 | 63.5 | 67,473 | 69.1 | 30 s |
+| 10 KiB  | 13,405 | 137.3 | 15,403 | 157.7 | 10 s |
+
+Group commit amortizes the fsync: sync mode reaches ~92% of async throughput
+at 1 KiB on a disk that manages ~1,500 single-record fsyncs per second. At
+small payloads the limit is the per-record cost on 4 vCPUs shared by the
+broker and the driver, not the disk. At 10 KiB it is disk bandwidth.
+
+### Catch-up (draining a backlog)
+
+1,000,000 records of 1 KiB already on disk (mostly in the page cache).
+
+| Reader | Sync-mode server msg/s | MB/s | Async-mode server msg/s | MB/s |
+|--------|-----------------------:|-----:|------------------------:|-----:|
+| Stateless reads, 1000 records per request, one request at a time | 353,790 | 362.3 | 300,750 | 308.0 |
+| Durable push consumer from offset 0, acks batched every 1024 records | 284,860 | 291.7 | 316,884 | 324.5 |
+
+The storage mode doesn't affect reads; the difference between the two
+columns is run-to-run noise.
+
+### End-to-end latency
+
+Publish → push-consumer delivery at a steady **5,000 msg/s** of 1 KiB for
+30 s, measured from the publish call to receipt by the subscriber (both on
+the same host, so no clock skew).
+
+| Mode | p50 | p90 | p99 | p99.9 | p99.99 | max |
+|------|----:|----:|----:|------:|-------:|----:|
+| Sync  | 5.3 ms | 8.0 ms | 11.2 ms | 26.0 ms | 33.4 ms | 34.7 ms |
+| Async | 5.3 ms | 7.9 ms | 76.3 ms | 224.6 ms | 226.0 ms | 228.2 ms |
+
+Both modes have the same ~5 ms median, so it isn't fsync; where it goes
+(client batching, the delivery path, the rate-driven producer on a shared
+4-vCPU box) hasn't been profiled yet. The async run had one stall of about
+220 ms that sets its tail; one run is not enough to say whether that is the
+VM or the broker, so don't read async as having the worse tail in general.
+
+### Fan-out
+
+Producer at 5,000 msg/s of 1 KiB for 10 s; N consumers on the same stream,
+each receiving every record.
+
+| Consumers | Producer rate | Aggregate delivery | Max lag at the end |
+|----------:|--------------:|-------------------:|-------------------:|
+| 1 (sync)  | 5,000 | 4,979 msg/s | 1 |
+| 4 (sync)  | 5,000 | 19,911 msg/s | 1 |
+| 1 (async) | 5,000 | 4,977 msg/s | 1 |
+| 4 (async) | 5,000 | 19,911 msg/s | 1 |
+
+Every consumer kept up: aggregate delivery is N × the producer rate.
 
 ## How to reproduce
 
 ```bash
-git checkout 9782c1d
-cargo build --release -p exspeed-bench
-# Sync mode (default, durable)
-./target/release/exspeed-bench all --profile reference \
-  --output bench/results/refresh-sync.json
-# Async mode (opt-in — start broker with EXSPEED_STORAGE_SYNC=async)
-./target/release/exspeed-bench all --profile reference \
-  --output bench/results/refresh-async.json
-./target/release/exspeed-bench render bench/results/refresh-sync.json --out BENCHMARKS.md
+cargo build --release -p exspeed -p exspeed-bench
+
+# Terminal 1 (repeat with --storage-sync async for the async columns)
+./target/release/exspeed server --data-dir /tmp/exspeed-bench --storage-sync sync
+
+# Terminal 2
+B=./target/release/exspeed-bench
+$B publish --profile reference --payload-sizes 100,1024 --duration-secs 30 --output publish.json
+$B publish --profile reference --payload-sizes 10240 --duration-secs 10 --output publish-10k.json
+$B catchup --profile reference --catchup-records 1000000 --output catchup.json
+$B latency --profile local --duration-secs 30 --rate 5000 --output latency.json
+$B fanout  --profile local --duration-secs 10 --output fanout.json
 ```
 
-## Publish (sync mode — default, durable)
+Start each mode on an empty data directory. The raw results are in
+[`bench/results/2026-10-03-linux-*.json`](bench/results/). The smaller
+payload set and shorter durations than `--profile reference` keep the run
+inside this VM's free disk space. See [bench/README.md](bench/README.md) for
+every scenario.
 
-| Payload | msg/s | MB/s | Duration |
-|---------|-------|------|----------|
-| 1024 B | 7010 | 7.2 | 5.1s |
+## Reproduce a comparison
 
-## Latency (sync mode)
+Kafka and NATS JetStream numbers are **not published** here. A comparison is
+only meaningful on the same hardware with matching durability settings, and
+it hasn't been run on this machine yet (it has no Docker daemon). To run one
+yourself:
 
-At a sustained **10k** msg/s (payload 1024 B) over 10s:
+```bash
+cargo build --release -p exspeed -p exspeed-bench
+BENCH_MODE=sync  bench/compare/run.sh    # every broker fsyncs before acking
+BENCH_MODE=async bench/compare/run.sh    # Kafka / JetStream defaults vs Exspeed async
+```
 
-| p50 | p90 | p99 | p99.9 | p99.99 | max |
-|-----|-----|-----|-------|--------|-----|
-| 15847µs | 49183µs | 60831µs | 73151µs | 76159µs | 76159µs |
+[`bench/compare/run.sh`](bench/compare/run.sh) starts single-node Kafka
+(KRaft) and NATS JetStream from
+[`bench/compare/docker-compose.yml`](bench/compare/docker-compose.yml) and
+runs the same three workloads (1 KiB publish with 4 producers, backlog
+consume, end-to-end latency) with each system's standard tool:
+`exspeed-bench`, `kafka-producer-perf-test.sh` /
+`kafka-consumer-perf-test.sh` / `kafka-e2e-latency.sh`, and `nats bench`.
+In sync mode Kafka runs with `log.flush.interval.messages=1` and JetStream
+with `sync_interval: always`, so all three fsync before acknowledging. The
+tools measure latency differently (see [bench/README.md](bench/README.md)),
+so compare the raw logs, not single numbers.
 
-## Fan-out (sync mode)
+## Earlier results
 
-| Consumers | Producer rate | Aggregate consumer rate | Max lag (msgs) |
-|-----------|---------------|-------------------------|----------------|
-| 1 | 5000 | 164 | 0 |
-| 4 | 5000 | 424 | 0 |
-
-## Async-sync mode
-
-With `--storage-sync=async`, Exspeed batches fsync on a timer (default
-10 ms) rather than per-flush. On a crash you may lose up to one tick of
-acked data. Numbers from `bench/results/2026-04-21-laptop-v020-async.json`:
-
-### Publish (async)
-
-| Payload | msg/s | MB/s | Duration |
-|---------|-------|------|----------|
-| 1024 B | 69728 | 71.4 | 5.0s |
-
-### Latency (async) at sustained 10k msg/s
-
-| p50 | p90 | p99 | p99.9 | p99.99 | max |
-|-----|-----|-----|-------|--------|-----|
-| 11055µs | 16447µs | 23343µs | 28623µs | 29167µs | 29167µs |
-
-### Fan-out (async)
-
-| Consumers | Producer rate | Aggregate consumer rate | Max lag (msgs) |
-|-----------|---------------|-------------------------|----------------|
-| 1 | 5000 | 165 | 0 |
-| 4 | 5000 | 334 | 0 |
-
-### Summary
-
-| Workload                | Sync (default, durable)        | Async (opt-in)                |
-|-------------------------|--------------------------------|-------------------------------|
-| Publish, 1 KB payload   | 7,010 msg/s                    | 69,728 msg/s                  |
-| E2E latency @ 10k/s     | p50 15.8 ms / p99 60.8 ms      | p50 11.1 ms / p99 23.3 ms     |
-| Fan-out @ 4 consumers   | 424 msg/s aggregate            | 334 msg/s aggregate           |
-
-Keep the default (sync) for production unless throughput is critical
-and you understand the data-loss tradeoff. This trade matches NATS
-JetStream's default (async); our default is stricter (sync) because
-durability is our differentiator.
-
-> **ExQL note:** The binary-search found no candidate that sustained
-> ≥95% of any target rate above the 5,000 msg/s floor on macOS. This
-> reflects APFS write overhead under the dual publish+query load, not
-> a bug in the query engine. The ExQL row is omitted from tables to
-> avoid publishing an "N/A" number.
-
-## Comparison to prior versions
-
-Same laptop, same workload, three successive pre-release milestones.
-The v0.3 line is the internal milestone immediately before storage
-unification; v0.2.0 is what ships now.
-
-### Sync mode (default, durable)
-
-| Version  | Publish 1 KB msg/s | p50 latency @ 10k/s | p99 latency @ 10k/s |
-|----------|-------------------:|--------------------:|--------------------:|
-| 0.1.1    | ~225               | 250+ ms             | 250+ ms             |
-| v0.3     | 7,406              | 33.3 ms             | 65.9 ms             |
-| 0.2.0    | 7,010              | 15.8 ms             | 60.8 ms             |
-
-### Async mode (opt-in)
-
-| Version  | Publish 1 KB msg/s | p50 latency @ 10k/s | p99 latency @ 10k/s |
-|----------|-------------------:|--------------------:|--------------------:|
-| 0.1.1    | n/a (not offered)  | n/a                 | n/a                 |
-| v0.3     | 43,382             | 41.4 ms             | 86.9 ms             |
-| 0.2.0    | 69,728             | 11.1 ms             | 23.3 ms             |
-
-### Honest commentary
-
-- **Sync throughput is essentially flat from v0.3 → 0.2.0** (7,406 → 7,010
-  msg/s, a wash). Single-writer sync publish on APFS is bounded by
-  `F_FULLFSYNC` (~5 ms per fsync on this laptop), and the v0.2
-  group-commit writer had already amortized fsyncs across records. Storage
-  unification did not unlock more sync throughput — it wasn't the
-  bottleneck.
-- **The real sync-mode win is latency.** p50 dropped from 33.3 ms to
-  15.8 ms (roughly halved) because there is now one encode/CRC/write/fsync
-  per batch instead of two (WAL + segment). p99 also improved (65.9 → 60.8
-  ms), but the tail is still APFS-dominated.
-- **Async publish throughput rose 61%** (43,382 → 69,728 msg/s). In async
-  mode the fsync isn't on the publish hot path, so removing the duplicate
-  write/encode path actually shows up in throughput.
-- **Async p99 latency dropped 73%** (86.9 → 23.3 ms). This is the most
-  dramatic single improvement — one write path per record produces a much
-  tighter tail under load.
-- Compared to the 0.1.1 baseline, sync publish is ~31× faster and sync p50
-  latency is ~94% lower; but that delta is the cumulative work of every
-  milestone between 0.1.1 and 0.2.0 (perf-overhaul-v0.2, perf-round-2,
-  profile-driven fixes, and now storage unification), not storage
-  unification alone.
-
-## Comparison to NATS JetStream
-
-To compare Exspeed v0.2.0 to NATS JetStream on your hardware, see
-[`bench/README.md`](bench/README.md) for methodology. We don't publish
-comparison numbers in this file — run your own measurement.
-
-Note on mode semantics: Exspeed **sync** mode is a genuine durable
-group-commit + fsync-per-batch, whereas NATS JetStream's "sync" mode is
-closer to wait-for-in-memory-ack. Exspeed **async** mode (fsync on a timer)
-is the apples-to-apples comparison to NATS JetStream's default async fsync.
-
-## ExQL bounded scan (pre-streaming)
-
-Baseline before the streaming-scan / lazy-payload rewrite (plan
-`docs/superpowers/plans/2026-04-23-exql-streaming-scan-lazy-payload.md`).
-
-| Case | Stream size | Baseline |
-|------|-------------|----------|
-| `SELECT * FROM s LIMIT 5` | 500 000 rows / 82 MB (SQL Server CDC payloads) | ~36 000 ms (user-reported) |
-
-Root cause (`crates/exspeed-processing/src/runtime/bounded.rs:108-125`): the
-bounded executor loads the entire stream and eager-parses every payload to
-`serde_json::Value` before `LimitOperator` ever runs. 82 MB ÷ 36 s ≈ 2.3 MB/s,
-well below disk throughput — CPU-bound JSON parse + allocation.
-
-## ExQL bounded scan (post-streaming)
-
-Streaming scan + lazy payload rewrite landed in plan
-`docs/superpowers/plans/2026-04-23-exql-streaming-scan-lazy-payload.md`.
-Benchmarks run on a 500k-record in-memory stream with ~164-byte JSON payloads.
-
-| Case | Wall-clock (mean) |
-|------|-------------------|
-| `SELECT * FROM s LIMIT 5` | 357 µs |
-| `SELECT offset FROM s LIMIT 1000` | 266 µs |
-| `SELECT payload->>'status' FROM s WHERE payload->>'type' = 'A' LIMIT 100` | 286 µs |
-| `SELECT * FROM s` (full scan) | 316 ms |
-
-Reproduce: `cargo bench -p exspeed-processing --bench scan`.
+The v0.2.0 numbers measured on a macOS laptop (April 2026) and the
+pre-DataFusion ExQL scan numbers are in this file's git history. They came
+from a different storage engine, protocol and query engine and are not
+comparable with the results above.

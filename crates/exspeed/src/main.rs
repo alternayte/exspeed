@@ -24,6 +24,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let client = CliClient::new(&args.server);
+    let server_url = args.server.clone();
     let json = args.json;
 
     match args.command {
@@ -111,6 +112,8 @@ async fn main() -> anyhow::Result<()> {
         cli::Command::View { name } => cli::view::get(&client, &name, json).await,
         cli::Command::Connectors => cli::stream::list_connectors(&client, json).await,
         cli::Command::Snapshot(a) => cli::snapshot::run(a).await,
+        cli::Command::Backup(a) => cli::backup::backup(a, &server_url).await,
+        cli::Command::Restore(a) => cli::backup::restore(a).await,
         cli::Command::Healthcheck { url, timeout } => healthcheck(&url, timeout).await,
         cli::Command::Auth { cmd } => cli::auth::run(cmd, &client).await,
     }

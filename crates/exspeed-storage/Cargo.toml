@@ -16,6 +16,8 @@ tokio = { workspace = true }
 dashmap = { workspace = true }
 arc-swap = "1.7"
 crossbeam-channel = "0.5"
+chrono = { workspace = true }
+tar = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

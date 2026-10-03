@@ -45,7 +45,7 @@ exspeed update-stream orders --dedup-window 30m
 
 ## Memory and on-disk cost
 
-Each dedup entry stores a `msg_id` string (variable), an offset (8 bytes), a timestamp (8 bytes), and a body hash (8 bytes). At the default 500,000-entry cap with average 32-byte `msg_id` strings the in-memory footprint is approximately **150 MB per stream** worst case. On disk, each stream maintains a `dedup_snapshot.bin` file in its stream directory. The snapshot is written every 60 seconds and on graceful shutdown, and is included in `exspeed snapshot` offline backups.
+Each dedup entry stores a `msg_id` string (variable), an offset (8 bytes), a timestamp (8 bytes), and a body hash (8 bytes). At the default 500,000-entry cap with average 32-byte `msg_id` strings the in-memory footprint is approximately **150 MB per stream** worst case. On disk, each stream maintains a `dedup_snapshot.bin` file in its stream directory. The snapshot is written every 60 seconds and on graceful shutdown, and is included in `exspeed snapshot` offline backups. Online backups (`exspeed backup`) leave it out; after `exspeed restore` the map is rebuilt from the restored log (a full scan of the dedup window at startup).
 
 Storage layout with dedup:
 

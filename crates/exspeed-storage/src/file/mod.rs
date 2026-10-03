@@ -15,6 +15,7 @@
 //! lock-free read path, [`writer`] for group commit and fencing, and
 //! [`compaction`] for log compaction.
 
+pub mod backup;
 pub mod compaction;
 pub mod fsutil;
 pub mod io_errors;

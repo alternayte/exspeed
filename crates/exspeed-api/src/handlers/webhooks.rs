@@ -14,6 +14,21 @@ use crate::state::AppState;
 
 /// `POST /webhooks/{*path}`: append the body through the matching
 /// `http_webhook` connector. 200 means the record is durable.
+#[utoipa::path(
+    post,
+    path = "/webhooks/{path}",
+    tag = "webhooks",
+    params(("path" = String, Path, description = "Path the http_webhook connector listens on (may contain slashes)")),
+    request_body(content = crate::openapi::BinaryBody, description = "Raw body, stored as the record value", content_type = "application/octet-stream"),
+    responses(
+        (status = 200, description = "Stored: `{offset}`", body = Object),
+        (status = 400, description = "Rejected by the connector", body = crate::openapi::ErrorBody),
+        (status = 401, description = "The connector's own auth failed", body = crate::openapi::ErrorBody),
+        (status = 404, description = "No webhook connector for this path", body = crate::openapi::ErrorBody),
+        (status = 409, description = "Idempotency key reused with another body", body = crate::openapi::ErrorBody),
+        (status = 503, description = "Not the leader, or retryable", body = crate::openapi::ErrorBody),
+    )
+)]
 pub async fn handle_webhook(
     State(state): State<Arc<AppState>>,
     Path(path): Path<String>,

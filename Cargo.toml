@@ -67,6 +67,8 @@ toml = "0.8"
 
 # HTTP
 axum = "0.8"
+# OpenAPI spec for the HTTP API (GET /api/v1/openapi.json)
+utoipa = "5"
 reqwest = { version = "0.12", features = ["json"] }
 
 # SQL parsing

@@ -799,6 +799,7 @@ impl Writer {
             return Ok(());
         }
         // Hide the doomed records first.
+        self.shared.begin_truncation();
         self.shared.publish_committed(drop_from);
         let dir = self.shared.dir.clone();
         if let Some(idx) = self.idx.as_mut() {

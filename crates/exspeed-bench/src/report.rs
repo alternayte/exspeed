@@ -23,6 +23,8 @@ pub struct Scenarios {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub fanout: Vec<FanoutResult>,
     pub exql: Option<ExqlResult>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub catchup: Option<CatchupResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +59,19 @@ pub struct FanoutResult {
     pub producer_rate: u64,
     pub aggregate_consumer_rate: f64,
     pub max_lag_msgs: u64,
+}
+
+/// Draining a backlog already on disk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatchupResult {
+    pub payload_bytes: usize,
+    pub records: u64,
+    /// Stateless `Read` requests, one at a time, 1000 records each.
+    pub read_msg_per_sec: f64,
+    pub read_mb_per_sec: f64,
+    /// Durable push consumer from the first record, acking in batches.
+    pub consume_msg_per_sec: f64,
+    pub consume_mb_per_sec: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
