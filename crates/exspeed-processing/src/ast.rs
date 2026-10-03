@@ -5,11 +5,11 @@ use std::ops::ControlFlow;
 use datafusion::execution::session_state::SessionState;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
-use datafusion::sql::sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, OrderByKind, SelectItem,
-    SetExpr, Statement as SQLStatement,
-};
 use datafusion::sql::sqlparser::ast::{visit_expressions_mut, BinaryOperator};
+use datafusion::sql::sqlparser::ast::{
+    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, OrderByKind,
+    SelectItem, SetExpr, Statement as SQLStatement,
+};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 
@@ -19,9 +19,34 @@ use crate::udfs::{WEND, WSTART};
 /// Aggregates and math functions whose JSON-text argument is read as a
 /// number (planned before type coercion would reject `avg(Utf8)`).
 const NUMERIC_FUNCS: &[&str] = &[
-    "sum", "avg", "mean", "min", "max", "stddev", "stddev_pop", "stddev_samp", "var",
-    "var_pop", "var_samp", "variance", "median", "approx_median", "abs", "round", "ceil",
-    "floor", "sqrt", "cbrt", "power", "pow", "ln", "log", "log2", "log10", "exp", "signum",
+    "sum",
+    "avg",
+    "mean",
+    "min",
+    "max",
+    "stddev",
+    "stddev_pop",
+    "stddev_samp",
+    "var",
+    "var_pop",
+    "var_samp",
+    "variance",
+    "median",
+    "approx_median",
+    "abs",
+    "round",
+    "ceil",
+    "floor",
+    "sqrt",
+    "cbrt",
+    "power",
+    "pow",
+    "ln",
+    "log",
+    "log2",
+    "log10",
+    "exp",
+    "signum",
     "trunc",
 ];
 
@@ -43,7 +68,9 @@ pub fn parse_one(sql: &str) -> Result<DFStatement, ExqlError> {
 fn is_arrow(e: &Expr) -> bool {
     match e {
         Expr::Nested(inner) => is_arrow(inner),
-        Expr::BinaryOp { op, .. } => matches!(op, BinaryOperator::Arrow | BinaryOperator::LongArrow),
+        Expr::BinaryOp { op, .. } => {
+            matches!(op, BinaryOperator::Arrow | BinaryOperator::LongArrow)
+        }
         _ => false,
     }
 }
@@ -139,7 +166,9 @@ pub fn rewrite_distinct_order_by(stmt: &mut DFStatement) -> Result<(), ExqlError
         for o in exprs.iter_mut() {
             let key = o.expr.to_string();
             let pos = sel.projection.iter().position(|item| match item {
-                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e.to_string() == key,
+                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                    e.to_string() == key
+                }
                 _ => false,
             });
             if let Some(i) = pos {
@@ -245,7 +274,11 @@ pub fn rewrite_window_markers(stmt: &mut DFStatement) -> Result<(), ExqlError> {
     let _ = visit_expressions_mut(select.as_mut(), |e: &mut Expr| {
         if let Expr::Identifier(id) = e {
             if let Some(m) = marker_for(id) {
-                *e = if m == WSTART { start.clone() } else { end.clone() };
+                *e = if m == WSTART {
+                    start.clone()
+                } else {
+                    end.clone()
+                };
             }
         }
         ControlFlow::<()>::Continue(())
@@ -264,7 +297,10 @@ pub fn rewrite_window_markers(stmt: &mut DFStatement) -> Result<(), ExqlError> {
             exprs.insert(0, start.clone());
         }
         GroupByExpr::All(_) => {
-            return Err(ExqlError::unsupported("GROUP BY ALL", "list the grouping columns"));
+            return Err(ExqlError::unsupported(
+                "GROUP BY ALL",
+                "list the grouping columns",
+            ));
         }
     }
     Ok(())

@@ -27,8 +27,7 @@ use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{DFSchema, Result as DFResult};
 use datafusion::config::ConfigOptions;
 use datafusion::logical_expr::expr::{
-    AggregateFunction, Between, InList, ScalarFunction, Sort as SortExpr,
-    WindowFunctionDefinition,
+    AggregateFunction, Between, InList, ScalarFunction, Sort as SortExpr, WindowFunctionDefinition,
 };
 use datafusion::logical_expr::expr_rewriter::NamePreserver;
 use datafusion::logical_expr::utils::merge_schema;
@@ -38,14 +37,29 @@ use datafusion::logical_expr::{
 use datafusion::optimizer::AnalyzerRule;
 
 const NUMERIC_AGGS: &[&str] = &[
-    "sum", "avg", "mean", "min", "max", "stddev", "stddev_pop", "stddev_samp", "var",
-    "var_pop", "var_samp", "variance", "median", "approx_median", "corr", "covar",
-    "covar_pop", "covar_samp",
+    "sum",
+    "avg",
+    "mean",
+    "min",
+    "max",
+    "stddev",
+    "stddev_pop",
+    "stddev_samp",
+    "var",
+    "var_pop",
+    "var_samp",
+    "variance",
+    "median",
+    "approx_median",
+    "corr",
+    "covar",
+    "covar_pop",
+    "covar_samp",
 ];
 
 const MATH_FUNCS: &[&str] = &[
-    "abs", "round", "ceil", "floor", "sqrt", "cbrt", "power", "pow", "ln", "log", "log2",
-    "log10", "exp", "signum", "trunc",
+    "abs", "round", "ceil", "floor", "sqrt", "cbrt", "power", "pow", "ln", "log", "log2", "log10",
+    "exp", "signum", "trunc",
 ];
 
 #[derive(Debug, Default)]
@@ -120,7 +134,10 @@ fn to_double(e: Expr) -> Expr {
 /// Numeric ORDER BY key for JSON text.
 fn sort_key(e: Expr) -> Expr {
     let udf = Arc::new(crate::udfs::json_num());
-    let arg = Expr::Cast(datafusion::logical_expr::Cast::new(Box::new(e), DataType::Utf8));
+    let arg = Expr::Cast(datafusion::logical_expr::Cast::new(
+        Box::new(e),
+        DataType::Utf8,
+    ));
     Expr::ScalarFunction(ScalarFunction::new_udf(udf, vec![arg]))
 }
 
@@ -149,18 +166,32 @@ fn is_arith(op: &Operator) -> bool {
     )
 }
 
-fn rewrite_expr(e: Expr, schema: &DFSchema, inputs: &[&LogicalPlan]) -> DFResult<Transformed<Expr>> {
+fn rewrite_expr(
+    e: Expr,
+    schema: &DFSchema,
+    inputs: &[&LogicalPlan],
+) -> DFResult<Transformed<Expr>> {
     let ty = |x: &Expr| x.get_type(schema).ok();
     match e {
         Expr::BinaryExpr(BinaryExpr { left, op, right }) if is_cmp(&op) || is_arith(&op) => {
             let lj = is_json_text(&left, inputs);
             let rj = is_json_text(&right, inputs);
             if !lj && !rj {
-                return Ok(Transformed::no(Expr::BinaryExpr(BinaryExpr { left, op, right })));
+                return Ok(Transformed::no(Expr::BinaryExpr(BinaryExpr {
+                    left,
+                    op,
+                    right,
+                })));
             }
             let lt = ty(&left);
             let rt = ty(&right);
-            if lj && rj && matches!(op, Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq) {
+            if lj
+                && rj
+                && matches!(
+                    op,
+                    Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
+                )
+            {
                 // Both sides JSON text: numbers compare as numbers, anything
                 // else as text.
                 let (l, r) = (*left, *right);
@@ -168,11 +199,13 @@ fn rewrite_expr(e: Expr, schema: &DFSchema, inputs: &[&LogicalPlan]) -> DFResult
                 let cond = ln.clone().is_not_null().and(rn.clone().is_not_null());
                 let then = Expr::BinaryExpr(BinaryExpr::new(Box::new(ln), op, Box::new(rn)));
                 let otherwise = Expr::BinaryExpr(BinaryExpr::new(Box::new(l), op, Box::new(r)));
-                return Ok(Transformed::yes(Expr::Case(datafusion::logical_expr::expr::Case::new(
-                    None,
-                    vec![(Box::new(cond), Box::new(then))],
-                    Some(Box::new(otherwise)),
-                ))));
+                return Ok(Transformed::yes(Expr::Case(
+                    datafusion::logical_expr::expr::Case::new(
+                        None,
+                        vec![(Box::new(cond), Box::new(then))],
+                        Some(Box::new(otherwise)),
+                    ),
+                )));
             }
             let (l, r) = if is_arith(&op) {
                 (
@@ -188,7 +221,11 @@ fn rewrite_expr(e: Expr, schema: &DFSchema, inputs: &[&LogicalPlan]) -> DFResult
             } else if rj && !lj && lt == Some(DataType::Boolean) {
                 (*left, Expr::TryCast(TryCast::new(right, DataType::Boolean)))
             } else {
-                return Ok(Transformed::no(Expr::BinaryExpr(BinaryExpr { left, op, right })));
+                return Ok(Transformed::no(Expr::BinaryExpr(BinaryExpr {
+                    left,
+                    op,
+                    right,
+                })));
             };
             Ok(Transformed::yes(Expr::BinaryExpr(BinaryExpr::new(
                 Box::new(l),
@@ -225,12 +262,20 @@ fn rewrite_expr(e: Expr, schema: &DFSchema, inputs: &[&LogicalPlan]) -> DFResult
         {
             af.params.args = std::mem::take(&mut af.params.args)
                 .into_iter()
-                .map(|a| if is_json_text(&a, inputs) { to_double(a) } else { a })
+                .map(|a| {
+                    if is_json_text(&a, inputs) {
+                        to_double(a)
+                    } else {
+                        a
+                    }
+                })
                 .collect();
-            Ok(Transformed::yes(Expr::AggregateFunction(AggregateFunction {
-                func: af.func,
-                params: af.params,
-            })))
+            Ok(Transformed::yes(Expr::AggregateFunction(
+                AggregateFunction {
+                    func: af.func,
+                    params: af.params,
+                },
+            )))
         }
         Expr::WindowFunction(mut wf) => {
             let numeric_agg = match &wf.fun {
@@ -240,7 +285,13 @@ fn rewrite_expr(e: Expr, schema: &DFSchema, inputs: &[&LogicalPlan]) -> DFResult
             if numeric_agg && wf.params.args.iter().any(|a| is_json_text(a, inputs)) {
                 wf.params.args = std::mem::take(&mut wf.params.args)
                     .into_iter()
-                    .map(|a| if is_json_text(&a, inputs) { to_double(a) } else { a })
+                    .map(|a| {
+                        if is_json_text(&a, inputs) {
+                            to_double(a)
+                        } else {
+                            a
+                        }
+                    })
                     .collect();
                 Ok(Transformed::yes(Expr::WindowFunction(wf)))
             } else {
@@ -254,9 +305,9 @@ fn rewrite_expr(e: Expr, schema: &DFSchema, inputs: &[&LogicalPlan]) -> DFResult
             let mut args = sf.args;
             let first = args.remove(0);
             args.insert(0, to_double(first));
-            Ok(Transformed::yes(Expr::ScalarFunction(ScalarFunction::new_udf(
-                sf.func, args,
-            ))))
+            Ok(Transformed::yes(Expr::ScalarFunction(
+                ScalarFunction::new_udf(sf.func, args),
+            )))
         }
         other => Ok(Transformed::no(other)),
     }
@@ -272,7 +323,11 @@ impl AnalyzerRule for JsonNumericRule {
                 for s in &sort.expr {
                     if is_json_text(&s.expr, &[input.as_ref()]) {
                         changed = true;
-                        exprs.push(SortExpr::new(sort_key(s.expr.clone()), s.asc, s.nulls_first));
+                        exprs.push(SortExpr::new(
+                            sort_key(s.expr.clone()),
+                            s.asc,
+                            s.nulls_first,
+                        ));
                     }
                     exprs.push(s.clone());
                 }
@@ -288,8 +343,11 @@ impl AnalyzerRule for JsonNumericRule {
             if matches!(plan, LogicalPlan::TableScan(_)) || plan.inputs().is_empty() {
                 return Ok(Transformed::no(plan));
             }
-            let inputs: Vec<Arc<LogicalPlan>> =
-                plan.inputs().into_iter().map(|p| Arc::new(p.clone())).collect();
+            let inputs: Vec<Arc<LogicalPlan>> = plan
+                .inputs()
+                .into_iter()
+                .map(|p| Arc::new(p.clone()))
+                .collect();
             let input_refs: Vec<&LogicalPlan> = inputs.iter().map(|p| p.as_ref()).collect();
             let schema = merge_schema(&input_refs);
             let names = NamePreserver::new(&plan);

@@ -32,10 +32,8 @@ pub fn ts_type() -> DataType {
 }
 
 fn json_field(name: &str, nullable: bool) -> Field {
-    Field::new(name, DataType::Utf8, nullable).with_metadata(HashMap::from([(
-        JSON_META.to_string(),
-        "true".to_string(),
-    )]))
+    Field::new(name, DataType::Utf8, nullable)
+        .with_metadata(HashMap::from([(JSON_META.to_string(), "true".to_string())]))
 }
 
 static STREAM_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
@@ -231,9 +229,9 @@ pub fn scalar_to_json(v: &ScalarValue) -> Json {
         ScalarValue::Float16(Some(f)) => f64_json(f.to_f64()),
         ScalarValue::Float32(Some(f)) => f64_json(*f as f64),
         ScalarValue::Float64(Some(f)) => f64_json(*f),
-        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) | ScalarValue::Utf8View(Some(s)) => {
-            Json::String(s.clone())
-        }
+        ScalarValue::Utf8(Some(s))
+        | ScalarValue::LargeUtf8(Some(s))
+        | ScalarValue::Utf8View(Some(s)) => Json::String(s.clone()),
         ScalarValue::TimestampMillisecond(Some(ms), _) => Json::String(format_ts_millis(*ms)),
         ScalarValue::TimestampSecond(Some(s), _) => {
             Json::String(format_ts_millis(s.saturating_mul(1000)))
@@ -341,7 +339,9 @@ pub fn json_to_scalar(v: &Json, field: &Field) -> ScalarValue {
     if let Some(x) = direct {
         return x;
     }
-    ScalarValue::Utf8(Some(text)).cast_to(ty).unwrap_or_else(|_| null())
+    ScalarValue::Utf8(Some(text))
+        .cast_to(ty)
+        .unwrap_or_else(|_| null())
 }
 
 #[cfg(test)]

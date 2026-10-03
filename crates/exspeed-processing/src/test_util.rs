@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use exspeed_broker::broker_append::BrokerAppend;
-use exspeed_broker::lease::NoopLeaderLease;
 use exspeed_broker::leadership::ClusterLeadership;
+use exspeed_broker::lease::NoopLeaderLease;
 use exspeed_broker::log::Log;
 use exspeed_common::metrics::Metrics;
 use exspeed_common::{Offset, StreamName};
@@ -58,7 +58,10 @@ impl World {
 
     pub async fn stream(&self, name: &str) {
         self.log
-            .create_stream(&StreamName::try_from(name).unwrap(), &StreamConfig::default())
+            .create_stream(
+                &StreamName::try_from(name).unwrap(),
+                &StreamConfig::default(),
+            )
             .await
             .unwrap();
     }

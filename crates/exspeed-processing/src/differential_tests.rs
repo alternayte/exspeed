@@ -13,7 +13,7 @@ use exspeed_storage::memory::MemoryStorage;
 use exspeed_streams::{Record, StorageEngine};
 use serde_json::{json, Value as Json};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions, SqliteRow};
-use sqlx::{Column, Row, TypeInfo, ValueRef};
+use sqlx::{Row, TypeInfo, ValueRef};
 
 use crate::bounded::execute;
 use crate::catalog::Resolver;
@@ -26,7 +26,10 @@ struct Lcg(u64);
 
 impl Lcg {
     fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.0 >> 33
     }
     fn below(&mut self, n: u64) -> u64 {
@@ -57,14 +60,22 @@ fn gen() -> (Vec<T1>, Vec<T2>) {
     let t1 = (0..60)
         .map(|id| T1 {
             id,
-            grp: if r.below(10) == 0 { None } else { Some(grps[r.below(3) as usize]) },
+            grp: if r.below(10) == 0 {
+                None
+            } else {
+                Some(grps[r.below(3) as usize])
+            },
             amount: match r.below(12) {
                 0 => None,
                 1 => Some((r.below(500) as f64, true)),
                 2 => Some(((r.below(1000) as f64) / 4.0, false)),
                 _ => Some((r.below(500) as f64, false)),
             },
-            name: if r.below(8) == 0 { None } else { Some(names[r.below(6) as usize].to_string()) },
+            name: if r.below(8) == 0 {
+                None
+            } else {
+                Some(names[r.below(6) as usize].to_string())
+            },
             key: format!("k{}", r.below(5)),
         })
         .collect();
@@ -117,7 +128,10 @@ async fn setup() -> (Resolver, SqlitePool, tempfile::TempDir) {
                 p.insert("amount".into(), json!(a));
             }
         }
-        p.insert("name".into(), r.name.clone().map(Json::String).unwrap_or(Json::Null));
+        p.insert(
+            "name".into(),
+            r.name.clone().map(Json::String).unwrap_or(Json::Null),
+        );
         storage
             .append(
                 &s1,
@@ -248,13 +262,23 @@ async fn check(r: &Resolver, pool: &SqlitePool, template: &str, ordered: bool) {
         .fetch_all(pool)
         .await
         .unwrap_or_else(|e| panic!("SQLite failed: {lite_sql}\n{e}"));
-    let mut a: Vec<Vec<Json>> = got.rows.iter().map(|r| r.iter().map(norm).collect()).collect();
-    let mut b: Vec<Vec<Json>> = sqlite_rows(&want).iter().map(|r| r.iter().map(norm).collect()).collect();
+    let mut a: Vec<Vec<Json>> = got
+        .rows
+        .iter()
+        .map(|r| r.iter().map(norm).collect())
+        .collect();
+    let mut b: Vec<Vec<Json>> = sqlite_rows(&want)
+        .iter()
+        .map(|r| r.iter().map(norm).collect())
+        .collect();
     if !ordered {
         a.sort_by_key(|r| serde_json::to_string(r).unwrap());
         b.sort_by_key(|r| serde_json::to_string(r).unwrap());
     }
-    assert!(!b.is_empty() || template.contains("empty"), "SQLite returned no rows: {lite_sql}");
+    assert!(
+        !b.is_empty() || template.contains("empty"),
+        "SQLite returned no rows: {lite_sql}"
+    );
     assert_eq!(a, b, "\nExQL:   {exql_sql}\nSQLite: {lite_sql}");
 }
 
@@ -322,8 +346,25 @@ async fn exql_matches_sqlite() {
 async fn json_text_compares_and_sums_numerically() {
     // "100" > "25" as text is false; numerically it is true.
     let (r, pool, _dir) = setup().await;
-    check(&r, &pool, "SELECT COUNT(*) FROM t1 WHERE {amount} > 25", true).await;
-    check(&r, &pool, "SELECT MAX({amount}), MIN({amount}) FROM t1", true).await;
-    check(&r, &pool, "SELECT {id} FROM t1 WHERE {amount} IS NOT NULL ORDER BY {amount}, {id} LIMIT 20", true).await;
+    check(
+        &r,
+        &pool,
+        "SELECT COUNT(*) FROM t1 WHERE {amount} > 25",
+        true,
+    )
+    .await;
+    check(
+        &r,
+        &pool,
+        "SELECT MAX({amount}), MIN({amount}) FROM t1",
+        true,
+    )
+    .await;
+    check(
+        &r,
+        &pool,
+        "SELECT {id} FROM t1 WHERE {amount} IS NOT NULL ORDER BY {amount}, {id} LIMIT 20",
+        true,
+    )
+    .await;
 }
-

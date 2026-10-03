@@ -33,7 +33,9 @@ pub struct KeyEncoder {
 
 impl std::fmt::Debug for KeyEncoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("KeyEncoder").field("types", &self.types).finish()
+        f.debug_struct("KeyEncoder")
+            .field("types", &self.types)
+            .finish()
     }
 }
 
@@ -78,7 +80,11 @@ impl KeyEncoder {
 
     /// Like [`Self::encode`], but `None` where any key column is NULL (SQL
     /// equality never matches NULL).
-    pub fn encode_join(&self, cols: &[ArrayRef], n: usize) -> Result<Vec<Option<Vec<u8>>>, ExqlError> {
+    pub fn encode_join(
+        &self,
+        cols: &[ArrayRef],
+        n: usize,
+    ) -> Result<Vec<Option<Vec<u8>>>, ExqlError> {
         let keys = self.encode(cols, n)?;
         Ok(keys
             .into_iter()
@@ -294,11 +300,17 @@ impl AggOp {
                 }
             }
             let ia = UInt32Array::from(idx.clone());
-            key_cols = key_cols.iter().map(|c| take_arr(c, &ia)).collect::<Result<_, _>>()?;
+            key_cols = key_cols
+                .iter()
+                .map(|c| take_arr(c, &ia))
+                .collect::<Result<_, _>>()?;
             key_cols.insert(0, ts_array(ends));
             key_cols.insert(0, ts_array(starts));
             for a in args.iter_mut() {
-                *a = a.iter().map(|c| take_arr(c, &ia)).collect::<Result<_, _>>()?;
+                *a = a
+                    .iter()
+                    .map(|c| take_arr(c, &ia))
+                    .collect::<Result<_, _>>()?;
             }
             for f in filters.iter_mut().flatten() {
                 *f = take_arr(f, &ia)?;
@@ -351,8 +363,12 @@ impl AggOp {
                 }
                 acc.update_batch(&vals)?;
             }
-            out.changed_et
-                .push(ids.iter().map(|&i| et[i as usize]).max().unwrap_or(i64::MIN));
+            out.changed_et.push(
+                ids.iter()
+                    .map(|&i| et[i as usize])
+                    .max()
+                    .unwrap_or(i64::MIN),
+            );
             out.changed.push(k);
         }
         Ok(out)
@@ -419,11 +435,8 @@ impl AggOp {
         let mut fields = vec![];
         let mut cols: Vec<ArrayRef> = vec![];
         for (i, t) in self.keys.types().to_vec().iter().enumerate() {
-            let arr = arrays_from_scalars(
-                keys.iter().map(|k| self.groups[k].key[i].clone()),
-                t,
-                n,
-            )?;
+            let arr =
+                arrays_from_scalars(keys.iter().map(|k| self.groups[k].key[i].clone()), t, n)?;
             fields.push(Field::new(format!("k{i}"), arr.data_type().clone(), true));
             cols.push(arr);
         }
@@ -443,7 +456,11 @@ impl AggOp {
                     f.data_type(),
                     n,
                 )?;
-                fields.push(Field::new(format!("a{j}_{s}"), arr.data_type().clone(), true));
+                fields.push(Field::new(
+                    format!("a{j}_{s}"),
+                    arr.data_type().clone(),
+                    true,
+                ));
                 cols.push(arr);
             }
         }
@@ -621,7 +638,12 @@ impl StreamJoin {
 
     /// Join new rows of both sides (already through their side chains).
     /// Rows with event time before `late_wm` are late and dropped.
-    pub fn process(&mut self, left: Rows, right: Rows, late_wm: Option<i64>) -> Result<JoinOutput, ExqlError> {
+    pub fn process(
+        &mut self,
+        left: Rows,
+        right: Rows,
+        late_wm: Option<i64>,
+    ) -> Result<JoinOutput, ExqlError> {
         let (left, l_late) = Self::drop_late(left, late_wm)?;
         let (right, r_late) = Self::drop_late(right, late_wm)?;
         let lkeys = self.side_keys(&self.left, &left)?;
@@ -783,9 +805,13 @@ impl StreamJoin {
             .collect();
         let mut cols: Vec<ArrayRef> = base.columns().to_vec();
         fields.push(Field::new("__off", DataType::UInt64, false));
-        cols.push(Arc::new(UInt64Array::from_iter_values(buf.rows.keys().copied())));
+        cols.push(Arc::new(UInt64Array::from_iter_values(
+            buf.rows.keys().copied(),
+        )));
         fields.push(Field::new("__et", DataType::Int64, false));
-        cols.push(Arc::new(Int64Array::from_iter_values(buf.rows.values().map(|r| r.et))));
+        cols.push(Arc::new(Int64Array::from_iter_values(
+            buf.rows.values().map(|r| r.et),
+        )));
         fields.push(Field::new("__matched", DataType::Boolean, false));
         cols.push(Arc::new(BooleanArray::from(
             buf.rows.values().map(|r| r.matched).collect::<Vec<_>>(),
@@ -806,13 +832,21 @@ impl StreamJoin {
         let n = batch.num_rows();
         let cols: Vec<ArrayRef> = (0..nf).map(|i| batch.column(i).clone()).collect();
         let data = super::rows::make_batch(&side.schema, cols, n)?;
-        let offs = batch.column(nf).as_primitive::<datafusion::arrow::datatypes::UInt64Type>();
-        let ets = batch.column(nf + 1).as_primitive::<datafusion::arrow::datatypes::Int64Type>();
+        let offs = batch
+            .column(nf)
+            .as_primitive::<datafusion::arrow::datatypes::UInt64Type>();
+        let ets = batch
+            .column(nf + 1)
+            .as_primitive::<datafusion::arrow::datatypes::Int64Type>();
         let matched = batch.column(nf + 2).as_boolean();
         let rows = Rows {
             batch: data,
             et: ets.values().to_vec(),
-            ids: offs.values().iter().map(|&off| RowId::Src { src: 0, off }).collect(),
+            ids: offs
+                .values()
+                .iter()
+                .map(|&off| RowId::Src { src: 0, off })
+                .collect(),
         };
         let keys = self.side_keys(side, &rows)?;
         let mut buf = SideBuf::default();

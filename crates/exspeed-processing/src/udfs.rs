@@ -94,7 +94,10 @@ pub fn subject_matches() -> ScalarUDF {
                     if s.is_null(r) || p.is_null(r) {
                         None
                     } else {
-                        Some(exspeed_common::subject::subject_matches(s.value(r), p.value(r)))
+                        Some(exspeed_common::subject::subject_matches(
+                            s.value(r),
+                            p.value(r),
+                        ))
                     }
                 })
                 .collect();
@@ -124,7 +127,11 @@ pub fn json_num() -> ScalarUDF {
                     if s.is_null(r) {
                         None
                     } else {
-                        s.value(r).trim().parse::<f64>().ok().filter(|f| !f.is_nan())
+                        s.value(r)
+                            .trim()
+                            .parse::<f64>()
+                            .ok()
+                            .filter(|f| !f.is_nan())
                     }
                 })
                 .collect();

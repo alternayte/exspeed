@@ -22,7 +22,9 @@ use datafusion::catalog::default_table_source::source_as_provider;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::{DFSchema, JoinType};
 use datafusion::execution::session_state::SessionState;
-use datafusion::logical_expr::{Aggregate, Expr, ExprSchemable, Join, LogicalPlan, SubqueryAlias, TableScan};
+use datafusion::logical_expr::{
+    Aggregate, Expr, ExprSchemable, Join, LogicalPlan, SubqueryAlias, TableScan,
+};
 use datafusion::optimizer::extract_equijoin_predicate::ExtractEquijoinPredicate;
 use datafusion::optimizer::{OptimizerContext, OptimizerRule};
 use datafusion::physical_expr::PhysicalExpr;
@@ -91,15 +93,31 @@ fn arrow(schema: &DFSchema) -> SchemaRef {
 
 fn unsupported_node(plan: &LogicalPlan) -> ExqlError {
     let (what, hint) = match plan {
-        LogicalPlan::Sort(_) => ("ORDER BY in a continuous query", "order results when reading the output"),
+        LogicalPlan::Sort(_) => (
+            "ORDER BY in a continuous query",
+            "order results when reading the output",
+        ),
         LogicalPlan::Limit(_) => ("LIMIT / OFFSET in a continuous query", ""),
-        LogicalPlan::Window(_) => ("window functions (OVER) in a continuous query", "use WINDOW TUMBLING / HOPPING with GROUP BY"),
+        LogicalPlan::Window(_) => (
+            "window functions (OVER) in a continuous query",
+            "use WINDOW TUMBLING / HOPPING with GROUP BY",
+        ),
         LogicalPlan::Distinct(_) => ("SELECT DISTINCT in a continuous query", "use GROUP BY"),
         LogicalPlan::Union(_) => ("UNION in a continuous query", "create one query per input"),
-        LogicalPlan::Aggregate(_) => ("more than one level of aggregation in a continuous query", "aggregate the output stream of another query"),
-        LogicalPlan::Join(_) => ("joining more than two relations in a continuous query", "join two streams per query and chain queries"),
-        LogicalPlan::Subquery(_) | LogicalPlan::SubqueryAlias(_) => ("subqueries in a continuous query", ""),
-        LogicalPlan::EmptyRelation(_) | LogicalPlan::Values(_) => ("a continuous query without a FROM stream", ""),
+        LogicalPlan::Aggregate(_) => (
+            "more than one level of aggregation in a continuous query",
+            "aggregate the output stream of another query",
+        ),
+        LogicalPlan::Join(_) => (
+            "joining more than two relations in a continuous query",
+            "join two streams per query and chain queries",
+        ),
+        LogicalPlan::Subquery(_) | LogicalPlan::SubqueryAlias(_) => {
+            ("subqueries in a continuous query", "")
+        }
+        LogicalPlan::EmptyRelation(_) | LogicalPlan::Values(_) => {
+            ("a continuous query without a FROM stream", "")
+        }
         LogicalPlan::Unnest(_) => ("UNNEST in a continuous query", ""),
         _ => ("this query shape in a continuous query", ""),
     };
@@ -116,7 +134,7 @@ fn map_expr_err(e: datafusion::error::DataFusionError) -> ExqlError {
 }
 
 /// `[Projection | Filter | SubqueryAlias]*` from the top, and the node below.
-fn split_chain(plan: &LogicalPlan) -> (Vec<&LogicalPlan>, &LogicalPlan) {
+pub(crate) fn split_chain(plan: &LogicalPlan) -> (Vec<&LogicalPlan>, &LogicalPlan) {
     let mut nodes = vec![];
     let mut cur = plan;
     loop {
@@ -155,6 +173,38 @@ fn is_marker(e: &Expr, name: &str) -> bool {
     }
 }
 
+/// Compile `[Projection | Filter | SubqueryAlias]*` nodes (top-down order)
+/// into stateless steps (applied bottom-up).
+pub(crate) fn compile_chain(
+    state: &SessionState,
+    nodes: &[&LogicalPlan],
+) -> Result<Chain, ExqlError> {
+    let phys = |e: &Expr, schema: &DFSchema| {
+        state
+            .create_physical_expr(e.clone(), schema)
+            .map_err(map_expr_err)
+    };
+    let mut steps = vec![];
+    for node in nodes.iter().rev() {
+        match node {
+            LogicalPlan::Projection(p) => {
+                let exprs = p
+                    .expr
+                    .iter()
+                    .map(|e| phys(e, p.input.schema()))
+                    .collect::<Result<_, _>>()?;
+                steps.push(Step::Project(exprs, arrow(&p.schema)));
+            }
+            LogicalPlan::Filter(f) => {
+                steps.push(Step::Filter(phys(&f.predicate, f.input.schema())?));
+            }
+            LogicalPlan::SubqueryAlias(_) => {}
+            other => return Err(unsupported_node(other)),
+        }
+    }
+    Ok(Chain { steps })
+}
+
 struct Builder<'a> {
     state: &'a SessionState,
     spec: &'a QuerySpec,
@@ -171,32 +221,20 @@ enum ScanKind {
 
 impl Builder<'_> {
     fn phys(&self, e: &Expr, schema: &DFSchema) -> Result<Arc<dyn PhysicalExpr>, ExqlError> {
-        self.state.create_physical_expr(e.clone(), schema).map_err(map_expr_err)
+        self.state
+            .create_physical_expr(e.clone(), schema)
+            .map_err(map_expr_err)
     }
 
     fn chain(&self, nodes: &[&LogicalPlan]) -> Result<Chain, ExqlError> {
-        let mut steps = vec![];
-        for node in nodes.iter().rev() {
-            match node {
-                LogicalPlan::Projection(p) => {
-                    let exprs = p
-                        .expr
-                        .iter()
-                        .map(|e| self.phys(e, p.input.schema()))
-                        .collect::<Result<_, _>>()?;
-                    steps.push(Step::Project(exprs, arrow(&p.schema)));
-                }
-                LogicalPlan::Filter(f) => {
-                    steps.push(Step::Filter(self.phys(&f.predicate, f.input.schema())?));
-                }
-                LogicalPlan::SubqueryAlias(_) => {}
-                other => return Err(unsupported_node(other)),
-            }
-        }
-        Ok(Chain { steps })
+        compile_chain(self.state, nodes)
     }
 
-    fn scan(&mut self, scan: &TableScan, alias: Option<&SubqueryAlias>) -> Result<ScanKind, ExqlError> {
+    fn scan(
+        &mut self,
+        scan: &TableScan,
+        alias: Option<&SubqueryAlias>,
+    ) -> Result<ScanKind, ExqlError> {
         if !scan.filters.is_empty() || scan.fetch.is_some() {
             return Err(ExqlError::Internal("unexpected pushed-down scan".into()));
         }
@@ -269,7 +307,9 @@ impl Builder<'_> {
         }
         if self.spec.window.is_some() {
             if groups.len() < 2 || !is_marker(groups[0], WSTART) || !is_marker(groups[1], WEND) {
-                return Err(ExqlError::Internal("window markers missing from GROUP BY".into()));
+                return Err(ExqlError::Internal(
+                    "window markers missing from GROUP BY".into(),
+                ));
             }
             groups.drain(0..2);
         }
@@ -305,7 +345,11 @@ impl Builder<'_> {
         AggOp::new(group_exprs, self.spec.window, aggs, arrow(&a.schema))
     }
 
-    fn input(&mut self, node: &LogicalPlan, chain_nodes: &[&LogicalPlan]) -> Result<InputOp, ExqlError> {
+    fn input(
+        &mut self,
+        node: &LogicalPlan,
+        chain_nodes: &[&LogicalPlan],
+    ) -> Result<InputOp, ExqlError> {
         match node {
             LogicalPlan::TableScan(scan) => match self.scan(scan, bottom_alias(chain_nodes))? {
                 ScanKind::Stream(src) => Ok(InputOp::Single { src }),
@@ -339,7 +383,11 @@ impl Builder<'_> {
         let (lnodes, lrest) = split_chain(&j.left);
         let (rnodes, rrest) = split_chain(&j.right);
         let (LogicalPlan::TableScan(ls), LogicalPlan::TableScan(rs)) = (lrest, rrest) else {
-            let bad = if matches!(lrest, LogicalPlan::TableScan(_)) { rrest } else { lrest };
+            let bad = if matches!(lrest, LogicalPlan::TableScan(_)) {
+                rrest
+            } else {
+                lrest
+            };
             return Err(unsupported_node(bad));
         };
         let lk = self.scan(ls, bottom_alias(&lnodes))?;
@@ -348,21 +396,18 @@ impl Builder<'_> {
         let rchain = self.chain(&rnodes)?;
         let lschema = j.left.schema();
         let rschema = j.right.schema();
-        let lkeys: Vec<Arc<dyn PhysicalExpr>> = j
-            .on
-            .iter()
-            .map(|(l, _)| self.phys(l, lschema))
-            .collect::<Result<_, _>>()?;
-        let rkeys: Vec<Arc<dyn PhysicalExpr>> = j
-            .on
-            .iter()
-            .map(|(_, r)| self.phys(r, rschema))
-            .collect::<Result<_, _>>()?;
-        let key_types: Vec<DataType> = j
-            .on
-            .iter()
-            .map(|(l, _)| l.get_type(lschema))
-            .collect::<Result<_, _>>()?;
+        let lkeys: Vec<Arc<dyn PhysicalExpr>> =
+            j.on.iter()
+                .map(|(l, _)| self.phys(l, lschema))
+                .collect::<Result<_, _>>()?;
+        let rkeys: Vec<Arc<dyn PhysicalExpr>> =
+            j.on.iter()
+                .map(|(_, r)| self.phys(r, rschema))
+                .collect::<Result<_, _>>()?;
+        let key_types: Vec<DataType> =
+            j.on.iter()
+                .map(|(l, _)| l.get_type(lschema))
+                .collect::<Result<_, _>>()?;
         let filter = j
             .filter
             .as_ref()
@@ -400,7 +445,9 @@ impl Builder<'_> {
             }
             (ScanKind::Stream(s), ScanKind::Table(t, cols)) => {
                 if within.is_some() {
-                    return Err(ExqlError::Plan("WITHIN only applies to stream-stream joins".into()));
+                    return Err(ExqlError::Plan(
+                        "WITHIN only applies to stream-stream joins".into(),
+                    ));
                 }
                 let mut tchain = rchain;
                 if let Some((idx, sch)) = cols {
@@ -433,7 +480,9 @@ impl Builder<'_> {
                     ));
                 }
                 if within.is_some() {
-                    return Err(ExqlError::Plan("WITHIN only applies to stream-stream joins".into()));
+                    return Err(ExqlError::Plan(
+                        "WITHIN only applies to stream-stream joins".into(),
+                    ));
                 }
                 let mut tchain = lchain;
                 if let Some((idx, sch)) = cols {

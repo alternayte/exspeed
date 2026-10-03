@@ -17,7 +17,10 @@ use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchema, Result as DFResult, ScalarValue};
 use datafusion::config::ConfigOptions;
-use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown, TableType};
+use datafusion::execution::TaskContext;
+use datafusion::logical_expr::{
+    BinaryExpr, Expr, Operator, TableProviderFilterPushDown, TableType,
+};
 use datafusion::physical_expr::expressions::Column as PhysColumn;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr, PhysicalSortExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
@@ -29,7 +32,6 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream, SortOrderPushdownResult,
 };
-use datafusion::execution::TaskContext;
 use exspeed_common::{Offset, StreamName};
 use exspeed_streams::{ReadLimits, StorageEngine, StoredRecord};
 
@@ -198,7 +200,11 @@ fn apply_filter(e: &Expr, session: &dyn Session, b: &mut Bounds) -> bool {
                 };
                 // The column is ms-truncated: compare at ms granularity.
                 let ms = ns.div_euclid(1_000_000);
-                let ms_ceil = if ns.rem_euclid(1_000_000) == 0 { ms } else { ms + 1 };
+                let ms_ceil = if ns.rem_euclid(1_000_000) == 0 {
+                    ms
+                } else {
+                    ms + 1
+                };
                 match op {
                     Operator::GtEq => b.ts_lo(clamp_u64(ms_ceil * 1_000_000)),
                     Operator::Gt => b.ts_lo(clamp_u64((ms + 1) * 1_000_000)),
@@ -590,7 +596,10 @@ impl ExecutionPlan for StreamScanExec {
                 return Ok(Some((batch, st)));
             }
         });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(self.schema.clone(), s)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema.clone(),
+            s,
+        )))
     }
 }
 
@@ -606,7 +615,11 @@ fn reverse_chain(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>
     }
     let children = plan.children();
     if children.len() != 1
-        || !plan.maintains_input_order().first().copied().unwrap_or(false)
+        || !plan
+            .maintains_input_order()
+            .first()
+            .copied()
+            .unwrap_or(false)
         || plan.properties().partitioning.partition_count() != 1
         || plan.fetch().is_some()
     {
@@ -692,4 +705,6 @@ impl PhysicalOptimizerRule for ReverseTailRule {
     }
 }
 
-use datafusion::physical_plan::{ChildrenPropertiesMode, ExecutionPlanProperties, ReplaceChildrenOptions};
+use datafusion::physical_plan::{
+    ChildrenPropertiesMode, ExecutionPlanProperties, ReplaceChildrenOptions,
+};

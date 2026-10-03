@@ -15,7 +15,7 @@
 | 1. Core log | ⏳ next |
 | 2. Consumers + protocol v2 | — |
 | 3. Ops | — |
-| 4. ExQL v2 | — |
+| 4. ExQL v2 | ✅ DataFusion bounded engine, continuous dataflow (event-time windows, joins, durable tables, checkpoints, effectively-once output), indexes removed, differential tests — see [exql.md](exql.md) |
 | 5. Connectors v2 | — |
 | 6. HA | — |
 

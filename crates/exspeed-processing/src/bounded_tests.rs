@@ -68,7 +68,14 @@ async fn select_star_columns() {
     let res = run(&r, "SELECT * FROM orders").await.unwrap();
     assert_eq!(
         res.columns,
-        vec!["offset", "timestamp", "subject", "key", "payload", "headers"]
+        vec![
+            "offset",
+            "timestamp",
+            "subject",
+            "key",
+            "payload",
+            "headers"
+        ]
     );
     assert_eq!(res.row_count, 5);
     assert_eq!(res.rows[0][4], json!({"amount": 100, "region": "eu"}));
@@ -94,7 +101,10 @@ async fn json_numeric_compare_order_and_sum() {
     .await
     .unwrap();
     let got: Vec<_> = res.rows.iter().map(|r| r[0].clone()).collect();
-    assert_eq!(got, vec![json!("1000"), json!("300"), json!("100"), json!("25.5")]);
+    assert_eq!(
+        got,
+        vec![json!("1000"), json!("300"), json!("100"), json!("25.5")]
+    );
 
     let res = run(
         &r,
@@ -119,7 +129,10 @@ async fn json_numeric_compare_order_and_sum() {
     .await
     .unwrap();
     let got: Vec<_> = res.rows.iter().map(|r| r[0].clone()).collect();
-    assert_eq!(got, vec![json!("25.5"), json!("100"), json!("300"), json!("1000")]);
+    assert_eq!(
+        got,
+        vec![json!("25.5"), json!("100"), json!("300"), json!("1000")]
+    );
 }
 
 #[tokio::test]
@@ -129,7 +142,9 @@ async fn errors_for_unknown_things() {
     assert_eq!(e.code(), "PLAN_ERROR", "{e}");
     let e = run(&r, "SELECT nope FROM orders").await.unwrap_err();
     assert_eq!(e.code(), "PLAN_ERROR", "{e}");
-    let e = run(&r, "SELECT no_such_fn(1) FROM orders").await.unwrap_err();
+    let e = run(&r, "SELECT no_such_fn(1) FROM orders")
+        .await
+        .unwrap_err();
     assert!(matches!(e.code(), "PLAN_ERROR" | "EXECUTION_ERROR"), "{e}");
     let e = run(&r, "SELEC 1").await.unwrap_err();
     assert_eq!(e.code(), "PARSE_ERROR", "{e}");
@@ -144,9 +159,12 @@ async fn tail_read_and_pushdown() {
         .await
         .unwrap();
     assert_eq!(res.rows, vec![vec![json!(4)], vec![json!(3)]]);
-    let plan = run(&r, "EXPLAIN SELECT offset FROM orders ORDER BY offset DESC LIMIT 2")
-        .await
-        .unwrap();
+    let plan = run(
+        &r,
+        "EXPLAIN SELECT offset FROM orders ORDER BY offset DESC LIMIT 2",
+    )
+    .await
+    .unwrap();
     let text = serde_json::to_string(&plan.rows).unwrap();
     assert!(text.contains("reverse=true"), "{text}");
 
@@ -166,13 +184,19 @@ async fn tail_read_and_pushdown() {
     let text = serde_json::to_string(&plan.rows).unwrap();
     assert!(text.contains("reverse=true"), "{text}");
 
-    let res = run(&r, "SELECT offset FROM orders WHERE offset >= 2 AND offset < 4")
-        .await
-        .unwrap();
+    let res = run(
+        &r,
+        "SELECT offset FROM orders WHERE offset >= 2 AND offset < 4",
+    )
+    .await
+    .unwrap();
     assert_eq!(res.rows, vec![vec![json!(2)], vec![json!(3)]]);
-    let plan = run(&r, "EXPLAIN SELECT offset FROM orders WHERE offset >= 2 AND offset < 4")
-        .await
-        .unwrap();
+    let plan = run(
+        &r,
+        "EXPLAIN SELECT offset FROM orders WHERE offset >= 2 AND offset < 4",
+    )
+    .await
+    .unwrap();
     let text = serde_json::to_string(&plan.rows).unwrap();
     assert!(text.contains("offsets=[2, 4)"), "{text}");
 }
@@ -234,9 +258,12 @@ async fn full_sql_features() {
     .await
     .unwrap();
     assert_eq!(res.row_count, 4);
-    let res = run(&r, "SELECT subject_part(subject, 2) AS p FROM orders LIMIT 1")
-        .await
-        .unwrap();
+    let res = run(
+        &r,
+        "SELECT subject_part(subject, 2) AS p FROM orders LIMIT 1",
+    )
+    .await
+    .unwrap();
     assert_eq!(res.rows, vec![vec![json!("eu")]]);
 }
 
@@ -251,4 +278,79 @@ async fn truncation_is_reported() {
     let res = execute(state, "SELECT * FROM orders", &cfg).await.unwrap();
     assert_eq!(res.row_count, 2);
     assert!(res.truncated);
+}
+
+/// Joins with a registered Postgres connection. Runs when
+/// `EXSPEED_POSTGRES_URL` is set (e.g. `postgres://testuser:testpass@127.0.0.1:5432/testdb`).
+#[tokio::test]
+async fn external_postgres_join() {
+    let Ok(url) = std::env::var("EXSPEED_POSTGRES_URL") else {
+        eprintln!("EXSPEED_POSTGRES_URL not set; skipping");
+        return;
+    };
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE IF EXISTS exql_regions")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE exql_regions (code TEXT PRIMARY KEY, name TEXT, vat DOUBLE PRECISION, \"we\"\"ird\" INT)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO exql_regions VALUES ('eu', 'Europe', 0.5, 1), ('us', 'United States', 0.0, 2)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (_s, r, _d) = setup(&amounts()).await;
+    r.external
+        .registry()
+        .add(crate::external::ConnectionConfig {
+            name: "wh".into(),
+            driver: "postgres".into(),
+            url: url.clone(),
+        })
+        .unwrap();
+    let res = run(
+        &r,
+        "SELECT o.payload->>'region' AS region, w.name, SUM(o.payload->>'amount' * (1 + w.vat)) AS gross \
+         FROM orders o JOIN wh.exql_regions w ON o.payload->>'region' = w.code \
+         GROUP BY o.payload->>'region', w.name ORDER BY region",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        res.rows,
+        vec![
+            vec![json!("eu"), json!("Europe"), json!(188.25)],
+            vec![json!("us"), json!("United States"), json!(1300.0)]
+        ]
+    );
+    // Quoted identifiers survive; unknown tables are errors.
+    let res = run(
+        &r,
+        "SELECT \"we\"\"ird\" FROM wh.public.exql_regions ORDER BY 1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(res.rows, vec![vec![json!(1)], vec![json!(2)]]);
+    let e = run(&r, "SELECT * FROM wh.nope").await.unwrap_err();
+    assert_eq!(e.code(), "PLAN_ERROR", "{e}");
+    let e = run(
+        &r,
+        "SELECT * FROM wh.\"exql_regions\"\"; DROP TABLE x; --\"",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(e.code(), "PLAN_ERROR", "{e}");
+    sqlx::query("DROP TABLE exql_regions")
+        .execute(&pool)
+        .await
+        .unwrap();
 }

@@ -75,18 +75,24 @@ Consumers are created by clients over TCP, for example with the SDK's
 
 ```bash
 exspeed query "SELECT * FROM orders LIMIT 10"
-exspeed query --continuous "CREATE VIEW eu_orders AS SELECT … FROM orders WHERE …"
-exspeed query "CREATE INDEX orders_by_customer ON orders(payload->>'customer_id')"
-exspeed query "DROP INDEX orders_by_customer"
+exspeed query "CREATE STREAM eu_orders AS SELECT … FROM orders WHERE payload->>'region' = 'eu'"
+exspeed query "CREATE TABLE revenue AS SELECT payload->>'region' AS region, SUM(payload->>'total') AS total FROM orders GROUP BY payload->>'region'"
+exspeed query "PAUSE QUERY eu_orders_1a2b3c4d"
+exspeed query "RESUME QUERY eu_orders_1a2b3c4d"
+exspeed query "DROP STREAM eu_orders"
+exspeed query --continuous "CREATE STREAM …"   # only accepts CREATE statements
 ```
+
+Every statement goes to `POST /api/v1/queries`. Secondary indexes
+(`CREATE INDEX`) were removed, and the server rejects them with `UNSUPPORTED`.
 
 See [exql.md](exql.md).
 
 ## Views
 
 ```bash
-exspeed views                 # list materialized views
-exspeed view <name>           # rows
+exspeed views                 # list materialized tables
+exspeed view <name>           # rows of a table
 ```
 
 ## Connectors

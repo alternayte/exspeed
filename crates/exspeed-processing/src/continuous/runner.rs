@@ -171,7 +171,10 @@ fn valid_subject(s: &str) -> bool {
     s.len() <= 1024
         && !s.is_empty()
         && s.split('.').all(|t| {
-            !t.is_empty() && !t.contains('*') && !t.contains('>') && !t.chars().any(char::is_whitespace)
+            !t.is_empty()
+                && !t.contains('*')
+                && !t.contains('>')
+                && !t.chars().any(char::is_whitespace)
         })
 }
 
@@ -211,7 +214,9 @@ fn event_times(arr: &ArrayRef, fallback: &[i64]) -> Result<Vec<i64>, ExqlError> 
             let c = cast(arr, &DataType::Timestamp(TimeUnit::Millisecond, None))?;
             let c = cast(&c, &DataType::Int64)?;
             let a = c.as_primitive::<datafusion::arrow::datatypes::Int64Type>();
-            Ok(pick((0..n).map(|i| a.is_valid(i).then(|| a.value(i))).collect()))
+            Ok(pick(
+                (0..n).map(|i| a.is_valid(i).then(|| a.value(i))).collect(),
+            ))
         }
         DataType::Date32 | DataType::Date64 => {
             let c = cast(arr, &DataType::Timestamp(TimeUnit::Millisecond, None))?;
@@ -220,19 +225,24 @@ fn event_times(arr: &ArrayRef, fallback: &[i64]) -> Result<Vec<i64>, ExqlError> 
         t if t.is_integer() => {
             let c = cast(arr, &DataType::Int64)?;
             let a = c.as_primitive::<datafusion::arrow::datatypes::Int64Type>();
-            Ok(pick((0..n).map(|i| a.is_valid(i).then(|| a.value(i))).collect()))
+            Ok(pick(
+                (0..n).map(|i| a.is_valid(i).then(|| a.value(i))).collect(),
+            ))
         }
         t if t.is_floating() => {
             let c = cast(arr, &DataType::Float64)?;
             let a = c.as_primitive::<datafusion::arrow::datatypes::Float64Type>();
             Ok(pick(
                 (0..n)
-                    .map(|i| (a.is_valid(i) && a.value(i).is_finite()).then(|| a.value(i).round() as i64))
+                    .map(|i| {
+                        (a.is_valid(i) && a.value(i).is_finite()).then(|| a.value(i).round() as i64)
+                    })
                     .collect(),
             ))
         }
         _ => {
-            let field = datafusion::arrow::datatypes::Field::new("t", arr.data_type().clone(), true);
+            let field =
+                datafusion::arrow::datatypes::Field::new("t", arr.data_type().clone(), true);
             Ok(pick(
                 (0..n)
                     .map(|i| cell_to_text(arr, &field, i).and_then(|s| parse_ts_text(&s)))
@@ -273,7 +283,9 @@ impl Runner {
         if seen.is_empty() {
             return None;
         }
-        seen.into_iter().min().map(|m| m.saturating_sub(self.df.grace_ms))
+        seen.into_iter()
+            .min()
+            .map(|m| m.saturating_sub(self.df.grace_ms))
     }
 
     fn qid(&self) -> &str {
@@ -298,8 +310,14 @@ impl Runner {
         let mut out_from = 0u64;
         match ck {
             Some(ck) => {
-                let names: Vec<String> = self.df.sources.iter().map(|s| s.stream.to_string()).collect();
-                let ck_names: Vec<String> = ck.meta.sources.iter().map(|s| s.stream.clone()).collect();
+                let names: Vec<String> = self
+                    .df
+                    .sources
+                    .iter()
+                    .map(|s| s.stream.to_string())
+                    .collect();
+                let ck_names: Vec<String> =
+                    ck.meta.sources.iter().map(|s| s.stream.clone()).collect();
                 if names != ck_names {
                     return Err(ExqlError::Internal(format!(
                         "checkpoint is for sources {ck_names:?}, query reads {names:?}"
@@ -315,14 +333,21 @@ impl Runner {
                     }
                 }
                 if let InputOp::StreamJoin(j) = &mut self.df.input {
-                    if let (Some(l), Some(r)) = (ck.section("join_left"), ck.section("join_right")) {
+                    if let (Some(l), Some(r)) = (ck.section("join_left"), ck.section("join_right"))
+                    {
                         j.restore(l, r)?;
                     }
                 }
                 let stats = &self.ctx.stats;
-                stats.records_in.store(ck.meta.records_in, Ordering::Relaxed);
-                stats.records_out.store(ck.meta.records_out, Ordering::Relaxed);
-                stats.late_dropped.store(ck.meta.late_dropped, Ordering::Relaxed);
+                stats
+                    .records_in
+                    .store(ck.meta.records_in, Ordering::Relaxed);
+                stats
+                    .records_out
+                    .store(ck.meta.records_out, Ordering::Relaxed);
+                stats
+                    .late_dropped
+                    .store(ck.meta.late_dropped, Ordering::Relaxed);
                 self.seq = ck.meta.seq;
                 let out = self.sink.stream().to_string();
                 out_from = ck
@@ -389,7 +414,8 @@ impl Runner {
                     if k == IDEMPOTENCY_HEADER {
                         self.written.insert(v.clone());
                     } else if k == H_POS {
-                        let parsed: Option<Vec<u64>> = v.split(',').map(|x| x.parse().ok()).collect();
+                        let parsed: Option<Vec<u64>> =
+                            v.split(',').map(|x| x.parse().ok()).collect();
                         if let Some(pv) = parsed {
                             let ahead = pv.len() == last.len()
                                 && pv.iter().zip(&last).all(|(a, b)| a >= b)
@@ -548,7 +574,10 @@ impl Runner {
                 &RecordBatchOptions::new().with_row_count(Some(recs.len())),
             )?;
         }
-        let rec_ts: Vec<i64> = recs.iter().map(|r| (r.timestamp / 1_000_000) as i64).collect();
+        let rec_ts: Vec<i64> = recs
+            .iter()
+            .map(|r| (r.timestamp / 1_000_000) as i64)
+            .collect();
         let et = match &def.ts {
             Some(e) if !recs.is_empty() => event_times(&eval(e, &batch)?, &rec_ts)?,
             _ => rec_ts,
@@ -574,7 +603,13 @@ impl Runner {
     fn group_outputs(
         &mut self,
         keys: &[Vec<u8>],
-    ) -> Result<Vec<(Vec<ScalarValue>, Option<(Vec<ScalarValue>, Map<String, Json>, Option<String>)>)>, ExqlError> {
+    ) -> Result<
+        Vec<(
+            Vec<ScalarValue>,
+            Option<(Vec<ScalarValue>, Map<String, Json>, Option<String>)>,
+        )>,
+        ExqlError,
+    > {
         let agg = self.df.agg.as_mut().expect("aggregate");
         let mut rows = vec![];
         let mut kvs = vec![];
@@ -606,7 +641,9 @@ impl Runner {
                     let values = out.row_values(j)?;
                     let payload = row_object(&out.batch, j);
                     let rk = match self.key_col {
-                        Some(c) => cell_to_text(out.batch.column(c), out.batch.schema().field(c), j),
+                        Some(c) => {
+                            cell_to_text(out.batch.column(c), out.batch.schema().field(c), j)
+                        }
                         None if kv.len() > window_keys => Some(key_string(&kv[window_keys..])),
                         None => None,
                     };
@@ -619,7 +656,12 @@ impl Runner {
         Ok(res)
     }
 
-    fn subject_of(&self, out: &Rows, j: usize, meta: &HashMap<(u8, u64), (String, Option<Bytes>)>) -> String {
+    fn subject_of(
+        &self,
+        out: &Rows,
+        j: usize,
+        meta: &HashMap<(u8, u64), (String, Option<Bytes>)>,
+    ) -> String {
         if let Some(c) = self.subject_col {
             if let Some(s) = cell_to_text(out.batch.column(c), out.batch.schema().field(c), j) {
                 if valid_subject(&s) {
@@ -636,11 +678,16 @@ impl Runner {
         String::new()
     }
 
-    fn process(&mut self, recs: Vec<Vec<StoredRecord>>, sig: &str) -> Result<Vec<OutItem>, ExqlError> {
+    fn process(
+        &mut self,
+        recs: Vec<Vec<StoredRecord>>,
+        sig: &str,
+    ) -> Result<Vec<OutItem>, ExqlError> {
         let wm_prev = self.watermark();
         let delay = self.df.delay_ms;
         let mut src_rows = Vec::with_capacity(recs.len());
-        let single_stateless = matches!(self.df.input, InputOp::Single { .. }) && self.df.agg.is_none();
+        let single_stateless =
+            matches!(self.df.input, InputOp::Single { .. }) && self.df.agg.is_none();
         let mut meta: HashMap<(u8, u64), (String, Option<Bytes>)> = HashMap::new();
         for (i, rs) in recs.iter().enumerate() {
             let rows = self.source_rows(i, rs)?;
@@ -662,15 +709,24 @@ impl Runner {
         let input = match &mut self.df.input {
             InputOp::Single { src } => src_rows[*src].take().expect("source rows"),
             InputOp::StreamJoin(j) => {
-                let l = j.left.chain.apply(src_rows[j.left.src].take().expect("left rows"))?;
-                let r = j.right.chain.apply(src_rows[j.right.src].take().expect("right rows"))?;
+                let l = j
+                    .left
+                    .chain
+                    .apply(src_rows[j.left.src].take().expect("left rows"))?;
+                let r = j
+                    .right
+                    .chain
+                    .apply(src_rows[j.right.src].take().expect("right rows"))?;
                 let out = j.process(l, r, wm_prev)?;
                 late += out.late;
                 let unmatched = j.advance(wm_new)?;
                 Rows::concat(j.out_schema.clone(), vec![out.rows, unmatched])?
             }
             InputOp::TableJoin(t) => {
-                let s = t.stream.chain.apply(src_rows[t.stream.src].take().expect("stream rows"))?;
+                let s = t
+                    .stream
+                    .chain
+                    .apply(src_rows[t.stream.src].take().expect("stream rows"))?;
                 t.process(s)?
             }
         };
@@ -710,7 +766,12 @@ impl Runner {
 
         let close_prev = wm_prev.map(|w| w.saturating_sub(delay));
         let close_new = wm_new.map(|w| w.saturating_sub(delay));
-        let upd = self.df.agg.as_mut().expect("aggregate").update(&rows, close_prev)?;
+        let upd = self
+            .df
+            .agg
+            .as_mut()
+            .expect("aggregate")
+            .update(&rows, close_prev)?;
         late += upd.late;
         self.add_late(late);
         let emit = self.df.emit;
@@ -772,7 +833,11 @@ impl Runner {
     // -- writing ------------------------------------------------------------
 
     /// Append with retries on transient errors.
-    async fn append_retry(&self, stream: &StreamName, records: Vec<Record>) -> Result<(), ExqlError> {
+    async fn append_retry(
+        &self,
+        stream: &StreamName,
+        records: Vec<Record>,
+    ) -> Result<(), ExqlError> {
         if records.is_empty() {
             return Ok(());
         }
@@ -786,7 +851,9 @@ impl Runner {
                     for r in records {
                         match self.ctx.log.append(stream, r).await {
                             Ok(_) => {}
-                            Err(LogError::Storage(StorageError::KeyCollision { stored_offset })) => {
+                            Err(LogError::Storage(StorageError::KeyCollision {
+                                stored_offset,
+                            })) => {
                                 warn!(query = %self.qid(), stream = %stream, stored_offset, "output differs from the copy written before the restore; keeping the stored record");
                             }
                             Err(e) => return Err(e.into()),
@@ -911,15 +978,24 @@ impl Runner {
                     wait_for_data(&mut watchers, wait, &cancel).await;
                     continue;
                 }
-                let sig = new_pos.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
+                let sig = new_pos
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
                 let items = self.process(recs, &sig)?;
                 self.write(items, &sig).await?;
-                self.ctx.stats.records_in.fetch_add(total as u64, Ordering::Relaxed);
+                self.ctx
+                    .stats
+                    .records_in
+                    .fetch_add(total as u64, Ordering::Relaxed);
                 self.pos = new_pos;
                 self.dirty = true;
                 self.batches_since_ckpt += 1;
                 let every = self.ctx.cfg.checkpoint_every_batches;
-                if self.last_ckpt.elapsed() >= interval || (every > 0 && self.batches_since_ckpt >= every) {
+                if self.last_ckpt.elapsed() >= interval
+                    || (every > 0 && self.batches_since_ckpt >= every)
+                {
                     self.checkpoint().await?;
                 }
             }

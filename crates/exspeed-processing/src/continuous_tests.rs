@@ -31,8 +31,13 @@ async fn clicks(w: &World) {
         ("b", 21_000, 10),
         ("a", 35_000, 1),
     ] {
-        w.publish("clicks", None, "c", json!({"user": u, "ts": T0 + dt, "amount": amount}))
-            .await;
+        w.publish(
+            "clicks",
+            None,
+            "c",
+            json!({"user": u, "ts": T0 + dt, "amount": amount}),
+        )
+        .await;
     }
 }
 
@@ -53,9 +58,7 @@ async fn tumbling_emit_final_once_per_window_on_replay() {
     let id = qid(&q);
     node.wait_input(&id, 7).await;
     let ts = |d: i64| crate::convert::format_ts_millis(T0 + d);
-    let row = |u: &str, s: i64, n: i64, total: f64, mx: f64| {
-        json!({"usr": u, "window_start": ts(s), "window_end": ts(s + 10_000), "n": n, "total": total, "mx": mx})
-    };
+    let row = |u: &str, s: i64, n: i64, total: f64, mx: f64| json!({"usr": u, "window_start": ts(s), "window_end": ts(s + 10_000), "n": n, "total": total, "mx": mx});
     let expected = vec![
         row("a", 0, 2, 6.0, 5.0),
         row("b", 0, 1, 7.0, 7.0),
@@ -66,8 +69,13 @@ async fn tumbling_emit_final_once_per_window_on_replay() {
     assert_eq!(w.payloads("w").await, expected);
 
     // A record for a closed window is late: dropped and counted.
-    w.publish("clicks", None, "c", json!({"user": "a", "ts": T0 + 5_000, "amount": 100}))
-        .await;
+    w.publish(
+        "clicks",
+        None,
+        "c",
+        json!({"user": "a", "ts": T0 + 5_000, "amount": 100}),
+    )
+    .await;
     node.wait_input(&id, 8).await;
     assert_eq!(w.payloads("w").await, expected);
     let info = node.engine.get_query(&id).unwrap();
@@ -76,7 +84,10 @@ async fn tumbling_emit_final_once_per_window_on_replay() {
     // Output records carry the group key and query id.
     let recs = w.read_all("w").await;
     assert_eq!(recs[0].key.as_deref(), Some(&b"a"[..]));
-    assert!(recs[0].headers.iter().any(|(k, v)| k == H_QUERY && v == &id));
+    assert!(recs[0]
+        .headers
+        .iter()
+        .any(|(k, v)| k == H_QUERY && v == &id));
     node.stop().await;
 }
 
@@ -93,9 +104,7 @@ async fn hopping_window_table() {
         )
         .await;
     node.wait_input(&qid(&q), 7).await;
-    let res = node
-        .sql("SELECT n FROM h ORDER BY window_start")
-        .await;
+    let res = node.sql("SELECT n FROM h ORDER BY window_start").await;
     let ns: Vec<i64> = res["rows"]
         .as_array()
         .unwrap()
@@ -136,21 +145,36 @@ async fn tables_group_by_global_and_having() {
         .await);
     // A global aggregate has its one row before any input.
     eventually("global row", || async {
-        node.engine.table_rows("totals").map(|v| v["row_count"] == 1).unwrap_or(false)
+        node.engine
+            .table_rows("totals")
+            .map(|v| v["row_count"] == 1)
+            .unwrap_or(false)
     })
     .await;
-    assert_eq!(node.engine.table_rows("totals").unwrap()["rows"], json!([[0, null]]));
+    assert_eq!(
+        node.engine.table_rows("totals").unwrap()["rows"],
+        json!([[0, null]])
+    );
 
     for (r, a) in [("eu", 100), ("us", 300), ("eu", 50)] {
-        w.publish("orders", None, "o", json!({"region": r, "amount": a})).await;
+        w.publish("orders", None, "o", json!({"region": r, "amount": a}))
+            .await;
     }
     for id in [&by_region, &totals, &big, &changes] {
         node.wait_input(id, 3).await;
     }
-    let res = node.sql("SELECT region, n, total FROM by_region ORDER BY region").await;
+    let res = node
+        .sql("SELECT region, n, total FROM by_region ORDER BY region")
+        .await;
     assert_eq!(res["rows"], json!([["eu", 2, 150.0], ["us", 1, 300.0]]));
-    assert_eq!(node.engine.table_rows("totals").unwrap()["rows"], json!([[3, 150.0]]));
-    assert_eq!(node.engine.table_rows("big").unwrap()["rows"], json!([["eu", 2]]));
+    assert_eq!(
+        node.engine.table_rows("totals").unwrap()["rows"],
+        json!([[3, 150.0]])
+    );
+    assert_eq!(
+        node.engine.table_rows("big").unwrap()["rows"],
+        json!([["eu", 2]])
+    );
     assert_eq!(
         node.engine.table_row("by_region", "us").unwrap(),
         json!({"columns": ["region", "n", "total"], "row": ["us", 1, 300.0]})
@@ -159,7 +183,10 @@ async fn tables_group_by_global_and_having() {
     // One micro-batch (3 records) → one update per changed key.
     assert_eq!(
         sorted(w.payloads("region_changes").await),
-        sorted(vec![json!({"region": "eu", "n": 2}), json!({"region": "us", "n": 1})])
+        sorted(vec![
+            json!({"region": "eu", "n": 2}),
+            json!({"region": "us", "n": 1})
+        ])
     );
     let keys: Vec<_> = w
         .read_all("region_changes")
@@ -167,21 +194,32 @@ async fn tables_group_by_global_and_having() {
         .iter()
         .map(|r| String::from_utf8(r.key.clone().unwrap().to_vec()).unwrap())
         .collect();
-    assert_eq!(sorted(keys.iter().map(|k| json!(k)).collect()), vec![json!("eu"), json!("us")]);
+    assert_eq!(
+        sorted(keys.iter().map(|k| json!(k)).collect()),
+        vec![json!("eu"), json!("us")]
+    );
     // The changelog stream backs the table.
     assert_eq!(w.read_all("by_region").await.len(), 2);
     node.stop().await;
 
     // Tables survive a restart (restored from checkpoint + changelog).
     let node = Node::start(&w, dir.path(), test_config()).await;
-    let res = node.sql("SELECT region, n, total FROM by_region ORDER BY region").await;
+    let res = node
+        .sql("SELECT region, n, total FROM by_region ORDER BY region")
+        .await;
     assert_eq!(res["rows"], json!([["eu", 2, 150.0], ["us", 1, 300.0]]));
-    w.publish("orders", None, "o", json!({"region": "us", "amount": 1})).await;
+    w.publish("orders", None, "o", json!({"region": "us", "amount": 1}))
+        .await;
     node.wait_input(&by_region, 4).await;
-    let res = node.sql("SELECT region, n FROM by_region ORDER BY region").await;
+    let res = node
+        .sql("SELECT region, n FROM by_region ORDER BY region")
+        .await;
     assert_eq!(res["rows"], json!([["eu", 2], ["us", 2]]));
     node.wait_input(&big, 4).await;
-    assert_eq!(node.engine.table_rows("big").unwrap()["rows"], json!([["eu", 2], ["us", 2]]));
+    assert_eq!(
+        node.engine.table_rows("big").unwrap()["rows"],
+        json!([["eu", 2], ["us", 2]])
+    );
     node.stop().await;
 }
 
@@ -189,16 +227,33 @@ async fn join_data(w: &World) {
     w.stream("orders").await;
     w.stream("payments").await;
     for (id, dt) in [("o1", 1_000), ("o2", 2_000), ("o3", 3_000)] {
-        w.publish("orders", Some("k"), "o", json!({"id": id, "ts": T0 + dt})).await;
+        w.publish("orders", Some("k"), "o", json!({"id": id, "ts": T0 + dt}))
+            .await;
     }
     // Out of order: p(o1) is older than p(o2) but arrives later.
     for (oid, dt, amt) in [("o2", 4_000, 20), ("o1", 0, 10), ("o3", 20_000, 30)] {
-        w.publish("payments", Some("k"), "p", json!({"order_id": oid, "ts": T0 + dt, "amt": amt}))
-            .await;
-    }
-    w.publish("orders", Some("k"), "o", json!({"id": "o4", "ts": T0 + 30_000})).await;
-    w.publish("payments", Some("k"), "p", json!({"order_id": "x", "ts": T0 + 31_000, "amt": 1}))
+        w.publish(
+            "payments",
+            Some("k"),
+            "p",
+            json!({"order_id": oid, "ts": T0 + dt, "amt": amt}),
+        )
         .await;
+    }
+    w.publish(
+        "orders",
+        Some("k"),
+        "o",
+        json!({"id": "o4", "ts": T0 + 30_000}),
+    )
+    .await;
+    w.publish(
+        "payments",
+        Some("k"),
+        "p",
+        json!({"order_id": "x", "ts": T0 + 31_000, "amt": 1}),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -229,7 +284,10 @@ async fn stream_stream_inner_and_left_joins() {
     node.wait_input(&left, 8).await;
     assert_eq!(
         sorted(w.payloads("paid").await),
-        vec![json!({"oid": "o1", "amt": "10"}), json!({"oid": "o2", "amt": "20"})]
+        vec![
+            json!({"oid": "o1", "amt": "10"}),
+            json!({"oid": "o2", "amt": "20"})
+        ]
     );
     // o3's payment is 17 s away (> WITHIN); it is emitted unmatched once the
     // watermark (min(30, 31) - 10 = 20 s) passes 3 + 5 s. o4 is still open.
@@ -242,15 +300,34 @@ async fn stream_stream_inner_and_left_joins() {
         ]
     );
     // A payment older than the watermark is late.
-    w.publish("payments", Some("k"), "p", json!({"order_id": "o4", "ts": T0 + 2_000, "amt": 5}))
-        .await;
+    w.publish(
+        "payments",
+        Some("k"),
+        "p",
+        json!({"order_id": "o4", "ts": T0 + 2_000, "amt": 5}),
+    )
+    .await;
     node.wait_input(&inner, 9).await;
     assert_eq!(w.payloads("paid").await.len(), 2);
-    assert_eq!(node.engine.get_query(&inner).unwrap().stats["late_records_dropped"], 1);
+    assert_eq!(
+        node.engine.get_query(&inner).unwrap().stats["late_records_dropped"],
+        1
+    );
     // Advancing both sides past o4 + WITHIN emits o4 unmatched.
-    w.publish("orders", Some("k"), "o", json!({"id": "o5", "ts": T0 + 60_000})).await;
-    w.publish("payments", Some("k"), "p", json!({"order_id": "y", "ts": T0 + 60_000, "amt": 1}))
-        .await;
+    w.publish(
+        "orders",
+        Some("k"),
+        "o",
+        json!({"id": "o5", "ts": T0 + 60_000}),
+    )
+    .await;
+    w.publish(
+        "payments",
+        Some("k"),
+        "p",
+        json!({"order_id": "y", "ts": T0 + 60_000, "amt": 1}),
+    )
+    .await;
     node.wait_input(&left, 11).await;
     let un = w.payloads("unpaid").await;
     assert_eq!(un.last().unwrap(), &json!({"oid": "o4", "amt": null}));
@@ -277,14 +354,19 @@ async fn stream_table_join_sees_live_updates() {
              FROM orders o LEFT JOIN rn r ON o.payload->>'region' = r.id",
         )
         .await);
-    w.publish("regions", None, "r", json!({"id": "eu", "name": "Europe"})).await;
+    w.publish("regions", None, "r", json!({"id": "eu", "name": "Europe"}))
+        .await;
     node.wait_input(&rn, 1).await;
-    w.publish("orders", None, "o", json!({"oid": "o1", "region": "eu"})).await;
+    w.publish("orders", None, "o", json!({"oid": "o1", "region": "eu"}))
+        .await;
     node.wait_input(&en, 1).await;
-    w.publish("regions", None, "r", json!({"id": "eu", "name": "EU"})).await;
+    w.publish("regions", None, "r", json!({"id": "eu", "name": "EU"}))
+        .await;
     node.wait_input(&rn, 2).await;
-    w.publish("orders", None, "o", json!({"oid": "o2", "region": "eu"})).await;
-    w.publish("orders", None, "o", json!({"oid": "o3", "region": "xx"})).await;
+    w.publish("orders", None, "o", json!({"oid": "o2", "region": "eu"}))
+        .await;
+    w.publish("orders", None, "o", json!({"oid": "o3", "region": "xx"}))
+        .await;
     node.wait_input(&en, 3).await;
     assert_eq!(
         w.payloads("enriched").await,
@@ -315,7 +397,8 @@ async fn publish_src(w: &World, from: i64, to: i64) {
         let k = ["x", "y", "z"][(i % 3) as usize];
         // Mostly increasing event time with some disorder.
         let dt = i * 1_700 - if i % 4 == 0 { 900 } else { 0 };
-        w.publish("src", None, "s", json!({"k": k, "v": i, "ts": T0 + dt})).await;
+        w.publish("src", None, "s", json!({"k": k, "v": i, "ts": T0 + dt}))
+            .await;
     }
 }
 
@@ -359,7 +442,12 @@ async fn recovery_run(crash: bool) -> (Vec<Vec<Json>>, Json, Vec<Vec<String>>) {
             w.read_all(o)
                 .await
                 .iter()
-                .flat_map(|r| r.headers.iter().filter(|(k, _)| k == "x-idempotency-key").map(|(_, v)| v.clone()))
+                .flat_map(|r| {
+                    r.headers
+                        .iter()
+                        .filter(|(k, _)| k == "x-idempotency-key")
+                        .map(|(_, v)| v.clone())
+                })
                 .collect(),
         );
     }
@@ -374,12 +462,18 @@ async fn crash_recovery_gives_identical_output_without_duplicates() {
     let (recovered, table, keys) = recovery_run(true).await;
     for (i, name) in OUTPUTS.iter().enumerate() {
         assert!(!reference[i].is_empty(), "{name} produced no output");
-        assert_eq!(recovered[i], reference[i], "output '{name}' differs after a crash");
+        assert_eq!(
+            recovered[i], reference[i],
+            "output '{name}' differs after a crash"
+        );
         let unique: HashSet<&String> = keys[i].iter().collect();
         assert_eq!(unique.len(), keys[i].len(), "duplicate records in '{name}'");
     }
     assert_eq!(table, ref_table);
-    assert_eq!(table, json!([["x", 10, 135.0], ["y", 10, 145.0], ["z", 10, 155.0]]));
+    assert_eq!(
+        table,
+        json!([["x", 10, 135.0], ["y", 10, 145.0], ["z", 10, 155.0]])
+    );
 }
 
 #[tokio::test]
@@ -420,7 +514,10 @@ async fn pause_resume_and_stopped_queries_stay_stopped() {
     let node = Node::start(&w, dir.path(), test_config()).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     let q = node.engine.get_query(&id).unwrap();
-    assert_eq!((q.status.as_str(), q.desired_state), ("paused", crate::DesiredState::Paused));
+    assert_eq!(
+        (q.status.as_str(), q.desired_state),
+        ("paused", crate::DesiredState::Paused)
+    );
     let b = node.engine.get_query(&bad).unwrap();
     assert_eq!(b.status, "failed");
     assert_eq!(b.desired_state, crate::DesiredState::Stopped);
@@ -432,7 +529,12 @@ async fn pause_resume_and_stopped_queries_stay_stopped() {
     assert_eq!(r["status"], "running");
     node.wait_input(&id, 6).await;
     let got: Vec<Json> = w.payloads("ev2").await;
-    assert_eq!(got, (0..6).map(|n| json!({"n": n.to_string()})).collect::<Vec<_>>());
+    assert_eq!(
+        got,
+        (0..6)
+            .map(|n| json!({"n": n.to_string()}))
+            .collect::<Vec<_>>()
+    );
     // Output records keep the source key and subject.
     let recs = w.read_all("ev2").await;
     assert_eq!(recs[0].subject, "e");
@@ -454,10 +556,19 @@ async fn invalid_queries_are_rejected_before_anything_is_persisted() {
     for (sql, code) in [
         ("CREATE STREAM o AS SELECT * FROM nope", "PLAN_ERROR"),
         ("CREATE STREAM o AS SELECT nope FROM s", "PLAN_ERROR"),
-        ("CREATE STREAM o AS SELECT * FROM s ORDER BY offset", "UNSUPPORTED"),
-        ("CREATE STREAM o AS SELECT * FROM s a JOIN s b ON a.key = b.key", "PLAN_ERROR"),
+        (
+            "CREATE STREAM o AS SELECT * FROM s ORDER BY offset",
+            "UNSUPPORTED",
+        ),
+        (
+            "CREATE STREAM o AS SELECT * FROM s a JOIN s b ON a.key = b.key",
+            "PLAN_ERROR",
+        ),
         ("CREATE TABLE o AS SELECT * FROM s", "PLAN_ERROR"),
-        ("CREATE STREAM o AS SELECT COUNT(*) FROM s EMIT FINAL", "PLAN_ERROR"),
+        (
+            "CREATE STREAM o AS SELECT COUNT(*) FROM s EMIT FINAL",
+            "PLAN_ERROR",
+        ),
         ("CREATE STREAM s AS SELECT * FROM s", "PLAN_ERROR"),
         ("CREATE STREAM ../x AS SELECT * FROM s", "PARSE_ERROR"),
         ("CREATE STREAM __x AS SELECT * FROM s", "PLAN_ERROR"),

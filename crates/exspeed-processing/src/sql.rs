@@ -159,9 +159,8 @@ fn ident_value(w: &Word) -> String {
     }
 }
 
-
 /// Render a token as SQL (sqlparser's `Display` does not re-escape quotes).
-fn token_sql(t: &Token) -> String {
+pub(crate) fn token_sql(t: &Token) -> String {
     match t {
         Token::SingleQuotedString(s) => format!("'{}'", s.replace('\'', "''")),
         Token::DoubleQuotedString(s) => format!("\"{}\"", s.replace('"', "\"\"")),
@@ -176,7 +175,12 @@ fn token_sql(t: &Token) -> String {
 }
 
 fn render(tokens: &[Token]) -> String {
-    tokens.iter().map(token_sql).collect::<String>().trim().to_string()
+    tokens
+        .iter()
+        .map(token_sql)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn is_arrow(t: &Token) -> bool {
@@ -184,9 +188,36 @@ fn is_arrow(t: &Token) -> bool {
 }
 
 const NOT_A_FUNCTION: &[&str] = &[
-    "SELECT", "WHERE", "AND", "OR", "NOT", "ON", "BY", "WHEN", "THEN", "ELSE", "CASE", "IN",
-    "AS", "HAVING", "FROM", "JOIN", "IS", "LIKE", "ILIKE", "BETWEEN", "DISTINCT", "EXISTS",
-    "ANY", "ALL", "SOME", "VALUES", "USING", "WITH", "RETURNING", "END",
+    "SELECT",
+    "WHERE",
+    "AND",
+    "OR",
+    "NOT",
+    "ON",
+    "BY",
+    "WHEN",
+    "THEN",
+    "ELSE",
+    "CASE",
+    "IN",
+    "AS",
+    "HAVING",
+    "FROM",
+    "JOIN",
+    "IS",
+    "LIKE",
+    "ILIKE",
+    "BETWEEN",
+    "DISTINCT",
+    "EXISTS",
+    "ANY",
+    "ALL",
+    "SOME",
+    "VALUES",
+    "USING",
+    "WITH",
+    "RETURNING",
+    "END",
 ];
 
 fn prev_nonws(v: &[Token], before: usize) -> Option<usize> {
@@ -226,7 +257,9 @@ fn left_operand_start(out: &[Token], k: usize) -> Option<usize> {
             if m > 0 {
                 if let Token::Word(w) = &out[m - 1] {
                     let clause = w.quote_style.is_none()
-                        && NOT_A_FUNCTION.iter().any(|x| w.value.eq_ignore_ascii_case(x));
+                        && NOT_A_FUNCTION
+                            .iter()
+                            .any(|x| w.value.eq_ignore_ascii_case(x));
                     if !clause {
                         return Some(qualified_start(out, m - 1));
                     }
@@ -303,7 +336,11 @@ fn wrap_arrows(t: &[Token]) -> Vec<Token> {
             while j < t.len() && is_ws(&t[j]) {
                 j += 1;
             }
-            let right = if j < t.len() { right_operand_end(t, j) } else { None };
+            let right = if j < t.len() {
+                right_operand_end(t, j)
+            } else {
+                None
+            };
             if let (Some(start), Some(end)) = (left, right) {
                 out.insert(start, Token::LParen);
                 out.extend_from_slice(&t[i..=end]);
@@ -335,11 +372,16 @@ impl Toks {
             .tokenize()
             .map_err(|e| ExqlError::parse(e.to_string()))?;
         // Drop trailing semicolons / whitespace.
-        while matches!(t.last(), Some(Token::SemiColon) | Some(Token::Whitespace(_))) {
+        while matches!(
+            t.last(),
+            Some(Token::SemiColon) | Some(Token::Whitespace(_))
+        ) {
             t.pop();
         }
         if t.iter().any(|x| matches!(x, Token::SemiColon)) {
-            return Err(ExqlError::parse("only one statement per request is allowed"));
+            return Err(ExqlError::parse(
+                "only one statement per request is allowed",
+            ));
         }
         Ok(Self { t })
     }
@@ -402,7 +444,10 @@ pub fn parse_duration_ms(s: &str) -> Result<i64, ExqlError> {
         while i < chars.len() && chars[i].is_ascii_alphabetic() {
             i += 1;
         }
-        let unit: String = chars[ustart..i].iter().collect::<String>().to_ascii_lowercase();
+        let unit: String = chars[ustart..i]
+            .iter()
+            .collect::<String>()
+            .to_ascii_lowercase();
         let mult = unit_ms(&unit).ok_or_else(err)?;
         total += num * mult as f64;
         pairs += 1;
@@ -460,14 +505,35 @@ fn parse_interval(t: &Toks, i: Option<usize>) -> Result<(i64, usize), ExqlError>
 }
 
 const RELATION_STOP: &[&str] = &[
-    "ON", "USING", "WHERE", "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL",
-    "GROUP", "HAVING", "ORDER", "LIMIT", "WINDOW", "TIMESTAMP", "WITHIN", "EMIT", "GRACE",
-    "UNION", "OFFSET", "OUTER", "EXCEPT", "INTERSECT",
+    "ON",
+    "USING",
+    "WHERE",
+    "JOIN",
+    "INNER",
+    "LEFT",
+    "RIGHT",
+    "FULL",
+    "CROSS",
+    "NATURAL",
+    "GROUP",
+    "HAVING",
+    "ORDER",
+    "LIMIT",
+    "WINDOW",
+    "TIMESTAMP",
+    "WITHIN",
+    "EMIT",
+    "GRACE",
+    "UNION",
+    "OFFSET",
+    "OUTER",
+    "EXCEPT",
+    "INTERSECT",
 ];
 
 const TS_EXPR_STOP: &[&str] = &[
-    "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", "ON", "USING", "WITHIN",
-    "WHERE", "GROUP", "HAVING", "WINDOW", "EMIT", "GRACE", "ORDER", "LIMIT", "UNION",
+    "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", "ON", "USING", "WITHIN", "WHERE",
+    "GROUP", "HAVING", "WINDOW", "EMIT", "GRACE", "ORDER", "LIMIT", "UNION",
 ];
 
 /// Look ahead from `i` (just after FROM/JOIN/`,`) for `name [[AS] alias]`.
@@ -490,10 +556,15 @@ fn peek_relation(t: &Toks, i: usize) -> Option<Relation> {
     }
     let n = t.nonws(k);
     let alias = match t.get(n) {
-        Some(tok) if kw(tok, "AS") => t.get(t.nonws(n.unwrap() + 1)).and_then(word).map(ident_value),
+        Some(tok) if kw(tok, "AS") => t
+            .get(t.nonws(n.unwrap() + 1))
+            .and_then(word)
+            .map(ident_value),
         Some(Token::Word(a))
             if !(a.quote_style.is_none()
-                && RELATION_STOP.iter().any(|s| a.value.eq_ignore_ascii_case(s))) =>
+                && RELATION_STOP
+                    .iter()
+                    .any(|s| a.value.eq_ignore_ascii_case(s))) =>
         {
             Some(ident_value(a))
         }
@@ -650,7 +721,9 @@ fn extract(t: &Toks, start: usize) -> Result<QuerySpec, ExqlError> {
                     .last()
                     .map(|r| r.alias.clone().unwrap_or_else(|| r.name.clone()));
                 if spec.timestamp_by.iter().any(|x| x.relation == relation) {
-                    return Err(ExqlError::parse("TIMESTAMP BY given twice for one relation"));
+                    return Err(ExqlError::parse(
+                        "TIMESTAMP BY given twice for one relation",
+                    ));
                 }
                 spec.timestamp_by.push(TimestampBy { relation, expr_sql });
                 i = j;
@@ -786,7 +859,9 @@ pub fn validate_query_id(id: &str) -> Result<(), ExqlError> {
 /// Parse one ExQL statement.
 pub fn parse_statement(sql: &str) -> Result<Statement, ExqlError> {
     let t = Toks::new(sql)?;
-    let first = t.nonws(0).ok_or_else(|| ExqlError::parse("empty statement"))?;
+    let first = t
+        .nonws(0)
+        .ok_or_else(|| ExqlError::parse("empty statement"))?;
     let second = t.nonws(first + 1);
     if t.is_kw(Some(first), "CREATE") {
         let mut n = second;
@@ -888,8 +963,7 @@ pub fn parse_statement(sql: &str) -> Result<Statement, ExqlError> {
             if_exists,
         });
     }
-    if (t.is_kw(Some(first), "PAUSE") || t.is_kw(Some(first), "RESUME"))
-        && t.is_kw(second, "QUERY")
+    if (t.is_kw(Some(first), "PAUSE") || t.is_kw(Some(first), "RESUME")) && t.is_kw(second, "QUERY")
     {
         let (id, _) = parse_name(&t, t.nonws(second.unwrap() + 1))?;
         return Ok(if t.is_kw(Some(first), "PAUSE") {
@@ -963,7 +1037,11 @@ mod tests {
         assert!(!c.query.select_sql.contains("WITHIN"));
         assert!(!c.query.select_sql.contains("TIMESTAMP BY"));
         assert!(!c.query.select_sql.contains("EMIT"));
-        assert!(c.query.select_sql.contains("ON o.key = p.key"), "{}", c.query.select_sql);
+        assert!(
+            c.query.select_sql.contains("ON o.key = p.key"),
+            "{}",
+            c.query.select_sql
+        );
         assert_eq!(c.query.relations[1].alias.as_deref(), Some("p"));
     }
 
@@ -1043,7 +1121,8 @@ mod tests {
     #[test]
     fn arrows_are_parenthesized() {
         assert_eq!(
-            normalize_sql("SELECT a.payload->'x'->>'y' IS NOT NULL, f(p)->>'k' > 2 FROM s").unwrap(),
+            normalize_sql("SELECT a.payload->'x'->>'y' IS NOT NULL, f(p)->>'k' > 2 FROM s")
+                .unwrap(),
             "SELECT ((a.payload->'x')->>'y') IS NOT NULL, (f(p)->>'k') > 2 FROM s"
         );
         assert_eq!(

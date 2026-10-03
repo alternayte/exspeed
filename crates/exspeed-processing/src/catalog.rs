@@ -50,7 +50,10 @@ impl Resolver {
             return Ok(None);
         };
         match self.storage.stream_bounds(&stream).await {
-            Ok(_) => Ok(Some(Arc::new(StreamTable::new(self.storage.clone(), stream)))),
+            Ok(_) => Ok(Some(Arc::new(StreamTable::new(
+                self.storage.clone(),
+                stream,
+            )))),
             Err(StorageError::StreamNotFound(_)) => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -79,7 +82,14 @@ impl CatalogProviderList for ExspeedCatalogList {
 
     fn catalog_names(&self) -> Vec<String> {
         let mut names = vec![CATALOG.to_string()];
-        names.extend(self.resolver.external.registry().list().into_iter().map(|(n, _)| n));
+        names.extend(
+            self.resolver
+                .external
+                .registry()
+                .list()
+                .into_iter()
+                .map(|(n, _)| n),
+        );
         names
     }
 

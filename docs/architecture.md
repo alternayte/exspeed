@@ -32,7 +32,7 @@ exspeed-bench        benchmark harness (not shipped in the image)
 
  FileStorage ──► delivery task (one per subscription) ──mpsc──► connection ──TCP──► consumers
             ──► sink connectors ──► external systems
-            ──► continuous queries / materialized views
+            ──► continuous queries / materialized tables
             ──► replication server (leader) ──TCP 5934──► followers
 ```
 
@@ -72,8 +72,8 @@ Every frame starts with a 10-byte header:
   consumers/<name>.json              consumer state (file backend)
   connectors.d/*.toml                connector configs (hot-reloaded)
   connectors/                        persisted connector configs + file offsets
-  queries/                           continuous query registry + checkpoints
-  indexes/<name>.json                secondary index definitions
+  exql/queries/<id>.json             continuous query definitions + desired state
+                                     (checkpoints live in the stream __exql_ckpt_<id>)
 ```
 
 The active (last) segment is recovered at startup by a CRC-validating tail

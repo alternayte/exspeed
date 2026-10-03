@@ -149,8 +149,7 @@ impl ConnectionRegistry {
         let json = serde_json::to_string_pretty(&config).map_err(|e| format!("serialize: {e}"))?;
         let tmp = json_dir.join(format!(".{}.json.tmp", config.name));
         fs::write(&tmp, json).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-        fs::rename(&tmp, &file_path)
-            .map_err(|e| format!("rename {}: {e}", file_path.display()))?;
+        fs::rename(&tmp, &file_path).map_err(|e| format!("rename {}: {e}", file_path.display()))?;
 
         self.connections
             .write()

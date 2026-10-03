@@ -60,17 +60,22 @@ pub struct Checkpoint {
 
 impl Checkpoint {
     pub fn section(&self, name: &str) -> Option<&RecordBatch> {
-        self.sections.iter().find(|(n, _)| n == name).map(|(_, b)| b)
+        self.sections
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, b)| b)
     }
 }
 
 /// Name of a query's checkpoint stream.
 pub fn ckpt_stream(query_id: &str) -> Result<StreamName, ExqlError> {
-    StreamName::try_from(format!("__exql_ckpt_{query_id}")).map_err(|e| ExqlError::Internal(e.to_string()))
+    StreamName::try_from(format!("__exql_ckpt_{query_id}"))
+        .map_err(|e| ExqlError::Internal(e.to_string()))
 }
 
 fn put_u32(out: &mut Vec<u8>, v: usize) -> Result<(), ExqlError> {
-    let v = u32::try_from(v).map_err(|_| ExqlError::Internal("checkpoint section too large".into()))?;
+    let v =
+        u32::try_from(v).map_err(|_| ExqlError::Internal("checkpoint section too large".into()))?;
     out.extend_from_slice(&v.to_le_bytes());
     Ok(())
 }
@@ -116,8 +121,9 @@ pub fn decode(bytes: &[u8]) -> Result<Checkpoint, ExqlError> {
     }
     let mut pos = 8;
     let mlen = get_u32(body, &mut pos)?;
-    let meta: CheckpointMeta = serde_json::from_slice(body.get(pos..pos + mlen).ok_or_else(|| bad("meta"))?)
-        .map_err(|e| bad(&e.to_string()))?;
+    let meta: CheckpointMeta =
+        serde_json::from_slice(body.get(pos..pos + mlen).ok_or_else(|| bad("meta"))?)
+            .map_err(|e| bad(&e.to_string()))?;
     pos += mlen;
     let mut sections = Vec::new();
     for name in &meta.sections {
@@ -147,11 +153,15 @@ pub fn internal_stream_config() -> StreamConfig {
 pub async fn ensure_stream(log: &Log, stream: &StreamName) -> Result<(), ExqlError> {
     match log.storage().stream_bounds(stream).await {
         Ok(_) => Ok(()),
-        Err(StorageError::StreamNotFound(_)) => match log.create_stream(stream, &internal_stream_config()).await {
-            Ok(()) => Ok(()),
-            Err(exspeed_broker::log::LogError::Storage(StorageError::StreamAlreadyExists(_))) => Ok(()),
-            Err(e) => Err(e.into()),
-        },
+        Err(StorageError::StreamNotFound(_)) => {
+            match log.create_stream(stream, &internal_stream_config()).await {
+                Ok(()) => Ok(()),
+                Err(exspeed_broker::log::LogError::Storage(StorageError::StreamAlreadyExists(
+                    _,
+                ))) => Ok(()),
+                Err(e) => Err(e.into()),
+            }
+        }
         Err(e) => Err(e.into()),
     }
 }
@@ -181,7 +191,10 @@ pub async fn save(log: &Log, stream: &StreamName, ck: &Checkpoint) -> Result<(),
 }
 
 fn header<'a>(r: &'a exspeed_streams::StoredRecord, k: &str) -> Option<&'a str> {
-    r.headers.iter().find(|(h, _)| h == k).map(|(_, v)| v.as_str())
+    r.headers
+        .iter()
+        .find(|(h, _)| h == k)
+        .map(|(_, v)| v.as_str())
 }
 
 async fn read_one(
@@ -203,7 +216,10 @@ async fn read_one(
 }
 
 /// Load the newest complete checkpoint, if any.
-pub async fn load(storage: &dyn StorageEngine, stream: &StreamName) -> Result<Option<Checkpoint>, ExqlError> {
+pub async fn load(
+    storage: &dyn StorageEngine,
+    stream: &StreamName,
+) -> Result<Option<Checkpoint>, ExqlError> {
     let (earliest, next) = match storage.stream_bounds(stream).await {
         Ok(b) => b,
         Err(StorageError::StreamNotFound(_)) => return Ok(None),
@@ -217,9 +233,14 @@ pub async fn load(storage: &dyn StorageEngine, stream: &StreamName) -> Result<Op
             end -= 1;
             continue;
         };
-        let parse = |r: &exspeed_streams::StoredRecord, k: &str| -> Option<u64> { header(r, k)?.parse().ok() };
-        let (Some(seq), Some(part), Some(parts)) = (parse(&last, H_SEQ), parse(&last, H_PART), parse(&last, H_PARTS))
-        else {
+        let parse = |r: &exspeed_streams::StoredRecord, k: &str| -> Option<u64> {
+            header(r, k)?.parse().ok()
+        };
+        let (Some(seq), Some(part), Some(parts)) = (
+            parse(&last, H_SEQ),
+            parse(&last, H_PART),
+            parse(&last, H_PARTS),
+        ) else {
             end -= 1;
             continue;
         };

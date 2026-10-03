@@ -63,10 +63,8 @@ impl ColKind {
             ColKind::Float => Field::new(name, DataType::Float64, true),
             ColKind::Bool => Field::new(name, DataType::Boolean, true),
             ColKind::Text => Field::new(name, DataType::Utf8, true),
-            ColKind::Json => Field::new(name, DataType::Utf8, true).with_metadata(HashMap::from([(
-                JSON_META.to_string(),
-                "true".to_string(),
-            )])),
+            ColKind::Json => Field::new(name, DataType::Utf8, true)
+                .with_metadata(HashMap::from([(JSON_META.to_string(), "true".to_string())])),
             ColKind::Timestamp => Field::new(name, ts_type(), true),
             ColKind::Date => Field::new(name, DataType::Date32, true),
         }
@@ -226,7 +224,10 @@ impl ExternalTables {
                 },
             );
         }
-        Ok(Some(Arc::new(MemTable::try_new(schema_ref, vec![vec![batch]])?)))
+        Ok(Some(Arc::new(MemTable::try_new(
+            schema_ref,
+            vec![vec![batch]],
+        )?)))
     }
 }
 
@@ -310,8 +311,8 @@ async fn fetch_table(
                 Arc::new(b.finish())
             }
             ColKind::Timestamp => {
-                let mut b = TimestampMillisecondBuilder::with_capacity(rows.len())
-                    .with_timezone("UTC");
+                let mut b =
+                    TimestampMillisecondBuilder::with_capacity(rows.len()).with_timezone("UTC");
                 for r in &rows {
                     b.append_option(r.try_get::<Option<i64>, _>(i).map_err(ext)?);
                 }
@@ -338,6 +339,9 @@ mod tests {
     #[test]
     fn quotes_identifiers() {
         assert_eq!(quote_ident("users"), "\"users\"");
-        assert_eq!(quote_ident("a\"; DROP TABLE x; --"), "\"a\"\"; DROP TABLE x; --\"");
+        assert_eq!(
+            quote_ident("a\"; DROP TABLE x; --"),
+            "\"a\"\"; DROP TABLE x; --\""
+        );
     }
 }

@@ -197,8 +197,12 @@ impl From<ArrowError> for ExqlError {
 impl From<StorageError> for ExqlError {
     fn from(e: StorageError) -> Self {
         match e {
-            StorageError::StreamNotFound(s) => ExqlError::NotFound(format!("stream '{s}' not found")),
-            StorageError::Io(_) | StorageError::ChannelClosed => ExqlError::Transient(e.to_string()),
+            StorageError::StreamNotFound(s) => {
+                ExqlError::NotFound(format!("stream '{s}' not found"))
+            }
+            StorageError::Io(_) | StorageError::ChannelClosed => {
+                ExqlError::Transient(e.to_string())
+            }
             other => ExqlError::Storage(other.to_string()),
         }
     }

@@ -30,7 +30,9 @@ use crate::convert::batch_rows_json;
 use crate::error::ExqlError;
 use crate::external::{ConnectionConfig, ConnectionRegistry, ExternalTables};
 use crate::session::{build_state, runtime_env, ExqlConfig};
-use crate::sql::{parse_statement, validate_object_name, validate_query_id, CreateKind, CreateQuery, Statement};
+use crate::sql::{
+    parse_statement, validate_object_name, validate_query_id, CreateKind, CreateQuery, Statement,
+};
 use crate::tables::{rows_to_batch, MaterializedTable, TableRegistry};
 
 /// What a continuous query writes.
@@ -132,7 +134,9 @@ impl StatementResult {
                 v["query_id"] = json!(q.id);
                 v
             }
-            StatementResult::Dropped { kind, name } => json!({"status": "dropped", "kind": kind, "name": name}),
+            StatementResult::Dropped { kind, name } => {
+                json!({"status": "dropped", "kind": kind, "name": name})
+            }
             StatementResult::Query(q) => {
                 let mut v = json!(q);
                 v["query_id"] = json!(q.id);
@@ -178,7 +182,9 @@ pub struct ExqlEngine {
 }
 
 fn now_rfc3339() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
 }
 
 fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
@@ -266,7 +272,11 @@ impl ExqlEngine {
     }
 
     fn state(&self, allow_external: bool) -> Result<SessionState, ExqlError> {
-        build_state(&self.cfg, self.runtime.clone(), self.resolver(allow_external))
+        build_state(
+            &self.cfg,
+            self.runtime.clone(),
+            self.resolver(allow_external),
+        )
     }
 
     // -- persistence --------------------------------------------------------
@@ -274,8 +284,10 @@ impl ExqlEngine {
     fn persist(&self, def: &QueryDef) -> Result<(), ExqlError> {
         validate_query_id(&def.id)?;
         let path = self.queries_dir().join(format!("{}.json", def.id));
-        let data = serde_json::to_vec_pretty(def).map_err(|e| ExqlError::Internal(e.to_string()))?;
-        write_atomic(&path, &data).map_err(|e| ExqlError::Storage(format!("persist query {}: {e}", def.id)))
+        let data =
+            serde_json::to_vec_pretty(def).map_err(|e| ExqlError::Internal(e.to_string()))?;
+        write_atomic(&path, &data)
+            .map_err(|e| ExqlError::Storage(format!("persist query {}: {e}", def.id)))
     }
 
     fn unpersist(&self, id: &str) -> Result<(), ExqlError> {
@@ -306,7 +318,9 @@ impl ExqlEngine {
                     .and_then(|b| serde_json::from_slice::<QueryDef>(&b).map_err(|e| e.to_string()))
                 {
                     Ok(d) if validate_query_id(&d.id).is_ok() => defs.push(d),
-                    Ok(_) => warn!(path = %path.display(), "ignoring query file with an invalid id"),
+                    Ok(_) => {
+                        warn!(path = %path.display(), "ignoring query file with an invalid id")
+                    }
                     Err(e) => warn!(path = %path.display(), "ignoring unreadable query file: {e}"),
                 }
             }
@@ -345,23 +359,42 @@ impl ExqlEngine {
 
     async fn plan_def(&self, def: &QueryDef) -> Result<(CreateQuery, Dataflow), ExqlError> {
         let Statement::Create(c) = parse_statement(&def.sql)? else {
-            return Err(ExqlError::Internal(format!("query {} is not a CREATE", def.id)));
+            return Err(ExqlError::Internal(format!(
+                "query {} is not a CREATE",
+                def.id
+            )));
         };
         let state = self.state(false)?;
-        let df = compile(&state, &c.query, c.kind, &self.tables, self.cfg.default_grace_ms).await?;
+        let df = compile(
+            &state,
+            &c.query,
+            c.kind,
+            &self.tables,
+            self.cfg.default_grace_ms,
+        )
+        .await?;
         Ok((c, df))
     }
 
     async fn register_table(&self, def: &QueryDef) -> Result<Arc<MaterializedTable>, ExqlError> {
         let (_, df) = self.plan_def(def).await?;
-        let table = Arc::new(MaterializedTable::new(&def.name, &def.id, df.out_schema.clone()));
+        let table = Arc::new(MaterializedTable::new(
+            &def.name,
+            &def.id,
+            df.out_schema.clone(),
+        ));
         self.load_changelog(&table, &def.name, &def.id).await?;
         self.tables.insert(table.clone());
         Ok(table)
     }
 
     /// Fill a table from its changelog stream (latest row per key).
-    async fn load_changelog(&self, table: &MaterializedTable, stream: &str, qid: &str) -> Result<(), ExqlError> {
+    async fn load_changelog(
+        &self,
+        table: &MaterializedTable,
+        stream: &str,
+        qid: &str,
+    ) -> Result<(), ExqlError> {
         let stream = stream_name(stream)?;
         let (earliest, end) = match self.storage.stream_bounds(&stream).await {
             Ok(b) => b,
@@ -386,7 +419,12 @@ impl ExqlEngine {
                 break;
             }
             for r in &b.records {
-                let h = |k: &str| r.headers.iter().find(|(x, _)| x == k).map(|(_, v)| v.as_str());
+                let h = |k: &str| {
+                    r.headers
+                        .iter()
+                        .find(|(x, _)| x == k)
+                        .map(|(_, v)| v.as_str())
+                };
                 if h(H_QUERY) != Some(qid) {
                     continue;
                 }
@@ -405,7 +443,9 @@ impl ExqlEngine {
                 let row = schema
                     .fields()
                     .iter()
-                    .map(|f| crate::convert::json_to_scalar(obj.get(f.name()).unwrap_or(&Json::Null), f))
+                    .map(|f| {
+                        crate::convert::json_to_scalar(obj.get(f.name()).unwrap_or(&Json::Null), f)
+                    })
                     .collect();
                 table.upsert_str(key, row);
             }
@@ -428,7 +468,11 @@ impl ExqlEngine {
         match parse_statement(sql)? {
             Statement::Query(_) => Ok(StatementResult::Rows(self.execute_bounded(sql).await?)),
             Statement::Create(c) => Ok(StatementResult::Created(self.create(sql, c).await?)),
-            Statement::Drop { kind, name, if_exists } => {
+            Statement::Drop {
+                kind,
+                name,
+                if_exists,
+            } => {
                 self.drop_object(kind, &name, if_exists).await?;
                 Ok(StatementResult::Dropped {
                     kind: match kind {
@@ -442,7 +486,10 @@ impl ExqlEngine {
             Statement::ResumeQuery(id) => Ok(StatementResult::Query(self.resume_query(&id).await?)),
             Statement::DropQuery(id) => {
                 self.drop_query(&id).await?;
-                Ok(StatementResult::Dropped { kind: "query", name: id })
+                Ok(StatementResult::Dropped {
+                    kind: "query",
+                    name: id,
+                })
             }
         }
     }
@@ -466,7 +513,9 @@ impl ExqlEngine {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or_default();
-        let mix = (t as u64) ^ (n.wrapping_mul(0x9e37_79b9_7f4a_7c15)) ^ (std::process::id() as u64) << 32;
+        let mix = (t as u64)
+            ^ (n.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+            ^ (std::process::id() as u64) << 32;
         let short: String = name.chars().take(40).collect();
         format!("{short}_{:08x}", (mix ^ (mix >> 29)) as u32)
     }
@@ -495,12 +544,22 @@ impl ExqlEngine {
                 )));
             }
         }
-        if c.kind == CreateKind::Stream && self.tables.get(&c.name).is_some() && self.query_for_name(&c.name).is_none() {
+        if c.kind == CreateKind::Stream
+            && self.tables.get(&c.name).is_some()
+            && self.query_for_name(&c.name).is_none()
+        {
             return Err(ExqlError::Conflict(format!("'{}' is a table", c.name)));
         }
         // Validate everything before persisting anything.
         let state = self.state(false)?;
-        let df = compile(&state, &c.query, c.kind, &self.tables, self.cfg.default_grace_ms).await?;
+        let df = compile(
+            &state,
+            &c.query,
+            c.kind,
+            &self.tables,
+            self.cfg.default_grace_ms,
+        )
+        .await?;
         if df.sources.iter().any(|s| s.stream == out) {
             return Err(ExqlError::Plan(format!(
                 "query reads its own output '{}'",
@@ -508,7 +567,10 @@ impl ExqlEngine {
             )));
         }
         if df.tables_read.iter().any(|t| t == &c.name) {
-            return Err(ExqlError::Plan(format!("query reads its own table '{}'", c.name)));
+            return Err(ExqlError::Plan(format!(
+                "query reads its own table '{}'",
+                c.name
+            )));
         }
         let exists = match self.storage.stream_bounds(&out).await {
             Ok(_) => true,
@@ -543,7 +605,11 @@ impl ExqlEngine {
             created_at: now_rfc3339(),
         };
         if def.kind == QueryKind::Table {
-            let table = Arc::new(MaterializedTable::new(&def.name, &def.id, df.out_schema.clone()));
+            let table = Arc::new(MaterializedTable::new(
+                &def.name,
+                &def.id,
+                df.out_schema.clone(),
+            ));
             self.tables.insert(table);
         }
         if let Err(e) = self.persist(&def) {
@@ -591,7 +657,10 @@ impl ExqlEngine {
             c.cancel();
         }
         if let Some(h) = handle {
-            if tokio::time::timeout(Duration::from_secs(30), h).await.is_err() {
+            if tokio::time::timeout(Duration::from_secs(30), h)
+                .await
+                .is_err()
+            {
                 warn!(query = %id, "query did not stop within 30s");
             }
         }
@@ -656,6 +725,15 @@ impl ExqlEngine {
             .collect()
     }
 
+    /// Ids of queries that write or read `stream`.
+    pub fn queries_referencing(&self, stream: &str) -> Vec<String> {
+        let mut ids = self.readers_of_stream(stream);
+        if let Some(d) = self.query_for_name(stream) {
+            ids.insert(0, d.id);
+        }
+        ids
+    }
+
     /// `DROP QUERY <id>`: stop and remove the query; keep its output.
     pub async fn drop_query(&self, id: &str) -> Result<(), ExqlError> {
         let _g = self.ddl.lock().await;
@@ -664,7 +742,12 @@ impl ExqlEngine {
 
     /// `DROP STREAM|TABLE <name>`: drop the query writing it (if any) and
     /// delete the stream / changelog.
-    pub async fn drop_object(&self, kind: CreateKind, name: &str, if_exists: bool) -> Result<(), ExqlError> {
+    pub async fn drop_object(
+        &self,
+        kind: CreateKind,
+        name: &str,
+        if_exists: bool,
+    ) -> Result<(), ExqlError> {
         let _g = self.ddl.lock().await;
         let stream = stream_name(name)?;
         let owner = self.query_for_name(name);
@@ -680,7 +763,9 @@ impl ExqlEngine {
             }
             CreateKind::Stream => {
                 if self.tables.get(name).is_some() {
-                    return Err(ExqlError::Conflict(format!("'{name}' is a table; use DROP TABLE")));
+                    return Err(ExqlError::Conflict(format!(
+                        "'{name}' is a table; use DROP TABLE"
+                    )));
                 }
                 let readers = self.readers_of_stream(name);
                 if !readers.is_empty() {
@@ -708,7 +793,12 @@ impl ExqlEngine {
 
     // -- continuous: pause / resume -----------------------------------------
 
-    fn set_desired(&self, id: &str, desired: DesiredState, error: Option<String>) -> Result<QueryDef, ExqlError> {
+    fn set_desired(
+        &self,
+        id: &str,
+        desired: DesiredState,
+        error: Option<String>,
+    ) -> Result<QueryDef, ExqlError> {
         validate_query_id(id)?;
         let def = {
             let mut q = self.queries.lock().unwrap();
@@ -766,7 +856,13 @@ impl ExqlEngine {
                 .values()
                 .filter(|e| e.def.desired == DesiredState::Running)
                 .filter(|e| !matches!(e.status, QueryStatus::Failed(_)))
-                .map(|e| (e.def.kind != QueryKind::Table, e.def.created_at.clone(), e.def.id.clone()))
+                .map(|e| {
+                    (
+                        e.def.kind != QueryKind::Table,
+                        e.def.created_at.clone(),
+                        e.def.id.clone(),
+                    )
+                })
                 .collect();
             v.sort();
             v.into_iter().map(|(_, _, id)| id).collect()
@@ -814,7 +910,9 @@ impl ExqlEngine {
         let Some(e) = q.get_mut(id) else {
             return;
         };
-        if e.cancel.as_ref().is_some_and(|c| !c.is_cancelled()) || e.def.desired != DesiredState::Running {
+        if e.cancel.as_ref().is_some_and(|c| !c.is_cancelled())
+            || e.def.desired != DesiredState::Running
+        {
             return;
         }
         let token = tenure.child_token();
@@ -831,12 +929,19 @@ impl ExqlEngine {
         }));
     }
 
-    async fn supervise(self: Arc<Self>, def: QueryDef, stats: Arc<QueryStats>, token: CancellationToken, generation: u64) {
+    async fn supervise(
+        self: Arc<Self>,
+        def: QueryDef,
+        stats: Arc<QueryStats>,
+        token: CancellationToken,
+        generation: u64,
+    ) {
         let mut backoff = Duration::from_millis(500);
         let outcome = loop {
-            let run = std::panic::AssertUnwindSafe(self.run_once(&def, stats.clone(), token.clone()))
-                .catch_unwind()
-                .await;
+            let run =
+                std::panic::AssertUnwindSafe(self.run_once(&def, stats.clone(), token.clone()))
+                    .catch_unwind()
+                    .await;
             match run {
                 Ok(Ok(())) => break None,
                 Ok(Err(e)) if token.is_cancelled() => {
@@ -886,13 +991,20 @@ impl ExqlEngine {
                 e.status = match e.def.desired {
                     DesiredState::Paused => QueryStatus::Paused,
                     DesiredState::Running => QueryStatus::Pending,
-                    DesiredState::Stopped => QueryStatus::Failed(e.def.error.clone().unwrap_or_default()),
+                    DesiredState::Stopped => {
+                        QueryStatus::Failed(e.def.error.clone().unwrap_or_default())
+                    }
                 };
             }
         }
     }
 
-    async fn run_once(&self, def: &QueryDef, stats: Arc<QueryStats>, token: CancellationToken) -> Result<(), ExqlError> {
+    async fn run_once(
+        &self,
+        def: &QueryDef,
+        stats: Arc<QueryStats>,
+        token: CancellationToken,
+    ) -> Result<(), ExqlError> {
         let (_, df) = self.plan_def(def).await?;
         let out = stream_name(&def.name)?;
         self.log.ensure_stream(&out).await?;
@@ -902,12 +1014,19 @@ impl ExqlEngine {
                 let table = match self.tables.get(&def.name) {
                     Some(t) if t.schema_ref() == df.out_schema => t,
                     _ => {
-                        let t = Arc::new(MaterializedTable::new(&def.name, &def.id, df.out_schema.clone()));
+                        let t = Arc::new(MaterializedTable::new(
+                            &def.name,
+                            &def.id,
+                            df.out_schema.clone(),
+                        ));
                         self.tables.insert(t.clone());
                         t
                     }
                 };
-                Sink::Table { table, changelog: out }
+                Sink::Table {
+                    table,
+                    changelog: out,
+                }
             }
         };
         let ctx = RunCtx {
@@ -950,7 +1069,13 @@ impl ExqlEngine {
     }
 
     pub fn list_queries(&self) -> Vec<QueryInfo> {
-        let mut v: Vec<QueryInfo> = self.queries.lock().unwrap().values().map(Self::info_of).collect();
+        let mut v: Vec<QueryInfo> = self
+            .queries
+            .lock()
+            .unwrap()
+            .values()
+            .map(Self::info_of)
+            .collect();
         v.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
         v
     }
@@ -986,9 +1111,9 @@ impl ExqlEngine {
             .tables
             .get(name)
             .ok_or_else(|| ExqlError::NotFound(format!("table '{name}' not found")))?;
-        let row = t
-            .get(key)
-            .ok_or_else(|| ExqlError::NotFound(format!("key '{key}' not found in table '{name}'")))?;
+        let row = t.get(key).ok_or_else(|| {
+            ExqlError::NotFound(format!("key '{key}' not found in table '{name}'"))
+        })?;
         let batch = rows_to_batch(&t.schema_ref(), &[&row])?;
         let mut rows = batch_rows_json(&batch);
         Ok(json!({"columns": t.columns(), "row": rows.pop().unwrap_or_default()}))

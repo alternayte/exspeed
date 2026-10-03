@@ -13,6 +13,7 @@ pub mod session;
 pub mod sql;
 pub mod stream_table;
 pub mod tables;
+pub mod transform;
 pub mod udfs;
 
 #[cfg(test)]

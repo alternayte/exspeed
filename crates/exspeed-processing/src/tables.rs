@@ -76,7 +76,11 @@ impl MaterializedTable {
     }
 
     pub fn columns(&self) -> Vec<String> {
-        self.schema.fields().iter().map(|f| f.name().clone()).collect()
+        self.schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect()
     }
 
     pub fn len(&self) -> usize {
@@ -162,7 +166,10 @@ impl MaterializedTable {
 }
 
 /// Build a batch from rows of scalars.
-pub fn rows_to_batch(schema: &SchemaRef, rows: &[&Vec<ScalarValue>]) -> Result<RecordBatch, ExqlError> {
+pub fn rows_to_batch(
+    schema: &SchemaRef,
+    rows: &[&Vec<ScalarValue>],
+) -> Result<RecordBatch, ExqlError> {
     let mut cols: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
     for (i, f) in schema.fields().iter().enumerate() {
         if rows.is_empty() {
@@ -250,7 +257,10 @@ mod tests {
         assert_eq!(key_string(&[ScalarValue::Utf8(Some("eu".into()))]), "eu");
         assert_eq!(key_string(&[ScalarValue::Int64(Some(3))]), "3");
         assert_eq!(
-            key_string(&[ScalarValue::Utf8(Some("eu".into())), ScalarValue::Int64(Some(3))]),
+            key_string(&[
+                ScalarValue::Utf8(Some("eu".into())),
+                ScalarValue::Int64(Some(3))
+            ]),
             r#"["eu",3]"#
         );
     }

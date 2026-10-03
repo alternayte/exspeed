@@ -281,7 +281,9 @@ impl Metrics {
         let replication_bytes_total = meter.u64_counter("exspeed_replication_bytes_total").build();
         let exql_late_records_total = meter
             .u64_counter("exspeed_exql_late_records_total")
-            .with_description("Records dropped by continuous queries for arriving after the watermark")
+            .with_description(
+                "Records dropped by continuous queries for arriving after the watermark",
+            )
             .build();
         let replication_truncated_records_total = meter
             .u64_counter("exspeed_replication_truncated_records_total")

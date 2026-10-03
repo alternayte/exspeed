@@ -6,7 +6,9 @@ use datafusion::arrow::array::{
     new_null_array, Array, ArrayRef, AsArray, BooleanArray, RecordBatch, RecordBatchOptions,
     UInt32Array,
 };
-use datafusion::arrow::compute::{cast, concat_batches, filter_record_batch, prep_null_mask_filter, take};
+use datafusion::arrow::compute::{
+    cast, concat_batches, filter_record_batch, prep_null_mask_filter, take,
+};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::ScalarValue;
 use datafusion::physical_expr::PhysicalExpr;
@@ -142,7 +144,10 @@ pub fn eval(expr: &Arc<dyn PhysicalExpr>, batch: &RecordBatch) -> Result<ArrayRe
 }
 
 /// Evaluate a predicate to a boolean array.
-pub fn eval_bool(expr: &Arc<dyn PhysicalExpr>, batch: &RecordBatch) -> Result<BooleanArray, ExqlError> {
+pub fn eval_bool(
+    expr: &Arc<dyn PhysicalExpr>,
+    batch: &RecordBatch,
+) -> Result<BooleanArray, ExqlError> {
     let arr = eval(expr, batch)?;
     match arr.as_boolean_opt() {
         Some(b) => Ok(b.clone()),
@@ -154,7 +159,10 @@ pub fn eval_bool(expr: &Arc<dyn PhysicalExpr>, batch: &RecordBatch) -> Result<Bo
 }
 
 /// Build a batch from rows of scalars, casting to the schema's types.
-pub fn batch_from_rows(schema: &SchemaRef, rows: &[Vec<ScalarValue>]) -> Result<RecordBatch, ExqlError> {
+pub fn batch_from_rows(
+    schema: &SchemaRef,
+    rows: &[Vec<ScalarValue>],
+) -> Result<RecordBatch, ExqlError> {
     let mut cols: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
     for (i, f) in schema.fields().iter().enumerate() {
         let arr = if rows.is_empty() {
@@ -184,7 +192,11 @@ pub fn conform(batch: RecordBatch, schema: &SchemaRef) -> Result<RecordBatch, Ex
 
 /// Build a batch with `schema` from `cols`, casting columns whose types
 /// differ.
-pub fn make_batch(schema: &SchemaRef, cols: Vec<ArrayRef>, n: usize) -> Result<RecordBatch, ExqlError> {
+pub fn make_batch(
+    schema: &SchemaRef,
+    cols: Vec<ArrayRef>,
+    n: usize,
+) -> Result<RecordBatch, ExqlError> {
     if cols.len() != schema.fields().len() {
         return Err(ExqlError::Internal(format!(
             "batch has {} columns, expected {}",

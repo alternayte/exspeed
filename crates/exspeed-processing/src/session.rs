@@ -106,8 +106,38 @@ pub fn runtime_env(cfg: &ExqlConfig) -> Result<Arc<RuntimeEnv>, ExqlError> {
     );
     Ok(RuntimeEnvBuilder::new()
         .with_memory_pool(Arc::new(pool))
-        .with_disk_manager_builder(DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled))
+        .with_disk_manager_builder(
+            DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
+        )
         .build_arc()?)
+}
+
+fn analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
+    vec![
+        Arc::new(ResolveGroupingFunction::new()),
+        Arc::new(JsonNumericRule),
+        Arc::new(TypeCoercion::new()),
+    ]
+}
+
+fn register_functions(state: &mut SessionState) -> Result<(), ExqlError> {
+    datafusion_functions_json::register_all(state)?;
+    for udf in crate::udfs::all() {
+        state.register_udf(Arc::new(udf))?;
+    }
+    Ok(())
+}
+
+/// A session with ExQL's functions and rules and DataFusion's default
+/// in-memory catalog (for evaluating expressions outside the engine).
+pub fn standalone_state() -> Result<SessionState, ExqlError> {
+    let mut state = SessionStateBuilder::new()
+        .with_config(SessionConfig::new().with_target_partitions(1))
+        .with_default_features()
+        .with_analyzer_rules(analyzer_rules())
+        .build();
+    register_functions(&mut state)?;
+    Ok(state)
 }
 
 /// A session with ExQL's catalog, functions and rules.
@@ -123,11 +153,7 @@ pub fn build_state(
         .with_target_partitions(cfg.target_partitions)
         .with_batch_size(cfg.batch_size);
     config.options_mut().optimizer.enable_sort_pushdown = true;
-    let analyzer: Vec<Arc<dyn AnalyzerRule + Send + Sync>> = vec![
-        Arc::new(ResolveGroupingFunction::new()),
-        Arc::new(JsonNumericRule),
-        Arc::new(TypeCoercion::new()),
-    ];
+    let analyzer = analyzer_rules();
     let mut physical = PhysicalOptimizer::new().rules;
     physical.push(Arc::new(ReverseTailRule));
     let mut state = SessionStateBuilder::new()
@@ -138,9 +164,6 @@ pub fn build_state(
         .with_analyzer_rules(analyzer)
         .with_physical_optimizer_rules(physical)
         .build();
-    datafusion_functions_json::register_all(&mut state)?;
-    for udf in crate::udfs::all() {
-        state.register_udf(Arc::new(udf))?;
-    }
+    register_functions(&mut state)?;
     Ok(state)
 }
