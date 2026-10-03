@@ -96,10 +96,13 @@ pub struct ClusterSection {
     pub node_id: Option<String>,
     pub replicator_credential: Option<String>,
     pub acks: Option<String>,
+    pub size: Option<usize>,
     pub min_insync_replicas: Option<usize>,
     pub replica_lag_max_ms: Option<u64>,
     pub ack_timeout_ms: Option<u64>,
     pub unclean_leader_election: Option<bool>,
+    pub tls: Option<bool>,
+    pub tls_ca: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -246,10 +249,13 @@ struct Layer {
     node_id: Option<String>,
     replicator_credential: Option<String>,
     acks: Option<String>,
+    cluster_size: Option<usize>,
     min_insync_replicas: Option<usize>,
     replica_lag_max_ms: Option<u64>,
     ack_timeout_ms: Option<u64>,
     unclean_leader_election: Option<bool>,
+    cluster_tls: Option<bool>,
+    cluster_tls_ca: Option<PathBuf>,
     connector_offset_store: Option<String>,
     log_format: Option<String>,
     log_level: Option<String>,
@@ -295,10 +301,13 @@ impl Layer {
             node_id: f.cluster.node_id,
             replicator_credential: f.cluster.replicator_credential,
             acks: f.cluster.acks,
+            cluster_size: f.cluster.size,
             min_insync_replicas: f.cluster.min_insync_replicas,
             replica_lag_max_ms: f.cluster.replica_lag_max_ms,
             ack_timeout_ms: f.cluster.ack_timeout_ms,
             unclean_leader_election: f.cluster.unclean_leader_election,
+            cluster_tls: f.cluster.tls,
+            cluster_tls_ca: f.cluster.tls_ca,
             connector_offset_store: f.connectors.offset_store,
             log_format: f.log.format,
             log_level: f.log.level,
@@ -368,6 +377,7 @@ impl Layer {
             node_id: s("EXSPEED_NODE_ID"),
             replicator_credential: s("EXSPEED_REPLICATOR_CREDENTIAL"),
             acks: s("EXSPEED_ACKS"),
+            cluster_size: num("EXSPEED_CLUSTER_SIZE", s("EXSPEED_CLUSTER_SIZE"))?,
             min_insync_replicas: num(
                 "EXSPEED_MIN_INSYNC_REPLICAS",
                 s("EXSPEED_MIN_INSYNC_REPLICAS"),
@@ -381,6 +391,8 @@ impl Layer {
                 "EXSPEED_UNCLEAN_LEADER_ELECTION",
                 s("EXSPEED_UNCLEAN_LEADER_ELECTION"),
             )?,
+            cluster_tls: num("EXSPEED_CLUSTER_TLS", s("EXSPEED_CLUSTER_TLS"))?,
+            cluster_tls_ca: s("EXSPEED_CLUSTER_TLS_CA").map(PathBuf::from),
             connector_offset_store: s("EXSPEED_CONNECTOR_OFFSET_STORE"),
             log_format: s("LOG_FORMAT"),
             log_level: s("RUST_LOG"),
@@ -464,10 +476,17 @@ impl Layer {
             t.cluster.replicator_credential = self.replicator_credential;
         }
         set!(acks => cluster.acks);
+        if self.cluster_size.is_some() {
+            t.cluster.size = self.cluster_size;
+        }
         set!(min_insync_replicas => cluster.min_insync_replicas);
         set!(replica_lag_max_ms => cluster.replica_lag_max_ms);
         set!(ack_timeout_ms => cluster.ack_timeout_ms);
         set!(unclean_leader_election => cluster.unclean_leader_election);
+        set!(cluster_tls => cluster.tls);
+        if self.cluster_tls_ca.is_some() {
+            t.cluster.tls_ca = self.cluster_tls_ca;
+        }
         set!(connector_offset_store => connector_offset_store);
         if self.log_format.is_some() {
             t.log_format = self.log_format;
@@ -550,14 +569,26 @@ pub fn validate(a: &ServerArgs) -> Result<()> {
             {
                 bail!("cluster.lease_heartbeat_secs must be between 1 and lease_ttl_secs / 3");
             }
-            if a.cluster.acks != "all" && a.cluster.acks != "leader" {
-                bail!(
-                    "cluster.acks must be `all` or `leader`, got `{}`",
-                    a.cluster.acks
-                );
+            match (a.cluster.acks.as_str(), a.cluster.size) {
+                ("all" | "leader", _) => {}
+                ("quorum", Some(n)) if n >= 1 => {}
+                ("quorum", _) => {
+                    bail!("cluster.acks = quorum needs cluster.size (the number of nodes)")
+                }
+                (other, _) => {
+                    bail!("cluster.acks must be `all`, `quorum` or `leader`, got `{other}`")
+                }
             }
             if a.cluster.min_insync_replicas == 0 {
                 bail!("cluster.min_insync_replicas must be at least 1");
+            }
+            if a.cluster.tls && (a.tls_cert.is_none() || a.tls_key.is_none()) {
+                bail!("cluster.tls needs the [tls] cert and key (the cluster port serves the same certificate)");
+            }
+            if let Some(ca) = &a.cluster.tls_ca {
+                if !ca.exists() {
+                    bail!("file not found: {}", ca.display());
+                }
             }
             if let Some(c) = &a.cluster.client_advertise {
                 if !c.contains(':') {
@@ -641,10 +672,13 @@ client_advertise = {cadv}
 node_id = {nid}
 replicator_credential = {repl}
 acks = {acks:?}
+size = {csize}
 min_insync_replicas = {misr}
 replica_lag_max_ms = {lag}
 ack_timeout_ms = {ackt}
 unclean_leader_election = {unclean}
+tls = {ctls}
+tls_ca = {ctlsca}
 
 [connectors]
 offset_store = {os:?}
@@ -686,10 +720,16 @@ level = {ll}
         nid = opt(&a.cluster.node_id),
         repl = secret(&a.cluster.replicator_credential),
         acks = a.cluster.acks,
+        csize = a
+            .cluster
+            .size
+            .map_or("# unset".to_string(), |n| n.to_string()),
         misr = a.cluster.min_insync_replicas,
         lag = a.cluster.replica_lag_max_ms,
         ackt = a.cluster.ack_timeout_ms,
         unclean = a.cluster.unclean_leader_election,
+        ctls = a.cluster.tls,
+        ctlsca = opt_path(&a.cluster.tls_ca),
         os = a.connector_offset_store,
         lf = opt(&a.log_format),
         ll = opt(&a.log_level),
@@ -739,11 +779,14 @@ bind = "0.0.0.0:5934"            # replication listener (EXSPEED_CLUSTER_BIND)
 # client_advertise = "exspeed-0.exspeed:5933"     # address clients are redirected to when this node leads (EXSPEED_CLIENT_ADVERTISE)
 # node_id = "..."                # default: generated once and kept in {data_dir}/node_id (EXSPEED_NODE_ID)
 # replicator_credential = "..."  # token followers present (needs the `replicate` action); required with auth (EXSPEED_REPLICATOR_CREDENTIAL)
-acks = "all"                     # "all": ack once every in-sync replica has the write; "leader": ack after the local write (EXSPEED_ACKS)
+acks = "all"                     # "all": ack once every in-sync replica has the write; "quorum": "all" plus at least a majority of `size` nodes; "leader": ack after the local write (EXSPEED_ACKS)
+# size = 3                       # number of nodes in the cluster; required for acks = "quorum" (EXSPEED_CLUSTER_SIZE)
 min_insync_replicas = 1          # acks=all writes fail with 503 while fewer replicas (leader included) are in sync (EXSPEED_MIN_INSYNC_REPLICAS)
 replica_lag_max_ms = 10000       # a follower that hasn't caught up for this long leaves the ISR (EXSPEED_REPLICA_LAG_MAX_MS)
 ack_timeout_ms = 10000           # how long an acks=all write waits for replication (EXSPEED_ACK_TIMEOUT_MS)
 unclean_leader_election = false  # true: any node may take over, even one missing acknowledged writes (EXSPEED_UNCLEAN_LEADER_ELECTION)
+tls = false                      # serve and require TLS on the cluster port, with the [tls] certificate (EXSPEED_CLUSTER_TLS)
+# tls_ca = "/etc/exspeed/ca.pem" # trust roots for peers' certificates; default: the [tls] cert itself (EXSPEED_CLUSTER_TLS_CA)
 
 [connectors]
 offset_store = "log"             # "log" (__connector_offsets stream) or "file" (EXSPEED_CONNECTOR_OFFSET_STORE)
@@ -866,6 +909,10 @@ dedup_window_secs = 60
         validate(&a).unwrap();
         a.cluster.acks = "some".into();
         assert!(format!("{:#}", validate(&a).unwrap_err()).contains("acks"));
+        a.cluster.acks = "quorum".into();
+        assert!(format!("{:#}", validate(&a).unwrap_err()).contains("cluster.size"));
+        a.cluster.size = Some(3);
+        validate(&a).unwrap();
         a.cluster.acks = "leader".into();
         a.cluster.lease_heartbeat_secs = 10;
         assert!(format!("{:#}", validate(&a).unwrap_err()).contains("heartbeat"));

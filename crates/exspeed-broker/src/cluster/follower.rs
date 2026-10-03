@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use opentelemetry::KeyValue;
-use tokio::io::BufReader;
+use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -95,7 +95,37 @@ async fn session(
         .record_replication_connect_attempt(socket.is_ok());
     let socket = socket?;
     let _ = socket.set_nodelay(true);
-    let (rd, mut wr) = socket.into_split();
+    match cluster.cfg.tls.as_ref() {
+        Some(tls) => {
+            let host = endpoint
+                .rsplit_once(':')
+                .map_or(endpoint, |(h, _)| h)
+                .trim_start_matches('[')
+                .trim_end_matches(']');
+            let name = tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_string())
+                .map_err(|e| format!("bad TLS server name {host:?}: {e}"))?;
+            let stream = tokio::time::timeout(
+                Duration::from_secs(10),
+                tokio_rustls::TlsConnector::from(tls.client.clone()).connect(name, socket),
+            )
+            .await
+            .map_err(|_| format!("TLS handshake with {endpoint} timed out"))?
+            .map_err(|e| format!("TLS handshake with {endpoint}: {e}"))?;
+            replicate(cluster, leader, endpoint, stream, metadata_version, cancel).await
+        }
+        None => replicate(cluster, leader, endpoint, socket, metadata_version, cancel).await,
+    }
+}
+
+async fn replicate<S: AsyncRead + AsyncWrite + Unpin>(
+    cluster: &Arc<Cluster>,
+    leader: &LeaseRecord,
+    endpoint: &str,
+    stream: S,
+    metadata_version: &mut u64,
+    cancel: &CancellationToken,
+) -> Result<(), String> {
+    let (rd, mut wr) = tokio::io::split(stream);
     let mut rd = BufReader::new(rd);
     write_msg(
         &mut wr,

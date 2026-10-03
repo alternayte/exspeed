@@ -98,10 +98,16 @@ pub struct ClusterArgs {
     pub replicator_credential: Option<String>,
     /// `all` or `leader`.
     pub acks: String,
+    /// Number of nodes in the cluster (for `acks = "quorum"`).
+    pub size: Option<usize>,
     pub min_insync_replicas: usize,
     pub replica_lag_max_ms: u64,
     pub ack_timeout_ms: u64,
     pub unclean_leader_election: bool,
+    /// Serve and require TLS on the cluster port (with the `[tls]` cert).
+    pub tls: bool,
+    /// Trust roots for peers' certificates; default: the `[tls]` cert.
+    pub tls_ca: Option<PathBuf>,
     /// Namespace of the `memory` lease backend (tests).
     pub memory_namespace: String,
     /// Millisecond overrides of the lease TTL / heartbeat (tests).
@@ -125,10 +131,13 @@ impl Default for ClusterArgs {
             node_id: None,
             replicator_credential: None,
             acks: "all".into(),
+            size: None,
             min_insync_replicas: 1,
             replica_lag_max_ms: 10_000,
             ack_timeout_ms: 10_000,
             unclean_leader_election: false,
+            tls: false,
+            tls_ca: None,
             memory_namespace: "default".into(),
             lease_ttl_ms: None,
             lease_heartbeat_ms: None,
@@ -454,9 +463,30 @@ where
         let mut cfg = exspeed_broker::cluster::ClusterConfig::new(node_id.clone());
         cfg.acks_all = args.cluster.acks != "leader";
         cfg.min_insync_replicas = args.cluster.min_insync_replicas.max(1);
+        if args.cluster.acks == "quorum" {
+            // `all`, plus never fewer than a majority of the cluster in sync:
+            // an acknowledged write is on a majority of nodes, and only an
+            // in-sync node can be elected.
+            let majority = args.cluster.size.unwrap_or(1) / 2 + 1;
+            cfg.min_insync_replicas = cfg.min_insync_replicas.max(majority);
+        }
         cfg.replica_lag_max = std::time::Duration::from_millis(args.cluster.replica_lag_max_ms);
         cfg.ack_timeout = std::time::Duration::from_millis(args.cluster.ack_timeout_ms);
         cfg.replicator_token = args.cluster.replicator_credential.clone();
+        if args.cluster.tls {
+            let paths = tls_paths
+                .as_ref()
+                .context("cluster.tls needs the [tls] cert and key")?;
+            let ca = args
+                .cluster
+                .tls_ca
+                .clone()
+                .unwrap_or_else(|| paths.cert.clone());
+            cfg.tls = Some(exspeed_broker::cluster::ClusterTls {
+                server: crate::cli::server_tls::load_tls_config(&paths.cert, &paths.key)?,
+                client: crate::cli::server_tls::load_client_config(&ca)?,
+            });
+        }
         Some(
             exspeed_broker::cluster::Cluster::new(
                 cfg,

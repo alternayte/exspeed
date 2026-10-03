@@ -158,6 +158,22 @@ connector config and SDK API all change.
   be deleted through the API (`409`); unparseable `connections.d/` files are
   logged instead of silently skipped.
 
+### Crash safety and HA hardening
+
+- Kill -9 loop tests against the real server binary, under concurrent
+  single and batch publishes and a pulling consumer.
+- Real-disk ENOSPC tests on a small tmpfs (CI mounts one): writes fail
+  cleanly, acknowledged data stays readable, writing resumes once space
+  frees. A full disk now answers `507` on TCP and HTTP instead of `500`.
+- Seeded, model-based storage property tests (appends, restarts,
+  torn-tail crashes, retention).
+- TLS on the cluster port (`cluster.tls`, `cluster.tls_ca`). The Helm chart
+  turns it on with `tls.secretName`.
+- `cluster.acks = "quorum"` with `cluster.size`: `all`, plus never fewer
+  than a majority of nodes in sync.
+- Jepsen-style randomized partition and restart test, and a kill -9 test
+  of a real three-process cluster on a Postgres lease.
+
 ## [0.5.0] — 2026-04-24
 
 Indexing release. Queries on timestamp, key, and payload fields are now

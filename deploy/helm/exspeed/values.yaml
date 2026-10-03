@@ -66,6 +66,12 @@ cluster:
   # acks=all writes fail while fewer replicas (leader included) are in sync.
   # 2 on a 3-node cluster never acknowledges a write held by one node only.
   minInsyncReplicas: 1
+  # With tls.secretName set, the cluster port uses TLS too. Peers verify each
+  # other against `tls.crt` (one certificate shared by all pods), or against
+  # this key of the same Secret when set (per-pod certificates from a CA,
+  # e.g. "ca.crt"). Certificates need the pods' headless-service DNS names
+  # (*.<fullname>-headless.<namespace>.svc.cluster.local) as SANs.
+  tlsCaKey: ""
 
 resources:
   requests:

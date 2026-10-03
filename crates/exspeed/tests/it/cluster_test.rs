@@ -21,6 +21,8 @@ struct Opts {
     acks: &'static str,
     min_isr: usize,
     unclean: bool,
+    /// (cert, key, trust roots) for TLS on every listener.
+    tls: Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)>,
 }
 
 impl Opts {
@@ -30,6 +32,7 @@ impl Opts {
             acks: "all",
             min_isr: 1,
             unclean: false,
+            tls: None,
         }
     }
 
@@ -44,6 +47,12 @@ impl Opts {
         a.cluster.acks = self.acks.into();
         a.cluster.min_insync_replicas = self.min_isr;
         a.cluster.unclean_leader_election = self.unclean;
+        if let Some((cert, key, ca)) = &self.tls {
+            a.tls_cert = Some(cert.clone());
+            a.tls_key = Some(key.clone());
+            a.cluster.tls = true;
+            a.cluster.tls_ca = Some(ca.clone());
+        }
     }
 
     fn backend(&self) -> std::sync::Arc<MemoryLeaseBackend> {
@@ -552,4 +561,339 @@ async fn queries_and_connectors_move_to_the_new_leader() {
     .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(count(&http, &b, "copy").await, Some(5));
+}
+
+fn self_signed(dir: &std::path::Path, name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let c =
+        rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
+    let cert = dir.join(format!("{name}.pem"));
+    let key = dir.join(format!("{name}.key"));
+    std::fs::write(&cert, c.cert.pem()).unwrap();
+    std::fs::write(&key, c.key_pair.serialize_pem()).unwrap();
+    (cert, key)
+}
+
+async fn https_json(url: String) -> Option<serde_json::Value> {
+    reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+        .get(url)
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replication_over_tls_and_untrusted_peers_are_refused() {
+    let certs = tempfile::tempdir().unwrap();
+    let (cert, key) = self_signed(certs.path(), "node");
+    let (other, _) = self_signed(certs.path(), "other");
+    let mut o = Opts::new();
+    o.tls = Some((cert.clone(), key.clone(), cert.clone()));
+    let dirs = Dirs::new(3);
+    let a = start_node(&o, dirs.path(0)).await;
+    let b = start_node(&o, dirs.path(1)).await;
+
+    // b replicates from a over TLS.
+    let status = eventually(Duration::from_secs(15), || async {
+        let s = https_json(format!("https://{}/api/v1/cluster", a.api_addr)).await?;
+        (s["isr"].as_array()?.len() == 2).then_some(s)
+    })
+    .await;
+    assert_eq!(status["role"], "leader");
+
+    // A node that doesn't trust a's certificate can't replicate from it.
+    let mut wrong = o.clone();
+    wrong.tls = Some((cert.clone(), key.clone(), other));
+    let c = start_node(&wrong, dirs.path(2)).await;
+    let err = eventually(Duration::from_secs(15), || async {
+        let s = https_json(format!("https://{}/api/v1/cluster", c.api_addr)).await?;
+        let e = s["replication"]["last_error"].as_str()?.to_string();
+        (s["replication"]["connected"] == false && !e.is_empty()).then_some(e)
+    })
+    .await;
+    assert!(err.contains("TLS"), "{err}");
+    let fs = https_json(format!("https://{}/api/v1/cluster", a.api_addr))
+        .await
+        .unwrap();
+    assert_eq!(
+        fs["isr"].as_array().unwrap().len(),
+        2,
+        "the untrusting node never joined"
+    );
+    drop((b, c));
+}
+
+// ---------------------------------------------------------------------------
+// Jepsen-style randomized faults
+// ---------------------------------------------------------------------------
+
+/// A TCP proxy in front of a node's replication listener. Peers dial the
+/// proxy (it is the node's advertised endpoint), so cutting it isolates the
+/// node's log from followers: open connections are dropped and new ones
+/// refused until it is healed.
+struct FaultProxy {
+    addr: String,
+    cut: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    generation: std::sync::Arc<tokio::sync::watch::Sender<u64>>,
+}
+
+impl FaultProxy {
+    async fn start(target: String) -> Self {
+        use std::sync::atomic::Ordering;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let cut = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let generation = std::sync::Arc::new(tokio::sync::watch::channel(0u64).0);
+        let (c, g) = (cut.clone(), generation.clone());
+        tokio::spawn(async move {
+            loop {
+                let Ok((inbound, _)) = listener.accept().await else {
+                    return;
+                };
+                if c.load(Ordering::SeqCst) {
+                    drop(inbound);
+                    continue;
+                }
+                let target = target.clone();
+                let mut killed = g.subscribe();
+                tokio::spawn(async move {
+                    let Ok(outbound) = tokio::net::TcpStream::connect(&target).await else {
+                        return;
+                    };
+                    let (mut ri, mut wi) = inbound.into_split();
+                    let (mut ro, mut wo) = outbound.into_split();
+                    tokio::select! {
+                        _ = tokio::io::copy(&mut ri, &mut wo) => {}
+                        _ = tokio::io::copy(&mut ro, &mut wi) => {}
+                        _ = killed.changed() => {}
+                    }
+                });
+            }
+        });
+        Self {
+            addr,
+            cut,
+            generation,
+        }
+    }
+
+    fn set_cut(&self, cut: bool) {
+        self.cut.store(cut, std::sync::atomic::Ordering::SeqCst);
+        if cut {
+            self.generation.send_modify(|g| *g += 1);
+        }
+    }
+}
+
+struct JNode {
+    server: Option<TestServer>,
+    dir: std::path::PathBuf,
+    proxy: FaultProxy,
+    bind: String,
+    id: String,
+}
+
+async fn start_jnode(o: &Opts, dir: &std::path::Path, bind: &str, advertise: &str) -> TestServer {
+    let o = o.clone();
+    let (bind, advertise) = (bind.to_string(), advertise.to_string());
+    TestServer::builder()
+        .data_dir(dir)
+        .with(move |a| {
+            o.apply(a);
+            a.cluster.bind = bind;
+            a.cluster.advertise = Some(advertise);
+        })
+        .start()
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn randomized_partitions_and_restarts_lose_no_acknowledged_write() {
+    use std::collections::{BTreeSet, HashSet};
+    let mut o = Opts::new();
+    o.min_isr = 2;
+    let dirs = Dirs::new(3);
+    let mut nodes = Vec::new();
+    for i in 0..3 {
+        let port = exspeed_testkit::pick_unused_port().unwrap();
+        let bind = format!("127.0.0.1:{port}");
+        let proxy = FaultProxy::start(bind.clone()).await;
+        let server = start_jnode(&o, dirs.path(i), &bind, &proxy.addr).await;
+        let id = node_id(&server);
+        nodes.push(JNode {
+            server: Some(server),
+            dir: dirs.path(i).to_path_buf(),
+            proxy,
+            bind,
+            id,
+        });
+    }
+    let seeds: Vec<String> = nodes
+        .iter()
+        .map(|n| n.server.as_ref().unwrap().addr.clone())
+        .collect();
+    {
+        let c = Client::connect_cluster(&seeds, ConnectOptions::default(), Duration::from_secs(20))
+            .await
+            .unwrap();
+        c.create_stream(StreamSpec::named("jep")).await.unwrap();
+    }
+
+    // Writer: unique values, each retried with its msg_id until acknowledged
+    // or given up on (outcome unknown).
+    let acked: std::sync::Arc<std::sync::Mutex<BTreeSet<String>>> = Default::default();
+    let unknown: std::sync::Arc<std::sync::Mutex<BTreeSet<String>>> = Default::default();
+    let stop = tokio_util::sync::CancellationToken::new();
+    let writer = {
+        let (acked, unknown, stop, seeds) =
+            (acked.clone(), unknown.clone(), stop.clone(), seeds.clone());
+        tokio::spawn(async move {
+            let mut client: Option<Client> = None;
+            for n in 0u64.. {
+                if stop.is_cancelled() {
+                    return;
+                }
+                let v = format!("v{n}");
+                let mut done = false;
+                for _attempt in 0..20 {
+                    if stop.is_cancelled() {
+                        break;
+                    }
+                    if client.as_ref().is_none_or(|c| c.is_closed()) {
+                        client = Client::connect_cluster(
+                            &seeds,
+                            ConnectOptions::default(),
+                            Duration::from_secs(2),
+                        )
+                        .await
+                        .ok();
+                    }
+                    let Some(c) = client.as_ref() else {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    };
+                    match tokio::time::timeout(
+                        Duration::from_secs(8),
+                        c.publish(
+                            "jep",
+                            PublishRecord::new("jep.v", v.clone()).msg_id(v.clone()),
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {
+                            acked.lock().unwrap().insert(v.clone());
+                            done = true;
+                            break;
+                        }
+                        Ok(Err(e)) => {
+                            if e.code() == Some(503) && e.leader_hint().is_some() {
+                                client = None; // follow the leader
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        Err(_) => client = None,
+                    }
+                }
+                if !done {
+                    unknown.lock().unwrap().insert(v);
+                }
+            }
+        })
+    };
+
+    // Nemesis.
+    let backend = o.backend();
+    let mut rng = 0x9E37_79B9_7F4A_7C15u64 ^ std::process::id() as u64;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    for _round in 0..8 {
+        let victim = (next() % 3) as usize;
+        match next() % 4 {
+            // Cut the victim off the lease backend and from its followers.
+            0 => {
+                backend.set_partitioned(&nodes[victim].id, true);
+                nodes[victim].proxy.set_cut(true);
+            }
+            // Cut only the replication link (acks=all writes stall; the ISR
+            // shrinks; with min_insync_replicas = 2 writes may be refused).
+            1 => nodes[victim].proxy.set_cut(true),
+            // Restart the victim.
+            2 => {
+                if let Some(mut s) = nodes[victim].server.take() {
+                    s.stop().await;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let n = &nodes[victim];
+                nodes[victim].server = Some(start_jnode(&o, &n.dir, &n.bind, &n.proxy.addr).await);
+            }
+            // Calm.
+            _ => {}
+        }
+        tokio::time::sleep(Duration::from_millis(1500 + next() % 1500)).await;
+        for n in &nodes {
+            backend.set_partitioned(&n.id, false);
+            n.proxy.set_cut(false);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    stop.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(30), writer).await;
+
+    // Healed: wait for a leader with the full ISR, then check every log.
+    let leader = eventually(Duration::from_secs(30), || async {
+        for (i, n) in nodes.iter().enumerate() {
+            let s = n.server.as_ref()?;
+            let st: serde_json::Value = reqwest::get(s.api_url("/api/v1/cluster"))
+                .await
+                .ok()?
+                .json()
+                .await
+                .ok()?;
+            if st["role"] == "leader" && st["isr"].as_array().is_some_and(|a| a.len() == 3) {
+                return Some(i);
+            }
+        }
+        None
+    })
+    .await;
+    let lc = nodes[leader].server.as_ref().unwrap().client().await;
+    let truth = read_all(&lc, "jep").await;
+    let values: Vec<String> = truth
+        .iter()
+        .map(|r| String::from_utf8(r.value.to_vec()).unwrap())
+        .collect();
+    let mut seen = HashSet::new();
+    for v in &values {
+        assert!(seen.insert(v.clone()), "{v} was written twice");
+    }
+    let acked = acked.lock().unwrap().clone();
+    let unknown = unknown.lock().unwrap().clone();
+    assert!(
+        acked.len() > 20,
+        "too few writes succeeded: {}",
+        acked.len()
+    );
+    for v in &acked {
+        assert!(seen.contains(v), "acknowledged {v} was lost");
+    }
+    for v in &values {
+        assert!(
+            acked.contains(v) || unknown.contains(v),
+            "{v} came from nowhere"
+        );
+    }
+    for n in &nodes {
+        let s = n.server.as_ref().unwrap();
+        wait_replicated(s, "jep", &truth).await;
+    }
 }
