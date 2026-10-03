@@ -1,12 +1,22 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
+use bytes::Bytes;
+use exspeed_broker::catalog::{CatalogStore, Migration};
+use exspeed_broker::log::LogError;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
+
+use crate::error::ExqlError;
+
+/// Internal stream holding API-created connections (key = name, value =
+/// [`ConnectionConfig`] JSON with `${VAR}` references unresolved).
+pub const CONNECTIONS_STREAM: &str = "__exql_connections";
 
 /// Configuration for a single external database connection.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionConfig {
     pub name: String,
     pub driver: String,
@@ -19,71 +29,131 @@ struct TomlWrapper {
     connection: ConnectionConfig,
 }
 
+/// Where a connection is defined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    Api,
+    File,
+    Env,
+}
+
 /// Registry that holds named connection configurations.
 ///
-/// Connections can be loaded from:
-/// 1. Environment variables (`EXSPEED_CONNECTION_{NAME}_DRIVER` / `_URL`)
-/// 2. TOML files in `{data_dir}/connections.d/*.toml`
-/// 3. JSON files in `{data_dir}/connections/*.json`
+/// Connections come from:
+/// 1. The HTTP API, stored in the replicated internal stream
+///    `__exql_connections` (see [`ConnectionRegistry::with_store`]); a
+///    registry without a store keeps API connections in memory only.
+/// 2. TOML files in `{data_dir}/connections.d/*.toml` (operator-managed,
+///    shipped to every node).
+/// 3. Environment variables (`EXSPEED_CONNECTION_{NAME}_DRIVER` / `_URL`).
 ///
-/// Priority: env vars override TOML, TOML overrides JSON.
+/// Priority: env vars override TOML, TOML overrides API. `${VAR}` in URLs is
+/// resolved from the server's environment in memory; the stored definition
+/// keeps the reference.
 pub struct ConnectionRegistry {
-    connections: RwLock<HashMap<String, ConnectionConfig>>,
+    /// Effective, resolved connections.
+    connections: RwLock<HashMap<String, (ConnectionConfig, Origin)>>,
+    /// API-created connections as stored (unresolved).
+    api: RwLock<BTreeMap<String, ConnectionConfig>>,
     data_dir: PathBuf,
+    store: Option<CatalogStore>,
+}
+
+/// Map a catalog write error; `NotLeader` stays `NotLeader` (503).
+pub(crate) fn catalog_err(e: LogError) -> ExqlError {
+    match e {
+        LogError::NotLeader => ExqlError::NotLeader,
+        e => ExqlError::from(e),
+    }
 }
 
 impl ConnectionRegistry {
-    /// Create a new, empty registry backed by the given data directory.
+    /// A registry without a catalog store: API connections live in memory.
     pub fn new(data_dir: PathBuf) -> Self {
         Self {
             connections: RwLock::new(HashMap::new()),
+            api: RwLock::new(BTreeMap::new()),
             data_dir,
+            store: None,
         }
     }
 
-    /// Load connections from all sources (JSON, then TOML, then env vars).
-    /// Later sources override earlier ones so that env vars win.
-    pub fn load_all(&self) {
-        let mut map = self.connections.write().unwrap();
+    /// A registry whose API connections are stored in `store` (the
+    /// `__exql_connections` stream).
+    pub fn with_store(data_dir: PathBuf, store: CatalogStore) -> Self {
+        Self {
+            store: Some(store),
+            ..Self::new(data_dir)
+        }
+    }
 
-        // --- 1. JSON files in {data_dir}/connections/*.json ---
-        let json_dir = self.data_dir.join("connections");
-        if json_dir.is_dir() {
-            if let Ok(entries) = fs::read_dir(&json_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                        if let Ok(content) = fs::read_to_string(&path) {
-                            if let Ok(cfg) = serde_json::from_str::<ConnectionConfig>(&content) {
-                                let cfg = ConnectionConfig {
-                                    url: resolve_env_vars(&cfg.url),
-                                    ..cfg
-                                };
-                                map.insert(cfg.name.clone(), cfg);
-                            }
-                        }
+    /// Where older versions kept API-created connections; imported once by
+    /// [`Self::reload`].
+    pub fn legacy_dir(&self) -> PathBuf {
+        self.data_dir.join("connections")
+    }
+
+    /// (Re)load every source: API connections from the catalog stream
+    /// (importing legacy `connections/*.json` files first when the stream is
+    /// empty and this node can write), then `connections.d/*.toml` and the
+    /// environment. Safe to call repeatedly (e.g. at the start of every
+    /// leader tenure); the in-memory catalog is replaced.
+    pub async fn reload(&self) -> Result<(), ExqlError> {
+        if let Some(store) = &self.store {
+            let migrated = store
+                .migrate_dir(&self.legacy_dir(), |_, bytes| {
+                    let cfg: ConnectionConfig =
+                        serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+                    validate_connection_name(&cfg.name)?;
+                    let value = serde_json::to_vec(&cfg).map_err(|e| e.to_string())?;
+                    Ok((cfg.name, Bytes::from(value)))
+                })
+                .await;
+            match migrated {
+                Ok(Migration::Deferred) => warn!(
+                    "legacy connections/ directory found; it is imported when this node leads"
+                ),
+                Ok(_) => {}
+                Err(e) => warn!("could not migrate legacy connections: {e}"),
+            }
+            let mut api = BTreeMap::new();
+            for (name, value) in store.load().await.map_err(catalog_err)? {
+                match serde_json::from_slice::<ConnectionConfig>(&value) {
+                    Ok(cfg) if cfg.name == name => {
+                        api.insert(name, cfg);
                     }
+                    Ok(_) => warn!(connection = %name, "connection record name mismatch; ignored"),
+                    Err(e) => warn!(connection = %name, "unreadable connection record: {e}"),
                 }
             }
+            *self.api.write().unwrap() = api;
+        }
+        self.rebuild();
+        Ok(())
+    }
+
+    /// Recompute the effective set from the API catalog, TOML files and env.
+    fn rebuild(&self) {
+        let mut map: HashMap<String, (ConnectionConfig, Origin)> = HashMap::new();
+
+        // --- 1. API-created ---
+        for cfg in self.api.read().unwrap().values() {
+            map.insert(cfg.name.clone(), (resolved(cfg.clone()), Origin::Api));
         }
 
         // --- 2. TOML files in {data_dir}/connections.d/*.toml ---
         let toml_dir = self.data_dir.join("connections.d");
-        if toml_dir.is_dir() {
-            if let Ok(entries) = fs::read_dir(&toml_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().and_then(|e| e.to_str()) == Some("toml") {
-                        if let Ok(content) = fs::read_to_string(&path) {
-                            if let Ok(wrapper) = toml::from_str::<TomlWrapper>(&content) {
-                                let cfg = ConnectionConfig {
-                                    url: resolve_env_vars(&wrapper.connection.url),
-                                    ..wrapper.connection
-                                };
-                                map.insert(cfg.name.clone(), cfg);
-                            }
-                        }
+        if let Ok(entries) = fs::read_dir(&toml_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                    continue;
+                }
+                match load_toml(&path) {
+                    Ok(cfg) => {
+                        map.insert(cfg.name.clone(), (resolved(cfg), Origin::File));
                     }
+                    Err(e) => warn!(path = %path.display(), "ignoring connection file: {e}"),
                 }
             }
         }
@@ -92,88 +162,97 @@ impl ConnectionRegistry {
         // Scan for EXSPEED_CONNECTION_*_DRIVER / EXSPEED_CONNECTION_*_URL pairs.
         // The name portion is lowercased and underscores become hyphens.
         let prefix = "EXSPEED_CONNECTION_";
-        let suffix_driver = "_DRIVER";
-        let suffix_url = "_URL";
-
-        // Collect all env var names that match the prefix.
         let mut driver_map: HashMap<String, String> = HashMap::new();
         let mut url_map: HashMap<String, String> = HashMap::new();
-
         for (key, value) in std::env::vars() {
             if let Some(rest) = key.strip_prefix(prefix) {
-                if let Some(name_part) = rest.strip_suffix(suffix_driver) {
+                if let Some(name_part) = rest.strip_suffix("_DRIVER") {
                     let name = name_part.to_lowercase().replace('_', "-");
                     driver_map.insert(name, value);
-                } else if let Some(name_part) = rest.strip_suffix(suffix_url) {
+                } else if let Some(name_part) = rest.strip_suffix("_URL") {
                     let name = name_part.to_lowercase().replace('_', "-");
                     url_map.insert(name, resolve_env_vars(&value));
                 }
             }
         }
-
         // Merge: only insert when both driver and url are present.
-        for (name, driver) in &driver_map {
-            if let Some(url) = url_map.get(name) {
-                map.insert(
-                    name.clone(),
-                    ConnectionConfig {
-                        name: name.clone(),
-                        driver: driver.clone(),
-                        url: url.clone(),
-                    },
-                );
+        for (name, driver) in driver_map {
+            if let Some(url) = url_map.remove(&name) {
+                let cfg = ConnectionConfig {
+                    name: name.clone(),
+                    driver,
+                    url,
+                };
+                map.insert(name, (cfg, Origin::Env));
             }
         }
+        *self.connections.write().unwrap() = map;
+    }
+
+    /// Names of every registered connection.
+    pub fn names(&self) -> Vec<String> {
+        self.connections.read().unwrap().keys().cloned().collect()
     }
 
     /// Look up a connection by name.
     pub fn get(&self, name: &str) -> Option<ConnectionConfig> {
-        self.connections.read().unwrap().get(name).cloned()
+        self.connections
+            .read()
+            .unwrap()
+            .get(name)
+            .map(|(c, _)| c.clone())
     }
 
-    /// Add a new connection, persisting it as a JSON file.
-    pub fn add(&self, config: ConnectionConfig) -> Result<(), String> {
-        validate_connection_name(&config.name)?;
+    /// Add (or replace) an API connection. With a store it is written to
+    /// `__exql_connections` first, which only the leader can do.
+    pub async fn add(&self, config: ConnectionConfig) -> Result<(), ExqlError> {
+        validate_connection_name(&config.name).map_err(ExqlError::Plan)?;
         if !SUPPORTED_DRIVERS.contains(&config.driver.as_str()) {
-            return Err(format!(
+            return Err(ExqlError::Plan(format!(
                 "unsupported driver '{}'; supported: {}",
                 config.driver,
                 SUPPORTED_DRIVERS.join(", ")
-            ));
+            )));
         }
-        let json_dir = self.data_dir.join("connections");
-        fs::create_dir_all(&json_dir)
-            .map_err(|e| format!("failed to create connections dir: {e}"))?;
-
-        let file_path = json_dir.join(format!("{}.json", config.name));
-        let json = serde_json::to_string_pretty(&config).map_err(|e| format!("serialize: {e}"))?;
-        let tmp = json_dir.join(format!(".{}.json.tmp", config.name));
-        fs::write(&tmp, json).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-        fs::rename(&tmp, &file_path).map_err(|e| format!("rename {}: {e}", file_path.display()))?;
-
-        self.connections
+        if let Some(store) = &self.store {
+            let value =
+                serde_json::to_vec(&config).map_err(|e| ExqlError::Internal(e.to_string()))?;
+            store
+                .put(&config.name, Bytes::from(value))
+                .await
+                .map_err(catalog_err)?;
+        }
+        self.api
             .write()
             .unwrap()
             .insert(config.name.clone(), config);
+        self.rebuild();
         Ok(())
     }
 
-    /// Remove a connection from the registry and delete its JSON file if present.
-    pub fn remove(&self, name: &str) -> Result<(), String> {
-        validate_connection_name(name)?;
-        if self.connections.write().unwrap().remove(name).is_none() {
-            return Err(format!("connection '{name}' not found"));
+    /// Remove an API connection (a tombstone in `__exql_connections`).
+    /// Connections defined in `connections.d/` or the environment can't be
+    /// removed through the API.
+    pub async fn remove(&self, name: &str) -> Result<(), ExqlError> {
+        validate_connection_name(name).map_err(ExqlError::Plan)?;
+        let in_api = self.api.read().unwrap().contains_key(name);
+        if !in_api {
+            let origin = self.connections.read().unwrap().get(name).map(|(_, o)| *o);
+            return Err(match origin {
+                Some(Origin::Env) => ExqlError::Conflict(format!(
+                    "connection '{name}' is defined by environment variables; remove it there"
+                )),
+                Some(_) => ExqlError::Conflict(format!(
+                    "connection '{name}' is defined in connections.d/; remove the file instead"
+                )),
+                None => ExqlError::NotFound(format!("connection '{name}' not found")),
+            });
         }
-
-        let file_path = self
-            .data_dir
-            .join("connections")
-            .join(format!("{name}.json"));
-        if file_path.exists() {
-            fs::remove_file(&file_path)
-                .map_err(|e| format!("delete {}: {e}", file_path.display()))?;
+        if let Some(store) = &self.store {
+            store.delete(name).await.map_err(catalog_err)?;
         }
-
+        self.api.write().unwrap().remove(name);
+        self.rebuild();
         Ok(())
     }
 
@@ -184,15 +263,28 @@ impl ConnectionRegistry {
             .read()
             .unwrap()
             .values()
-            .map(|c| (c.name.clone(), c.driver.clone()))
+            .map(|(c, _)| (c.name.clone(), c.driver.clone()))
             .collect()
     }
+}
+
+fn resolved(cfg: ConnectionConfig) -> ConnectionConfig {
+    ConnectionConfig {
+        url: resolve_env_vars(&cfg.url),
+        ..cfg
+    }
+}
+
+fn load_toml(path: &Path) -> Result<ConnectionConfig, String> {
+    let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let wrapper = toml::from_str::<TomlWrapper>(&content).map_err(|e| e.to_string())?;
+    Ok(wrapper.connection)
 }
 
 /// Drivers external tables can read from.
 pub const SUPPORTED_DRIVERS: &[&str] = &["postgres", "postgresql"];
 
-/// Connection names become file names and SQL schema names: keep them to
+/// Connection names become SQL schema names: keep them to
 /// `[A-Za-z0-9_-]{1,64}`.
 pub fn validate_connection_name(name: &str) -> Result<(), String> {
     if name.is_empty()
@@ -227,10 +319,25 @@ fn resolve_env_vars(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::World;
 
-    #[test]
-    fn load_from_env_vars() {
-        // Set env vars for a test connection named "test-db"
+    fn pg(name: &str, url: &str) -> ConnectionConfig {
+        ConnectionConfig {
+            name: name.into(),
+            driver: "postgres".into(),
+            url: url.into(),
+        }
+    }
+
+    fn stored(world: &World, dir: &Path) -> ConnectionRegistry {
+        ConnectionRegistry::with_store(
+            dir.to_path_buf(),
+            CatalogStore::new(world.log.clone(), CONNECTIONS_STREAM, "exql.connection"),
+        )
+    }
+
+    #[tokio::test]
+    async fn load_from_env_vars() {
         // Name = TEST_DB → lowercase, underscores → hyphens → "test-db"
         std::env::set_var("EXSPEED_CONNECTION_TEST_DB_DRIVER", "postgres");
         std::env::set_var(
@@ -240,19 +347,22 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let registry = ConnectionRegistry::new(dir.path().to_path_buf());
-        registry.load_all();
+        registry.reload().await.unwrap();
 
         let cfg = registry.get("test-db").expect("should find test-db");
         assert_eq!(cfg.driver, "postgres");
         assert_eq!(cfg.url, "postgresql://localhost/test");
+        assert!(matches!(
+            registry.remove("test-db").await,
+            Err(ExqlError::Conflict(_))
+        ));
 
-        // Clean up env
         std::env::remove_var("EXSPEED_CONNECTION_TEST_DB_DRIVER");
         std::env::remove_var("EXSPEED_CONNECTION_TEST_DB_URL");
     }
 
-    #[test]
-    fn load_from_toml_file() {
+    #[tokio::test]
+    async fn load_from_toml_file() {
         let dir = tempfile::tempdir().unwrap();
         let toml_dir = dir.path().join("connections.d");
         fs::create_dir_all(&toml_dir).unwrap();
@@ -268,85 +378,91 @@ url = "postgresql://localhost/mydb"
         .unwrap();
 
         let registry = ConnectionRegistry::new(dir.path().to_path_buf());
-        registry.load_all();
+        registry.reload().await.unwrap();
 
         let cfg = registry.get("mydb").expect("should find mydb");
         assert_eq!(cfg.driver, "postgres");
         assert_eq!(cfg.url, "postgresql://localhost/mydb");
+        assert!(matches!(
+            registry.remove("mydb").await,
+            Err(ExqlError::Conflict(_))
+        ));
     }
 
-    #[test]
-    fn load_from_json_file() {
+    #[tokio::test]
+    async fn api_connections_live_in_the_catalog_stream() {
+        let world = World::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        let registry = stored(&world, dir.path());
+        registry.reload().await.unwrap();
+        registry
+            .add(pg("my-pg", "postgresql://localhost/test"))
+            .await
+            .unwrap();
+        registry
+            .add(pg("other", "postgresql://localhost/other"))
+            .await
+            .unwrap();
+        assert_eq!(registry.get("my-pg").unwrap().driver, "postgres");
+        assert!(!dir.path().join("connections").exists(), "no files");
+
+        // Another node (or a restart) reads the same catalog.
+        let fresh = stored(&world, dir.path());
+        fresh.reload().await.unwrap();
+        let mut names = fresh.names();
+        names.sort();
+        assert_eq!(names, vec!["my-pg", "other"]);
+
+        registry.remove("my-pg").await.unwrap();
+        assert!(registry.get("my-pg").is_none());
+        assert!(matches!(
+            registry.remove("my-pg").await,
+            Err(ExqlError::NotFound(_))
+        ));
+        // Reloading replaces the in-memory catalog.
+        fresh.reload().await.unwrap();
+        assert!(fresh.get("my-pg").is_none());
+        assert!(fresh.get("other").is_some());
+    }
+
+    #[tokio::test]
+    async fn legacy_json_files_are_migrated_once() {
+        std::env::set_var("TEST_PG_HOST", "my-host");
+        std::env::set_var("TEST_PG_PORT", "5433");
+        let world = World::new().await;
         let dir = tempfile::tempdir().unwrap();
         let json_dir = dir.path().join("connections");
         fs::create_dir_all(&json_dir).unwrap();
         fs::write(
-            json_dir.join("warehouse.json"),
-            r#"{"name":"warehouse","driver":"postgres","url":"postgresql://localhost/wh"}"#,
+            json_dir.join("envurl.json"),
+            r#"{"name":"envurl","driver":"postgres","url":"postgresql://${TEST_PG_HOST}:${TEST_PG_PORT}/db"}"#,
         )
         .unwrap();
+        fs::write(json_dir.join("broken.json"), "{").unwrap();
 
-        let registry = ConnectionRegistry::new(dir.path().to_path_buf());
-        registry.load_all();
+        let registry = stored(&world, dir.path());
+        registry.reload().await.unwrap();
+        // Resolved in memory, stored with the reference.
+        let cfg = registry.get("envurl").expect("should find envurl");
+        assert_eq!(cfg.url, "postgresql://my-host:5433/db");
+        assert!(!json_dir.exists());
+        assert!(dir.path().join("connections.migrated/envurl.json").exists());
+        let store = CatalogStore::new(world.log.clone(), CONNECTIONS_STREAM, "x");
+        let raw = store.load().await.unwrap();
+        assert!(String::from_utf8_lossy(&raw["envurl"]).contains("${TEST_PG_HOST}"));
+        assert_eq!(raw.len(), 1);
 
-        let cfg = registry.get("warehouse").expect("should find warehouse");
-        assert_eq!(cfg.driver, "postgres");
-        assert_eq!(cfg.url, "postgresql://localhost/wh");
+        std::env::remove_var("TEST_PG_HOST");
+        std::env::remove_var("TEST_PG_PORT");
     }
 
-    #[test]
-    fn add_and_get() {
+    #[tokio::test]
+    async fn list_returns_name_driver_pairs() {
         let dir = tempfile::tempdir().unwrap();
         let registry = ConnectionRegistry::new(dir.path().to_path_buf());
-
         registry
-            .add(ConnectionConfig {
-                name: "my-pg".into(),
-                driver: "postgres".into(),
-                url: "postgresql://localhost/test".into(),
-            })
-            .unwrap();
-
-        let cfg = registry.get("my-pg").expect("should find my-pg");
-        assert_eq!(cfg.driver, "postgres");
-
-        // JSON file should exist
-        let file = dir.path().join("connections/my-pg.json");
-        assert!(file.exists());
-    }
-
-    #[test]
-    fn remove_deletes_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let registry = ConnectionRegistry::new(dir.path().to_path_buf());
-
-        registry
-            .add(ConnectionConfig {
-                name: "rm-test".into(),
-                driver: "postgres".into(),
-                url: "postgresql://localhost/rm".into(),
-            })
-            .unwrap();
-
-        let file = dir.path().join("connections/rm-test.json");
-        assert!(file.exists());
-
-        registry.remove("rm-test").unwrap();
-        assert!(registry.get("rm-test").is_none());
-        assert!(!file.exists());
-    }
-
-    #[test]
-    fn list_returns_name_driver_pairs() {
-        let dir = tempfile::tempdir().unwrap();
-        let registry = ConnectionRegistry::new(dir.path().to_path_buf());
-
-        registry
-            .add(ConnectionConfig {
-                name: "a".into(),
-                driver: "postgres".into(),
-                url: "postgresql://localhost/a".into(),
-            })
+            .add(pg("a", "postgresql://localhost/a"))
+            .await
             .unwrap();
         registry
             .add(ConnectionConfig {
@@ -354,6 +470,7 @@ url = "postgresql://localhost/mydb"
                 driver: "postgresql".into(),
                 url: "postgresql://localhost/b".into(),
             })
+            .await
             .unwrap();
 
         let mut pairs = registry.list();
@@ -363,17 +480,14 @@ url = "postgresql://localhost/mydb"
         assert_eq!(pairs[1], ("b".to_string(), "postgresql".to_string()));
     }
 
-    #[test]
-    fn rejects_bad_names_and_drivers() {
+    #[tokio::test]
+    async fn rejects_bad_names_and_drivers() {
         let dir = tempfile::tempdir().unwrap();
         let registry = ConnectionRegistry::new(dir.path().to_path_buf());
         for name in ["../x", "", "a/b", "a.b"] {
             assert!(registry
-                .add(ConnectionConfig {
-                    name: name.into(),
-                    driver: "postgres".into(),
-                    url: "postgresql://localhost/a".into(),
-                })
+                .add(pg(name, "postgresql://localhost/a"))
+                .await
                 .is_err());
         }
         assert!(registry
@@ -382,12 +496,13 @@ url = "postgresql://localhost/mydb"
                 driver: "mssql".into(),
                 url: "mssql://localhost/a".into(),
             })
+            .await
             .is_err());
-        assert!(registry.remove("../consumers/foo").is_err());
+        assert!(registry.remove("../consumers/foo").await.is_err());
     }
 
-    #[test]
-    fn env_vars_override_toml() {
+    #[tokio::test]
+    async fn env_vars_override_toml_and_toml_overrides_api() {
         let dir = tempfile::tempdir().unwrap();
         let toml_dir = dir.path().join("connections.d");
         fs::create_dir_all(&toml_dir).unwrap();
@@ -402,15 +517,22 @@ url = "postgresql://toml-host/db"
         )
         .unwrap();
 
+        let registry = ConnectionRegistry::new(dir.path().to_path_buf());
+        registry
+            .add(pg("override-db", "postgresql://api-host/db"))
+            .await
+            .unwrap();
+        assert_eq!(
+            registry.get("override-db").unwrap().url,
+            "postgresql://toml-host/db"
+        );
+
         std::env::set_var("EXSPEED_CONNECTION_OVERRIDE_DB_DRIVER", "postgres");
         std::env::set_var(
             "EXSPEED_CONNECTION_OVERRIDE_DB_URL",
             "postgresql://env-host/db",
         );
-
-        let registry = ConnectionRegistry::new(dir.path().to_path_buf());
-        registry.load_all();
-
+        registry.reload().await.unwrap();
         let cfg = registry
             .get("override-db")
             .expect("should find override-db");
@@ -419,29 +541,5 @@ url = "postgresql://toml-host/db"
 
         std::env::remove_var("EXSPEED_CONNECTION_OVERRIDE_DB_DRIVER");
         std::env::remove_var("EXSPEED_CONNECTION_OVERRIDE_DB_URL");
-    }
-
-    #[test]
-    fn resolve_env_var_in_url() {
-        std::env::set_var("TEST_PG_HOST", "my-host");
-        std::env::set_var("TEST_PG_PORT", "5433");
-
-        let dir = tempfile::tempdir().unwrap();
-        let json_dir = dir.path().join("connections");
-        fs::create_dir_all(&json_dir).unwrap();
-        fs::write(
-            json_dir.join("envurl.json"),
-            r#"{"name":"envurl","driver":"postgres","url":"postgresql://${TEST_PG_HOST}:${TEST_PG_PORT}/db"}"#,
-        )
-        .unwrap();
-
-        let registry = ConnectionRegistry::new(dir.path().to_path_buf());
-        registry.load_all();
-
-        let cfg = registry.get("envurl").expect("should find envurl");
-        assert_eq!(cfg.url, "postgresql://my-host:5433/db");
-
-        std::env::remove_var("TEST_PG_HOST");
-        std::env::remove_var("TEST_PG_PORT");
     }
 }

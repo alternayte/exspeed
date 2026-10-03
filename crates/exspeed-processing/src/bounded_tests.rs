@@ -316,6 +316,7 @@ async fn external_postgres_join() {
             driver: "postgres".into(),
             url: url.clone(),
         })
+        .await
         .unwrap();
     let res = run(
         &r,

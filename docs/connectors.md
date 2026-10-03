@@ -11,8 +11,15 @@ You can define a connector in two ways:
   truth: it is hot-reloaded, `${VAR}` references are resolved when the
   connector starts, and nothing (in particular no resolved secret) is
   written to disk.
-- **Through the HTTP API** at `POST /api/v1/connectors`. The config is saved
-  as JSON under `<data-dir>/connectors/`.
+- **Through the HTTP API** at `POST /api/v1/connectors`. The config (with
+  any `${VAR}` left as written) is stored in the compacted internal stream
+  `__connectors`, keyed by connector name, so it replicates with the log and
+  any node that becomes leader runs it. Creating, updating or deleting one
+  needs the leader (`503` elsewhere). Older versions kept these configs as
+  JSON under `<data-dir>/connectors/`; the first leader to start imports
+  them into `__connectors` and renames the directory to
+  `connectors.migrated/`. If a `connectors.d/` file defines a connector
+  with the same name, the file wins and the API copy is deleted.
 
 Connectors run on the leader. Each one has its own **supervisor** that
 restarts it with backoff, reports its status, and implements the checkpoint

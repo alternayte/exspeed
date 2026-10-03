@@ -1,14 +1,16 @@
 //! [`ExqlEngine`]: bounded queries, continuous-query lifecycle, tables and
 //! connections.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bytes::Bytes;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::session_state::SessionState;
+use exspeed_broker::catalog::{CatalogStore, Migration};
 use exspeed_broker::leadership::ClusterLeadership;
 use exspeed_broker::log::{Log, LogError};
 use exspeed_common::metrics::Metrics;
@@ -28,12 +30,17 @@ use crate::continuous::plan::{compile, Dataflow};
 use crate::continuous::runner::{QueryStats, RunCtx, Runner, Sink, H_OP, H_QUERY};
 use crate::convert::batch_rows_json;
 use crate::error::ExqlError;
+use crate::external::connections::{catalog_err, CONNECTIONS_STREAM};
 use crate::external::{ConnectionConfig, ConnectionRegistry, ExternalTables};
 use crate::session::{build_state, runtime_env, ExqlConfig};
 use crate::sql::{
     parse_statement, validate_object_name, validate_query_id, CreateKind, CreateQuery, Statement,
 };
 use crate::tables::{rows_to_batch, MaterializedTable, TableRegistry};
+
+/// Internal stream holding continuous-query definitions (key = query id,
+/// value = [`QueryDef`] JSON; a drop is a tombstone).
+pub const QUERIES_STREAM: &str = "__exql_queries";
 
 /// What a continuous query writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,6 +178,8 @@ pub struct ExqlEngine {
     runtime: Arc<RuntimeEnv>,
     pub connection_registry: Arc<ConnectionRegistry>,
     external: Arc<ExternalTables>,
+    /// Query definitions in `__exql_queries`.
+    query_store: CatalogStore,
     tables: Arc<TableRegistry>,
     queries: Mutex<HashMap<String, Entry>>,
     pub leadership: Arc<ClusterLeadership>,
@@ -185,26 +194,6 @@ fn now_rfc3339() -> String {
     chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
         .to_string()
-}
-
-fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let dir = path.parent().expect("file in a directory");
-    std::fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!(
-        ".{}.tmp",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("query")
-    ));
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(data)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    if let Ok(d) = std::fs::File::open(dir) {
-        let _ = d.sync_all();
-    }
-    Ok(())
 }
 
 fn stream_name(name: &str) -> Result<StreamName, ExqlError> {
@@ -222,7 +211,11 @@ impl ExqlEngine {
         cfg: ExqlConfig,
     ) -> Result<Self, ExqlError> {
         let storage = log.storage().clone();
-        let connection_registry = Arc::new(ConnectionRegistry::new(data_dir.clone()));
+        let connection_registry = Arc::new(ConnectionRegistry::with_store(
+            data_dir.clone(),
+            CatalogStore::new(log.clone(), CONNECTIONS_STREAM, "exql.connection"),
+        ));
+        let query_store = CatalogStore::new(log.clone(), QUERIES_STREAM, "exql.query");
         let external = Arc::new(ExternalTables::new(
             connection_registry.clone(),
             cfg.external.clone(),
@@ -235,6 +228,7 @@ impl ExqlEngine {
             runtime,
             connection_registry,
             external,
+            query_store,
             tables: Arc::new(TableRegistry::new()),
             queries: Mutex::new(HashMap::new()),
             leadership,
@@ -258,7 +252,9 @@ impl ExqlEngine {
         &self.tables
     }
 
-    fn queries_dir(&self) -> PathBuf {
+    /// Where older versions kept query definitions; imported into
+    /// `__exql_queries` once by [`Self::load`].
+    pub fn legacy_queries_dir(&self) -> PathBuf {
         self.data_dir.join("exql").join("queries")
     }
 
@@ -281,52 +277,86 @@ impl ExqlEngine {
 
     // -- persistence --------------------------------------------------------
 
-    fn persist(&self, def: &QueryDef) -> Result<(), ExqlError> {
+    /// Write a definition to `__exql_queries` (leader only).
+    async fn persist(&self, def: &QueryDef) -> Result<(), ExqlError> {
         validate_query_id(&def.id)?;
-        let path = self.queries_dir().join(format!("{}.json", def.id));
-        let data =
-            serde_json::to_vec_pretty(def).map_err(|e| ExqlError::Internal(e.to_string()))?;
-        write_atomic(&path, &data)
-            .map_err(|e| ExqlError::Storage(format!("persist query {}: {e}", def.id)))
+        let data = serde_json::to_vec(def).map_err(|e| ExqlError::Internal(e.to_string()))?;
+        self.query_store
+            .put(&def.id, Bytes::from(data))
+            .await
+            .map_err(catalog_err)
     }
 
-    fn unpersist(&self, id: &str) -> Result<(), ExqlError> {
+    /// Tombstone a definition in `__exql_queries` (leader only).
+    async fn unpersist(&self, id: &str) -> Result<(), ExqlError> {
         validate_query_id(id)?;
-        let path = self.queries_dir().join(format!("{id}.json"));
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(ExqlError::Storage(format!("delete query {id}: {e}"))),
-        }
+        self.query_store.delete(id).await.map_err(catalog_err)
     }
 
-    /// Load connections and persisted queries; register tables and fill
-    /// them from their changelogs. Queries start when this node leads
-    /// ([`Self::resume_all_and_run`]).
+    /// (Re)load the catalog: connections, then the query definitions in
+    /// `__exql_queries` (importing legacy `exql/queries/*.json` files first
+    /// when the stream is empty and this node can write). Registers tables
+    /// and fills them from their changelogs. Queries start when this node
+    /// leads ([`Self::resume_all_and_run`]).
+    ///
+    /// Safe to call repeatedly, and meant to be called at the start of every
+    /// leader tenure: a follower's copy of the catalog streams changes as it
+    /// replicates. Any query task still running (e.g. from a previous
+    /// tenure) is stopped first, and the in-memory catalog is replaced.
     pub async fn load(&self) -> Result<(), ExqlError> {
-        self.connection_registry.load_all();
-        let dir = self.queries_dir();
+        let _g = self.ddl.lock().await;
+
+        let before: HashSet<String> = self.connection_registry.names().into_iter().collect();
+        self.connection_registry.reload().await?;
+        for name in before.into_iter().chain(self.connection_registry.names()) {
+            self.external.invalidate(&name);
+        }
+
+        match self
+            .query_store
+            .migrate_dir(&self.legacy_queries_dir(), |_, bytes| {
+                let def: QueryDef = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+                validate_query_id(&def.id).map_err(|e| e.to_string())?;
+                let value = serde_json::to_vec(&def).map_err(|e| e.to_string())?;
+                Ok((def.id, Bytes::from(value)))
+            })
+            .await
+        {
+            Ok(Migration::Deferred) => {
+                warn!("legacy exql/queries/ directory found; it is imported when this node leads")
+            }
+            Ok(_) => {}
+            Err(e) => warn!("could not migrate legacy query definitions: {e}"),
+        }
+
         let mut defs: Vec<QueryDef> = vec![];
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for e in entries.flatten() {
-                let path = e.path();
-                if path.extension().and_then(|x| x.to_str()) != Some("json") {
-                    continue;
+        for (id, value) in self.query_store.load().await.map_err(catalog_err)? {
+            match serde_json::from_slice::<QueryDef>(&value) {
+                Ok(d) if d.id == id && validate_query_id(&d.id).is_ok() => defs.push(d),
+                Ok(_) => {
+                    warn!(query = %id, "ignoring query record with a mismatched or invalid id")
                 }
-                match std::fs::read(&path)
-                    .map_err(|e| e.to_string())
-                    .and_then(|b| serde_json::from_slice::<QueryDef>(&b).map_err(|e| e.to_string()))
-                {
-                    Ok(d) if validate_query_id(&d.id).is_ok() => defs.push(d),
-                    Ok(_) => {
-                        warn!(path = %path.display(), "ignoring query file with an invalid id")
-                    }
-                    Err(e) => warn!(path = %path.display(), "ignoring unreadable query file: {e}"),
-                }
+                Err(e) => warn!(query = %id, "ignoring unreadable query record: {e}"),
             }
         }
+
+        // Stop whatever still runs before replacing the catalog.
+        let running: Vec<String> = self.queries.lock().unwrap().keys().cloned().collect();
+        for id in &running {
+            self.stop_task(id).await;
+        }
+        let old_generations: HashMap<String, u64> = self
+            .queries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, e)| (id.clone(), e.generation))
+            .collect();
+
         // Tables first, so queries joining them can be planned.
         defs.sort_by_key(|d| (d.kind != QueryKind::Table, d.created_at.clone()));
+        let mut entries: HashMap<String, Entry> = HashMap::new();
+        let mut table_names: HashSet<String> = HashSet::new();
         for def in defs {
             let mut status = match def.desired {
                 DesiredState::Running => QueryStatus::Pending,
@@ -336,13 +366,17 @@ impl ExqlEngine {
                 }
             };
             if def.kind == QueryKind::Table {
+                table_names.insert(def.name.clone());
                 if let Err(e) = self.register_table(&def).await {
                     warn!(query = %def.id, "cannot plan table query: {e}");
                     status = QueryStatus::Failed(e.to_string());
                 }
             }
             info!(query = %def.id, name = %def.name, status = status.as_str(), "loaded continuous query");
-            self.queries.lock().unwrap().insert(
+            // A newer generation than any task of the old entry, so a late
+            // finisher can't overwrite the fresh entry.
+            let generation = old_generations.get(&def.id).map_or(0, |g| g + 1);
+            entries.insert(
                 def.id.clone(),
                 Entry {
                     def,
@@ -350,10 +384,16 @@ impl ExqlEngine {
                     stats: Arc::new(QueryStats::default()),
                     cancel: None,
                     handle: None,
-                    generation: 0,
+                    generation,
                 },
             );
         }
+        for t in self.tables.list() {
+            if !table_names.contains(&t.name) {
+                self.tables.remove(&t.name);
+            }
+        }
+        *self.queries.lock().unwrap() = entries;
         Ok(())
     }
 
@@ -612,7 +652,7 @@ impl ExqlEngine {
             ));
             self.tables.insert(table);
         }
-        if let Err(e) = self.persist(&def) {
+        if let Err(e) = self.persist(&def).await {
             self.tables.remove(&def.name);
             return Err(e);
         }
@@ -686,8 +726,10 @@ impl ExqlEngine {
                 )));
             }
         }
+        // Forget it in the replicated catalog first: on a node that can't
+        // write, nothing changes.
+        self.unpersist(id).await?;
         self.stop_task(id).await;
-        self.unpersist(id)?;
         self.queries.lock().unwrap().remove(id);
         if def.kind == QueryKind::Table {
             self.tables.remove(&def.name);
@@ -793,30 +835,34 @@ impl ExqlEngine {
 
     // -- continuous: pause / resume -----------------------------------------
 
-    fn set_desired(
+    /// Persist a new desired state, then apply it in memory.
+    async fn set_desired(
         &self,
         id: &str,
         desired: DesiredState,
         error: Option<String>,
     ) -> Result<QueryDef, ExqlError> {
         validate_query_id(id)?;
-        let def = {
-            let mut q = self.queries.lock().unwrap();
-            let e = q
-                .get_mut(id)
-                .ok_or_else(|| ExqlError::NotFound(format!("query '{id}' not found")))?;
-            e.def.desired = desired;
-            e.def.error = error;
-            e.def.clone()
-        };
-        self.persist(&def)?;
+        let mut def = self
+            .queries
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|e| e.def.clone())
+            .ok_or_else(|| ExqlError::NotFound(format!("query '{id}' not found")))?;
+        def.desired = desired;
+        def.error = error;
+        self.persist(&def).await?;
+        if let Some(e) = self.queries.lock().unwrap().get_mut(id) {
+            e.def = def.clone();
+        }
         Ok(def)
     }
 
     /// `PAUSE QUERY <id>`: stop processing; state and position are kept.
     pub async fn pause_query(&self, id: &str) -> Result<QueryInfo, ExqlError> {
         let _g = self.ddl.lock().await;
-        self.set_desired(id, DesiredState::Paused, None)?;
+        self.set_desired(id, DesiredState::Paused, None).await?;
         self.stop_task(id).await;
         if let Some(e) = self.queries.lock().unwrap().get_mut(id) {
             e.status = QueryStatus::Paused;
@@ -828,7 +874,7 @@ impl ExqlEngine {
     /// checkpoint.
     pub async fn resume_query(self: &Arc<Self>, id: &str) -> Result<QueryInfo, ExqlError> {
         let _g = self.ddl.lock().await;
-        let def = self.set_desired(id, DesiredState::Running, None)?;
+        let def = self.set_desired(id, DesiredState::Running, None).await?;
         if def.kind == QueryKind::Table && self.tables.get(&def.name).is_none() {
             self.register_table(&def).await?;
         }
@@ -967,34 +1013,38 @@ impl ExqlEngine {
                 }
             }
         };
-        let mut q = self.queries.lock().unwrap();
-        let Some(e) = q.get_mut(&def.id) else {
-            return;
-        };
-        if e.generation != generation {
-            return;
-        }
-        e.cancel = None;
-        match outcome {
-            Some(err) => {
-                warn!(query = %def.id, "query failed: {err}");
-                e.status = QueryStatus::Failed(err.clone());
-                e.def.desired = DesiredState::Stopped;
-                e.def.error = Some(err);
-                let d = e.def.clone();
-                drop(q);
-                if let Err(pe) = self.persist(&d) {
-                    warn!(query = %d.id, "could not persist failure: {pe}");
+        let failed: Option<QueryDef> = {
+            let mut q = self.queries.lock().unwrap();
+            let Some(e) = q.get_mut(&def.id) else {
+                return;
+            };
+            if e.generation != generation {
+                return;
+            }
+            e.cancel = None;
+            match outcome {
+                Some(err) => {
+                    warn!(query = %def.id, "query failed: {err}");
+                    e.status = QueryStatus::Failed(err.clone());
+                    e.def.desired = DesiredState::Stopped;
+                    e.def.error = Some(err);
+                    Some(e.def.clone())
+                }
+                None => {
+                    e.status = match e.def.desired {
+                        DesiredState::Paused => QueryStatus::Paused,
+                        DesiredState::Running => QueryStatus::Pending,
+                        DesiredState::Stopped => {
+                            QueryStatus::Failed(e.def.error.clone().unwrap_or_default())
+                        }
+                    };
+                    None
                 }
             }
-            None => {
-                e.status = match e.def.desired {
-                    DesiredState::Paused => QueryStatus::Paused,
-                    DesiredState::Running => QueryStatus::Pending,
-                    DesiredState::Stopped => {
-                        QueryStatus::Failed(e.def.error.clone().unwrap_or_default())
-                    }
-                };
+        };
+        if let Some(d) = failed {
+            if let Err(pe) = self.persist(&d).await {
+                warn!(query = %d.id, "could not persist failure: {pe}");
             }
         }
     }
@@ -1121,21 +1171,17 @@ impl ExqlEngine {
 
     // -- connections --------------------------------------------------------
 
-    pub fn add_connection(&self, cfg: ConnectionConfig) -> Result<(), ExqlError> {
+    /// Register (or replace) a connection; stored in `__exql_connections`.
+    pub async fn add_connection(&self, cfg: ConnectionConfig) -> Result<(), ExqlError> {
         let name = cfg.name.clone();
-        self.connection_registry.add(cfg).map_err(ExqlError::Plan)?;
+        self.connection_registry.add(cfg).await?;
         self.external.invalidate(&name);
         Ok(())
     }
 
-    pub fn remove_connection(&self, name: &str) -> Result<(), ExqlError> {
-        self.connection_registry.remove(name).map_err(|e| {
-            if e.contains("not found") {
-                ExqlError::NotFound(e)
-            } else {
-                ExqlError::Plan(e)
-            }
-        })?;
+    /// Remove an API-created connection.
+    pub async fn remove_connection(&self, name: &str) -> Result<(), ExqlError> {
+        self.connection_registry.remove(name).await?;
         self.external.invalidate(name);
         Ok(())
     }
