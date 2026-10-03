@@ -16,13 +16,7 @@ async fn start_server(auth_token: Option<String>) -> (u16, TempDir) {
         credentials_file: None,
         tls_cert: None,
         tls_key: None,
-        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-        storage_flush_window_us: 500,
-        storage_flush_threshold_records: 256,
-        storage_flush_threshold_bytes: 1_048_576,
-        storage_sync_interval_ms: 10,
-        storage_sync_bytes: 4 * 1024 * 1024,
-        delivery_buffer: 8192,
+        ..Default::default()
     };
 
     tokio::spawn(async move {
@@ -114,7 +108,7 @@ async fn leases_endpoint_postgres_backend_returns_single_cluster_leader_row() {
     let schema = format!("lease_api_{}", uuid::Uuid::new_v4().simple());
     ensure_schema(&schema).await;
 
-    std::env::set_var("EXSPEED_CONSUMER_STORE", "postgres");
+    std::env::set_var("EXSPEED_LEASE_BACKEND", "postgres");
     std::env::set_var("EXSPEED_OFFSET_STORE_POSTGRES_SCHEMA", &schema);
     std::env::set_var("EXSPEED_LEASE_TTL_SECS", "5");
     std::env::set_var("EXSPEED_LEASE_HEARTBEAT_SECS", "1");
@@ -159,7 +153,7 @@ async fn leases_endpoint_postgres_backend_returns_single_cluster_leader_row() {
     );
 
     // Clean up env vars.
-    std::env::remove_var("EXSPEED_CONSUMER_STORE");
+    std::env::remove_var("EXSPEED_LEASE_BACKEND");
     std::env::remove_var("EXSPEED_OFFSET_STORE_POSTGRES_SCHEMA");
     std::env::remove_var("EXSPEED_LEASE_TTL_SECS");
     std::env::remove_var("EXSPEED_LEASE_HEARTBEAT_SECS");

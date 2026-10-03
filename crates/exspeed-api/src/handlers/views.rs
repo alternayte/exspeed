@@ -1,3 +1,6 @@
+//! Materialized tables (`CREATE TABLE … AS SELECT`), served under
+//! `/api/v1/views` for compatibility.
+
 use std::sync::Arc;
 
 use axum::extract::{Extension, Path, Query, State};
@@ -8,8 +11,7 @@ use exspeed_common::auth::Identity;
 use serde::Deserialize;
 use serde_json::json;
 
-use exspeed_processing::types::Value;
-
+use super::queries::exql_error;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -22,122 +24,64 @@ pub struct GetViewParams {
     pub key: Option<String>,
 }
 
-/// Convert an ExQL `Value` to a `serde_json::Value`.
-fn value_to_json(v: &Value) -> serde_json::Value {
-    match v {
-        Value::Null => serde_json::Value::Null,
-        Value::Bool(b) => serde_json::Value::Bool(*b),
-        Value::Int(n) => json!(n),
-        Value::Float(f) => json!(f),
-        Value::Text(s) => serde_json::Value::String(s.clone()),
-        Value::Json(j) => j.clone(),
-        Value::RawJson(b) => serde_json::from_slice(b).unwrap_or(serde_json::Value::Null),
-        Value::Timestamp(ts) => json!(ts),
-    }
+fn deny(identity: Option<Extension<Arc<Identity>>>) -> Option<Response> {
+    identity.and_then(|Extension(id)| super::require_global_admin(&id))
 }
 
 /// GET /api/v1/views
-///
-/// List all registered materialized views.
 pub async fn list_views(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<Arc<Identity>>>,
 ) -> Response {
-    if let Some(Extension(id)) = identity {
-        if let Some(resp) = super::require_global_admin(&id) {
-            return resp;
-        }
+    if let Some(r) = deny(identity) {
+        return r;
     }
-    let infos = state.exql.mv_registry.list();
-    (StatusCode::OK, Json(json!(infos))).into_response()
+    (StatusCode::OK, Json(json!(state.exql.list_tables()))).into_response()
 }
 
-/// GET /api/v1/views/{name}
+/// GET /api/v1/views/{name}[?key=<k>]
 ///
-/// Return rows for a materialized view. With `?key=<k>` returns a single row;
-/// without it returns all rows.
+/// All rows (`{columns, rows, row_count}`), or with `?key=` the row of one
+/// group (`{columns, row}`). The key is the group value; for several
+/// GROUP BY columns it is a JSON array (`["eu",3]`), and empty for a
+/// global aggregate.
 pub async fn get_view(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
     identity: Option<Extension<Arc<Identity>>>,
     Query(params): Query<GetViewParams>,
 ) -> Response {
-    if let Some(Extension(id)) = identity {
-        if let Some(resp) = super::require_global_admin(&id) {
-            return resp;
-        }
+    if let Some(r) = deny(identity) {
+        return r;
     }
-    if let Some(key) = params.key {
-        // Single-row lookup
-        match state.exql.mv_registry.get_row(&name, &key) {
-            Some(row) => {
-                let values: Vec<serde_json::Value> = row.values.iter().map(value_to_json).collect();
-                (
-                    StatusCode::OK,
-                    Json(json!({
-                        "columns": row.columns,
-                        "row": values,
-                    })),
-                )
-                    .into_response()
-            }
-            None => (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": format!("key '{key}' not found in view '{name}'")})),
-            )
-                .into_response(),
-        }
-    } else {
-        // All-rows lookup
-        match state.exql.mv_registry.get_rows(&name) {
-            Some((columns, rows)) => {
-                let json_rows: Vec<Vec<serde_json::Value>> = rows
-                    .iter()
-                    .map(|row| row.values.iter().map(value_to_json).collect())
-                    .collect();
-                let row_count = json_rows.len();
-                (
-                    StatusCode::OK,
-                    Json(json!({
-                        "columns": columns,
-                        "rows": json_rows,
-                        "row_count": row_count,
-                    })),
-                )
-                    .into_response()
-            }
-            None => (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": format!("view '{name}' not found")})),
-            )
-                .into_response(),
-        }
+    let res = match params.key {
+        Some(key) => state.exql.table_row(&name, &key),
+        None => state.exql.table_rows(&name),
+    };
+    match res {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(e) => exql_error(&e),
     }
 }
 
 /// POST /api/v1/views
 ///
-/// Create and start a materialized view.
+/// Create a materialized table (`CREATE TABLE … AS SELECT … GROUP BY …`;
+/// `CREATE MATERIALIZED VIEW` is an alias).
 pub async fn create_view(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<Arc<Identity>>>,
     Json(body): Json<CreateViewRequest>,
 ) -> Response {
-    if let Some(Extension(id)) = identity {
-        if let Some(resp) = super::require_global_admin(&id) {
-            return resp;
-        }
+    if let Some(r) = deny(identity) {
+        return r;
     }
-    match state.exql.create_materialized_view(&body.sql).await {
-        Ok(query_id) => (
-            StatusCode::CREATED,
-            Json(json!({"query_id": query_id, "status": "running"})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+    match state.exql.create_continuous(&body.sql).await {
+        Ok(info) => {
+            let mut v = json!(info);
+            v["query_id"] = json!(info.id);
+            (StatusCode::CREATED, Json(v)).into_response()
+        }
+        Err(e) => exql_error(&e),
     }
 }

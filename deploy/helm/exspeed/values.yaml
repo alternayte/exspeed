@@ -1,0 +1,92 @@
+# Default: a single-node Exspeed with a persistent volume.
+
+image:
+  repository: docker.io/nayth/exspeed
+  tag: ""            # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+# Number of broker pods. 1 = single node. >1 enables multi-pod mode
+# (leader lease + replication), which also requires `cluster` below.
+# ⚠️ Multi-pod HA is experimental until Phase 6 of docs/REVIEW.md lands.
+replicas: 1
+
+ports:
+  tcp: 5933        # binary protocol (SDK clients)
+  http: 8080       # HTTP API, /metrics, /healthz, /readyz, /webhooks
+  cluster: 5934    # replication (multi-pod only)
+
+persistence:
+  enabled: true
+  size: 10Gi
+  storageClass: ""          # "" = cluster default
+  accessModes: [ReadWriteOnce]
+
+# Optional exspeed.toml contents (see `exspeed config print-default`),
+# mounted at /etc/exspeed/exspeed.toml. Environment variables below and the
+# chart's own settings (ports, auth, TLS, cluster) override it.
+config: ""
+#  [storage]
+#  sync = "async"
+#  [server]
+#  max_connections = 4096
+
+# Extra environment variables for the server (see docs/configuration.md).
+env:
+  LOG_FORMAT: json
+  # RUST_LOG: info
+  # EXSPEED_STORAGE_SYNC: sync
+  # EXSPEED_MAX_CONNS: "1024"
+
+# Authentication. Leave both empty to run without auth (trusted network only).
+auth:
+  # Name of an existing Secret holding a shared admin token under key `token`
+  # (sets EXSPEED_AUTH_TOKEN).
+  tokenSecret: ""
+  # Name of an existing Secret holding `credentials.toml` (scoped credentials,
+  # see docs/security.md). Mounted at /etc/exspeed/credentials.toml.
+  credentialsSecret: ""
+
+# TLS for both the TCP and HTTP listeners: an existing kubernetes.io/tls Secret.
+tls:
+  secretName: ""
+
+# Multi-pod coordination (only used when replicas > 1).
+cluster:
+  # Secret with the Postgres URL used for the leader lease and shared state,
+  # under key `url`.
+  postgresUrlSecret: ""
+  # Secret with the replicator bearer token under key `token`
+  # (must map to a credential with the `replicate` action).
+  replicatorTokenSecret: ""
+  leaseTtlSecs: 30
+  leaseHeartbeatSecs: 10
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    memory: 2Gi
+
+# Seconds the kubelet waits after SIGTERM before SIGKILL. Exspeed drains for
+# up to 10 s; leave headroom.
+terminationGracePeriodSeconds: 60
+
+service:
+  type: ClusterIP
+  annotations: {}
+
+# Create a Prometheus Operator ServiceMonitor scraping /metrics.
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  labels: {}
+
+podDisruptionBudget:
+  enabled: false
+  maxUnavailable: 1
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}

@@ -1,9 +1,14 @@
+//! Each test embeds a server plus benchmark clients. They use a
+//! multi-threaded runtime so the server, producer and consumer don't share
+//! one thread: on a single thread, a rate-driven producer falls behind under
+//! CI load and the measured latency turns into queueing time.
+
 use crate::embedded_server;
 use embedded_server::start;
 use exspeed_bench::driver::Target;
 use exspeed_bench::profile::Profile;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn publish_scenario_returns_nonzero_throughput_for_each_payload() {
     let srv = start().await;
     let mut profile = Profile::local();
@@ -20,7 +25,7 @@ async fn publish_scenario_returns_nonzero_throughput_for_each_payload() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn latency_scenario_reports_sensible_percentiles() {
     let srv = start().await;
     let mut profile = Profile::local();
@@ -38,7 +43,7 @@ async fn latency_scenario_reports_sensible_percentiles() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fanout_scenario_returns_one_row_per_consumer_count() {
     let srv = start().await;
     let mut profile = Profile::local();
@@ -54,7 +59,7 @@ async fn fanout_scenario_returns_one_row_per_consumer_count() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exql_scenario_reports_a_sustained_rate() {
     let srv = start().await;
     let mut profile = Profile::local();
@@ -82,7 +87,7 @@ async fn exql_scenario_reports_a_sustained_rate() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exql_returns_zero_with_warning_when_no_candidate_passes() {
     let srv = start().await;
     let mut profile = Profile::local();

@@ -1,953 +1,640 @@
-// Built in Task 8, updated in Task 4 (Phase 3)
+//! One partition: the state readers share with the writer, recovery from
+//! disk, and the lock-free read paths.
+//!
+//! Readers never take the writer's lock and never fsync. They load the high
+//! watermark, then the segment list (an [`ArcSwap`]), then each segment's
+//! committed length, binary-search the sparse index and `pread` forward.
+//! The writer publishes in the opposite order (bytes, index entries,
+//! segment length, high watermark), so a reader never sees a partial frame
+//! or a record at or beyond the high watermark.
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use tokio::sync::mpsc;
-
+use arc_swap::ArcSwap;
 use exspeed_common::Offset;
-use exspeed_streams::record::{Record, StoredRecord};
-use tracing::{error, info};
+use exspeed_streams::{ReadBatch, StorageError, StoredRecord, StreamConfig};
+use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
+use tracing::{info, warn};
 
-use crate::file::io_errors::is_storage_full;
+use crate::encoding::decode_payload;
+use crate::file::fsutil::{atomic_write, fsync_dir, remove_if_exists};
+use crate::file::segment::{
+    create_segment_file, encode_index, header_bytes, idx_path, load_meta, meta_path,
+    parse_seg_name, read_header, save_meta, scan_segment, seg_path, valid_frame_after, FrameError,
+    FrameIter, IndexEntry, Segment, SegmentMeta, SegmentStats, INDEX_ENTRY_LEN, SEGMENT_HEADER_LEN,
+};
 
-use crate::file::bloom_filter::BloomFilter;
-use crate::file::offset_index::OffsetIndex;
-use crate::file::segment_reader::SegmentReader;
-use crate::file::segment_syncer::SegmentSyncerHandle;
-use crate::file::segment_writer::SegmentWriter;
-use crate::file::time_index::{self, TimeIndex};
+/// Name of the truncation intent marker inside a partition directory.
+pub const TRUNCATE_MARKER: &str = "truncate.json";
 
-/// Default maximum segment size before rolling: 256 MiB.
-const DEFAULT_SEGMENT_MAX_BYTES: u64 = 256 * 1024 * 1024;
-
-/// Stats from retention enforcement.
-#[derive(Debug, Default)]
-pub struct RetentionStats {
-    pub segments_deleted: u32,
-    pub bytes_reclaimed: u64,
+/// Health of a partition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PartitionStatus {
+    Healthy,
+    /// An IO error could not be rolled back. The partition is read-only
+    /// until the process restarts and recovery runs.
+    Failed {
+        reason: String,
+    },
 }
 
-/// Information about a segment that has just been sealed (rolled).
-/// Sent via the notification channel so that background tasks (e.g. S3 upload)
-/// can act on the newly sealed segment.
-#[derive(Debug, Clone)]
-pub struct SealedSegmentInfo {
-    pub stream_name: String,
-    pub partition_id: u32,
-    pub seg_path: PathBuf,
-    pub base_offset: u64,
-    pub end_offset: u64,
-    pub size_bytes: u64,
-    pub record_count: u64,
-    pub first_timestamp: u64,
-    pub last_timestamp: u64,
+/// State shared between the writer thread and readers.
+pub struct PartitionShared {
+    pub stream: String,
+    pub dir: PathBuf,
+    segments: ArcSwap<Vec<Arc<Segment>>>,
+    /// One past the last committed record (durable in sync mode, written in
+    /// async mode).
+    committed: AtomicU64,
+    /// Replication floor: visible = min(committed, floor). `u64::MAX` when
+    /// unset.
+    floor: AtomicU64,
+    /// The high watermark readers see.
+    visible: AtomicU64,
+    publish_lock: Mutex<()>,
+    watch_tx: watch::Sender<u64>,
+    failed: AtomicBool,
+    failed_reason: Mutex<Option<String>>,
+    /// Cached `stream.json`. `None` when the file exists but can't be parsed
+    /// — retention and compaction then skip this stream instead of guessing.
+    config: Mutex<Option<StreamConfig>>,
 }
 
-fn now_nanos() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64
-}
-
-/// Pick a base_offset for a throw-away placeholder segment whose filename
-/// is guaranteed not to collide with the old active segment, any doomed
-/// sealed segment, or any file the truncate rewrite is about to create.
-/// We walk down from `u64::MAX` — real segments never reach that range.
-fn pick_placeholder_base(
-    dir: &Path,
-    active_path: &Path,
-    doomed_sealed: &[PathBuf],
-) -> io::Result<u64> {
-    let mut candidate: u64 = u64::MAX;
-    loop {
-        let filename = format!("{:020}.seg", candidate);
-        let path = dir.join(&filename);
-        let collides =
-            path == active_path || doomed_sealed.iter().any(|p| p == &path) || path.exists();
-        if !collides {
-            return Ok(candidate);
-        }
-        candidate = candidate
-            .checked_sub(1)
-            .ok_or_else(|| io::Error::other("no placeholder base_offset available"))?;
-    }
-}
-
-/// Emit a structured `error!` log for a partition write failure. Disk-full
-/// errors are highlighted separately so operators can alert on them.
-fn log_write_error(stream_name: &str, partition_id: u32, msg: &'static str, err: &io::Error) {
-    if is_storage_full(err) {
-        error!(
-            stream = stream_name,
-            partition = partition_id,
-            error = %err,
-            kind = "storage_full",
-            "{msg}: storage full"
-        );
-    } else {
-        error!(
-            stream = stream_name,
-            partition = partition_id,
-            error = %err,
-            kind = "other",
-            "{msg}"
-        );
-    }
-}
-
-/// Manages a single partition's on-disk state: active segment writer and
-/// sealed segment readers.
-///
-/// v0.2.0 removed the separate WAL file — the active segment is the sole
-/// durability journal. Every `append` / `append_batch` writes directly to
-/// the segment and (in sync mode) fsyncs it. In async mode the
-/// `SegmentSyncer` task fsyncs periodically on a cloned file handle.
-pub struct Partition {
-    dir: PathBuf,
-    active_writer: SegmentWriter,
-    sealed_readers: Vec<SegmentReader>,
-    next_offset: u64,
-    stream_name: String,
-    partition_id: u32,
-    segment_max_bytes: u64,
-    seal_tx: Option<mpsc::UnboundedSender<SealedSegmentInfo>>,
-    /// Handle to the per-partition `SegmentSyncer` task in async mode.
-    /// Present only when `FileStorage` is configured with
-    /// `StorageSyncMode::Async`. On segment roll, `roll_segment` uses this
-    /// to swap the syncer's fsync target to the newly created active
-    /// segment so periodic fsync follows the active segment instead of
-    /// fsyncing a sealed (unchanging) file.
-    syncer_handle: Option<Arc<SegmentSyncerHandle>>,
-    /// Secondary index definitions: (index_name, field_path).
-    /// Populated via `register_secondary_index()` when the ExqlEngine loads
-    /// index metadata. Built into `.sidx.{name}` files at segment seal time.
-    pub(crate) secondary_indexes: Vec<(String, String)>,
-}
-
-impl Partition {
-    /// Create a brand-new partition directory with its first segment.
-    ///
-    /// v0.2.0 removed the separate WAL file — the segment is the sole
-    /// durability journal from the first write onwards.
-    pub fn create(dir: &Path, stream_name: &str, partition_id: u32) -> io::Result<Self> {
-        fs::create_dir_all(dir)?;
-
-        let writer = SegmentWriter::create(dir, 0)?;
-
-        Ok(Self {
+impl PartitionShared {
+    pub fn new(
+        stream: &str,
+        dir: &Path,
+        segments: Vec<Arc<Segment>>,
+        next_offset: u64,
+        config: Option<StreamConfig>,
+    ) -> Self {
+        let (watch_tx, _) = watch::channel(next_offset);
+        Self {
+            stream: stream.to_string(),
             dir: dir.to_path_buf(),
-            active_writer: writer,
-            sealed_readers: Vec::new(),
-            next_offset: 0,
-            stream_name: stream_name.to_string(),
-            partition_id,
-            segment_max_bytes: DEFAULT_SEGMENT_MAX_BYTES,
-            seal_tx: None,
-            syncer_handle: None,
-            secondary_indexes: Vec::new(),
+            segments: ArcSwap::from_pointee(segments),
+            committed: AtomicU64::new(next_offset),
+            floor: AtomicU64::new(u64::MAX),
+            visible: AtomicU64::new(next_offset),
+            publish_lock: Mutex::new(()),
+            watch_tx,
+            failed: AtomicBool::new(false),
+            failed_reason: Mutex::new(None),
+            config: Mutex::new(config),
+        }
+    }
+
+    pub fn segments(&self) -> Arc<Vec<Arc<Segment>>> {
+        self.segments.load_full()
+    }
+
+    /// Writer only.
+    pub fn set_segments(&self, list: Vec<Arc<Segment>>) {
+        self.segments.store(Arc::new(list));
+    }
+
+    /// The high watermark: one past the last record readers may see.
+    pub fn high_watermark(&self) -> u64 {
+        self.visible.load(Ordering::Acquire)
+    }
+
+    pub fn committed(&self) -> u64 {
+        self.committed.load(Ordering::Acquire)
+    }
+
+    /// Offset of the first retained record (the first segment's base),
+    /// never above the high watermark.
+    pub fn earliest(&self) -> u64 {
+        let hwm = self.high_watermark();
+        self.segments
+            .load()
+            .first()
+            .map_or(hwm, |s| s.base_offset)
+            .min(hwm)
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        self.segments.load().iter().map(|s| s.len()).sum()
+    }
+
+    /// Writer only: committed data now ends at `next`.
+    pub fn publish_committed(&self, next: u64) {
+        let _g = self.publish_lock.lock().unwrap();
+        self.committed.store(next, Ordering::Release);
+        self.recompute_visible();
+    }
+
+    /// Hold the high watermark at or below `floor` (e.g. the offset a
+    /// replication quorum has acknowledged); `None` removes the floor.
+    pub fn set_floor(&self, floor: Option<u64>) {
+        let _g = self.publish_lock.lock().unwrap();
+        self.floor
+            .store(floor.unwrap_or(u64::MAX), Ordering::Release);
+        self.recompute_visible();
+    }
+
+    fn recompute_visible(&self) {
+        let vis = self
+            .committed
+            .load(Ordering::Acquire)
+            .min(self.floor.load(Ordering::Acquire));
+        self.visible.store(vis, Ordering::Release);
+        self.watch_tx.send_if_modified(|v| {
+            if *v != vis {
+                *v = vis;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.watch_tx.subscribe()
+    }
+
+    pub fn fail(&self, reason: String) {
+        tracing::error!(
+            stream = self.stream.as_str(),
+            reason = reason.as_str(),
+            "partition fenced read-only after an unrecoverable storage error"
+        );
+        *self.failed_reason.lock().unwrap() = Some(reason);
+        self.failed.store(true, Ordering::Release);
+    }
+
+    pub fn failure(&self) -> Option<String> {
+        if self.failed.load(Ordering::Acquire) {
+            self.failed_reason.lock().unwrap().clone()
+        } else {
+            None
+        }
+    }
+
+    pub fn status(&self) -> PartitionStatus {
+        match self.failure() {
+            None => PartitionStatus::Healthy,
+            Some(reason) => PartitionStatus::Failed { reason },
+        }
+    }
+
+    pub fn failed_error(&self) -> Option<StorageError> {
+        self.failure().map(|reason| StorageError::PartitionFailed {
+            stream: self.stream.clone(),
+            reason,
         })
     }
 
-    /// Open an existing partition directory, recovering state via a
-    /// CRC-validating tail scan of the active segment.
-    ///
-    /// v0.2.0 removed the separate `wal.log` file — recovery is now unified
-    /// through `SegmentWriter::recover_tail`, which walks the active segment
-    /// from the header forward and truncates any torn/corrupt tail. If a
-    /// legacy `wal.log` is present the open fails fast rather than silently
-    /// ignoring durable data the caller expected to be replayed.
-    pub fn open(dir: &Path, stream_name: &str, partition_id: u32) -> io::Result<Self> {
-        // Fail-fast if a legacy WAL is present. Pre-v0.2.0 data is unsupported.
-        let legacy_wal = dir.join("wal.log");
-        if legacy_wal.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "legacy wal.log found at {}; v0.2.0 removed the separate \
-                     WAL file. Either delete your data dir (fresh start) or \
-                     downgrade to exspeed 0.1.1.",
-                    legacy_wal.display()
-                ),
-            ));
+    pub fn config(&self) -> Option<StreamConfig> {
+        self.config.lock().unwrap().clone()
+    }
+
+    pub fn set_config(&self, cfg: StreamConfig) {
+        *self.config.lock().unwrap() = Some(cfg);
+    }
+
+    /// Read records at offsets `>= from`, below the high watermark. `strict`
+    /// reports `from` below the earliest retained offset as
+    /// [`StorageError::OffsetOutOfRange`]; otherwise `from` is clamped.
+    pub fn read(
+        &self,
+        from: u64,
+        max_records: usize,
+        max_bytes: usize,
+        strict: bool,
+    ) -> Result<ReadBatch, StorageError> {
+        let hwm = self.high_watermark();
+        let list = self.segments();
+        let earliest = list.first().map_or(hwm, |s| s.base_offset).min(hwm);
+        let mut from = from;
+        if from < earliest {
+            if strict && from < hwm {
+                return Err(StorageError::OffsetOutOfRange {
+                    requested: from,
+                    earliest,
+                });
+            }
+            from = earliest;
         }
 
-        // Find all .seg files, sorted by name (which sorts by base_offset
-        // due to zero-padded filenames).
-        let mut seg_paths: Vec<PathBuf> = fs::read_dir(dir)?
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("seg") {
-                    Some(path)
-                } else {
-                    None
+        let mut out: Vec<StoredRecord> = Vec::new();
+        let mut bytes = 0usize;
+        if from < hwm && max_records > 0 {
+            let start = list
+                .partition_point(|s| s.base_offset <= from)
+                .saturating_sub(1);
+            // Initial read size: roughly what the limits ask for.
+            let chunk = max_bytes
+                .min(max_records.saturating_mul(256))
+                .saturating_add(4096)
+                .clamp(8 * 1024, 1 << 20);
+            'segments: for seg in &list[start..] {
+                if seg.base_offset >= hwm {
+                    break;
                 }
-            })
-            .collect();
-        seg_paths.sort();
-
-        if seg_paths.is_empty() {
-            // No segments exist — treat as a fresh partition.
-            return Self::create(dir, stream_name, partition_id);
-        }
-
-        // Open all but the last as sealed readers.
-        let mut sealed_readers = Vec::new();
-        for path in &seg_paths[..seg_paths.len() - 1] {
-            sealed_readers.push(SegmentReader::open(path)?);
-        }
-
-        // Derive next_offset from sealed segments first.
-        let mut next_offset: u64 = 0;
-        for reader in &sealed_readers {
-            if let Some(last) = reader.last_offset()? {
-                next_offset = next_offset.max(last + 1);
-            }
-        }
-
-        // Tail-scan the active segment: validate every frame's CRC and
-        // truncate at the first torn/corrupt record. Replaces WAL replay.
-        let last_seg_path = &seg_paths[seg_paths.len() - 1];
-        let (max_offset_in_active, _max_ts, current_size) =
-            SegmentWriter::recover_tail(last_seg_path)?;
-
-        if let Some(m) = max_offset_in_active {
-            next_offset = next_offset.max(m + 1);
-        }
-        // An empty active segment (e.g. after a roll followed by retention
-        // deleting every sealed segment) still pins the next offset to its
-        // base offset; without this, offsets would restart at 0.
-        let active_base = SegmentReader::open(last_seg_path)?.base_offset();
-        next_offset = next_offset.max(active_base);
-
-        info!(
-            stream = stream_name,
-            partition = partition_id,
-            segment = %last_seg_path.display(),
-            current_size,
-            next_offset,
-            "partition recovery complete (tail-scan)"
-        );
-
-        // Open the active segment for append at the post-recovery length.
-        let last_reader = SegmentReader::open(last_seg_path)?;
-        let base_offset = last_reader.base_offset();
-        let active_writer = SegmentWriter::open_append(last_seg_path, base_offset, current_size)?;
-
-        Ok(Self {
-            dir: dir.to_path_buf(),
-            active_writer,
-            sealed_readers,
-            next_offset,
-            stream_name: stream_name.to_string(),
-            partition_id,
-            segment_max_bytes: DEFAULT_SEGMENT_MAX_BYTES,
-            seal_tx: None,
-            syncer_handle: None,
-            secondary_indexes: Vec::new(),
-        })
-    }
-
-    /// Append a record to this partition.
-    ///
-    /// v0.2.0: the active segment is the sole durability journal. The record
-    /// is written to the segment and `sync_data` is called directly (this
-    /// used to happen via the WAL). If the segment exceeds `segment_max_bytes`
-    /// after the write, a new segment is rolled.
-    pub fn append(&mut self, record: &Record) -> io::Result<(Offset, u64)> {
-        let offset = Offset(self.next_offset);
-        // Honor the caller-supplied timestamp when present (replication
-        // follower path preserves the leader's persisted timestamp); else
-        // mint a fresh one from the wall clock.
-        let timestamp = record.timestamp_ns.unwrap_or_else(now_nanos);
-
-        // Write to the active segment (sole durability path as of v0.2.0).
-        if let Err(e) = self.active_writer.append(offset, timestamp, record) {
-            log_write_error(
-                &self.stream_name,
-                self.partition_id,
-                "segment write failed",
-                &e,
-            );
-            return Err(e);
-        }
-        // Fsync the segment directly (previously done via the WAL).
-        self.active_writer.sync_data()?;
-
-        self.next_offset += 1;
-
-        // Check if we need to roll the segment.
-        if self.active_writer.bytes_written() >= self.segment_max_bytes {
-            self.roll_segment()?;
-        }
-
-        Ok((offset, timestamp))
-    }
-
-    /// Append N records in one shot via `SegmentWriter::append_batch`.
-    ///
-    /// v0.2.0: the active segment is the sole durability journal. A single
-    /// `write_all` lands every record's framed bytes in the page cache; if
-    /// `sync_now` is true the writer issues exactly one `sync_data` at the
-    /// end (group-commit + fsync). In `Async` mode `sync_now` is false —
-    /// the `SegmentSyncer` task handles the periodic fsync on a cloned file
-    /// handle.
-    ///
-    /// On `Err`, the entire batch fails from the caller's perspective. If
-    /// the write reached the page cache partially before failing, the next
-    /// `Partition::open` will detect the torn tail via `recover_tail` and
-    /// truncate to the last durable frame.
-    pub fn append_batch(
-        &mut self,
-        records: &[Record],
-        sync_now: bool,
-    ) -> io::Result<Vec<(Offset, u64)>> {
-        if records.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Phase 1: assign offsets + timestamps.
-        let mut assignments: Vec<(Offset, u64, Record)> = Vec::with_capacity(records.len());
-        let mut results: Vec<(Offset, u64)> = Vec::with_capacity(records.len());
-        for record in records {
-            let offset = Offset(self.next_offset);
-            let timestamp = record.timestamp_ns.unwrap_or_else(now_nanos);
-            assignments.push((offset, timestamp, record.clone()));
-            results.push((offset, timestamp));
-            self.next_offset += 1;
-        }
-
-        // Phase 2: ONE segment append + (conditional) sync_data. No WAL step.
-        if let Err(e) = self.active_writer.append_batch(&assignments, sync_now) {
-            log_write_error(
-                &self.stream_name,
-                self.partition_id,
-                "segment batch write failed",
-                &e,
-            );
-            self.next_offset -= records.len() as u64;
-            return Err(e);
-        }
-
-        // Segment roll AFTER the batch completes.
-        if self.active_writer.bytes_written() >= self.segment_max_bytes {
-            self.roll_segment()?;
-        }
-
-        Ok(results)
-    }
-
-    /// Read records from this partition starting at `from_offset`.
-    ///
-    /// Reads from sealed segments first, then from the active segment.
-    /// The active writer is synced before reading so that recently appended
-    /// data is visible.
-    pub fn read(&self, from: Offset, max_records: usize) -> io::Result<Vec<StoredRecord>> {
-        let mut result = Vec::new();
-        let mut remaining = max_records;
-
-        // Read from sealed segments (they are ordered by base_offset).
-        for reader in &self.sealed_readers {
-            if remaining == 0 {
-                break;
-            }
-            let records = reader.read_from(from.0, remaining)?;
-            remaining -= records.len();
-            result.extend(records);
-        }
-
-        // Read from the active segment.
-        if remaining > 0 {
-            // Sync so that buffered writes are visible to a new reader.
-            self.active_writer.sync()?;
-
-            let active_reader = SegmentReader::open(self.active_writer.path())?;
-            let records = active_reader.read_from(from.0, remaining)?;
-            result.extend(records);
-        }
-
-        Ok(result)
-    }
-
-    /// Find the offset of the first record at or after the given timestamp.
-    ///
-    /// Checks sealed segments (which have time indexes) in reverse order,
-    /// then falls back to scanning the active segment.
-    pub fn seek_by_time(&self, timestamp: u64) -> io::Result<Offset> {
-        // Check sealed segments (they have time indexes)
-        for reader in self.sealed_readers.iter().rev() {
-            if let Some(first_ts) = reader.first_timestamp() {
-                if timestamp >= first_ts {
-                    if let Some(offset) = reader.seek_by_time(timestamp) {
-                        return Ok(Offset(offset));
+                let end = seg.len();
+                let pos = if from > seg.base_offset {
+                    seg.position_for_offset(from)?.min(end)
+                } else {
+                    SEGMENT_HEADER_LEN
+                };
+                let mut it = FrameIter::new(seg.file(), pos, end, chunk);
+                loop {
+                    let f = match it.next_frame() {
+                        Ok(Some(f)) => f,
+                        Ok(None) => break,
+                        // Truncated underneath us (truncate_from): stop.
+                        Err(FrameError::Short { .. }) => break,
+                        Err(e) => {
+                            return Err(StorageError::CorruptedRecord {
+                                offset: from,
+                                reason: e.into_io(&seg.path).to_string(),
+                            })
+                        }
+                    };
+                    if f.offset >= hwm {
+                        break 'segments;
+                    }
+                    if f.offset < from {
+                        continue;
+                    }
+                    let rec = decode_payload(&f.payload).map_err(|reason| {
+                        StorageError::CorruptedRecord {
+                            offset: f.offset,
+                            reason,
+                        }
+                    })?;
+                    let size = rec.value.len()
+                        + rec.subject.len()
+                        + rec.key.as_ref().map_or(0, |k| k.len());
+                    if !out.is_empty() && bytes + size > max_bytes {
+                        break 'segments;
+                    }
+                    bytes += size;
+                    out.push(rec);
+                    if out.len() >= max_records {
+                        break 'segments;
                     }
                 }
             }
         }
-        // Fall back: scan active segment
-        self.active_writer.sync()?;
-        let active_reader = SegmentReader::open(self.active_writer.path())?;
-        let records = active_reader.read_all()?;
-        for record in &records {
-            if record.timestamp >= timestamp {
-                return Ok(record.offset);
-            }
-        }
-        Ok(Offset(self.next_offset))
+        // An empty read below the high watermark means every offset in
+        // `[from, hwm)` is a gap (compaction); skip past it.
+        let next_offset = out.last().map_or(from.max(hwm), |r| r.offset.0 + 1);
+        Ok(ReadBatch {
+            records: out,
+            next_offset: Offset(next_offset),
+            high_watermark: Offset(hwm),
+        })
     }
 
-    /// Remove the sealed segment at `i` from `self.sealed_readers`, delete
-    /// its `.seg` / `.idx` / `.tix` files on disk, and account for the
-    /// reclaimed space in `stats`. Errors from the file deletes are swallowed
-    /// (they're best-effort) — the in-memory state is always updated.
-    fn remove_sealed_segment(&mut self, i: usize, stats: &mut RetentionStats) {
-        let reader = self.sealed_readers.remove(i);
-        let seg_path = reader.path().to_path_buf();
-        let size = reader.file_size();
-
-        let _ = fs::remove_file(&seg_path);
-        let _ = fs::remove_file(seg_path.with_extension("idx"));
-        let _ = fs::remove_file(seg_path.with_extension("tix"));
-        let _ = fs::remove_file(seg_path.with_extension("bloom"));
-
-        // Clean up secondary index files (.sidx.*)
-        if let Some(parent) = seg_path.parent() {
-            if let Some(stem) = seg_path.file_stem().and_then(|s| s.to_str()) {
-                if let Ok(entries) = fs::read_dir(parent) {
-                    for entry in entries.flatten() {
-                        if let Some(name) = entry.file_name().to_str() {
-                            if name.starts_with(stem) && name.contains(".sidx.") {
-                                let _ = fs::remove_file(entry.path());
-                            }
+    /// Offset of the first record with timestamp `>= ts`, or the high
+    /// watermark when there is none.
+    pub fn seek_by_time(&self, ts: u64) -> Result<u64, StorageError> {
+        let hwm = self.high_watermark();
+        let list = self.segments();
+        for seg in list.iter() {
+            if seg.base_offset >= hwm {
+                break;
+            }
+            match seg.stats().max_ts {
+                Some(max) if max >= ts => {}
+                _ => continue,
+            }
+            let end = seg.len();
+            let pos = seg.position_for_time(ts)?.min(end);
+            let mut it = FrameIter::new(seg.file(), pos, end, 64 * 1024);
+            loop {
+                match it.next_frame() {
+                    Ok(Some(f)) => {
+                        if f.offset >= hwm {
+                            return Ok(hwm);
+                        }
+                        if f.timestamp >= ts {
+                            return Ok(f.offset);
                         }
                     }
-                }
-            }
-        }
-
-        stats.segments_deleted += 1;
-        stats.bytes_reclaimed += size;
-    }
-
-    /// Enforce retention: delete old sealed segments based on age and size limits.
-    /// Never deletes the active segment.
-    pub fn enforce_retention(
-        &mut self,
-        max_age_secs: u64,
-        max_bytes: u64,
-    ) -> io::Result<RetentionStats> {
-        let mut stats = RetentionStats::default();
-        let now = now_nanos();
-        let age_cutoff_nanos = now.saturating_sub(max_age_secs * 1_000_000_000);
-
-        // Age-based deletion: remove sealed segments where all records are older than cutoff
-        let mut indices_to_remove: Vec<usize> = Vec::new();
-        for (i, reader) in self.sealed_readers.iter().enumerate() {
-            let is_old = match reader.last_timestamp() {
-                Some(ts) => ts < age_cutoff_nanos,
-                None => {
-                    // No time index -- try reading last record
-                    match reader.last_offset() {
-                        Ok(Some(_)) => false, // has records but no timestamp info -- keep it safe
-                        _ => true,            // empty segment, ok to delete
-                    }
-                }
-            };
-            if is_old {
-                indices_to_remove.push(i);
-            }
-        }
-
-        // Remove in reverse order so indices stay valid
-        for &i in indices_to_remove.iter().rev() {
-            self.remove_sealed_segment(i, &mut stats);
-        }
-
-        // Size-based deletion: remove oldest sealed segments until under limit
-        loop {
-            let total_size = self.total_bytes();
-            if total_size <= max_bytes || self.sealed_readers.is_empty() {
-                break;
-            }
-            self.remove_sealed_segment(0, &mut stats);
-        }
-
-        Ok(stats)
-    }
-
-    /// Return the next offset to be assigned.
-    pub fn next_offset(&self) -> u64 {
-        self.next_offset
-    }
-
-    /// Flush buffered writes in the active segment so readers see them.
-    pub fn sync_active(&self) -> std::io::Result<()> {
-        self.active_writer.sync()
-    }
-
-    /// Snapshot of the sealed segment readers (cheap Clone via derive).
-    pub fn sealed_readers(&self) -> &Vec<SegmentReader> {
-        &self.sealed_readers
-    }
-
-    /// Path to the active segment file.
-    pub fn active_path(&self) -> std::path::PathBuf {
-        self.active_writer.path().to_path_buf()
-    }
-
-    /// Return the earliest retained offset across sealed and active segments.
-    ///
-    /// Returns 0 when no records have ever been written (or `next_offset == 0`).
-    /// Returns `next_offset` when the stream exists but all records have been
-    /// trimmed — callers treat `earliest == next` as empty.
-    pub fn earliest_offset(&self) -> u64 {
-        if let Some(first) = self.sealed_readers.first() {
-            return first.base_offset();
-        }
-        self.active_writer.base_offset()
-    }
-
-    /// Delete sealed segments whose records are entirely below `keep_from`.
-    ///
-    /// The segment containing `keep_from` is preserved intact (sub-segment
-    /// rewrite is out of scope). Safe to call with `keep_from` at or before
-    /// the current earliest offset — such calls are no-ops.
-    pub fn trim_up_to(&mut self, keep_from: u64) -> io::Result<RetentionStats> {
-        let mut stats = RetentionStats::default();
-        if keep_from == 0 {
-            return Ok(stats);
-        }
-
-        // Remove any sealed segment whose last offset is strictly less than
-        // `keep_from`. We walk from oldest to newest and stop at the first
-        // segment that might contain `keep_from`.
-        let mut to_remove: Vec<usize> = Vec::new();
-        for (i, reader) in self.sealed_readers.iter().enumerate() {
-            let last = match reader.last_offset()? {
-                Some(o) => o,
-                None => {
-                    // Empty sealed segment — safe to drop.
-                    to_remove.push(i);
-                    continue;
-                }
-            };
-            if last < keep_from {
-                to_remove.push(i);
-            } else {
-                break;
-            }
-        }
-
-        for &i in to_remove.iter().rev() {
-            self.remove_sealed_segment(i, &mut stats);
-        }
-
-        Ok(stats)
-    }
-
-    /// Drop records at offsets `>= drop_from`. Record-exact truncation —
-    /// the partition is rewritten so that subsequent `stream_bounds`
-    /// returns `next == drop_from`, and the next `append` assigns exactly
-    /// `drop_from`.
-    ///
-    /// Algorithm:
-    ///   1. Classify the segment that straddles `drop_from` (the one whose
-    ///      records include offsets `< drop_from` AND `>= drop_from`), if any.
-    ///      It is either the last surviving sealed segment or the active
-    ///      segment.
-    ///   2. Read the surviving records (offset `< drop_from`) from the
-    ///      straddled segment into memory.
-    ///   3. Delete every segment whose records are entirely `>= drop_from`
-    ///      (sealed and the active segment if it falls past drop_from).
-    ///   4. Delete the straddled segment's file.
-    ///   5. Create a fresh active segment at the straddled segment's
-    ///      `base_offset` and replay the surviving records into it.
-    ///   6. Set `next_offset = drop_from`.
-    ///
-    /// Called only on the follower's divergent-history recovery path, so
-    /// the rewrite cost (bounded by `replication_lag`) is acceptable;
-    /// correctness over speed.
-    pub fn truncate_from(&mut self, drop_from: u64) -> io::Result<RetentionStats> {
-        let mut stats = RetentionStats::default();
-        if drop_from >= self.next_offset {
-            return Ok(stats);
-        }
-
-        // ── Step 1: Classify segments. ────────────────────────────────────
-        //
-        // Sealed segments are ordered by base_offset. We split them into:
-        //   - kept:    entirely below drop_from (base < drop_from AND
-        //              last_offset < drop_from)
-        //   - straddle: contains drop_from (some records below, some at/past)
-        //   - gone:    base >= drop_from (entirely at or past drop_from)
-        //
-        // The active segment is either straddled, entirely gone, or entirely
-        // below drop_from (which can't happen here because drop_from <
-        // next_offset, and the active always contains next_offset - 1 when
-        // the stream has records).
-
-        enum StraddleSegment {
-            Sealed(usize, PathBuf, u64), // (index in sealed_readers, path, base_offset)
-            Active(PathBuf, u64),        // (path, base_offset)
-            None,                        // no straddle (e.g. drop_from == 0)
-        }
-
-        let active_base = self.active_writer.base_offset();
-        let active_path = self.active_writer.path().to_path_buf();
-
-        let straddle = if drop_from == 0 {
-            StraddleSegment::None
-        } else if active_base < drop_from {
-            // drop_from - 1 is at or past active_base → active is the straddle.
-            StraddleSegment::Active(active_path.clone(), active_base)
-        } else {
-            // drop_from - 1 is in some sealed segment. Find the last sealed
-            // segment whose base_offset < drop_from.
-            match self
-                .sealed_readers
-                .iter()
-                .rposition(|r| r.base_offset() < drop_from)
-            {
-                Some(i) => {
-                    let r = &self.sealed_readers[i];
-                    StraddleSegment::Sealed(i, r.path().to_path_buf(), r.base_offset())
-                }
-                None => StraddleSegment::None,
-            }
-        };
-
-        // ── Step 2: Read surviving records from the straddle. ─────────────
-        //
-        // Do this BEFORE any deletion so a read error leaves the partition
-        // intact.
-        let (replay_records, replay_base_offset): (Vec<StoredRecord>, u64) = match &straddle {
-            StraddleSegment::None => (Vec::new(), drop_from),
-            StraddleSegment::Sealed(_i, path, base) => {
-                let reader = SegmentReader::open(path)?;
-                let records: Vec<StoredRecord> = reader
-                    .read_all()?
-                    .into_iter()
-                    .filter(|r| r.offset.0 < drop_from)
-                    .collect();
-                (records, *base)
-            }
-            StraddleSegment::Active(_path, base) => {
-                self.active_writer.sync()?;
-                let reader = SegmentReader::open(&active_path)?;
-                let records: Vec<StoredRecord> = reader
-                    .read_all()?
-                    .into_iter()
-                    .filter(|r| r.offset.0 < drop_from)
-                    .collect();
-                (records, *base)
-            }
-        };
-
-        // ── Step 3: Determine what to delete. ─────────────────────────────
-        //
-        // We'll delete the straddle (if any) + all sealed segments strictly
-        // past the straddle + the old active segment (whether or not it's
-        // the straddle). Kept sealed segments stay untouched.
-
-        let kept_sealed_count = match &straddle {
-            StraddleSegment::Sealed(i, _, _) => *i, // sealed below the straddle
-            StraddleSegment::Active(_, _) => self.sealed_readers.len(),
-            StraddleSegment::None => {
-                // drop_from is 0 or earlier than every sealed segment.
-                // Keep nothing.
-                0
-            }
-        };
-
-        // ── Step 4: Close and delete doomed segments. ─────────────────────
-        //
-        // Close the active writer first by replacing it with a placeholder.
-        // The placeholder's base_offset is picked to avoid colliding with
-        // any retained or doomed segment filename.
-        let sealed_doomed_paths: Vec<PathBuf> = self
-            .sealed_readers
-            .iter()
-            .skip(kept_sealed_count)
-            .map(|r| r.path().to_path_buf())
-            .collect();
-        let placeholder_base =
-            pick_placeholder_base(&self.dir, &active_path, &sealed_doomed_paths)?;
-        let placeholder = SegmentWriter::create(&self.dir, placeholder_base)?;
-        let placeholder_path = placeholder.path().to_path_buf();
-        let old_active_size = self.active_writer.bytes_written();
-        drop(std::mem::replace(&mut self.active_writer, placeholder));
-
-        // Drop doomed sealed segments (straddle + everything past it) via
-        // the shared helper. Walk in reverse so indices stay valid.
-        while self.sealed_readers.len() > kept_sealed_count {
-            self.remove_sealed_segment(self.sealed_readers.len() - 1, &mut stats);
-        }
-
-        // Drop the old active segment's files. It isn't a "sealed" segment
-        // for stats purposes (no increment to `segments_deleted`), but its
-        // bytes are reclaimed.
-        let _ = fs::remove_file(&active_path);
-        let _ = fs::remove_file(active_path.with_extension("idx"));
-        let _ = fs::remove_file(active_path.with_extension("tix"));
-        let _ = fs::remove_file(active_path.with_extension("bloom"));
-        stats.bytes_reclaimed += old_active_size;
-
-        // ── Step 5: Build the new active segment and replay. ──────────────
-        let new_active = SegmentWriter::create(&self.dir, replay_base_offset)?;
-        drop(std::mem::replace(&mut self.active_writer, new_active));
-        // Remove the placeholder now that the real writer owns a different file.
-        let _ = fs::remove_file(&placeholder_path);
-        let _ = fs::remove_file(placeholder_path.with_extension("idx"));
-        let _ = fs::remove_file(placeholder_path.with_extension("tix"));
-        let _ = fs::remove_file(placeholder_path.with_extension("bloom"));
-
-        for stored in &replay_records {
-            let record = Record {
-                key: stored.key.clone(),
-                value: stored.value.clone(),
-                subject: stored.subject.clone(),
-                headers: stored.headers.clone(),
-                timestamp_ns: None,
-            };
-            self.active_writer
-                .append(stored.offset, stored.timestamp, &record)?;
-        }
-        self.active_writer.sync()?;
-
-        // ── Step 6: Update next_offset. ───────────────────────────────────
-        self.next_offset = drop_from;
-
-        Ok(stats)
-    }
-
-    /// Total bytes across all segments (sealed + active).
-    pub fn total_bytes(&self) -> u64 {
-        let sealed: u64 = self.sealed_readers.iter().map(|r| r.file_size()).sum();
-        sealed + self.active_writer.bytes_written()
-    }
-
-    /// Set the notification sender for sealed segments.
-    pub fn set_seal_notifier(&mut self, tx: mpsc::UnboundedSender<SealedSegmentInfo>) {
-        self.seal_tx = Some(tx);
-    }
-
-    /// Clone the seal notification sender, if one has been set.
-    pub fn seal_tx_clone(&self) -> Option<mpsc::UnboundedSender<SealedSegmentInfo>> {
-        self.seal_tx.clone()
-    }
-
-    /// Override the segment max bytes threshold. Intended for tests that
-    /// need to force segment rolling without writing 256MB of data.
-    pub fn set_segment_max_bytes(&mut self, max: u64) {
-        self.segment_max_bytes = max;
-    }
-
-    /// Clone the active segment's file handle so `SegmentSyncer` can issue
-    /// `sync_data` without holding the per-partition `Mutex<Partition>`
-    /// that serializes writes. Both handles share the same kernel fd —
-    /// concurrent fsync on the syncer's handle does not block writes
-    /// through the `SegmentWriter`'s handle, which is exactly the
-    /// async-storage-mode semantic.
-    pub(crate) fn try_clone_active_segment_file(&self) -> io::Result<std::fs::File> {
-        self.active_writer.try_clone_file()
-    }
-
-    /// Register the `SegmentSyncer` handle for this partition so that
-    /// `roll_segment` can swap the syncer's fsync target when a segment
-    /// rolls. Called once at construction (in async mode) from
-    /// `FileStorage`; in sync mode the handle remains `None`.
-    pub(crate) fn set_syncer_handle(&mut self, handle: Arc<SegmentSyncerHandle>) {
-        self.syncer_handle = Some(handle);
-    }
-
-    /// Register a secondary index definition so that `.sidx.{name}` files
-    /// are built when segments are sealed. Also backfills existing sealed
-    /// segments that do not yet have a `.sidx.{name}` file.
-    ///
-    /// No-op if an index with the same name is already registered.
-    pub fn register_secondary_index(&mut self, name: String, field_path: String) {
-        if !self.secondary_indexes.iter().any(|(n, _)| n == &name) {
-            self.secondary_indexes
-                .push((name.clone(), field_path.clone()));
-
-            // Force-roll the active segment so it becomes sealed and gets
-            // indexed. Without this, streams under 256MB would never have
-            // .sidx files because the segment never rolls naturally.
-            if self.next_offset > 0 {
-                if let Err(e) = self.roll_segment() {
-                    tracing::warn!(index = %name, error = %e, "failed to roll segment for index backfill");
-                }
-            }
-
-            if let Err(e) = self.backfill_secondary_index(&name, &field_path) {
-                tracing::warn!(index = %name, error = %e, "failed to backfill secondary index");
-            }
-        }
-    }
-
-    /// Build `.sidx.{name}` files for every sealed segment that does not
-    /// already have one. Called from `register_secondary_index` so that
-    /// indexes created after data already exists cover the full history.
-    fn backfill_secondary_index(&self, name: &str, field_path: &str) -> io::Result<()> {
-        for reader in &self.sealed_readers {
-            let sidx_path = reader.path().with_extension(format!("sidx.{name}"));
-            if sidx_path.exists() {
-                continue; // already indexed
-            }
-            let records = reader.read_all()?;
-            let mut entries = Vec::new();
-            for record in &records {
-                if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&record.value) {
-                    if let Some(val) = json.get(field_path) {
-                        let val_str = match val {
-                            serde_json::Value::String(s) => s.clone(),
-                            other => other.to_string(),
-                        };
-                        entries.push((
-                            crate::file::secondary_index::SecondaryIndex::hash_value(&val_str),
-                            record.offset.0,
-                        ));
+                    Ok(None) | Err(FrameError::Short { .. }) => break,
+                    Err(e) => {
+                        return Err(StorageError::CorruptedRecord {
+                            offset: seg.base_offset,
+                            reason: e.into_io(&seg.path).to_string(),
+                        })
                     }
                 }
             }
-            if !entries.is_empty() {
-                crate::file::secondary_index::SecondaryIndex::build(&sidx_path, &mut entries)?;
-                info!(
-                    index = name,
-                    segment = %reader.path().display(),
-                    entries = entries.len(),
-                    "backfilled secondary index for sealed segment"
-                );
-            }
         }
-        Ok(())
+        Ok(hwm)
     }
+}
 
-    /// Roll the active segment: seal it, build indexes, open a reader for it,
-    /// and create a new active segment starting at `next_offset`.
-    fn roll_segment(&mut self) -> io::Result<()> {
-        // Never seal an empty segment: the new segment would get the same
-        // base offset (and file name) as the old one, and the old path would
-        // end up registered as both sealed and active.
-        if self.active_writer.base_offset() >= self.next_offset {
-            return Ok(());
-        }
+/// Durability mode of a partition writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Durability {
+    /// fsync before acknowledging (and before data becomes visible).
+    Sync,
+    /// Acknowledge after the write; fsync in the background.
+    Async,
+}
 
-        // Sync the current active writer.
-        self.active_writer.sync()?;
+/// What recovery found on disk: everything the writer needs to resume.
+pub struct Recovered {
+    pub segments: Vec<Arc<Segment>>,
+    /// Append handle on the active segment.
+    pub active_file: File,
+    pub active_entries: Vec<IndexEntry>,
+    pub active_stats: SegmentStats,
+    pub next_offset: u64,
+}
 
-        // Build indexes for the sealed segment.
-        let seg_path = self.active_writer.path().to_path_buf();
-        self.build_indexes(&seg_path)?;
+#[derive(Debug, Serialize, Deserialize)]
+struct TruncateMarker {
+    drop_from: u64,
+}
 
-        // Open the current segment as a sealed reader (will load the new index files).
-        let sealed = SegmentReader::open(&seg_path)?;
+fn invalid(msg: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg)
+}
 
-        // Collect metadata for the sealed segment notification.
-        let info = SealedSegmentInfo {
-            stream_name: self.stream_name.clone(),
-            partition_id: self.partition_id,
-            seg_path: seg_path.clone(),
-            base_offset: sealed.base_offset(),
-            end_offset: self.next_offset.saturating_sub(1),
-            size_bytes: sealed.file_size(),
-            record_count: 0, // Not tracked per-segment currently
-            first_timestamp: sealed.first_timestamp().unwrap_or(0),
-            last_timestamp: sealed.last_timestamp().unwrap_or(0),
+/// Segment base offsets present in `dir`, ascending.
+pub fn list_segment_bases(dir: &Path) -> io::Result<Vec<u64>> {
+    let mut bases: Vec<u64> = fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| parse_seg_name(e.file_name().to_str()?))
+        .collect();
+    bases.sort_unstable();
+    Ok(bases)
+}
+
+/// Remove leftovers of interrupted operations: `*.tmp` sidecars,
+/// `*.compacting` rewrites, and `.idx` / `.meta` files whose segment is gone.
+fn cleanup_dir(dir: &Path, bases: &[u64]) -> io::Result<()> {
+    let mut removed = false;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let orphan = |ext: &str| {
+            name.strip_suffix(ext)
+                .and_then(|stem| stem.parse::<u64>().ok())
+                .is_some_and(|b| bases.binary_search(&b).is_err())
         };
-
-        // Create the new segment before mutating any state, so a failure
-        // leaves the partition exactly as it was.
-        let new_writer = SegmentWriter::create(&self.dir, self.next_offset)?;
-        self.sealed_readers.push(sealed);
-        self.active_writer = new_writer;
-
-        // If an async-mode syncer is attached, hand it a clone of the new
-        // active segment's file handle. Without this the syncer would keep
-        // fsyncing the now-sealed (unchanging) segment instead of the new
-        // active one.
-        if let Some(handle) = &self.syncer_handle {
-            let new_file = self.active_writer.try_clone_file()?;
-            handle.set_active_file(new_file);
+        if name.ends_with(".tmp")
+            || name.ends_with(".compacting")
+            || orphan(".idx")
+            || orphan(".meta")
+        {
+            remove_if_exists(&entry.path())?;
+            removed = true;
         }
+    }
+    if removed {
+        fsync_dir(dir)?;
+    }
+    Ok(())
+}
 
-        // Send sealed-segment notification (non-blocking, best-effort).
-        if let Some(ref tx) = self.seal_tx {
-            let _ = tx.send(info);
+/// Open a sealed segment from its `.meta`, rebuilding the index and metadata
+/// with a scan when they are missing or don't match the file (a crash
+/// during roll or compaction).
+fn open_sealed(dir: &Path, base: u64) -> io::Result<Segment> {
+    let path = seg_path(dir, base);
+    let file_len = fs::metadata(&path)?.len();
+    if let Some(meta) = load_meta(&meta_path(dir, base)) {
+        let idx_len = fs::metadata(idx_path(dir, base)).map(|m| m.len()).ok();
+        if meta.base_offset == base
+            && meta.len == file_len
+            && idx_len == Some(meta.index_entries * INDEX_ENTRY_LEN as u64)
+        {
+            let seg = Segment::new_sealed(dir, &meta)?;
+            if read_header(seg.file(), &path)? != base {
+                return Err(invalid(format!(
+                    "{}: header base offset does not match file name",
+                    path.display()
+                )));
+            }
+            return Ok(seg);
         }
+    }
+    warn!(segment = %path.display(), "segment metadata missing or stale; rebuilding index");
+    let file = File::open(&path)?;
+    if read_header(&file, &path)? != base {
+        return Err(invalid(format!(
+            "{}: header base offset does not match file name",
+            path.display()
+        )));
+    }
+    let scan = scan_segment(&file, base, file_len)?;
+    if let Some(stop) = scan.stop {
+        // Sealed segments were fsynced in full before the roll completed,
+        // so a bad frame here is real corruption.
+        return Err(invalid(format!(
+            "{}: corrupt sealed segment at byte {}: {}",
+            path.display(),
+            stop.pos,
+            stop.reason
+        )));
+    }
+    let meta = SegmentMeta {
+        base_offset: base,
+        len: scan.stats.len,
+        end_offset: scan.stats.end_offset,
+        first_ts: scan.stats.first_ts,
+        max_ts: scan.stats.max_ts,
+        records: scan.stats.records,
+        index_entries: scan.entries.len() as u64,
+    };
+    atomic_write(&idx_path(dir, base), &encode_index(&scan.entries))?;
+    save_meta(&meta_path(dir, base), &meta)?;
+    Segment::new_sealed(dir, &meta)
+}
 
-        Ok(())
+/// Recover a partition directory: finish an interrupted truncation, clean
+/// up leftovers, open sealed segments from their metadata and tail-scan the
+/// active segment.
+///
+/// A bad frame in the active segment is a torn tail when nothing valid
+/// follows it; it is truncated away. If valid frames follow it, the file is
+/// corrupt in the middle: in [`Durability::Sync`] every acknowledged record
+/// was fsynced, so this is real corruption and recovery fails loudly. In
+/// [`Durability::Async`] the kernel may have written later pages before
+/// earlier ones before a crash, so the tail is truncated at the first bad
+/// frame (acknowledged-but-unsynced data is the documented async risk).
+pub fn recover(dir: &Path, durability: Durability) -> io::Result<Recovered> {
+    fs::create_dir_all(dir)?;
+    let marker = dir.join(TRUNCATE_MARKER);
+    if let Ok(data) = fs::read(&marker) {
+        let m: TruncateMarker = serde_json::from_slice(&data)
+            .map_err(|e| invalid(format!("{}: {e}", marker.display())))?;
+        info!(dir = %dir.display(), drop_from = m.drop_from, "finishing interrupted truncation");
+        apply_truncation(dir, m.drop_from)?;
+        remove_if_exists(&marker)?;
+        fsync_dir(dir)?;
     }
 
-    /// Scan the segment at `seg_path` and build companion `.idx` and `.tix`
-    /// index files alongside it.
-    fn build_indexes(&self, seg_path: &Path) -> io::Result<()> {
-        // Open a temporary reader to scan the data. Indexes don't exist yet,
-        // so offset_index and time_index will be None — that's fine, we only
-        // need sequential scanning here.
-        let reader = SegmentReader::open(seg_path)?;
-        let index_data = reader.scan_for_index_data()?;
-
-        if index_data.is_empty() {
-            return Ok(());
-        }
-
-        // Build offset index (.idx).
-        let offset_entries: Vec<(u64, u32)> = index_data
-            .iter()
-            .map(|&(offset, file_pos, _)| (offset, file_pos))
-            .collect();
-        let idx_path = seg_path.with_extension("idx");
-        OffsetIndex::build(&idx_path, &offset_entries)?;
-
-        // Build timestamp index (.tix).
-        let time_entries: Vec<(u64, u64)> = index_data
-            .iter()
-            .map(|&(offset, _, timestamp)| (timestamp, offset))
-            .collect();
-        let tix_path = seg_path.with_extension("tix");
-        TimeIndex::build(&tix_path, &time_entries, time_index::DEFAULT_INTERVAL)?;
-
-        // Build bloom filter (.bloom) for record keys.
-        let bloom_path = seg_path.with_extension("bloom");
-        let all_records = reader.read_all()?;
-        let keys: Vec<&[u8]> = all_records
-            .iter()
-            .filter_map(|r| r.key.as_ref().map(|k| k.as_ref()))
-            .collect();
-        if !keys.is_empty() {
-            let _ = BloomFilter::build(&bloom_path, &keys);
-        }
-
-        // Build secondary indexes (.sidx.{name})
-        for (idx_name, field_path) in &self.secondary_indexes {
-            let sidx_path = seg_path.with_extension(format!("sidx.{idx_name}"));
-            let mut entries = Vec::new();
-            for record in &all_records {
-                if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&record.value) {
-                    if let Some(val) = json.get(field_path.as_str()) {
-                        let val_str = match val {
-                            serde_json::Value::String(s) => s.clone(),
-                            other => other.to_string(),
-                        };
-                        entries.push((
-                            crate::file::secondary_index::SecondaryIndex::hash_value(&val_str),
-                            record.offset.0,
-                        ));
-                    }
-                }
-            }
-            if !entries.is_empty() {
-                let _ =
-                    crate::file::secondary_index::SecondaryIndex::build(&sidx_path, &mut entries);
-            }
-        }
-
-        Ok(())
+    let mut bases = list_segment_bases(dir)?;
+    cleanup_dir(dir, &bases)?;
+    if bases.is_empty() {
+        drop(create_segment_file(dir, 0)?);
+        bases.push(0);
     }
+
+    let active_base = *bases.last().unwrap();
+    let mut segments: Vec<Arc<Segment>> = Vec::with_capacity(bases.len());
+    let mut prev_end: Option<u64> = None;
+    for &base in &bases[..bases.len() - 1] {
+        let seg = open_sealed(dir, base)?;
+        if let Some(pe) = prev_end {
+            if base < pe {
+                return Err(invalid(format!(
+                    "{}: segment base {base} overlaps the previous segment (ends at {pe})",
+                    dir.display()
+                )));
+            }
+        }
+        prev_end = Some(seg.end_offset());
+        segments.push(Arc::new(seg));
+    }
+    if let Some(pe) = prev_end {
+        if active_base < pe {
+            return Err(invalid(format!(
+                "{}: active segment base {active_base} overlaps the previous segment (ends at {pe})",
+                dir.display()
+            )));
+        }
+    }
+
+    // Active segment: CRC-validating tail scan.
+    let path = seg_path(dir, active_base);
+    let mut file = OpenOptions::new().read(true).append(true).open(&path)?;
+    if file.metadata()?.len() < SEGMENT_HEADER_LEN {
+        // Crash while the segment was being created: it never held data.
+        warn!(segment = %path.display(), "rewriting torn segment header");
+        file.set_len(0)?;
+        std::io::Write::write_all(&mut file, &header_bytes(active_base))?;
+        file.sync_all()?;
+    }
+    if read_header(&file, &path)? != active_base {
+        return Err(invalid(format!(
+            "{}: header base offset does not match file name",
+            path.display()
+        )));
+    }
+    let file_len = file.metadata()?.len();
+    let scan = scan_segment(&file, active_base, file_len)?;
+    if let Some(stop) = &scan.stop {
+        let last = scan
+            .stats
+            .end_offset
+            .checked_sub(1)
+            .filter(|_| scan.stats.records > 0);
+        if durability == Durability::Sync && valid_frame_after(&file, stop.pos, file_len, last)? {
+            return Err(invalid(format!(
+                "{}: corruption in the middle of the active segment at byte {} ({}); \
+                 valid records follow it, so this is not a torn write. Refusing to \
+                 truncate acknowledged data — restore the file or remove the damaged \
+                 tail manually",
+                path.display(),
+                stop.pos,
+                stop.reason
+            )));
+        }
+        warn!(
+            segment = %path.display(),
+            at = stop.pos,
+            dropped_bytes = file_len - scan.stats.len,
+            reason = stop.reason.as_str(),
+            "truncating torn tail of active segment"
+        );
+        file.set_len(scan.stats.len)?;
+        file.sync_all()?;
+    }
+    atomic_write(&idx_path(dir, active_base), &encode_index(&scan.entries))?;
+    remove_if_exists(&meta_path(dir, active_base))?;
+
+    let next_offset = scan
+        .stats
+        .end_offset
+        .max(active_base)
+        .max(prev_end.unwrap_or(0));
+    let active = Segment::new_active(dir, active_base, scan.stats, scan.entries.clone())?;
+    segments.push(Arc::new(active));
+    Ok(Recovered {
+        segments,
+        active_file: file,
+        active_entries: scan.entries,
+        active_stats: scan.stats,
+        next_offset,
+    })
+}
+
+/// Write the truncation intent marker (tmp + rename + dir fsync).
+pub fn write_truncate_marker(dir: &Path, drop_from: u64) -> io::Result<()> {
+    let json = serde_json::to_vec(&TruncateMarker { drop_from }).map_err(io::Error::other)?;
+    atomic_write(&dir.join(TRUNCATE_MARKER), &json)
+}
+
+/// Drop every record at offset `>= drop_from` from the files in `dir`.
+/// Idempotent, so recovery can re-run it after a crash:
+///
+/// 1. delete every segment whose base is `>= drop_from` (newest first);
+/// 2. truncate the last remaining segment just before its first record
+///    `>= drop_from`;
+/// 3. if that segment now ends exactly at `drop_from` it becomes the active
+///    segment (its `.meta` is removed); otherwise it stays sealed (fresh
+///    `.idx` + `.meta`) and an empty segment with base `drop_from` is
+///    created, so the next offset is `drop_from` after any restart.
+pub fn apply_truncation(dir: &Path, drop_from: u64) -> io::Result<()> {
+    let bases = list_segment_bases(dir)?;
+    for &base in bases.iter().rev().filter(|&&b| b >= drop_from) {
+        remove_if_exists(&seg_path(dir, base))?;
+        remove_if_exists(&idx_path(dir, base))?;
+        remove_if_exists(&meta_path(dir, base))?;
+    }
+    fsync_dir(dir)?;
+
+    let Some(&base) = bases.iter().rev().find(|&&b| b < drop_from) else {
+        drop(create_segment_file(dir, drop_from)?);
+        return Ok(());
+    };
+    let path = seg_path(dir, base);
+    let file = OpenOptions::new().read(true).write(true).open(&path)?;
+    let file_len = file.metadata()?.len();
+    let mut it = FrameIter::new(&file, SEGMENT_HEADER_LEN, file_len, 1 << 20);
+    let mut cut = SEGMENT_HEADER_LEN;
+    loop {
+        match it.next_frame() {
+            Ok(Some(f)) if f.offset < drop_from => cut = f.pos + f.size,
+            Ok(_) => break,
+            Err(FrameError::Io(e)) => return Err(e),
+            // A torn tail only exists past the records we keep.
+            Err(_) => break,
+        }
+    }
+    file.set_len(cut)?;
+    file.sync_all()?;
+    let scan = scan_segment(&file, base, cut)?;
+    if scan.stats.end_offset.max(base) == drop_from {
+        remove_if_exists(&meta_path(dir, base))?;
+        atomic_write(&idx_path(dir, base), &encode_index(&scan.entries))?;
+    } else {
+        let meta = SegmentMeta {
+            base_offset: base,
+            len: scan.stats.len,
+            end_offset: scan.stats.end_offset,
+            first_ts: scan.stats.first_ts,
+            max_ts: scan.stats.max_ts,
+            records: scan.stats.records,
+            index_entries: scan.entries.len() as u64,
+        };
+        atomic_write(&idx_path(dir, base), &encode_index(&scan.entries))?;
+        save_meta(&meta_path(dir, base), &meta)?;
+        drop(create_segment_file(dir, drop_from)?);
+    }
+    fsync_dir(dir)
 }

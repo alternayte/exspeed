@@ -4,146 +4,28 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::Args;
-use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot, Semaphore};
-use tokio_util::codec::{FramedRead, FramedWrite};
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, info_span, warn, Instrument};
 
 use exspeed_broker::broker_append::BrokerAppend;
-use exspeed_broker::consumer_state::DeliveryBatch;
 use exspeed_broker::replication::{ReplicationClient, ReplicationCoordinator, ReplicationServer};
 use exspeed_broker::Broker;
-use exspeed_common::auth::{Action, CredentialStore, Identity, Permission, StreamGlob};
-use exspeed_common::types::StreamName;
+use exspeed_common::auth::CredentialStore;
 use exspeed_connectors::ConnectorManager;
 use exspeed_processing::ExqlEngine;
-use exspeed_protocol::codec::ExspeedCodec;
-use exspeed_protocol::messages::record_delivery::RecordDelivery;
-use exspeed_protocol::messages::{ClientMessage, ServerMessage};
 use exspeed_storage::file::FileStorage;
 use exspeed_streams::StorageEngine;
-use sha2::{Digest, Sha256};
+
+use crate::session::{self, SessionContext};
+
+/// A TLS handshake must finish within this time or the socket is dropped.
+const TLS_ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Default cluster-replication bind address. Matches the advertised default
 /// in the replication design doc and the Plan G Wave 5 contract.
 const DEFAULT_CLUSTER_BIND: &str = "0.0.0.0:5934";
-
-/// Parse `EXSPEED_CLUSTER_BIND` (default `0.0.0.0:5934`). Returns `None` on
-/// parse failure so the caller can fall back rather than panicking at startup.
-fn cluster_bind_addr() -> Option<SocketAddr> {
-    let raw =
-        std::env::var("EXSPEED_CLUSTER_BIND").unwrap_or_else(|_| DEFAULT_CLUSTER_BIND.to_string());
-    match raw.parse() {
-        Ok(a) => Some(a),
-        Err(e) => {
-            warn!(raw = %raw, error = %e, "EXSPEED_CLUSTER_BIND invalid — treating as unset");
-            None
-        }
-    }
-}
-
-/// What address followers should dial to reach this pod's cluster listener.
-/// Defaults to the bind string; set `EXSPEED_CLUSTER_ADVERTISE` when the
-/// container's bind address differs from what followers can route to
-/// (k8s service name, external LB host, etc.).
-fn cluster_advertise_addr(bind: SocketAddr) -> String {
-    std::env::var("EXSPEED_CLUSTER_ADVERTISE").unwrap_or_else(|_| bind.to_string())
-}
-
-/// The raw bearer a follower sends on the replication Connect handshake.
-/// Must resolve (after sha256) to a credential in the shared credentials
-/// store that holds `actions = ["replicate"]`. Required in multi-pod mode;
-/// startup hard-fails if missing there.
-fn replicator_credential() -> Option<String> {
-    std::env::var("EXSPEED_REPLICATOR_CREDENTIAL").ok()
-}
-
-/// True when the operator asked for a coordinated backend. That's the
-/// single source of truth for "this pod is part of a multi-pod deployment"
-/// — every downstream multi-pod decision (build coord, bind cluster
-/// listener, run the supervisor) branches on this one check.
-fn multi_pod_mode() -> bool {
-    matches!(
-        std::env::var("EXSPEED_CONSUMER_STORE").as_deref(),
-        Ok("postgres") | Ok("redis")
-    )
-}
-
-/// Per-follower mpsc capacity. 100k records is ~100MB at 1KB records —
-/// generous enough that bursty writes don't drop a healthy follower, small
-/// enough that a permanently-stuck follower doesn't balloon leader memory.
-///
-/// Defense-in-depth cap at 10_000_000: a misconfigured env var that
-/// reads `100000000` (extra zero) would otherwise reserve ~10GB of
-/// heap per follower the moment a session registers. Above that the
-/// disk-based follower-seed flow is a better answer than heap.
-fn replication_follower_queue_records() -> usize {
-    const MAX: usize = 10_000_000;
-    std::env::var("EXSPEED_REPLICATION_FOLLOWER_QUEUE_RECORDS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|v| v.min(MAX))
-        .unwrap_or(100_000)
-}
-
-/// Synthetic identity used when auth is globally disabled. Grants every verb
-/// against every stream so the per-op `authorize` gates short-circuit to
-/// allow. Cheap to construct (a few allocations); called once per Connect
-/// in the open-broker case.
-fn anonymous_identity() -> Identity {
-    Identity {
-        name: "anonymous".to_string(),
-        permissions: vec![Permission {
-            streams: StreamGlob::compile("*", "anonymous").expect("* is a valid glob"),
-            actions: Action::Publish | Action::Subscribe | Action::Admin,
-        }],
-    }
-}
-
-/// Send a 401 error frame and bump `exspeed_auth_denied_total`. Used when a
-/// data-plane op arrives before a successful Connect.
-async fn reject_unauthenticated<W>(
-    framed: &mut FramedWrite<W, ExspeedCodec>,
-    correlation_id: u32,
-    metrics: &exspeed_common::Metrics,
-    op: &'static str,
-) -> Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    metrics.auth_denied("unauthorized", "tcp", op);
-    let response = ServerMessage::Error {
-        code: 401,
-        message: "unauthorized".into(),
-    }
-    .into_frame(correlation_id);
-    framed.send(response).await?;
-    Ok(())
-}
-
-/// Send a 403 error frame and bump `exspeed_auth_denied_total`. The
-/// connection stays open — only the offending op is rejected.
-async fn reject_forbidden<W>(
-    framed: &mut FramedWrite<W, ExspeedCodec>,
-    correlation_id: u32,
-    metrics: &exspeed_common::Metrics,
-    op: &'static str,
-) -> Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    metrics.auth_denied("forbidden", "tcp", op);
-    let response = ServerMessage::Error {
-        code: 403,
-        message: "forbidden".into(),
-    }
-    .into_frame(correlation_id);
-    framed.send(response).await?;
-    Ok(())
-}
 
 /// Storage durability mode for the `--storage-sync` CLI flag.
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -155,76 +37,134 @@ pub enum StorageSyncArg {
     Async,
 }
 
-#[derive(Args)]
+/// Resolved server settings. The CLI builds this from defaults, the config
+/// file, the environment and flags (see [`crate::config`]); embedders and
+/// tests construct it directly, usually as `ServerArgs { .., ..Default::default() }`.
+#[derive(Debug, Clone)]
 pub struct ServerArgs {
-    /// Address to bind to
-    #[arg(long, default_value = "0.0.0.0:5933")]
+    /// Client protocol listener.
     pub bind: String,
-
-    /// Address for the HTTP API
-    #[arg(long, default_value = "0.0.0.0:8080")]
+    /// HTTP API listener.
     pub api_bind: String,
-
-    /// Directory for persistent data
-    #[arg(long, default_value = "./exspeed-data")]
     pub data_dir: PathBuf,
-
-    /// Shared bearer token. When set, required on all TCP and HTTP connections.
-    #[arg(long, env = "EXSPEED_AUTH_TOKEN", hide_env_values = true)]
+    /// Shared admin bearer token. When set (or a credentials file exists),
+    /// every TCP and HTTP connection must authenticate.
     pub auth_token: Option<String>,
-
-    /// Path to a TOML credentials file. When unset here, falls back to
-    /// `EXSPEED_CREDENTIALS_FILE` and then to `{data_dir}/credentials.toml`.
-    /// Having a first-class field lets integration tests point at a per-test
-    /// tempfile without mutating process-global env vars.
-    #[arg(long, env = "EXSPEED_CREDENTIALS_FILE")]
+    /// Credentials file; falls back to `{data_dir}/credentials.toml` when
+    /// that exists.
     pub credentials_file: Option<PathBuf>,
-
-    /// Path to PEM-encoded server certificate (full chain). Must be set with --tls-key.
-    #[arg(long, env = "EXSPEED_TLS_CERT")]
     pub tls_cert: Option<PathBuf>,
-
-    /// Path to PEM-encoded private key. Must be set with --tls-cert.
-    #[arg(long, env = "EXSPEED_TLS_KEY")]
     pub tls_key: Option<PathBuf>,
-
-    /// Storage durability mode. `sync` = group commit + fsync per batch (safe default).
-    /// `async` = batch without fsync, periodic fsync on `--storage-sync-interval-ms`.
-    #[arg(long, value_enum, default_value = "sync", env = "EXSPEED_STORAGE_SYNC")]
     pub storage_sync: StorageSyncArg,
-
-    /// Appender flush window in microseconds. Incoming appends are coalesced
-    /// into a batch for up to this many µs before being committed to disk.
-    #[arg(long, default_value_t = 500, env = "EXSPEED_FLUSH_WINDOW_US")]
     pub storage_flush_window_us: u64,
-
-    /// Flush the appender batch early when this many records are queued.
-    #[arg(long, default_value_t = 256, env = "EXSPEED_FLUSH_THRESHOLD_RECORDS")]
     pub storage_flush_threshold_records: usize,
-
-    /// Flush the appender batch early when this many bytes are queued.
-    #[arg(
-        long,
-        default_value_t = 1_048_576,
-        env = "EXSPEED_FLUSH_THRESHOLD_BYTES"
-    )]
     pub storage_flush_threshold_bytes: usize,
-
-    /// Interval in milliseconds between periodic fsyncs in async sync mode.
-    /// Only relevant when `--storage-sync=async`.
-    #[arg(long, default_value_t = 10, env = "EXSPEED_SYNC_INTERVAL_MS")]
     pub storage_sync_interval_ms: u64,
-
-    /// Unflushed-bytes threshold to trigger an early fsync in async sync mode.
-    /// Currently reserved for future use — timer-only in this release.
-    #[arg(long, default_value_t = 4 * 1024 * 1024, env = "EXSPEED_SYNC_BYTES")]
     pub storage_sync_bytes: usize,
+    /// Default `msg_id` dedup window for streams that don't set one.
+    pub dedup_window_secs: u64,
+    pub max_connections: usize,
+    /// How long open connections get to finish on shutdown.
+    pub drain_timeout_secs: u64,
+    /// `log` or `file`.
+    pub connector_offset_store: String,
+    pub cluster: ClusterArgs,
+    /// `text` / `json`; `None` = the environment decides.
+    pub log_format: Option<String>,
+    pub log_level: Option<String>,
+    /// The config file these settings came from, if any.
+    pub config_file: Option<PathBuf>,
+}
 
-    /// mpsc channel capacity for per-subscription delivery tasks. Larger values
-    /// tolerate burstier producers at the cost of more memory per subscription.
-    /// Wired through ServerArgs now; consumed by the broker in a future task.
-    #[arg(long, default_value_t = 8192, env = "EXSPEED_DELIVERY_BUFFER")]
-    pub delivery_buffer: usize,
+/// Multi-pod settings (`[cluster]`).
+#[derive(Debug, Clone)]
+pub struct ClusterArgs {
+    /// `none`, `postgres` or `redis`.
+    pub lease: String,
+    pub postgres_url: Option<String>,
+    pub postgres_schema: String,
+    pub redis_url: Option<String>,
+    pub redis_key_prefix: String,
+    pub lease_ttl_secs: u64,
+    pub lease_heartbeat_secs: u64,
+    /// Replication listener.
+    pub bind: String,
+    /// Address peers dial; defaults to `bind`.
+    pub advertise: Option<String>,
+    /// Token followers present on the replication handshake.
+    pub replicator_credential: Option<String>,
+    pub follower_queue_records: usize,
+}
+
+impl Default for ClusterArgs {
+    fn default() -> Self {
+        Self {
+            lease: "none".into(),
+            postgres_url: None,
+            postgres_schema: "public".into(),
+            redis_url: None,
+            redis_key_prefix: "exspeed:lease:".into(),
+            lease_ttl_secs: 30,
+            lease_heartbeat_secs: 10,
+            bind: DEFAULT_CLUSTER_BIND.into(),
+            advertise: None,
+            replicator_credential: None,
+            follower_queue_records: 100_000,
+        }
+    }
+}
+
+impl ClusterArgs {
+    pub fn multi_pod(&self) -> bool {
+        self.lease != "none"
+    }
+
+    pub fn lease_config(&self) -> exspeed_broker::lease::LeaseConfig {
+        exspeed_broker::lease::LeaseConfig {
+            backend: self.lease.clone(),
+            postgres_url: self.postgres_url.clone(),
+            postgres_schema: self.postgres_schema.clone(),
+            redis_url: self.redis_url.clone(),
+            redis_key_prefix: self.redis_key_prefix.clone(),
+            ttl: std::time::Duration::from_secs(self.lease_ttl_secs),
+            heartbeat: std::time::Duration::from_secs(self.lease_heartbeat_secs),
+        }
+    }
+}
+
+impl Default for ServerArgs {
+    fn default() -> Self {
+        Self::new("./exspeed-data")
+    }
+}
+
+impl ServerArgs {
+    /// Built-in defaults with the given data directory.
+    pub fn new(data_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            bind: "0.0.0.0:5933".into(),
+            api_bind: "0.0.0.0:8080".into(),
+            data_dir: data_dir.into(),
+            auth_token: None,
+            credentials_file: None,
+            tls_cert: None,
+            tls_key: None,
+            storage_sync: StorageSyncArg::Sync,
+            storage_flush_window_us: 500,
+            storage_flush_threshold_records: 256,
+            storage_flush_threshold_bytes: 1_048_576,
+            storage_sync_interval_ms: 10,
+            storage_sync_bytes: 4 * 1024 * 1024,
+            dedup_window_secs: 300,
+            max_connections: 1024,
+            drain_timeout_secs: 10,
+            connector_offset_store: "log".into(),
+            cluster: ClusterArgs::default(),
+            log_format: None,
+            log_level: None,
+            config_file: None,
+        }
+    }
 }
 
 pub async fn run(args: ServerArgs) -> Result<()> {
@@ -341,10 +281,9 @@ where
         warn!("TLS disabled — do not expose broker ports to the public internet");
     }
 
-    // Acquire exclusive data-dir lock — held for the lifetime of this process.
-    // Leaks intentionally; the OS releases the flock on process exit.
-    let lock = crate::cli::server_lock::acquire_data_dir_lock(&args.data_dir)?;
-    Box::leak(Box::new(lock));
+    // Exclusive data-dir lock, held until this function returns (or the
+    // process exits) so an embedded server can be restarted in-process.
+    let _data_dir_lock = crate::cli::server_lock::acquire_data_dir_lock(&args.data_dir)?;
 
     // Build storage sync mode from CLI args.
     let storage_sync_mode = match args.storage_sync {
@@ -363,19 +302,11 @@ where
     }
 
     // Build appender config from CLI args.
-    let appender_config = exspeed_storage::file::segment_appender::AppenderConfig {
+    let appender_config = exspeed_storage::file::AppenderConfig {
         flush_window: std::time::Duration::from_micros(args.storage_flush_window_us),
         flush_threshold_records: args.storage_flush_threshold_records,
         flush_threshold_bytes: args.storage_flush_threshold_bytes,
     };
-
-    // Set delivery_buffer env var so Task 8 (broker mpsc bump) can pick it up.
-    // SAFETY: single-threaded at this point in startup; no other thread reads this var yet.
-    // LINT: set_var is deprecated in edition 2024 for unsafe reasons but acceptable here.
-    #[allow(deprecated)]
-    unsafe {
-        std::env::set_var("EXSPEED_DELIVERY_BUFFER", args.delivery_buffer.to_string());
-    }
 
     // Create storage
     let file_storage = Arc::new(FileStorage::open_with_mode(
@@ -383,38 +314,13 @@ where
         storage_sync_mode,
         appender_config,
     )?);
-    // Check for S3 tiered storage
-    let storage: Arc<dyn StorageEngine> = match exspeed_storage::s3::config::S3Config::from_env() {
-        Ok(Some(s3_config)) => {
-            info!("S3 tiered storage enabled");
-            let s3_storage = exspeed_storage::s3::S3TieredStorage::new(
-                (*file_storage).clone(),
-                s3_config.bucket,
-                s3_config.prefix,
-                s3_config.local_max_bytes,
-            )
-            .await
-            .expect("failed to initialize S3 tiered storage");
-            Arc::new(s3_storage)
-        }
-        Ok(None) => {
-            info!("using local file storage");
-            file_storage.clone()
-        }
-        Err(e) => {
-            panic!("S3 storage configuration error: {e}");
-        }
-    };
+    let storage: Arc<dyn StorageEngine> = file_storage.clone();
 
     // Create metrics
     let (metrics, prometheus_registry) = exspeed_common::Metrics::new();
     let metrics = Arc::new(metrics);
 
-    // Create BrokerAppend with dedup window from env (default 300s)
-    let dedup_window_secs: u64 = std::env::var("EXSPEED_DEDUP_WINDOW_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(300);
+    let dedup_window_secs = args.dedup_window_secs;
     let broker_append = Arc::new(
         BrokerAppend::new(storage.clone(), dedup_window_secs).with_metrics(metrics.clone()),
     );
@@ -441,31 +347,9 @@ where
         }
     }
 
-    // Build consumer store (selects backend from EXSPEED_CONSUMER_STORE or EXSPEED_OFFSET_STORE)
-    let consumer_backend = std::env::var("EXSPEED_CONSUMER_STORE")
-        .or_else(|_| std::env::var("EXSPEED_OFFSET_STORE"))
-        .unwrap_or_else(|_| "file".to_string());
-    let consumer_store = exspeed_broker::consumer_store::from_env(&args.data_dir)
+    let lease = exspeed_broker::lease::from_config(&args.cluster.lease_config())
         .await
-        .expect("failed to initialize consumer store");
-    info!(
-        backend = consumer_backend.as_str(),
-        "consumer store initialized"
-    );
-
-    // Build work coordinator (uses same backend as consumer store).
-    let work_coordinator = exspeed_broker::work_coordinator::from_env()
-        .await
-        .expect("failed to initialize work coordinator");
-    info!(
-        supports_coordination = work_coordinator.supports_coordination(),
-        "work coordinator initialized"
-    );
-
-    // Build lease backend (same env var dispatch as work coordinator).
-    let lease = exspeed_broker::lease::from_env()
-        .await
-        .expect("failed to initialize lease backend");
+        .context("failed to initialize the lease backend")?;
     info!(
         lease_backend = if lease.supports_coordination() {
             "coordinated"
@@ -478,9 +362,9 @@ where
     // Warn if file-backed — multi-pod deployments need postgres/redis.
     if !lease.supports_coordination() {
         warn!(
-            "lease backend is file — multi-pod deployment not supported; \
+            "no lease backend — multi-pod deployment not supported; \
              all connectors and continuous queries will run on this pod. \
-             Set EXSPEED_CONSUMER_STORE=postgres|redis for multi-pod coordination."
+             Set cluster.lease (EXSPEED_LEASE_BACKEND) to postgres or redis for multi-pod."
         );
     }
 
@@ -492,28 +376,38 @@ where
     // Single-pod deployments get `None` for both and skip every multi-pod
     // branch below — no cluster listener, no follower client, no
     // role-transition supervisor, no `state.replication_coordinator`.
-    let multi_pod = multi_pod_mode();
+    let multi_pod = args.cluster.multi_pod();
     let replication_coordinator: Option<Arc<ReplicationCoordinator>> = if multi_pod {
-        let queue_cap = replication_follower_queue_records();
+        let queue_cap = args.cluster.follower_queue_records;
         Some(ReplicationCoordinator::new(metrics.clone(), queue_cap))
     } else {
         None
     };
-    let cluster_bind = cluster_bind_addr();
-    let replication_advertise: Option<String> = match (multi_pod, cluster_bind) {
-        (true, Some(bind)) => Some(cluster_advertise_addr(bind)),
-        _ => None,
-    };
+    let cluster_bind: Option<SocketAddr> =
+        if multi_pod {
+            Some(args.cluster.bind.parse().with_context(|| {
+                format!("cluster.bind `{}` is not host:port", args.cluster.bind)
+            })?)
+        } else {
+            None
+        };
+    let replication_advertise: Option<String> = cluster_bind.map(|bind| {
+        args.cluster
+            .advertise
+            .clone()
+            .unwrap_or_else(|| bind.to_string())
+    });
 
     // Spawn cluster-leader leadership state machine. The advertised
     // endpoint is written into the `cluster:leader` lease row on every
     // acquire so followers can discover the current leader via
     // `list_all()` without a separate registry.
     let leadership = Arc::new(
-        exspeed_broker::leadership::ClusterLeadership::spawn(
+        exspeed_broker::leadership::ClusterLeadership::spawn_with_ttl(
             lease.clone(),
             metrics.clone(),
             replication_advertise.clone(),
+            std::time::Duration::from_secs(args.cluster.lease_ttl_secs),
         )
         .await,
     );
@@ -521,17 +415,7 @@ where
     // Validate heartbeat vs TTL — heartbeat must be well under TTL or the
     // first heartbeat fires after the lease has already expired and the
     // cluster will thrash.
-    let lease_ttl = exspeed_broker::lease::ttl_from_env();
-    let lease_hb = exspeed_broker::lease::heartbeat_interval_from_env();
-    if lease_hb * 2 >= lease_ttl {
-        warn!(
-            ttl_secs = lease_ttl.as_secs(),
-            heartbeat_secs = lease_hb.as_secs(),
-            "EXSPEED_LEASE_HEARTBEAT_SECS should be at most TTL/2 to avoid \
-             expiring the lease before the first refresh; current config will \
-             cause leader thrashing"
-        );
-    }
+    let lease_ttl = std::time::Duration::from_secs(args.cluster.lease_ttl_secs);
 
     // Give the retry loop one full tick to race for the lease before we
     // log posture or spawn the supervisor. We wait for is_leader=true with
@@ -558,14 +442,7 @@ where
 
     // Posture log (always). Emitted after lease is built so the backend name
     // appears alongside auth/tls state.
-    let lease_backend_name = if lease.supports_coordination() {
-        // Read the env var so we show postgres/redis rather than "coordinated"
-        std::env::var("EXSPEED_CONSUMER_STORE")
-            .or_else(|_| std::env::var("EXSPEED_OFFSET_STORE"))
-            .unwrap_or_else(|_| "file".to_string())
-    } else {
-        "file".to_string()
-    };
+    let lease_backend_name = exspeed_broker::lease::backend_from_env();
     let (cred_file_count, cred_legacy) = credential_store
         .as_ref()
         .map(|s| s.source_breakdown())
@@ -602,11 +479,8 @@ where
         storage.clone(),
         broker_append,
         args.data_dir.clone(),
-        consumer_store,
-        work_coordinator.clone(),
         lease.clone(),
         metrics.clone(),
-        args.delivery_buffer,
     );
     let broker = Arc::new(match replication_coordinator.as_ref() {
         Some(coord) => broker_builder.with_replication_coordinator(coord.clone()),
@@ -615,10 +489,6 @@ where
     // Only the leader accepts writes. Every write path (TCP, HTTP, webhooks,
     // connectors, ExQL) goes through `broker.log`, which enforces this.
     broker.log.set_write_gate(leadership.clone());
-    broker
-        .load_consumers()
-        .await
-        .map_err(|e| anyhow::anyhow!(e))?;
 
     // Spawn watcher that flips `dedup_ready` once all per-stream rebuild tasks finish.
     {
@@ -637,43 +507,24 @@ where
     }
 
     // Spawn periodic dedup snapshot task (runs every 60s, final snapshot on shutdown).
-    let _snapshot_handle = exspeed_broker::snapshot_task::spawn_dedup_snapshot_task(
+    let snapshot_handle = exspeed_broker::snapshot_task::spawn_dedup_snapshot_task(
         broker.broker_append.clone(),
         args.data_dir.clone(),
         cancel_token.clone(),
     );
 
-    // Spawn queue-depth sampler (5s interval) — reports per-subscription
-    // delivery channel fill ratio to `subscription_queue_fill_ratio`.
-    exspeed_broker::queue_depth_task::spawn_queue_depth_sampler(broker.clone(), metrics.clone());
-
-    // Warn if grouped consumers exist but the coordinator doesn't support
-    // multi-pod coordination (file/s3 backends).
-    if !work_coordinator.supports_coordination() {
-        let consumers = broker.consumers.read().unwrap();
-        let grouped_count = consumers
-            .values()
-            .filter(|c| !c.config.group.is_empty())
-            .count();
-        if grouped_count > 0 {
-            warn!(
-                grouped_consumers = grouped_count,
-                "grouped consumers exist but the active backend does not support multi-pod \
-                 coordination — running multiple pods will cause duplicate deliveries. \
-                 Set EXSPEED_CONSUMER_STORE=postgres or redis for multi-pod safety."
-            );
-        }
-    }
-
-    // Create offset store (backend selected by EXSPEED_OFFSET_STORE env var)
-    let offset_backend =
-        std::env::var("EXSPEED_OFFSET_STORE").unwrap_or_else(|_| "file".to_string());
-    let offset_store = exspeed_connectors::offset_store::from_env(&args.data_dir, storage.clone())
-        .await
-        .expect("failed to initialize offset store");
+    // Connector offsets: the `__connector_offsets` stream (default, replicates
+    // with the log) or atomic files (`EXSPEED_CONNECTOR_OFFSET_STORE=file`).
+    let offset_backend = args.connector_offset_store.clone();
+    let offset_store = exspeed_connectors::offset_store::build(
+        &offset_backend,
+        &args.data_dir,
+        broker.log.clone(),
+    )
+    .map_err(|e| anyhow::anyhow!("connector offset store: {e}"))?;
     info!(
         backend = offset_backend.as_str(),
-        "offset store initialized"
+        "connector offset store initialized"
     );
 
     // Create connector manager
@@ -702,22 +553,27 @@ where
 
     // Create ExQL engine. Reads hit storage directly; query output is written
     // through the broker's write path.
-    let exql_storage: Arc<dyn StorageEngine> = Arc::new(
-        exspeed_broker::log::LogBackedStorage::new(broker.log.clone()),
+    let exql = Arc::new(
+        ExqlEngine::new(
+            broker.log.clone(),
+            args.data_dir.clone(),
+            leadership.clone(),
+            metrics.clone(),
+            exspeed_processing::ExqlConfig::from_env(),
+        )
+        .map_err(|e| anyhow::anyhow!("ExQL engine: {e}"))?,
     );
-    let exql = Arc::new(ExqlEngine::new(
-        exql_storage,
-        args.data_dir.clone(),
-        leadership.clone(),
-        metrics.clone(),
-    ));
-    exql.load().unwrap_or_else(|e| warn!("ExQL load: {e}"));
+    if let Err(e) = exql.load().await {
+        warn!("ExQL load: {e}");
+    }
     // resume_all_and_run(token) is called by the leader supervisor (Task 9).
 
     // Clone before moving into AppState so the leader supervisor can capture them.
     let connector_manager_for_supervisor = connector_manager.clone();
+    let connector_manager_for_shutdown = connector_manager.clone();
     let exql_for_supervisor = exql.clone();
     let exql_for_tcp = exql.clone();
+    let exql_for_shutdown = exql.clone();
 
     // Readiness flag, flipped to true after the HTTP API server is spawned.
     // Until then, /readyz returns 503 with {"status":"starting"}.
@@ -726,7 +582,7 @@ where
     // Create shared AppState. `replication_coordinator` lights up
     // `GET /api/v1/cluster/followers` in multi-pod mode and stays `None`
     // elsewhere (the endpoint returns 503 in that case, with a hint
-    // pointing at EXSPEED_CONSUMER_STORE).
+    // pointing at EXSPEED_LEASE_BACKEND).
     let state = Arc::new(exspeed_api::AppState {
         broker: broker.clone(),
         storage: file_storage.clone(),
@@ -743,6 +599,7 @@ where
         replication_coordinator: replication_coordinator.clone(),
     });
 
+    let supervisor_handle: tokio::task::JoinHandle<()>;
     // Spawn the leader supervisor: waits for is_leader=true, then runs
     // connectors + continuous queries + retention under the current
     // leader token. Loops so that if we get demoted and re-promoted,
@@ -753,16 +610,18 @@ where
         let connector_manager_sup = connector_manager_for_supervisor;
         let exql_sup = exql_for_supervisor;
         let storage_sup = file_storage.clone();
+        let consumers_sup = broker.consumers.clone();
         let supervisor_cancel = cancel_token.clone();
         // Retention task emits `RetentionTrimmed` replication events in
         // multi-pod mode; `None` in single-pod short-circuits the emit
         // call inside the task.
         let replication_coordinator_for_retention = replication_coordinator.clone();
-        // Leader supervisor: three select-wraps observe `supervisor_cancel` because the
-        // supervisor has three idle states (awaiting promotion, active tenure, awaiting
-        // demotion). Without the third wrap, SIGTERM during the post-tenure idle window
-        // would block until the next promotion or watcher channel close.
-        tokio::spawn(async move {
+        // Leader supervisor. While idle (awaiting promotion or demotion) it
+        // exits on `supervisor_cancel`. An active tenure ends only when the
+        // leader token is cancelled: on demotion, or when shutdown calls
+        // `leadership.resign()` after draining connections and connectors,
+        // so leader work stops in order and persists its state.
+        supervisor_handle = tokio::spawn(async move {
             let mut is_leader_rx = leadership_sup.is_leader.clone();
             loop {
                 tokio::select! {
@@ -779,6 +638,12 @@ where
                 }
                 let token = leadership_sup.current_child_token().await;
                 info!("leader supervisor: assuming leadership; starting work");
+                // Consumers run only on the leader; they restore their state
+                // from `__consumers` and stop when the token is cancelled.
+                if let Err(e) = consumers_sup.start(token.clone()).await {
+                    error!(error = %e, "failed to start consumers; resigning tenure");
+                    token.cancel();
+                }
 
                 tokio::select! {
                     _ = connector_manager_sup.run_all(token.clone()) => {}
@@ -788,11 +653,10 @@ where
                             token.clone(),
                             replication_coordinator_for_retention.clone(),
                         ) => {}
+                    // Shutdown also ends a tenure: the server resigns
+                    // leadership (cancelling `token`) only after draining
+                    // connections and stopping connectors.
                     _ = token.cancelled() => {}
-                    _ = supervisor_cancel.cancelled() => {
-                        info!("leader supervisor: cancelled");
-                        return;
-                    }
                 }
 
                 info!("leader supervisor: tenure ended; awaiting re-promotion");
@@ -839,15 +703,6 @@ where
             .context("failed to bind cluster listener")?;
             info!(%bind, advertise = ?replication_advertise, "cluster replication listener bound");
             Some(Arc::new(server))
-        } else if multi_pod {
-            // Multi-pod mode but cluster_bind couldn't be resolved. We
-            // warned above; coord is still useful for emit-on-append but
-            // no peer can actually dial this pod. Prefer a hard error so
-            // the operator doesn't silently run a crippled cluster.
-            anyhow::bail!(
-                "EXSPEED_CONSUMER_STORE is multi-pod but EXSPEED_CLUSTER_BIND is unparseable — \
-                 refusing to start so the misconfiguration is caught at deploy time"
-            );
         } else {
             None
         };
@@ -890,9 +745,9 @@ where
         // and the leader-side server enforces `Action::Replicate` on the
         // resulting identity. A misconfiguration here would manifest as
         // every follower session failing with 401; fail fast instead.
-        let replicator_bearer = replicator_credential().context(
-            "EXSPEED_REPLICATOR_CREDENTIAL must be set when EXSPEED_CONSUMER_STORE=postgres|redis \
-             (the bearer a follower uses to authenticate its replication session)",
+        let replicator_bearer = args.cluster.replicator_credential.clone().context(
+            "cluster.replicator_credential (EXSPEED_REPLICATOR_CREDENTIAL) must be set in \
+             multi-pod mode (the bearer a follower uses to authenticate its replication session)",
         )?;
 
         tokio::spawn(async move {
@@ -1064,12 +919,19 @@ where
 
     // Bound concurrent connections. Each accepted connection holds one permit
     // for its lifetime; the OS-level accept queue absorbs short bursts.
-    let max_conns: usize = std::env::var("EXSPEED_MAX_CONNS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1024);
+    let max_conns = args.max_connections;
     let conn_sem = Arc::new(Semaphore::new(max_conns));
     info!(max_conns, "connection cap configured");
+
+    let session_ctx = Arc::new(SessionContext {
+        broker: broker.clone(),
+        exql: exql_for_tcp,
+        credential_store: credential_store.clone(),
+        metrics: metrics.clone(),
+        node_id: leadership.holder_id.to_string(),
+        // Leader hints for clients arrive with the HA work (Phase 6).
+        leader_hint: Arc::new(|| None),
+    });
 
     loop {
         tokio::select! {
@@ -1100,18 +962,13 @@ where
                 info!(%peer, "new connection");
                 metrics.connection_opened();
 
-                let broker = broker.clone();
-                let exql = exql_for_tcp.clone();
+                let session_ctx = session_ctx.clone();
                 let metrics_clone = metrics.clone();
-                let metrics_for_handler = metrics.clone();
-                let credential_store_clone = credential_store.clone();
                 let tls_config_clone = tls_config.clone();
                 let conn_token = cancel_token.child_token();
                 // Per-connection span: `identity` starts empty and is filled
-                // in via `Span::current().record(...)` when Connect succeeds.
-                // Every `info!`/`warn!` inside this connection inherits the
-                // field, so log aggregators can slice by tenant without
-                // needing each call-site to pass `identity = ...`.
+                // in when Connect succeeds, so every log line inside this
+                // connection carries it.
                 let conn_span = info_span!(
                     "connection",
                     %peer,
@@ -1123,28 +980,13 @@ where
                         let result: Result<()> = async move {
                             if let Some(tls_cfg) = tls_config_clone {
                                 let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
-                                let tls_stream = acceptor.accept(socket).await?;
-                                handle_connection(
-                                    tls_stream,
-                                    peer,
-                                    broker,
-                                    exql,
-                                    credential_store_clone,
-                                    metrics_for_handler,
-                                    conn_token,
-                                )
-                                .await
+                                let tls_stream =
+                                    tokio::time::timeout(TLS_ACCEPT_TIMEOUT, acceptor.accept(socket))
+                                        .await
+                                        .map_err(|_| anyhow::anyhow!("TLS handshake timed out"))??;
+                                session::run(tls_stream, peer, session_ctx, conn_token).await
                             } else {
-                                handle_connection(
-                                    socket,
-                                    peer,
-                                    broker,
-                                    exql,
-                                    credential_store_clone,
-                                    metrics_for_handler,
-                                    conn_token,
-                                )
-                                .await
+                                session::run(socket, peer, session_ctx, conn_token).await
                             }
                         }
                         .await;
@@ -1163,7 +1005,7 @@ where
     // Drain: wait for active connections to finish, up to 10 seconds. Each
     // connection holds one semaphore permit for its lifetime; when permits
     // return to `max_conns` available, all connection tasks have exited.
-    let drain_deadline = std::time::Duration::from_secs(10);
+    let drain_deadline = std::time::Duration::from_secs(args.drain_timeout_secs);
     let drain_start = std::time::Instant::now();
     let active_at_start = max_conns - conn_sem.available_permits();
     info!(
@@ -1180,859 +1022,50 @@ where
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+    // Stop connectors: sinks flush and commit, sources finish their batch.
+    if tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        connector_manager_for_shutdown.shutdown(),
+    )
+    .await
+    .is_err()
+    {
+        warn!("connectors did not stop within 30s");
+    }
+
+    // Stop continuous queries; each writes a final checkpoint.
+    if tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        exql_for_shutdown.shutdown(),
+    )
+    .await
+    .is_err()
+    {
+        warn!("continuous queries did not stop within 10s");
+    }
+
+    // Step down: cancels the leader token, stopping consumers, continuous
+    // queries and retention, and releases the lease so a peer can take
+    // over at once.
+    leadership.resign().await;
+    if !broker
+        .consumers
+        .wait_stopped(std::time::Duration::from_secs(10))
+        .await
+    {
+        warn!("consumers did not stop within 10s");
+    }
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), supervisor_handle).await;
+
+    // Final dedup snapshot (taken by the snapshot task on cancel).
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), snapshot_handle).await;
+
+    // Flush and fsync every partition, then release the data-dir lock
+    // (dropped when this function returns).
+    let storage_for_close = file_storage.clone();
+    let _ = tokio::task::spawn_blocking(move || storage_for_close.close()).await;
+    // Give the lease release (an async DELETE in the guard's task) a moment.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     info!("server stopped");
-    Ok(())
-}
-
-async fn handle_connection<S>(
-    socket: S,
-    peer: SocketAddr,
-    broker: Arc<Broker>,
-    exql: Arc<ExqlEngine>,
-    credential_store: Option<Arc<CredentialStore>>,
-    metrics: Arc<exspeed_common::Metrics>,
-    cancel: CancellationToken,
-) -> Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let (reader, writer) = tokio::io::split(socket);
-    let mut framed_read = FramedRead::new(reader, ExspeedCodec::new());
-    let mut framed_write = FramedWrite::new(writer, ExspeedCodec::new());
-
-    // Authenticated principal on this connection. `None` until a successful
-    // Connect. When credential_store is None we still attach a synthetic
-    // "anonymous" identity on Connect so per-op gates short-circuit.
-    let mut identity: Option<Arc<Identity>> = None;
-
-    // Per-connection subscription state (single subscription per TCP connection).
-    // Tracks (consumer_name, subscriber_id) so disconnect cleanup removes the right subscriber.
-    let mut active_subscription: Option<(String, String)> = None;
-    // Stream bound to the active subscription (captured on Subscribe OK).
-    // Authz for Fetch/Ack/Nack uses this because those ops don't carry a
-    // stream name on the wire. Intentionally frozen at Subscribe-time — a
-    // mid-subscription consumer rebind (rare: delete + recreate with a
-    // different stream under the same name) would authorize against the
-    // old stream, but the broker tears down the delivery task in that
-    // case so the invariant holds end-to-end.
-    let mut active_sub_stream: Option<StreamName> = None;
-    let mut delivery_rx: Option<mpsc::Receiver<DeliveryBatch>> = None;
-    let mut cancel_tx: Option<oneshot::Sender<()>> = None;
-
-    loop {
-        tokio::select! {
-            biased;
-            // Branch 0: process-wide shutdown (SIGTERM/SIGINT).
-            // `biased` ensures cancel wins races against in-flight reads.
-            _ = cancel.cancelled() => {
-                info!(%peer, "connection cancelled by shutdown");
-                break;
-            }
-            // Branch 1: incoming frame from client
-            frame_result = framed_read.next() => {
-                match frame_result {
-                    Some(Ok(frame)) => {
-                        let correlation_id = frame.correlation_id;
-
-                        let parsed = ClientMessage::from_frame(frame);
-
-                        // First-frame gate: before a successful Connect, only
-                        // Connect itself is allowed. Ping is cheap but we still
-                        // require Connect first to keep the gate simple.
-                        if identity.is_none() {
-                            match &parsed {
-                                Ok(ClientMessage::Connect(_)) => { /* allowed */ }
-                                _ => {
-                                    warn!(%peer, "rejected op before auth");
-                                    metrics.auth_denied("unauthorized", "tcp", "pre_connect");
-                                    let response = ServerMessage::Error {
-                                        code: 401,
-                                        message: "unauthorized".into(),
-                                    }
-                                    .into_frame(correlation_id);
-                                    framed_write.send(response).await?;
-                                    break;
-                                }
-                            }
-                        }
-
-                        match parsed {
-                            Ok(ClientMessage::Connect(req)) => {
-                                // TODO(post-plan-g): this Connect handshake duplicates
-                                // `crates/exspeed-broker/src/replication/server.rs`
-                                // `read_connect_and_authorize`. Extract a shared helper.
-                                // The exhaustive match on `req.auth_type` below forces a
-                                // compile error in BOTH sites when a new AuthType variant
-                                // is added, so the two paths cannot silently drift.
-                                use exspeed_protocol::messages::connect::AuthType;
-                                let result: Result<Arc<Identity>, &'static str> =
-                                    if let Some(store) = credential_store.as_ref() {
-                                        match req.auth_type {
-                                            AuthType::Token => {
-                                                let digest: [u8; 32] =
-                                                    Sha256::digest(&req.auth_payload).into();
-                                                match store.lookup(&digest) {
-                                                    Some(id) => Ok(id),
-                                                    None => Err("unauthorized"),
-                                                }
-                                            }
-                                            // Non-Token variants are rejected. Listed
-                                            // explicitly so adding a new AuthType forces a
-                                            // compile error in both Connect sites.
-                                            AuthType::None
-                                            | AuthType::MTls
-                                            | AuthType::Sasl => Err("unauthorized"),
-                                        }
-                                    } else {
-                                        // Auth off — attach a synthetic anonymous identity
-                                        // with full access so the per-op gates short-circuit.
-                                        Ok(Arc::new(anonymous_identity()))
-                                    };
-                                match result {
-                                    Ok(id) => {
-                                        // Populate the enclosing connection span's
-                                        // `identity` field so every subsequent log
-                                        // line on this connection carries it.
-                                        tracing::Span::current()
-                                            .record("identity", id.name.as_str());
-                                        info!(
-                                            %peer,
-                                            client_id = %req.client_id,
-                                            identity = %id.name,
-                                            "CONNECT authenticated"
-                                        );
-                                        identity = Some(id);
-                                        let response = ServerMessage::ConnectOk(
-                                            exspeed_protocol::messages::ConnectResponse {
-                                                server_version: exspeed_protocol::messages::WIRE_VERSION,
-                                            },
-                                        )
-                                        .into_frame(correlation_id);
-                                        framed_write.send(response).await?;
-                                    }
-                                    Err(msg) => {
-                                        metrics.auth_denied("unauthorized", "tcp", "Connect");
-                                        warn!(%peer, client_id = %req.client_id, "CONNECT rejected");
-                                        let response = ServerMessage::Error {
-                                            code: 401,
-                                            message: msg.to_string(),
-                                        }
-                                        .into_frame(correlation_id);
-                                        framed_write.send(response).await?;
-                                        break; // close the socket
-                                    }
-                                }
-                            }
-                            Ok(ClientMessage::Ping) => {
-                                // Ping is not scoped — no authz gate beyond
-                                // the first-frame check above.
-                                let response = ServerMessage::Pong.into_frame(correlation_id);
-                                framed_write.send(response).await?;
-                            }
-                            Ok(ClientMessage::Publish(req)) => {
-                                let Some(id) = identity.as_ref() else {
-                                    reject_unauthenticated(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Publish",
-                                    )
-                                    .await?;
-                                    continue;
-                                };
-                                let stream_name = match StreamName::try_from(req.stream.as_str()) {
-                                    Ok(n) => n,
-                                    Err(_) => {
-                                        // Fall through to broker, which already
-                                        // returns a 400 for invalid stream names.
-                                        let response = broker
-                                            .handle_message(ClientMessage::Publish(req))
-                                            .await;
-                                        framed_write
-                                            .send(response.into_frame(correlation_id))
-                                            .await?;
-                                        continue;
-                                    }
-                                };
-                                if !id.authorize(Action::Publish, &stream_name) {
-                                    reject_forbidden(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Publish",
-                                    )
-                                    .await?;
-                                    continue;
-                                }
-                                let response = broker
-                                    .handle_message(ClientMessage::Publish(req))
-                                    .await;
-                                framed_write
-                                    .send(response.into_frame(correlation_id))
-                                    .await?;
-                            }
-                            Ok(ClientMessage::PublishBatch(req)) => {
-                                use exspeed_protocol::messages::publish_batch::{
-                                    BatchResult, PublishBatchOkResponse,
-                                };
-                                use exspeed_streams::record::Record;
-
-                                let Some(id) = identity.as_ref() else {
-                                    reject_unauthenticated(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "PublishBatch",
-                                    )
-                                    .await?;
-                                    continue;
-                                };
-
-                                let stream_name = match StreamName::try_from(req.stream.as_str()) {
-                                    Ok(n) => n,
-                                    Err(_) => {
-                                        let response = ServerMessage::Error {
-                                            code: 400,
-                                            message: "invalid stream name".into(),
-                                        }
-                                        .into_frame(correlation_id);
-                                        framed_write.send(response).await?;
-                                        continue;
-                                    }
-                                };
-
-                                if !id.authorize(Action::Publish, &stream_name) {
-                                    reject_forbidden(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "PublishBatch",
-                                    )
-                                    .await?;
-                                    continue;
-                                }
-
-                                let records: Vec<Record> = req
-                                    .records
-                                    .into_iter()
-                                    .map(|br| Record {
-                                        subject: br.subject,
-                                        key: br.key,
-                                        value: br.value,
-                                        headers: exspeed_broker::handlers::with_msg_id(
-                                            br.headers, br.msg_id,
-                                        ),
-                                        timestamp_ns: None,
-                                    })
-                                    .collect();
-
-                                let results =
-                                    match broker.log.append_batch(&stream_name, records).await {
-                                        Ok(r) => r,
-                                        Err(e) => {
-                                            let response =
-                                                exspeed_broker::handlers::log_error_response(e)
-                                                    .into_frame(correlation_id);
-                                            framed_write.send(response).await?;
-                                            continue;
-                                        }
-                                    };
-
-                                let batch_results: Vec<BatchResult> = results
-                                    .into_iter()
-                                    .map(|r| match r {
-                                        exspeed_broker::broker_append::AppendResult::Written(
-                                            offset,
-                                            _ts,
-                                        ) => BatchResult::Written { offset: offset.0 },
-                                        exspeed_broker::broker_append::AppendResult::Duplicate(
-                                            offset,
-                                        ) => BatchResult::Duplicate {
-                                            offset: offset.0,
-                                            duplicate_of: offset.0,
-                                        },
-                                    })
-                                    .collect();
-
-                                let resp = PublishBatchOkResponse {
-                                    results: batch_results,
-                                };
-                                let mut buf = bytes::BytesMut::new();
-                                resp.encode(&mut buf);
-                                framed_write
-                                    .send(exspeed_protocol::frame::Frame::new(
-                                        exspeed_protocol::opcodes::OpCode::PublishBatchOk,
-                                        correlation_id,
-                                        buf.freeze(),
-                                    ))
-                                    .await?;
-                            }
-                            Ok(ClientMessage::Fetch(req)) => {
-                                let Some(id) = identity.as_ref() else {
-                                    reject_unauthenticated(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Fetch",
-                                    )
-                                    .await?;
-                                    continue;
-                                };
-                                let stream_name = match StreamName::try_from(req.stream.as_str()) {
-                                    Ok(n) => n,
-                                    Err(_) => {
-                                        let response = broker
-                                            .handle_message(ClientMessage::Fetch(req))
-                                            .await;
-                                        framed_write
-                                            .send(response.into_frame(correlation_id))
-                                            .await?;
-                                        continue;
-                                    }
-                                };
-                                if !id.authorize(Action::Subscribe, &stream_name) {
-                                    reject_forbidden(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Fetch",
-                                    )
-                                    .await?;
-                                    continue;
-                                }
-                                let response = broker
-                                    .handle_message(ClientMessage::Fetch(req))
-                                    .await;
-                                framed_write
-                                    .send(response.into_frame(correlation_id))
-                                    .await?;
-                            }
-                            Ok(ClientMessage::CreateStream(req)) => {
-                                let Some(id) = identity.as_ref() else {
-                                    reject_unauthenticated(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "CreateStream",
-                                    )
-                                    .await?;
-                                    continue;
-                                };
-                                let stream_name =
-                                    match StreamName::try_from(req.stream_name.as_str()) {
-                                        Ok(n) => n,
-                                        Err(_) => {
-                                            let response = broker
-                                                .handle_message(ClientMessage::CreateStream(req))
-                                                .await;
-                                            framed_write
-                                                .send(response.into_frame(correlation_id))
-                                                .await?;
-                                            continue;
-                                        }
-                                    };
-                                if !id.authorize(Action::Admin, &stream_name) {
-                                    reject_forbidden(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "CreateStream",
-                                    )
-                                    .await?;
-                                    continue;
-                                }
-                                let response = broker
-                                    .handle_message(ClientMessage::CreateStream(req))
-                                    .await;
-                                framed_write
-                                    .send(response.into_frame(correlation_id))
-                                    .await?;
-                            }
-                            Ok(ClientMessage::CreateConsumer(req)) => {
-                                let Some(id) = identity.as_ref() else {
-                                    reject_unauthenticated(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "CreateConsumer",
-                                    )
-                                    .await?;
-                                    continue;
-                                };
-                                let stream_name =
-                                    match StreamName::try_from(req.stream.as_str()) {
-                                        Ok(n) => n,
-                                        Err(_) => {
-                                            let response = broker
-                                                .handle_message(ClientMessage::CreateConsumer(req))
-                                                .await;
-                                            framed_write
-                                                .send(response.into_frame(correlation_id))
-                                                .await?;
-                                            continue;
-                                        }
-                                    };
-                                if !id.authorize(Action::Admin, &stream_name) {
-                                    reject_forbidden(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "CreateConsumer",
-                                    )
-                                    .await?;
-                                    continue;
-                                }
-                                let response = broker
-                                    .handle_message(ClientMessage::CreateConsumer(req))
-                                    .await;
-                                framed_write
-                                    .send(response.into_frame(correlation_id))
-                                    .await?;
-                            }
-                            Ok(ClientMessage::DeleteConsumer(req)) => {
-                                let Some(id) = identity.as_ref() else {
-                                    reject_unauthenticated(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "DeleteConsumer",
-                                    )
-                                    .await?;
-                                    continue;
-                                };
-                                // Look up the consumer's attached stream.
-                                // If the consumer doesn't exist, let the broker
-                                // return the authoritative 404 to avoid leaking
-                                // existence via an authz denial.
-                                let maybe_stream = {
-                                    let consumers = broker.consumers.read().unwrap();
-                                    consumers
-                                        .get(&req.name)
-                                        .map(|c| c.config.stream.clone())
-                                };
-                                if let Some(ref s) = maybe_stream {
-                                    if let Ok(n) = StreamName::try_from(s.as_str()) {
-                                        if !id.authorize(Action::Admin, &n) {
-                                            reject_forbidden(
-                                                &mut framed_write,
-                                                correlation_id,
-                                                &metrics,
-                                                "DeleteConsumer",
-                                            )
-                                            .await?;
-                                            continue;
-                                        }
-                                    }
-                                    // Malformed stored stream name falls through
-                                    // to the broker which returns the canonical error.
-                                }
-                                let response = broker
-                                    .handle_message(ClientMessage::DeleteConsumer(req))
-                                    .await;
-                                framed_write
-                                    .send(response.into_frame(correlation_id))
-                                    .await?;
-                            }
-                            Ok(ClientMessage::Ack(req)) => {
-                                let Some(id) = identity.as_ref() else {
-                                    reject_unauthenticated(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Ack",
-                                    )
-                                    .await?;
-                                    continue;
-                                };
-                                // Ack/Nack don't carry a stream name on the wire —
-                                // authorize against the stream bound to the active
-                                // subscription. No active subscription → 403:
-                                // you can't ack what you didn't subscribe to.
-                                let Some(stream_name) = active_sub_stream.as_ref() else {
-                                    reject_forbidden(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Ack",
-                                    )
-                                    .await?;
-                                    continue;
-                                };
-                                // The ack must target the consumer this connection
-                                // subscribed to; otherwise a client could move any
-                                // other consumer's offset.
-                                let owns_consumer = active_subscription
-                                    .as_ref()
-                                    .is_some_and(|(c, _)| c == &req.consumer_name);
-                                if !owns_consumer || !id.authorize(Action::Subscribe, stream_name) {
-                                    reject_forbidden(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Ack",
-                                    )
-                                    .await?;
-                                    continue;
-                                }
-                                let response = broker
-                                    .handle_message(ClientMessage::Ack(req))
-                                    .await;
-                                framed_write
-                                    .send(response.into_frame(correlation_id))
-                                    .await?;
-                            }
-                            Ok(ClientMessage::Nack(req)) => {
-                                let Some(id) = identity.as_ref() else {
-                                    reject_unauthenticated(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Nack",
-                                    )
-                                    .await?;
-                                    continue;
-                                };
-                                let Some(stream_name) = active_sub_stream.as_ref() else {
-                                    reject_forbidden(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Nack",
-                                    )
-                                    .await?;
-                                    continue;
-                                };
-                                // The ack must target the consumer this connection
-                                // subscribed to; otherwise a client could move any
-                                // other consumer's offset.
-                                let owns_consumer = active_subscription
-                                    .as_ref()
-                                    .is_some_and(|(c, _)| c == &req.consumer_name);
-                                if !owns_consumer || !id.authorize(Action::Subscribe, stream_name) {
-                                    reject_forbidden(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Nack",
-                                    )
-                                    .await?;
-                                    continue;
-                                }
-                                let response = broker
-                                    .handle_message(ClientMessage::Nack(req))
-                                    .await;
-                                framed_write
-                                    .send(response.into_frame(correlation_id))
-                                    .await?;
-                            }
-                            Ok(ClientMessage::Seek(req)) => {
-                                let Some(id) = identity.as_ref() else {
-                                    reject_unauthenticated(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Seek",
-                                    )
-                                    .await?;
-                                    continue;
-                                };
-                                // Seek is keyed by consumer_name. Derive the
-                                // target stream from broker state; if the
-                                // consumer is missing, let the broker return
-                                // its own 404.
-                                let maybe_stream = {
-                                    let consumers = broker.consumers.read().unwrap();
-                                    consumers
-                                        .get(&req.consumer_name)
-                                        .map(|c| c.config.stream.clone())
-                                };
-                                if let Some(ref s) = maybe_stream {
-                                    if let Ok(n) = StreamName::try_from(s.as_str()) {
-                                        if !id.authorize(Action::Subscribe, &n) {
-                                            reject_forbidden(
-                                                &mut framed_write,
-                                                correlation_id,
-                                                &metrics,
-                                                "Seek",
-                                            )
-                                            .await?;
-                                            continue;
-                                        }
-                                    }
-                                    // Malformed stored stream name falls through
-                                    // to the broker which returns the canonical error.
-                                }
-                                let response = broker
-                                    .handle_message(ClientMessage::Seek(req))
-                                    .await;
-                                framed_write
-                                    .send(response.into_frame(correlation_id))
-                                    .await?;
-                            }
-                            Ok(ClientMessage::Subscribe(req)) => {
-                                let Some(id) = identity.as_ref() else {
-                                    reject_unauthenticated(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Subscribe",
-                                    )
-                                    .await?;
-                                    continue;
-                                };
-                                if active_subscription.is_some() {
-                                    let response = ServerMessage::Error {
-                                        code: 400,
-                                        message: "already subscribed; unsubscribe first".into(),
-                                    }
-                                    .into_frame(correlation_id);
-                                    framed_write.send(response).await?;
-                                    continue;
-                                }
-
-                                // Resolve consumer → stream before subscribing so
-                                // we can authorize. Unknown consumer → let the
-                                // broker emit its own error (today: 400); don't
-                                // deny via 403 just because authz couldn't
-                                // resolve, or we'd leak consumer existence.
-                                let maybe_stream = {
-                                    let consumers = broker.consumers.read().unwrap();
-                                    consumers
-                                        .get(&req.consumer_name)
-                                        .map(|c| c.config.stream.clone())
-                                };
-                                let authz_stream = maybe_stream
-                                    .as_deref()
-                                    .and_then(|s| StreamName::try_from(s).ok());
-                                if let Some(ref n) = authz_stream {
-                                    if !id.authorize(Action::Subscribe, n) {
-                                        reject_forbidden(
-                                            &mut framed_write,
-                                            correlation_id,
-                                            &metrics,
-                                            "Subscribe",
-                                        )
-                                        .await?;
-                                        continue;
-                                    }
-                                }
-
-                                // Auto-generate subscriber_id if client didn't provide one
-                                // (legacy client, or new client opting out of explicit IDs).
-                                let subscriber_id = if req.subscriber_id.is_empty() {
-                                    uuid::Uuid::new_v4().to_string()
-                                } else {
-                                    req.subscriber_id.clone()
-                                };
-
-                                match broker.subscribe(&req.consumer_name, &subscriber_id) {
-                                    Ok((rx, cancel)) => {
-                                        active_subscription =
-                                            Some((req.consumer_name.clone(), subscriber_id));
-                                        active_sub_stream = authz_stream;
-                                        delivery_rx = Some(rx);
-                                        drop(cancel_tx.replace(cancel));
-                                        framed_write
-                                            .send(ServerMessage::Ok.into_frame(correlation_id))
-                                            .await?;
-                                    }
-                                    Err(e) => {
-                                        let response = ServerMessage::Error {
-                                            code: 400,
-                                            message: e,
-                                        }
-                                        .into_frame(correlation_id);
-                                        framed_write.send(response).await?;
-                                    }
-                                }
-                            }
-                            Ok(ClientMessage::Unsubscribe(req)) => {
-                                // Unsubscribe doesn't need an authz gate beyond
-                                // authentication — you can always drop your own
-                                // subscription. Still require identity for
-                                // defense-in-depth against the unreachable case.
-                                if identity.is_none() {
-                                    reject_unauthenticated(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Unsubscribe",
-                                    )
-                                    .await?;
-                                    continue;
-                                }
-                                // Use the subscriber_id the client sent, or fall back to the one
-                                // the server generated on the Subscribe call (stored in active_subscription).
-                                let subscriber_id = if !req.subscriber_id.is_empty() {
-                                    req.subscriber_id.clone()
-                                } else if let Some((_, ref sub_id)) = active_subscription {
-                                    sub_id.clone()
-                                } else {
-                                    String::new()
-                                };
-                                if !subscriber_id.is_empty() {
-                                    let _ = broker.unsubscribe(&req.consumer_name, &subscriber_id);
-                                }
-                                drop(cancel_tx.take());
-                                delivery_rx = None;
-                                active_subscription = None;
-                                active_sub_stream = None;
-                                framed_write
-                                    .send(ServerMessage::Ok.into_frame(correlation_id))
-                                    .await?;
-                            }
-                            Ok(ClientMessage::Query(sql)) => {
-                                use exspeed_processing::types::value_to_json;
-
-                                // A query can read any stream (and registered
-                                // external databases), so it needs global admin —
-                                // the same rule as POST /api/v1/queries.
-                                let Some(id) = identity.as_ref() else {
-                                    reject_unauthenticated(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Query",
-                                    )
-                                    .await?;
-                                    continue;
-                                };
-                                if !id.has_global_admin() {
-                                    reject_forbidden(
-                                        &mut framed_write,
-                                        correlation_id,
-                                        &metrics,
-                                        "Query",
-                                    )
-                                    .await?;
-                                    continue;
-                                }
-
-                                let result = exql.execute_bounded(&sql).await;
-                                let response = match result {
-                                    Ok(result_set) => {
-                                        let rows: Vec<Vec<serde_json::Value>> = result_set
-                                            .rows
-                                            .iter()
-                                            .map(|row| row.values.iter().map(value_to_json).collect())
-                                            .collect();
-                                        let row_count = rows.len();
-                                        let json = serde_json::json!({
-                                            "columns": result_set.columns,
-                                            "rows": rows,
-                                            "row_count": row_count,
-                                            "execution_time_ms": result_set.execution_time_ms,
-                                        });
-                                        let payload = serde_json::to_vec(&json).unwrap();
-                                        ServerMessage::QueryResult(bytes::Bytes::from(payload))
-                                    }
-                                    Err(e) => {
-                                        let json = e.to_json();
-                                        let payload = serde_json::to_vec(&json).unwrap();
-                                        ServerMessage::Error {
-                                            code: 400,
-                                            message: String::from_utf8(payload).unwrap(),
-                                        }
-                                    }
-                                };
-                                framed_write.send(response.into_frame(correlation_id)).await?;
-                            }
-                            Err(e) => {
-                                warn!(%peer, "unhandled message: {}", e);
-                                let response = ServerMessage::Error {
-                                    code: 400,
-                                    message: e.to_string(),
-                                }
-                                .into_frame(correlation_id);
-                                framed_write.send(response).await?;
-                            }
-                        }
-                    }
-                    Some(Err(e)) => {
-                        error!(%peer, "frame decode error: {}", e);
-                        return Err(e.into());
-                    }
-                    None => break, // client disconnected
-                }
-            }
-
-            // Branch 2: outgoing delivery batch from active subscription
-            delivery = async {
-                match delivery_rx.as_mut() {
-                    Some(rx) => rx.recv().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                if let Some(batch) = delivery {
-                    // Guard: check if subscription is still active without cloning.
-                    if active_subscription.is_none() {
-                        warn!(
-                            %peer,
-                            "received delivery batch after subscription was cleared; \
-                             dropping batch and tearing down delivery channel"
-                        );
-                        delivery_rx = None;
-                        drop(cancel_tx.take());
-                        continue;
-                    }
-
-                    if batch.records.len() == 1 {
-                        // Single-record path: one Record frame (0x82). Grouped consumers
-                        // always deliver size-1 batches; this keeps that path allocation-free.
-                        // Clone consumer_name only here where it's used.
-                        let consumer_name = match active_subscription.as_ref() {
-                            Some((name, _)) => name.clone(),
-                            None => unreachable!("guarded above"),
-                        };
-                        let d = batch.records.into_iter().next().unwrap();
-                        let record_delivery = RecordDelivery {
-                            consumer_name,
-                            offset: d.record.offset.0,
-                            timestamp: d.record.timestamp,
-                            subject: d.record.subject,
-                            delivery_attempt: d.delivery_attempt,
-                            key: d.record.key,
-                            value: d.record.value,
-                            headers: d.record.headers,
-                        };
-                        let response = ServerMessage::Record(record_delivery);
-                        framed_write.send(response.into_frame(0)).await?;
-                    } else {
-                        // Batch path: one RecordsBatch frame (0x83) for the whole batch.
-                        // Moves payload Bytes out of each DeliveryRecord — no extra clones.
-                        use exspeed_protocol::messages::records_batch::{BatchRecord, RecordsBatch};
-
-                        let records: Vec<BatchRecord> = batch
-                            .records
-                            .into_iter()
-                            .map(|d| BatchRecord {
-                                offset: d.record.offset.0,
-                                timestamp: d.record.timestamp,
-                                subject: d.record.subject,
-                                key: d.record.key,
-                                value: d.record.value,
-                                headers: d.record.headers,
-                            })
-                            .collect();
-
-                        let response = ServerMessage::RecordsBatch(RecordsBatch { records });
-                        framed_write.send(response.into_frame(0)).await?;
-                    }
-                } else {
-                    // Channel closed — delivery task stopped
-                    delivery_rx = None;
-                    drop(cancel_tx.take());
-                    active_subscription = None;
-                }
-            }
-        }
-    }
-
-    // Clean up: if this connection had an active subscription, unsubscribe this
-    // specific subscriber so other subscribers on the same consumer are unaffected.
-    if let Some((ref consumer_name, ref subscriber_id)) = active_subscription {
-        let _ = broker.unsubscribe(consumer_name, subscriber_id);
-    }
-
     Ok(())
 }

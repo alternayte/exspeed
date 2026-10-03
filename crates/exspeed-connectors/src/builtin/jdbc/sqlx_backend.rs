@@ -12,9 +12,12 @@ pub(super) struct SqlxBackend {
 impl SqlxBackend {
     pub(super) async fn connect(url: &str) -> Result<Self, BackendError> {
         sqlx::any::install_default_drivers();
-        let pool = AnyPool::connect(url)
+        let pool = sqlx::any::AnyPoolOptions::new()
+            .max_connections(4)
+            .acquire_timeout(std::time::Duration::from_secs(30))
+            .connect(url)
             .await
-            .map_err(|e| BackendError::Pool(format!("sqlx::AnyPool::connect: {e}")))?;
+            .map_err(super::errors::from_sqlx)?;
         Ok(Self { pool })
     }
 }
@@ -59,15 +62,7 @@ fn bind_param<'q>(
 }
 
 fn map_sqlx_err(e: sqlx::Error) -> BackendError {
-    let sqlstate = e
-        .as_database_error()
-        .and_then(|db| db.code())
-        .map(|c| c.to_string())
-        .unwrap_or_default();
-    BackendError::Sql {
-        sqlstate,
-        message: e.to_string(),
-    }
+    super::errors::from_sqlx(e)
 }
 
 #[cfg(test)]

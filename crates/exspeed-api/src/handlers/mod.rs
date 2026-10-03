@@ -107,10 +107,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/v1/streams/{name}/publish",
             post(streams::publish_to_stream),
         )
-        .route("/api/v1/consumers", get(consumers::list_consumers))
+        .route("/api/v1/streams/{name}/records", get(streams::read_records))
+        .route(
+            "/api/v1/consumers",
+            get(consumers::list_consumers).post(consumers::create_consumer),
+        )
         .route(
             "/api/v1/consumers/{name}",
             get(consumers::get_consumer).delete(consumers::delete_consumer),
+        )
+        .route(
+            "/api/v1/consumers/{name}/seek",
+            post(consumers::seek_consumer),
         )
         .route(
             "/api/v1/connectors",
@@ -118,7 +126,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/v1/connectors/{name}",
-            get(connectors::get_connector).delete(connectors::delete_connector),
+            get(connectors::get_connector)
+                .put(connectors::update_connector)
+                .delete(connectors::delete_connector),
         )
         .route(
             "/api/v1/connectors/{name}/restart",
@@ -141,11 +151,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/v1/queries/{id}",
             get(queries::get_query).delete(queries::delete_query),
         )
-        .route(
-            "/api/v1/indexes",
-            get(queries::list_indexes).post(queries::create_index),
-        )
-        .route("/api/v1/indexes/{name}", delete(queries::drop_index))
+        .route("/api/v1/queries/{id}/pause", post(queries::pause_query))
+        .route("/api/v1/queries/{id}/resume", post(queries::resume_query))
         .route(
             "/api/v1/connections",
             get(connections::list_connections).post(connections::create_connection),

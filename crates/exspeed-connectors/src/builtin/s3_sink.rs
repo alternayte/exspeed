@@ -1,282 +1,251 @@
+//! `s3` sink: NDJSON objects in an S3-compatible bucket.
+//!
+//! `write()` only buffers. The framework calls `flush()` on a timer
+//! (`flush_interval_ms`, default 60 s), when the buffer is full
+//! (`max_records` / `max_bytes`) and on stop; `flush()` uploads the buffer
+//! as one object, and only then is the stream offset committed.
+//!
+//! The object key is a pure function of the buffer's first offset and that
+//! record's timestamp:
+//!
+//! ```text
+//! {prefix}{stream}/{YYYY}/{MM}/{DD}/{HH}/part-{first_offset:020}.ndjson
+//! ```
+//!
+//! After a crash between upload and commit, the restarted sink re-reads from
+//! the committed offset, rebuilds a buffer that starts at the same record
+//! and overwrites the same object, so the bucket never holds the same
+//! record twice: **effectively-once** (per object; a reader listing the
+//! bucket mid-retry can briefly see the older version of an object).
+
+use std::time::Duration;
+
 use async_trait::async_trait;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tracing::{info, warn};
+use serde::Deserialize;
+use tracing::info;
 
-use crate::config::ConnectorConfig;
-use crate::traits::{
-    ConnectorError, HealthStatus, SinkBatch, SinkConnector, SinkRecord, WriteResult,
-};
+use crate::registry::PluginInit;
+use crate::settings::{self, de};
+use crate::traits::{ConnectorError, SinkConnector, SinkRecord, WriteResult};
 
-/// Flush buffer when it reaches this many records, even before the time
-/// interval has elapsed.
-const FLUSH_SIZE_THRESHOLD: usize = 1_000;
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct S3SinkSettings {
+    pub bucket: String,
+    #[serde(default = "default_region")]
+    pub region: String,
+    #[serde(default)]
+    pub prefix: String,
+    /// Static credentials. When both are unset, the standard AWS chain
+    /// (env vars, profile, instance metadata) is used.
+    #[serde(default)]
+    pub access_key: Option<String>,
+    #[serde(default)]
+    pub secret_key: Option<String>,
+    /// Custom endpoint (MinIO, R2, …).
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default, deserialize_with = "de::bool")]
+    pub path_style: bool,
+    /// Upload as soon as the buffer holds this many records…
+    #[serde(default = "default_max_records", deserialize_with = "de::usize")]
+    pub max_records: usize,
+    /// …or this many bytes.
+    #[serde(default = "default_max_bytes", deserialize_with = "de::usize")]
+    pub max_bytes: usize,
+    #[serde(default = "default_timeout", deserialize_with = "de::u64")]
+    pub timeout_secs: u64,
+}
 
-// ---------------------------------------------------------------------------
-// Struct
-// ---------------------------------------------------------------------------
+fn default_region() -> String {
+    "us-east-1".into()
+}
+fn default_max_records() -> usize {
+    10_000
+}
+fn default_max_bytes() -> usize {
+    16 * 1024 * 1024
+}
+fn default_timeout() -> u64 {
+    60
+}
 
 pub struct S3SinkConnector {
-    bucket_name: String,
-    region: String,
-    prefix: String,
-    access_key: String,
-    secret_key: String,
-    endpoint: Option<String>,
-    path_style: bool,
-    flush_interval_secs: u64,
-    buffer: Vec<String>,
-    first_offset: Option<u64>,
-    last_flush: Instant,
+    settings: S3SinkSettings,
+    stream: String,
+    /// NDJSON lines (each ending in `\n`).
+    buffer: Vec<u8>,
+    buffered: usize,
+    /// Offset and timestamp (ns) of the first buffered record.
+    first: Option<(u64, u64)>,
     bucket: Option<Box<s3::Bucket>>,
 }
 
 impl S3SinkConnector {
-    pub fn new(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
-        let bucket_name = config
-            .setting("bucket")
-            .map_err(ConnectorError::Config)?
-            .to_string();
-
-        let region = config.setting_or("region", "us-east-1");
-        let prefix = config.setting_or("prefix", "");
-
-        let access_key = config
-            .setting("access_key")
-            .map_err(ConnectorError::Config)?
-            .to_string();
-
-        let secret_key = config
-            .setting("secret_key")
-            .map_err(ConnectorError::Config)?
-            .to_string();
-
-        let endpoint_str = config.setting_or("endpoint", "");
-        let endpoint = if endpoint_str.is_empty() {
-            None
-        } else {
-            Some(endpoint_str)
-        };
-
-        let path_style = config
-            .setting_or("path_style", "false")
-            .eq_ignore_ascii_case("true");
-
-        let flush_interval_secs = config
-            .setting_or("flush_interval_secs", "60")
-            .parse::<u64>()
-            .map_err(|e| ConnectorError::Config(format!("invalid flush_interval_secs: {e}")))?;
-
+    pub fn new(init: &PluginInit) -> Result<Self, ConnectorError> {
+        let s: S3SinkSettings = settings::parse("s3", &init.settings)?;
+        if s.bucket.trim().is_empty() {
+            return Err(ConnectorError::config("s3: bucket must not be empty"));
+        }
+        if s.access_key.is_some() != s.secret_key.is_some() {
+            return Err(ConnectorError::config(
+                "s3: set both access_key and secret_key, or neither",
+            ));
+        }
+        if s.max_records == 0 || s.max_bytes == 0 || s.timeout_secs == 0 {
+            return Err(ConnectorError::config(
+                "s3: max_records, max_bytes and timeout_secs must be > 0",
+            ));
+        }
         Ok(Self {
-            bucket_name,
-            region,
-            prefix,
-            access_key,
-            secret_key,
-            endpoint,
-            path_style,
-            flush_interval_secs,
+            settings: s,
+            stream: init.config.stream.clone(),
             buffer: Vec::new(),
-            first_offset: None,
-            last_flush: Instant::now(),
+            buffered: 0,
+            first: None,
             bucket: None,
         })
     }
 
-    // -----------------------------------------------------------------------
-    // Private helpers
-    // -----------------------------------------------------------------------
-
-    /// Format a single record as one NDJSON line.
+    /// Format a single record as one NDJSON line (without the newline).
     fn format_ndjson(record: &SinkRecord) -> String {
-        // Value: try UTF-8, fall back to base64.
-        let value_str = match std::str::from_utf8(&record.value) {
+        let text_or_b64 = |b: &[u8]| match std::str::from_utf8(b) {
             Ok(s) => serde_json::Value::String(s.to_string()),
-            Err(_) => {
-                let encoded = base64_encode(&record.value);
-                serde_json::Value::String(encoded)
-            }
+            Err(_) => serde_json::Value::String(base64_encode(b)),
         };
-
-        // Key: try UTF-8, fall back to base64, None → null.
-        let key_str = match &record.key {
-            None => serde_json::Value::Null,
-            Some(k) => match std::str::from_utf8(k) {
-                Ok(s) => serde_json::Value::String(s.to_string()),
-                Err(_) => serde_json::Value::String(base64_encode(k)),
-            },
-        };
-
-        // Headers object.
-        let headers_obj: serde_json::Map<String, serde_json::Value> = record
+        let headers: serde_json::Map<String, serde_json::Value> = record
             .headers
             .iter()
             .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
             .collect();
-
-        let mut obj = serde_json::Map::new();
-        obj.insert(
-            "offset".into(),
-            serde_json::Value::Number(record.offset.into()),
-        );
-        obj.insert(
-            "timestamp".into(),
-            serde_json::Value::Number(record.timestamp.into()),
-        );
-        obj.insert(
-            "subject".into(),
-            serde_json::Value::String(record.subject.clone()),
-        );
-        obj.insert("key".into(), key_str);
-        obj.insert("value".into(), value_str);
-        obj.insert("headers".into(), serde_json::Value::Object(headers_obj));
-
-        serde_json::to_string(&obj).unwrap_or_else(|_| "{}".to_string())
+        serde_json::json!({
+            "offset": record.offset,
+            "timestamp": record.timestamp,
+            "subject": record.subject,
+            "key": record.key.as_deref().map(text_or_b64),
+            "value": text_or_b64(&record.value),
+            "headers": headers,
+        })
+        .to_string()
     }
 
-    /// Generate the S3 object path for the current buffer.
-    /// Format: `{prefix}{year}/{month}/{day}/{hour}/part-{offset:020}.ndjson`
-    fn generate_path(&self, first_offset: u64) -> String {
-        let (year, month, day, hour) = utc_parts();
+    /// The object key for a buffer starting at `first_offset`, whose first
+    /// record has timestamp `ts_ns`. Deterministic: retries overwrite.
+    fn object_key(&self, first_offset: u64, ts_ns: u64) -> String {
+        let secs = (ts_ns / 1_000_000_000) as i64;
+        let t = chrono::DateTime::from_timestamp(secs, 0).unwrap_or_default();
         format!(
-            "{}{:04}/{:02}/{:02}/{:02}/part-{:020}.ndjson",
-            self.prefix, year, month, day, hour, first_offset
+            "{}{}/{}/part-{:020}.ndjson",
+            self.settings.prefix,
+            self.stream,
+            t.format("%Y/%m/%d/%H"),
+            first_offset
         )
-    }
-
-    /// Flush the in-memory buffer to S3. No-op if buffer is empty.
-    async fn flush_buffer(&mut self) -> Result<(), ConnectorError> {
-        if self.buffer.is_empty() {
-            return Ok(());
-        }
-
-        let bucket = match &self.bucket {
-            Some(b) => b,
-            None => {
-                return Err(ConnectorError::Connection(
-                    "S3 sink: bucket not initialised — call start() first".into(),
-                ))
-            }
-        };
-
-        let first_offset = self.first_offset.unwrap_or(0);
-        let path = self.generate_path(first_offset);
-
-        let mut ndjson = self.buffer.join("\n");
-        ndjson.push('\n');
-        let content = ndjson.into_bytes();
-
-        match bucket
-            .put_object_with_content_type(&path, &content, "application/x-ndjson")
-            .await
-        {
-            Ok(_) => {
-                info!(
-                    path = %path,
-                    records = self.buffer.len(),
-                    "S3 sink: flushed buffer"
-                );
-            }
-            Err(e) => {
-                return Err(ConnectorError::Connection(format!(
-                    "S3 sink: put_object failed for path '{path}': {e}"
-                )));
-            }
-        }
-
-        self.buffer.clear();
-        self.first_offset = None;
-        self.last_flush = Instant::now();
-        Ok(())
-    }
-
-    fn should_flush(&self) -> bool {
-        if self.buffer.len() >= FLUSH_SIZE_THRESHOLD {
-            return true;
-        }
-        self.last_flush.elapsed().as_secs() >= self.flush_interval_secs
     }
 }
 
-// ---------------------------------------------------------------------------
-// SinkConnector impl
-// ---------------------------------------------------------------------------
+fn s3_err(what: &str, e: s3::error::S3Error) -> ConnectorError {
+    use s3::error::S3Error as E;
+    match e {
+        E::HttpFailWithBody(status, body) => {
+            let snippet: String = body.chars().take(512).collect();
+            match status {
+                408 | 429 | 500..=599 => {
+                    ConnectorError::transient(format!("s3 {what}: HTTP {status}: {snippet}"))
+                }
+                // Credentials, missing bucket, bad request: retrying won't help.
+                _ => ConnectorError::fatal(format!("s3 {what}: HTTP {status}: {snippet}")),
+            }
+        }
+        E::Credentials(_) | E::Region(_) | E::UrlParse(_) => {
+            ConnectorError::config(format!("s3 {what}: {e}"))
+        }
+        other => ConnectorError::transient(format!("s3 {what}: {other}")),
+    }
+}
 
 #[async_trait]
 impl SinkConnector for S3SinkConnector {
     async fn start(&mut self) -> Result<(), ConnectorError> {
-        let credentials = s3::creds::Credentials::new(
-            Some(&self.access_key),
-            Some(&self.secret_key),
-            None,
-            None,
-            None,
-        )
-        .map_err(|e| ConnectorError::Config(format!("S3 sink: invalid credentials: {e}")))?;
-
-        let region: s3::Region = match &self.endpoint {
+        let s = &self.settings;
+        let credentials = match (&s.access_key, &s.secret_key) {
+            (Some(a), Some(k)) => s3::creds::Credentials::new(Some(a), Some(k), None, None, None),
+            // The default chain may do blocking HTTP (instance metadata).
+            _ => tokio::task::spawn_blocking(s3::creds::Credentials::default)
+                .await
+                .map_err(|e| ConnectorError::transient(format!("s3: credentials task: {e}")))?,
+        }
+        .map_err(|e| ConnectorError::config(format!("s3: invalid credentials: {e}")))?;
+        let region: s3::Region = match &s.endpoint {
             Some(ep) => s3::Region::Custom {
-                region: self.region.clone(),
+                region: s.region.clone(),
                 endpoint: ep.clone(),
             },
-            None => self.region.parse().map_err(|e| {
-                ConnectorError::Config(format!("S3 sink: invalid region '{}': {e}", self.region))
+            None => s.region.parse().map_err(|e| {
+                ConnectorError::config(format!("s3: invalid region '{}': {e}", s.region))
             })?,
         };
-
-        let mut bucket = s3::Bucket::new(&self.bucket_name, region, credentials).map_err(|e| {
-            ConnectorError::Connection(format!("S3 sink: failed to create bucket handle: {e}"))
-        })?;
-
-        if self.path_style {
+        let mut bucket = s3::Bucket::new(&s.bucket, region, credentials)
+            .map_err(|e| ConnectorError::config(format!("s3: bucket handle: {e}")))?;
+        if s.path_style {
             bucket = bucket.with_path_style();
         }
-
-        info!(
-            bucket = %self.bucket_name,
-            region = %self.region,
-            prefix = %self.prefix,
-            path_style = self.path_style,
-            "S3 sink connected"
-        );
-
+        bucket.set_request_timeout(Some(Duration::from_secs(s.timeout_secs)));
+        info!(bucket = %s.bucket, prefix = %s.prefix, "s3 sink started");
         self.bucket = Some(bucket);
+        // A restart rebuilds the buffer from the committed offset.
+        self.buffer.clear();
+        self.buffered = 0;
+        self.first = None;
         Ok(())
     }
 
-    async fn write(&mut self, batch: SinkBatch) -> Result<WriteResult, ConnectorError> {
-        for record in &batch.records {
-            if self.first_offset.is_none() {
-                self.first_offset = Some(record.offset);
+    async fn write(&mut self, records: &[SinkRecord]) -> Result<WriteResult, ConnectorError> {
+        for r in records {
+            if self.first.is_none() {
+                self.first = Some((r.offset, r.timestamp));
             }
-            let line = Self::format_ndjson(record);
-            self.buffer.push(line);
+            self.buffer
+                .extend_from_slice(Self::format_ndjson(r).as_bytes());
+            self.buffer.push(b'\n');
+            self.buffered += 1;
         }
-
-        if self.should_flush() {
-            self.flush_buffer().await?;
-        }
-
-        Ok(WriteResult::AllSuccess)
+        Ok(WriteResult::Accepted)
     }
 
     async fn flush(&mut self) -> Result<(), ConnectorError> {
-        self.flush_buffer().await
+        let Some((first_offset, ts)) = self.first else {
+            return Ok(());
+        };
+        let key = self.object_key(first_offset, ts);
+        let bucket = self
+            .bucket
+            .as_ref()
+            .ok_or_else(|| ConnectorError::connection("s3: not started"))?;
+        bucket
+            .put_object_with_content_type(&key, &self.buffer, "application/x-ndjson")
+            .await
+            .map_err(|e| s3_err("put_object", e))?;
+        info!(key = %key, records = self.buffered, "s3 sink: object written");
+        self.buffer.clear();
+        self.buffered = 0;
+        self.first = None;
+        Ok(())
     }
 
     async fn stop(&mut self) -> Result<(), ConnectorError> {
-        if let Err(e) = self.flush_buffer().await {
-            warn!("S3 sink: error flushing on stop: {e}");
-        }
+        // The framework flushes before a graceful stop; anything left here
+        // is uncommitted and will be re-read after the restart.
         self.bucket = None;
         Ok(())
     }
 
-    async fn health(&self) -> HealthStatus {
-        if self.bucket.is_some() {
-            HealthStatus::Healthy
-        } else {
-            HealthStatus::Unhealthy("S3 sink: bucket not initialised".into())
-        }
+    fn wants_flush(&self) -> bool {
+        self.buffered >= self.settings.max_records || self.buffer.len() >= self.settings.max_bytes
+    }
+
+    fn default_flush_interval(&self) -> Duration {
+        Duration::from_secs(60)
     }
 }
 
@@ -319,48 +288,27 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
-/// Decompose the current UTC wall-clock time into (year, month, day, hour).
-/// Uses `SystemTime` so we don't need an extra chrono dependency.
-fn utc_parts() -> (u32, u32, u32, u32) {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    // Days since epoch.
-    let days = secs / 86400;
-    let time_of_day = secs % 86400;
-    let hour = (time_of_day / 3600) as u32;
-
-    // Gregorian calendar computation from days-since-epoch (Jan 1 1970).
-    // Using the civil-date algorithm from Howard Hinnant (public domain).
-    let z = days as i64 + 719_468;
-    let era: i64 = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097; // day of era
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-
-    (y as u32, m as u32, d as u32, hour)
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{ConnectorConfig, ConnectorType};
     use bytes::Bytes;
+    use serde_json::json;
+
+    fn init(settings: serde_json::Value) -> PluginInit {
+        let (m, _) = exspeed_common::Metrics::new();
+        PluginInit {
+            config: ConnectorConfig::new("s3", ConnectorType::Sink, "s3", "orders"),
+            settings: settings.as_object().unwrap().clone(),
+            metrics: std::sync::Arc::new(m),
+        }
+    }
 
     fn make_record(offset: u64, subject: &str, key: Option<&str>, value: &[u8]) -> SinkRecord {
         SinkRecord {
             offset,
-            timestamp: 1_713_100_800,
+            // 2024-04-14T13:20:00Z in ns
+            timestamp: 1_713_100_800_000_000_000,
             subject: subject.to_string(),
             key: key.map(|k| Bytes::from(k.to_string())),
             value: Bytes::from(value.to_vec()),
@@ -371,11 +319,9 @@ mod tests {
     #[test]
     fn ndjson_line_utf8_value() {
         let record = make_record(42, "order.created", Some("ord-1"), b"hello world");
-        let line = S3SinkConnector::format_ndjson(&record);
-
-        let parsed: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&S3SinkConnector::format_ndjson(&record)).unwrap();
         assert_eq!(parsed["offset"], 42);
-        assert_eq!(parsed["timestamp"], 1_713_100_800_u64);
         assert_eq!(parsed["subject"], "order.created");
         assert_eq!(parsed["key"], "ord-1");
         assert_eq!(parsed["value"], "hello world");
@@ -384,55 +330,45 @@ mod tests {
 
     #[test]
     fn ndjson_line_binary_value_base64() {
-        // Non-UTF-8 byte sequence → should be base64-encoded.
         let record = make_record(7, "blob.stored", None, &[0xFF, 0x00, 0xAB]);
-        let line = S3SinkConnector::format_ndjson(&record);
-
-        let parsed: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
-        assert_eq!(parsed["offset"], 7);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&S3SinkConnector::format_ndjson(&record)).unwrap();
         assert_eq!(parsed["key"], serde_json::Value::Null);
-        // base64 of [0xFF, 0x00, 0xAB] = "/wCr"
         assert_eq!(parsed["value"], "/wCr");
     }
 
     #[test]
-    fn path_generation_format() {
-        // Build a minimal connector just to exercise generate_path.
-        let connector = S3SinkConnector {
-            bucket_name: "my-bucket".into(),
-            region: "us-east-1".into(),
-            prefix: "data/".into(),
-            access_key: "key".into(),
-            secret_key: "secret".into(),
-            endpoint: None,
-            path_style: false,
-            flush_interval_secs: 60,
-            buffer: Vec::new(),
-            first_offset: None,
-            last_flush: Instant::now(),
-            bucket: None,
-        };
-
-        let path = connector.generate_path(12345);
-
-        assert!(path.starts_with("data/"), "path prefix: {path}");
-        assert!(
-            path.ends_with("/part-00000000000000012345.ndjson"),
-            "path suffix: {path}"
+    fn object_key_is_deterministic() {
+        let c = S3SinkConnector::new(&init(json!({"bucket": "b", "prefix": "data/"}))).unwrap();
+        let ts = 1_713_100_800_000_000_000;
+        assert_eq!(
+            c.object_key(12345, ts),
+            "data/orders/2024/04/14/13/part-00000000000000012345.ndjson"
         );
+        assert_eq!(c.object_key(12345, ts), c.object_key(12345, ts));
+    }
 
-        let parts: Vec<&str> = path.split('/').collect();
-        // parts: ["data", "YYYY", "MM", "DD", "HH", "part-....ndjson"]
-        assert_eq!(parts.len(), 6, "expected 6 path segments: {path}");
+    #[tokio::test]
+    async fn write_buffers_until_full() {
+        let mut c = S3SinkConnector::new(&init(json!({"bucket": "b", "max_records": 2}))).unwrap();
+        let r = make_record(1, "a", None, b"{}");
+        assert!(matches!(
+            c.write(std::slice::from_ref(&r)).await.unwrap(),
+            WriteResult::Accepted
+        ));
+        assert!(!c.wants_flush());
+        c.write(std::slice::from_ref(&r)).await.unwrap();
+        assert!(c.wants_flush());
+        assert_eq!(c.first.map(|f| f.0), Some(1));
+    }
 
-        let year: u32 = parts[1].parse().expect("year must be numeric");
-        let month: u32 = parts[2].parse().expect("month must be numeric");
-        let day: u32 = parts[3].parse().expect("day must be numeric");
-        let hour: u32 = parts[4].parse().expect("hour must be numeric");
-
-        assert!(year >= 2024, "year sanity: {year}");
-        assert!((1..=12).contains(&month), "month range: {month}");
-        assert!((1..=31).contains(&day), "day range: {day}");
-        assert!(hour < 24, "hour range: {hour}");
+    #[test]
+    fn settings_errors() {
+        assert!(S3SinkConnector::new(&init(json!({}))).is_err());
+        assert!(S3SinkConnector::new(&init(json!({"bucket": "b", "access_key": "a"}))).is_err());
+        assert!(
+            S3SinkConnector::new(&init(json!({"bucket": "b", "flush_interval_secs": 5}))).is_err()
+        );
+        assert!(S3SinkConnector::new(&init(json!({"bucket": "b", "max_records": "10"}))).is_ok());
     }
 }

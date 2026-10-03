@@ -7,7 +7,7 @@ use uuid::Uuid;
 use super::{LeaderLease, LeaseError, LeaseGuard, LeaseInfo};
 
 /// Always-succeed lease backend used when no shared coordination backend
-/// is configured (`EXSPEED_CONSUMER_STORE=file` or unset). Each pod acts as
+/// is configured (`EXSPEED_LEASE_BACKEND` unset). Each pod acts as
 /// its own leader — preserving current single-pod behavior exactly.
 pub struct NoopLeaderLease;
 

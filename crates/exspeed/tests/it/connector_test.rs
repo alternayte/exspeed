@@ -27,13 +27,7 @@ async fn start_server() -> (String, String) {
             credentials_file: None,
             tls_cert: None,
             tls_key: None,
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -262,10 +256,24 @@ async fn connector_status() {
         "connector should be running, got: {:?}",
         body["status"]
     );
-    assert!(
-        body.get("uptime_secs").is_some(),
-        "response should include uptime_secs"
-    );
+    for field in [
+        "last_error",
+        "restart_count",
+        "lag",
+        "last_success_ms",
+        "status_secs",
+        "checkpoint",
+        "origin",
+        "config",
+    ] {
+        assert!(
+            body.get(field).is_some(),
+            "response should include {field}: {body}"
+        );
+    }
+    assert_eq!(body["origin"], "api");
+    assert_eq!(body["restart_count"], 0);
+    assert_eq!(body["config"]["settings"]["auth_type"], "none");
 }
 
 async fn start_server_in(data_dir: std::path::PathBuf) -> String {
@@ -280,13 +288,7 @@ async fn start_server_in(data_dir: std::path::PathBuf) -> String {
             credentials_file: None,
             tls_cert: None,
             tls_key: None,
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -330,7 +332,7 @@ async fn file_watcher_leaves_api_created_connectors_alone() {
             "type": "source",
             "plugin": "http_webhook",
             "stream": "api-events",
-            "settings": {"path": "api-hook"}
+            "settings": {"path": "api-hook", "auth_type": "none"}
         }))
         .send()
         .await
@@ -341,7 +343,7 @@ async fn file_watcher_leaves_api_created_connectors_alone() {
     std::fs::write(
         dir.path().join("connectors.d").join("hooks.toml"),
         "[connector]\nname = \"file-hook\"\ntype = \"source\"\nplugin = \"http_webhook\"\n\
-         stream = \"file-events\"\n\n[settings]\npath = \"file-hook\"\n",
+         stream = \"file-events\"\n\n[settings]\npath = \"file-hook\"\nauth_type = \"none\"\n",
     )
     .unwrap();
 

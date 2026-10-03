@@ -663,7 +663,7 @@ impl BrokerAppend {
                     });
                     for e in snap.entries {
                         let age_ms = now_ms.saturating_sub(e.inserted_at_unix_ms);
-                        if age_ms >= window_secs * 1000 {
+                        if age_ms >= window_secs.saturating_mul(1000) {
                             continue; // already expired
                         }
                         let inserted_at = Instant::now()
@@ -692,8 +692,8 @@ impl BrokerAppend {
 
         // Determine where to start scanning the log.
         let cutoff_unix_ms = snapshot_covers_through_unix_ms
-            .unwrap_or_else(|| now_ms.saturating_sub(window_secs * 1000));
-        let cutoff_ns = cutoff_unix_ms * 1_000_000;
+            .unwrap_or_else(|| now_ms.saturating_sub(window_secs.saturating_mul(1000)));
+        let cutoff_ns = cutoff_unix_ms.saturating_mul(1_000_000);
 
         let start_offset = match self.storage.seek_by_time(stream, cutoff_ns).await {
             Ok(o) => o,
@@ -717,7 +717,7 @@ impl BrokerAppend {
                     let body_hash = hash_body(&rec.value);
                     let rec_ms = rec.timestamp / 1_000_000;
                     let age_ms = now_ms.saturating_sub(rec_ms);
-                    let clamped_age = age_ms.min(window_secs * 1000);
+                    let clamped_age = age_ms.min(window_secs.saturating_mul(1000));
                     let inserted_at = Instant::now()
                         .checked_sub(Duration::from_millis(clamped_age))
                         .unwrap_or_else(Instant::now);

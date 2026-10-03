@@ -38,7 +38,10 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// Start the exspeed server
-    Server(server::ServerArgs),
+    Server(crate::config::ServeArgs),
+    /// Inspect and validate server configuration (exspeed.toml)
+    #[command(subcommand)]
+    Config(crate::config::ConfigCommand),
     /// Manage and validate connector configs
     Connector(connector::ConnectorCommand),
     /// Create a new stream
@@ -130,25 +133,36 @@ pub enum Command {
         /// Consumer name
         name: String,
     },
-    /// Run a SQL query
+    /// Run an ExQL statement: SELECT, CREATE STREAM/TABLE … AS SELECT,
+    /// DROP STREAM/TABLE/QUERY, PAUSE/RESUME QUERY
     Query {
-        /// SQL query string
+        /// SQL statement
         sql: String,
-        /// Run as continuous query
+        /// Only accept CREATE STREAM/TABLE (posts to /api/v1/queries/continuous)
         #[arg(long)]
         continuous: bool,
     },
-    /// List all views
+    /// List materialized tables (CREATE TABLE … AS SELECT)
     Views,
-    /// Show view details
+    /// Show the rows of a materialized table
     View {
-        /// View name
+        /// Table name
         name: String,
     },
     /// List all connectors
     Connectors,
     /// Snapshot an offline data directory to a .tar.gz file
     Snapshot(snapshot::SnapshotArgs),
+    /// Exit 0 if the server's readiness probe answers 200 (for Docker
+    /// HEALTHCHECK and other probes that can only run a command)
+    Healthcheck {
+        /// Probe URL
+        #[arg(long, default_value = "http://127.0.0.1:8080/readyz")]
+        url: String,
+        /// Timeout in seconds
+        #[arg(long, default_value_t = 3)]
+        timeout: u64,
+    },
     /// Credential management helpers (gen-token, hash, lint, whoami)
     Auth {
         #[command(subcommand)]

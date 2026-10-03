@@ -18,11 +18,16 @@ permission. A publish-only credential cannot use `exspeed pub`.
 ## Server
 
 ```bash
-exspeed server [--bind 0.0.0.0:5933] [--api-bind 0.0.0.0:8080] [--data-dir ./exspeed-data]
+exspeed server [--config exspeed.toml] [--bind 0.0.0.0:5933] [--api-bind 0.0.0.0:8080] [--data-dir ./exspeed-data]
+
+exspeed config print-default          # commented exspeed.toml with every setting
+exspeed config validate -c FILE       # resolve file + env + flags, check, exit non-zero on error
+exspeed config show -c FILE           # resolved settings, secrets redacted
+exspeed healthcheck [--url URL]       # exit 0 when /readyz answers 200 (Docker HEALTHCHECK)
 ```
 
-The full list of flags and environment variables is in
-[configuration.md](configuration.md).
+Settings come from defaults < config file < environment < flags; the full
+list is in [configuration.md](configuration.md).
 
 ## Streams
 
@@ -58,43 +63,51 @@ exspeed tail <stream> --from-beginning
 exspeed tail <stream> --subject 'order.eu.*'
 ```
 
-`tail` polls the SQL endpoint every 200 ms. Each poll scans the whole
-stream, so it is slow on large streams.
+`tail` reads through `GET /api/v1/streams/{name}/records`, page by page,
+and polls every 200 ms once caught up. It doesn't create a consumer. Output
+lines are `#offset [unix.ms] subject key=… value`; `--json` prints each
+record as JSON.
 
 ## Consumers
 
 ```bash
-exspeed consumers                  # list
-exspeed consumer-info <name>       # offset, lag, group, subject filter
+exspeed consumers                  # list: ack floor, unacked, lag, subscribers
+exspeed consumer-info <name>       # spec and live state
 ```
 
-Consumers are created by clients over TCP, for example with the SDK's
-`createConsumer`. The CLI cannot create them.
+Consumers are created by applications (SDK `createConsumer`) or with
+`POST /api/v1/consumers`.
 
 ## Queries
 
 ```bash
 exspeed query "SELECT * FROM orders LIMIT 10"
-exspeed query --continuous "CREATE VIEW eu_orders AS SELECT … FROM orders WHERE …"
-exspeed query "CREATE INDEX orders_by_customer ON orders(payload->>'customer_id')"
-exspeed query "DROP INDEX orders_by_customer"
+exspeed query "CREATE STREAM eu_orders AS SELECT … FROM orders WHERE payload->>'region' = 'eu'"
+exspeed query "CREATE TABLE revenue AS SELECT payload->>'region' AS region, SUM(payload->>'total') AS total FROM orders GROUP BY payload->>'region'"
+exspeed query "PAUSE QUERY eu_orders_1a2b3c4d"
+exspeed query "RESUME QUERY eu_orders_1a2b3c4d"
+exspeed query "DROP STREAM eu_orders"
+exspeed query --continuous "CREATE STREAM …"   # only accepts CREATE statements
 ```
+
+Every statement goes to `POST /api/v1/queries`. Secondary indexes
+(`CREATE INDEX`) were removed, and the server rejects them with `UNSUPPORTED`.
 
 See [exql.md](exql.md).
 
 ## Views
 
 ```bash
-exspeed views                 # list materialized views
-exspeed view <name>           # rows
+exspeed views                 # list materialized tables
+exspeed view <name>           # rows of a table
 ```
 
 ## Connectors
 
 ```bash
-exspeed connectors                                   # list running connectors
-exspeed connector validate <file.toml>               # syntax, plugin, stream, transform
-exspeed connector dry-run  <file.toml>               # + connect and fetch a sample
+exspeed connectors                                   # list connectors and their status
+exspeed connector validate <file.toml>               # syntax, names, transform and every plugin setting
+exspeed connector dry-run  <file.toml> [--max 3]     # + connect and print samples, without side effects
 ```
 
 See [connectors.md](connectors.md).

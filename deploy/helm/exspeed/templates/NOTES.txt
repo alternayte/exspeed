@@ -1,0 +1,12 @@
+Exspeed is starting.
+
+  TCP (SDK):  {{ include "exspeed.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.ports.tcp }}
+  HTTP API:   http://{{ include "exspeed.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.ports.http }}
+
+Try it:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "exspeed.fullname" . }} {{ .Values.ports.http }}:{{ .Values.ports.http }}
+  curl -X POST localhost:{{ .Values.ports.http }}/api/v1/streams -H 'Content-Type: application/json' -d '{"name":"orders"}'
+{{- if gt (int .Values.replicas) 1 }}
+
+⚠️ Multi-pod mode is experimental (see docs/high-availability.md).
+{{- end }}

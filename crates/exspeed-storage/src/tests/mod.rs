@@ -1,12 +1,12 @@
 // Built in Task 4
 
+mod bench;
+mod compaction_tests;
+mod durability_tests;
 mod file_tests;
-mod segment_appender_tests;
-mod segment_recovery_tests;
+mod read_tests;
 mod trait_tests;
-
-#[cfg(test)]
-mod segment_syncer_tests;
+mod util;
 
 mod memory_tests {
     use super::trait_tests;
@@ -132,6 +132,16 @@ mod memory_tests {
     #[tokio::test]
     async fn delete_stream() {
         trait_tests::test_delete_stream(&MemoryStorage::new()).await;
+    }
+
+    #[tokio::test]
+    async fn append_at() {
+        trait_tests::test_append_at(&MemoryStorage::new()).await;
+    }
+
+    #[tokio::test]
+    async fn watch_appends() {
+        trait_tests::test_watch_appends(&MemoryStorage::new()).await;
     }
 }
 
@@ -275,5 +285,45 @@ mod file_trait_tests {
     async fn delete_stream() {
         let (s, _d) = make_storage();
         trait_tests::test_delete_stream(&s).await;
+    }
+
+    #[tokio::test]
+    async fn append_at() {
+        let (s, _d) = make_storage();
+        trait_tests::test_append_at(&s).await;
+    }
+
+    #[tokio::test]
+    async fn append_at_survives_restart() {
+        let (s, d) = make_storage();
+        trait_tests::test_append_at(&s).await;
+        drop(s);
+        let s = FileStorage::open(d.path()).unwrap();
+        let name = exspeed_common::StreamName::try_from("test-append-at").unwrap();
+        let offs: Vec<u64> =
+            exspeed_streams::StorageEngine::read(&s, &name, exspeed_common::Offset(0), 100)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.offset.0)
+                .collect();
+        assert_eq!(offs, vec![0, 1, 5, 6, 7]);
+        let (o, _) = exspeed_streams::StorageEngine::append(
+            &s,
+            &name,
+            &exspeed_streams::Record {
+                value: bytes::Bytes::from_static(b"z"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(o.0, 8);
+    }
+
+    #[tokio::test]
+    async fn watch_appends() {
+        let (s, _d) = make_storage();
+        trait_tests::test_watch_appends(&s).await;
     }
 }

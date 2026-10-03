@@ -15,9 +15,18 @@ impl fmt::Display for InvalidName {
 
 impl std::error::Error for InvalidName {}
 
+/// Prefix of internal streams (`__consumers`, `__connector_offsets`, …).
+/// Users can read them but not create, write or delete them directly.
+pub const INTERNAL_STREAM_PREFIX: &str = "__";
+
 impl StreamName {
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Whether this is an internal (system) stream.
+    pub fn is_internal(&self) -> bool {
+        self.0.starts_with(INTERNAL_STREAM_PREFIX)
     }
 }
 
@@ -71,7 +80,7 @@ pub struct PartitionId(pub u32);
 pub struct Offset(pub u64);
 
 /// Protocol version.
-pub const PROTOCOL_VERSION: u8 = 0x01;
+pub const PROTOCOL_VERSION: u8 = 0x02;
 
 /// Default server port.
 pub const DEFAULT_PORT: u16 = 5933;

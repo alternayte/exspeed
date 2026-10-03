@@ -34,9 +34,11 @@ deployment misconfiguration, not a bug.**
 
 ## Requirements
 
-1. **Shared consumer store.** `EXSPEED_CONSUMER_STORE=postgres` or `=redis`.
-   The `file` backend does not support multi-pod coordination; the server
-   warns loudly on every boot when file-backed.
+1. **A shared lease backend.** `EXSPEED_LEASE_BACKEND=postgres` or `=redis`
+   (the old name `EXSPEED_CONSUMER_STORE` still works, with a warning).
+   Without one the server runs single-node and says so on every boot.
+   Consumer state needs no shared store: it lives in the internal
+   `__consumers` stream and replicates with the log.
 
 2. **One `data_dir` per pod.** The data-dir `flock` guarantees exclusive
    access. Multi-pod does NOT mean shared storage — each pod owns its own
@@ -84,7 +86,7 @@ spec:
             - containerPort: 8080
             - containerPort: 5933
           env:
-            - name: EXSPEED_CONSUMER_STORE
+            - name: EXSPEED_LEASE_BACKEND
               value: postgres
             - name: EXSPEED_OFFSET_STORE_POSTGRES_URL
               valueFrom: { secretKeyRef: { name: pg, key: url } }
@@ -256,7 +258,7 @@ EXSPEED_OFFSET_STORE_POSTGRES_URL=postgres://testuser:testpass@localhost:5432/te
 - `GET /api/v1/cluster/followers` — leader-only, admin-bearer-gated.
   Returns a list of currently-connected followers with `follower_id` +
   `registered_at`. Returns 503 on single-pod pods with an explicit
-  `hint` string pointing at `EXSPEED_CONSUMER_STORE`.
+  `hint` string pointing at `EXSPEED_LEASE_BACKEND`.
 
 ### Known limitation: TCP publish leader-gate
 
@@ -311,7 +313,7 @@ spec:
             - containerPort: 5933
             - containerPort: 5934
           env:
-            - name: EXSPEED_CONSUMER_STORE
+            - name: EXSPEED_LEASE_BACKEND
               value: postgres
             - name: EXSPEED_OFFSET_STORE_POSTGRES_URL
               valueFrom: { secretKeyRef: { name: pg, key: url } }

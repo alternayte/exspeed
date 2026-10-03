@@ -116,7 +116,7 @@ async fn start_leader(schema: &str) -> LeaderHarness {
     let (cred_path, pub_token, rep_token) = write_credentials_toml(&tmp);
 
     // Postgres + leader wiring env. Short lease TTL keeps the test fast.
-    std::env::set_var("EXSPEED_CONSUMER_STORE", "postgres");
+    std::env::set_var("EXSPEED_LEASE_BACKEND", "postgres");
     std::env::set_var("EXSPEED_OFFSET_STORE_POSTGRES_SCHEMA", schema);
     std::env::set_var("EXSPEED_LEASE_TTL_SECS", "5");
     std::env::set_var("EXSPEED_LEASE_HEARTBEAT_SECS", "1");
@@ -135,13 +135,7 @@ async fn start_leader(schema: &str) -> LeaderHarness {
         credentials_file: Some(cred_path),
         tls_cert: None,
         tls_key: None,
-        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-        storage_flush_window_us: 500,
-        storage_flush_threshold_records: 256,
-        storage_flush_threshold_bytes: 1_048_576,
-        storage_sync_interval_ms: 10,
-        storage_sync_bytes: 4 * 1024 * 1024,
-        delivery_buffer: 8192,
+        ..Default::default()
     };
 
     tokio::spawn(async move {
@@ -203,7 +197,7 @@ async fn dial_and_handshake(
 }
 
 fn clear_env() {
-    std::env::remove_var("EXSPEED_CONSUMER_STORE");
+    std::env::remove_var("EXSPEED_LEASE_BACKEND");
     std::env::remove_var("EXSPEED_OFFSET_STORE_POSTGRES_SCHEMA");
     std::env::remove_var("EXSPEED_LEASE_TTL_SECS");
     std::env::remove_var("EXSPEED_LEASE_HEARTBEAT_SECS");

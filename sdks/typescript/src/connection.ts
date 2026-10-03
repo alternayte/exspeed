@@ -1,420 +1,313 @@
-import { EventEmitter } from "node:events";
+/**
+ * One TCP (or TLS) connection: handshake, frame parsing, correlation-id
+ * multiplexing, push routing and keepalive. Reconnection lives one level up,
+ * in `ExspeedClient`.
+ */
 import * as net from "node:net";
 import * as tls from "node:tls";
+import { ConnectionError, ProtocolError, ServerError, TimeoutError } from "./errors.js";
+import { DEFAULT_PORT } from "./protocol/constants.js";
+import { FrameParser } from "./protocol/frame.js";
 import {
-  OpCode,
-  PROTOCOL_VERSION,
-  DEFAULT_PORT,
-  encodeFrame,
-  decodeFrame,
-  type Frame,
-} from "./protocol/index.js";
-import { encodeConnect, decodeConnectResponse } from "./protocol/connect.js";
-import { decodeErrorFrame, ERR_KEY_COLLISION, ERR_DEDUP_MAP_FULL } from "./protocol/error-frame.js";
-import {
-  ConnectionError,
-  ServerError,
-  KeyCollisionError,
-  DedupMapFullError,
-  TimeoutError,
-} from "./errors.js";
-import { AUTH_NONE, AUTH_TOKEN } from "./protocol/types.js";
-import type { BrokerEndpoint } from "./types.js";
+  decodeResponse,
+  requestFrame,
+  type Request,
+  type Response,
+  type WireRecord,
+} from "./protocol/messages.js";
+import type { ServerInfo } from "./types.js";
 
 export interface ConnectionOptions {
-  endpoints: BrokerEndpoint[];
+  host: string;
+  port: number;
+  tls?: boolean | tls.ConnectionOptions;
   clientId: string;
-  auth?: { type: "token"; token: string };
-  reconnect: boolean;
-  maxReconnectAttempts?: number;
-  reconnectBaseDelay?: number;
-  reconnectMaxDelay?: number;
-  requestTimeout: number;
-  pingInterval: number;
-  tls?: boolean | {
-    rejectUnauthorized?: boolean;
-    ca?: Buffer | Buffer[];
-  };
+  token?: string;
+  requestTimeoutMs: number;
+  keepaliveMs: number;
 }
 
-interface PendingRequest {
-  resolve: (frame: Frame) => void;
-  reject: (err: Error) => void;
-  timer: ReturnType<typeof setTimeout>;
+/** Receives a subscription's pushes. */
+export interface SubscriptionSink {
+  /** Called synchronously when `SubscribeOk` arrives, before any `Deliver` for it is routed. */
+  onSubscribed(conn: Connection, subId: number): void;
+  onDeliver(records: WireRecord[]): void;
+  onEnded(code: number, message: string): void;
 }
 
-export class Connection extends EventEmitter {
-  private socket: net.Socket | null = null;
-  private readBuffer = Buffer.alloc(0);
-  private correlationCounter = 0;
-  private pending = new Map<number, PendingRequest>();
-  private closed = false;
-  private connected = false;
-  private socketReady = false;
-  private reconnecting = false;
-  private connecting = false;
-  private pingTimer: ReturnType<typeof setInterval> | null = null;
-  private currentEndpointIndex = 0;
-  private _serverVersion = 1;
-  private _warnedV1 = false;
+export interface ConnectionHandlers {
+  /** The connection closed (for any reason other than `close()`). Called once. */
+  onClose(err: Error): void;
+  /** An `Error` with correlation id 0: a fire-and-forget request failed. */
+  onAsyncError(err: ServerError | ProtocolError): void;
+}
 
-  private readonly opts: Required<Omit<ConnectionOptions, "auth" | "tls">> & {
-    auth?: ConnectionOptions["auth"];
-    tls?: ConnectionOptions["tls"];
-  };
+interface Pending {
+  resolve(resp: Response): void;
+  reject(err: Error): void;
+  timer: ReturnType<typeof setTimeout> | null;
+  sink?: SubscriptionSink;
+}
 
-  constructor(options: ConnectionOptions) {
-    super();
-    this.opts = {
-      maxReconnectAttempts: 10,
-      reconnectBaseDelay: 100,
-      reconnectMaxDelay: 5000,
-      ...options,
-    };
-  }
+export interface RequestOptions {
+  /** Overrides the default request timeout. */
+  timeoutMs?: number;
+  /** For `Subscribe`: where the subscription's pushes go. */
+  sink?: SubscriptionSink;
+}
 
-  currentEndpoint(): BrokerEndpoint {
-    return this.opts.endpoints[this.currentEndpointIndex]!;
-  }
-
-  getServerVersion(): number {
-    return this._serverVersion;
-  }
-
-  /** Test-only: override server version without a real handshake. */
-  _setServerVersionForTest(v: number): void {
-    this._serverVersion = v;
-    this._warnedV1 = true; // suppress warning in tests
-  }
-
-  async connect(): Promise<void> {
-    const totalEndpoints = this.opts.endpoints.length;
-    if (totalEndpoints === 0) {
-      throw new ConnectionError("No broker endpoints configured");
-    }
-
-    this.connecting = true;
-    let lastError: unknown;
+export function errorFromResponse(resp: Extract<Response, { type: "Error" }>): ServerError {
+  let detail: unknown = null;
+  if (resp.detail && resp.detail.length > 0) {
     try {
-      for (let attempt = 0; attempt < totalEndpoints; attempt++) {
-        const tried = this.currentEndpoint();
-        try {
-          await this.openSocket();
-          await this.handshake();
-          this.connected = true;
-          this.startPing();
-          // Clear connecting BEFORE emit so listeners see consistent state.
-          this.connecting = false;
-          this.emit("connected", this.currentEndpoint());
-          return;
-        } catch (err) {
-          lastError = err;
-          // openSocket advances the index on socket error.  If handshake
-          // failed, the index still points at `tried` — advance it now.
-          if (
-            this.currentEndpoint().host === tried.host &&
-            this.currentEndpoint().port === tried.port
-          ) {
-            this.currentEndpointIndex =
-              (this.currentEndpointIndex + 1) % this.opts.endpoints.length;
-          }
-        }
-      }
-    } finally {
-      // Ensure connecting is cleared even on the throw path below.
-      this.connecting = false;
+      detail = JSON.parse(resp.detail.toString("utf8"));
+    } catch {
+      detail = resp.detail.toString("utf8");
     }
+  }
+  return new ServerError(resp.code, resp.message, detail);
+}
 
-    throw new ConnectionError(
-      `Failed to connect to any of ${totalEndpoints} endpoints: ${(lastError as Error)?.message ?? "unknown"}`,
-    );
+export class Connection {
+  private readonly parser = new FrameParser();
+  private readonly pending = new Map<number, Pending>();
+  private readonly subs = new Map<number, SubscriptionSink>();
+  private nextCorr = 1;
+  private keepalive: ReturnType<typeof setInterval> | null = null;
+  private _closed = false;
+  private closedByUser = false;
+  private _info: ServerInfo | null = null;
+
+  private constructor(
+    private readonly socket: net.Socket,
+    private readonly opts: ConnectionOptions,
+    private handlers: ConnectionHandlers,
+  ) {}
+
+  /** Open a socket and run the `Connect` handshake. */
+  static async open(opts: ConnectionOptions, handlers: ConnectionHandlers): Promise<Connection> {
+    const socket = await openSocket(opts);
+    const conn = new Connection(socket, opts, handlers);
+    conn.attach();
+    try {
+      const resp = await conn.request({
+        type: "Connect",
+        clientId: opts.clientId,
+        token: opts.token ?? null,
+      });
+      if (resp.type !== "ConnectOk") throw new ProtocolError(`unexpected handshake reply ${resp.type}`);
+      conn._info = { serverVersion: resp.serverVersion, nodeId: resp.nodeId, leader: resp.leader };
+    } catch (err) {
+      conn.closedByUser = true;
+      conn.teardown(err as Error);
+      throw err;
+    }
+    conn.startKeepalive();
+    return conn;
   }
 
+  get info(): ServerInfo {
+    return this._info!;
+  }
+
+  get closed(): boolean {
+    return this._closed;
+  }
+
+  private attach(): void {
+    this.socket.on("data", (chunk: Buffer) => this.onData(chunk));
+    this.socket.on("error", (err) => this.teardown(new ConnectionError(`connection error: ${err.message}`)));
+    this.socket.on("close", () => this.teardown(new ConnectionError("connection closed")));
+  }
+
+  /** Send a request and wait for its response. Error responses reject with {@link ServerError}. */
+  request(req: Request, opts: RequestOptions = {}): Promise<Response> {
+    if (this._closed) return Promise.reject(new ConnectionError("connection closed"));
+    const corr = this.allocCorr();
+    let frame: Buffer;
+    try {
+      frame = requestFrame(req, corr);
+    } catch (err) {
+      return Promise.reject(err);
+    }
+    return new Promise<Response>((resolve, reject) => {
+      const timeoutMs = opts.timeoutMs ?? this.opts.requestTimeoutMs;
+      const timer =
+        timeoutMs > 0
+          ? setTimeout(() => {
+              this.pending.delete(corr);
+              reject(new TimeoutError(`${req.type} timed out after ${timeoutMs} ms`));
+            }, timeoutMs)
+          : null;
+      this.pending.set(corr, { resolve, reject, timer, sink: opts.sink });
+      this.socket.write(frame);
+    });
+  }
+
+  /**
+   * Send with correlation id 0 (fire-and-forget): no reply on success; a
+   * failure arrives as an async error. Returns false when not sent.
+   */
+  send(req: Request): boolean {
+    if (this._closed) return false;
+    this.socket.write(requestFrame(req, 0));
+    return true;
+  }
+
+  /** Stop routing pushes for a subscription. */
+  removeSub(subId: number): void {
+    this.subs.delete(subId);
+  }
+
+  /** Close gracefully: flush what was written (acks), then drop the socket. */
   async close(): Promise<void> {
-    this.closed = true;
-    this.socketReady = false;
-    this.stopPing();
-    this.rejectAllPending(new ConnectionError("Connection closed"));
-    if (this.socket) {
-      this.socket.removeAllListeners();
-      this.socket.destroy();
-      this.socket = null;
-    }
-    this.connected = false;
-  }
-
-  async request(opcode: OpCode, payload: Buffer): Promise<Frame> {
-    if (this.closed || !this.socket || !this.socketReady) {
-      throw new ConnectionError("Connection is closed");
-    }
-
-    const correlationId = this.nextCorrelationId();
-    const frame = encodeFrame({
-      version: PROTOCOL_VERSION,
-      opcode,
-      correlationId,
-      payload,
-    });
-
-    return new Promise<Frame>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(correlationId);
-        reject(new TimeoutError(`Request timed out (opcode 0x${opcode.toString(16)})`));
-      }, this.opts.requestTimeout);
-
-      this.pending.set(correlationId, { resolve, reject, timer });
-      this.socket!.write(frame);
-    });
-  }
-
-  send(opcode: OpCode, payload: Buffer, correlationId: number): void {
-    if (this.closed || !this.socket) return;
-    const frame = encodeFrame({
-      version: PROTOCOL_VERSION,
-      opcode,
-      correlationId,
-      payload,
-    });
-    this.socket.write(frame);
-  }
-
-  private nextCorrelationId(): number {
-    this.correlationCounter = (this.correlationCounter + 1) & 0xffffffff;
-    if (this.correlationCounter === 0) this.correlationCounter = 1;
-    return this.correlationCounter;
-  }
-
-  private openSocket(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const endpoint = this.currentEndpoint();
-      const port = endpoint.port ?? DEFAULT_PORT;
-      const useTls = this.opts.tls !== undefined && this.opts.tls !== false;
-      const baseOpts = { host: endpoint.host, port };
-
-      // onReady fires on 'connect' for plain TCP, 'secureConnect' for TLS —
-      // both mean the socket is ready for application I/O.
-      const onReady = () => {
-        socket.removeListener("error", onInitialError);
-        this.socketReady = true;
+    if (this._closed) return;
+    this.closedByUser = true;
+    await new Promise<void>((resolve) => {
+      const done = () => {
+        clearTimeout(t);
         resolve();
       };
-
-      const onInitialError = (err: Error) => {
-        this.currentEndpointIndex = (this.currentEndpointIndex + 1) % this.opts.endpoints.length;
-        reject(err);
-      };
-
-      let socket: net.Socket;
-      if (useTls) {
-        const tlsOpts: tls.ConnectionOptions = {
-          ...baseOpts,
-          rejectUnauthorized:
-            typeof this.opts.tls === "object" && this.opts.tls !== null && this.opts.tls.rejectUnauthorized === false
-              ? false
-              : true,
-          ca:
-            typeof this.opts.tls === "object" && this.opts.tls !== null && this.opts.tls.ca
-              ? (Array.isArray(this.opts.tls.ca) ? this.opts.tls.ca : [this.opts.tls.ca])
-              : undefined,
-        };
-        socket = tls.connect(tlsOpts, onReady);
-      } else {
-        socket = net.createConnection(baseOpts, onReady);
-      }
-
-      // Register error listener BEFORE other listeners so synchronous errors
-      // during socket setup properly reject the promise instead of being
-      // absorbed by onSocketError with no listener.
-      socket.once("error", onInitialError);
-      socket.setKeepAlive(true, 10000);
-      socket.on("data", (data) => this.onData(data));
-      socket.on("error", (err) => this.onSocketError(err));
-      socket.on("close", () => this.onSocketClose());
-      this.socket = socket;
+      const t = setTimeout(() => {
+        this.socket.destroy();
+        resolve();
+      }, 1000);
+      this.socket.once("close", done);
+      this.socket.end();
     });
+    this.teardown(new ConnectionError("connection closed"));
   }
 
-  private async handshake(): Promise<void> {
-    const authType = this.opts.auth ? AUTH_TOKEN : AUTH_NONE;
-    const authPayload = this.opts.auth
-      ? Buffer.from(this.opts.auth.token, "utf8")
-      : Buffer.alloc(0);
-
-    const payload = encodeConnect({
-      clientId: this.opts.clientId,
-      authType,
-      authPayload,
-    });
-
-    const response = await this.request(OpCode.Connect, payload);
-    if (response.opcode === OpCode.Error) {
-      const err = decodeErrorFrame(response.payload);
-      throw new ServerError(err.code, err.message);
-    }
-
-    if (response.opcode === OpCode.ConnectOk) {
-      const { serverVersion } = decodeConnectResponse(response.payload);
-      this._serverVersion = serverVersion;
-    } else {
-      // Legacy Ok from v1 broker — leave _serverVersion at 1
-      this._serverVersion = 1;
-    }
-
-    if (this._serverVersion < 2 && !this._warnedV1) {
-      this._warnedV1 = true;
-      console.warn(
-        "[exspeed] connected to broker wire v1 — msgId publishes will use x-idempotency-key header (upgrade broker for full feature)",
-      );
-    }
+  private allocCorr(): number {
+    const c = this.nextCorr;
+    this.nextCorr = this.nextCorr >= 0xffffffff ? 1 : this.nextCorr + 1;
+    return c;
   }
 
-  private onData(data: Buffer): void {
-    this.readBuffer = Buffer.concat([this.readBuffer, data]);
-    let offset = 0;
-
-    while (true) {
-      let result;
-      try {
-        result = decodeFrame(this.readBuffer, offset);
-      } catch (err) {
-        this.emit("error", err);
-        offset += 1;
-        continue;
-      }
-      if (!result) break;
-      offset += result.bytesConsumed;
-      this.dispatchFrame(result.frame);
-    }
-
-    if (offset > 0) {
-      this.readBuffer = this.readBuffer.subarray(offset);
-    }
-  }
-
-  private dispatchFrame(frame: Frame): void {
-    if (frame.correlationId === 0) {
-      this.emit("push", frame);
+  private onData(chunk: Buffer): void {
+    let frames;
+    try {
+      frames = this.parser.push(chunk);
+    } catch (err) {
+      // The byte stream can't be resynchronised: drop the connection.
+      this.socket.destroy();
+      this.teardown(err as Error);
       return;
     }
-
-    const pending = this.pending.get(frame.correlationId);
-    if (!pending) return;
-
-    this.pending.delete(frame.correlationId);
-    clearTimeout(pending.timer);
-
-    if (frame.opcode === OpCode.Error) {
-      const parsed = decodeErrorFrame(frame.payload);
-      if (parsed.code === ERR_KEY_COLLISION && parsed.storedOffset !== undefined) {
-        // Enrich with msgId/stream context at the call site (client.ts).
-        // Use a sentinel so client.ts can distinguish and re-throw with context.
-        pending.reject(new KeyCollisionError("", parsed.storedOffset));
-      } else if (parsed.code === ERR_DEDUP_MAP_FULL && parsed.retryAfterSecs !== undefined) {
-        pending.reject(new DedupMapFullError("", parsed.retryAfterSecs));
-      } else {
-        pending.reject(new ServerError(parsed.code, parsed.message));
-      }
-    } else {
-      pending.resolve(frame);
-    }
-  }
-
-  private onSocketError(err: Error): void {
-    if (this.closed) return;
-    // Only emit "error" if there's a listener; otherwise swallow it
-    // (the socket "close" event that follows will handle cleanup)
-    if (this.listenerCount("error") > 0) {
-      this.emit("error", err);
-    }
-  }
-
-  private onSocketClose(): void {
-    if (this.closed) return;
-    // During the initial connect() loop a failed openSocket() triggers a close
-    // event before we've ever emitted "connected".  Suppress the disconnected
-    // emit and any reconnect scheduling until connect() finishes.
-    if (this.connecting) return;
-    this.connected = false;
-    this.socketReady = false;
-    this.stopPing();
-    this.emit("disconnected", { error: new ConnectionError("Socket closed") });
-
-    if (this.opts.reconnect && !this.reconnecting) {
-      this.attemptReconnect();
-    } else {
-      this.rejectAllPending(new ConnectionError("Connection lost"));
-    }
-  }
-
-  private async attemptReconnect(): Promise<void> {
-    this.reconnecting = true;
-    const max = this.opts.maxReconnectAttempts;
-    // Capture the endpoint we were on when the connection dropped.
-    // Must be captured before the loop because openSocket() advances the
-    // index on socket error, so by attempt 2 currentEndpoint() may already
-    // reflect the next endpoint.
-    const before = this.currentEndpoint();
-
-    for (let attempt = 1; attempt <= max; attempt++) {
-      const delay = Math.min(
-        this.opts.reconnectBaseDelay * Math.pow(2, attempt - 1) +
-          Math.random() * 100,
-        this.opts.reconnectMaxDelay,
-      );
-
-      this.emit("reconnecting", { attempt, delay });
-      await new Promise((r) => setTimeout(r, delay));
-
-      if (this.closed) break;
-
+    for (const f of frames) {
+      if (this._closed) return;
+      let resp: Response;
       try {
-        if (this.socket) {
-          this.socket.removeAllListeners();
-          this.socket.destroy();
+        resp = decodeResponse(f.opcode, f.payload);
+      } catch (err) {
+        const p = f.correlationId !== 0 ? this.takePending(f.correlationId) : undefined;
+        if (p) p.reject(err as Error);
+        else this.handlers.onAsyncError(err as ProtocolError);
+        continue;
+      }
+      this.route(f.correlationId, resp);
+    }
+  }
+
+  private takePending(corr: number): Pending | undefined {
+    const p = this.pending.get(corr);
+    if (p) {
+      this.pending.delete(corr);
+      if (p.timer) clearTimeout(p.timer);
+    }
+    return p;
+  }
+
+  private route(corr: number, resp: Response): void {
+    if (corr === 0) {
+      switch (resp.type) {
+        case "Deliver":
+          this.subs.get(resp.subId)?.onDeliver(resp.records);
+          return;
+        case "SubscriptionEnded": {
+          const sink = this.subs.get(resp.subId);
+          this.subs.delete(resp.subId);
+          sink?.onEnded(resp.code, resp.message);
+          return;
         }
-        await this.openSocket();
-        await this.handshake();
-        this.connected = true;
-        this.reconnecting = false;
-        this.startPing();
-        const after = this.currentEndpoint();
-        this.emit("reconnected", { attempt });
-        this.emit("connected", after);
-        if (after.host !== before.host || after.port !== before.port) {
-          this.emit("endpoint_changed", { from: before, to: after });
-        }
-        return;
-      } catch {
-        // Try again
+        case "Error":
+          this.handlers.onAsyncError(errorFromResponse(resp));
+          return;
+        default:
+          return;
       }
     }
-
-    this.reconnecting = false;
-    this.rejectAllPending(new ConnectionError("Reconnection exhausted"));
-    this.emit("close", {
-      error: new ConnectionError("Failed to reconnect"),
-    });
+    const p = this.takePending(corr);
+    if (resp.type === "SubscribeOk") {
+      if (p?.sink) {
+        // Register before resolving so a Deliver in the same chunk is not lost.
+        this.subs.set(resp.subId, p.sink);
+        p.sink.onSubscribed(this, resp.subId);
+      } else {
+        // The subscribe call timed out or was abandoned; release the server side.
+        this.send({ type: "Unsubscribe", subId: resp.subId });
+      }
+    }
+    if (!p) return;
+    if (resp.type === "Error") p.reject(errorFromResponse(resp));
+    else p.resolve(resp);
   }
 
-  private rejectAllPending(err: Error): void {
-    for (const [, pending] of this.pending) {
-      clearTimeout(pending.timer);
-      pending.reject(err);
-    }
+  private startKeepalive(): void {
+    if (this.opts.keepaliveMs <= 0) return;
+    this.keepalive = setInterval(() => {
+      this.request({ type: "Ping" }).catch((err) => {
+        // A ping that times out means the peer is gone (half-open socket).
+        if (err instanceof TimeoutError) this.socket.destroy();
+      });
+    }, this.opts.keepaliveMs);
+    this.keepalive.unref();
+  }
+
+  private teardown(err: Error): void {
+    if (this._closed) return;
+    this._closed = true;
+    if (this.keepalive) clearInterval(this.keepalive);
+    this.keepalive = null;
+    if (!this.socket.destroyed) this.socket.destroy();
+    const pending = [...this.pending.values()];
     this.pending.clear();
-  }
-
-  private startPing(): void {
-    if (this.opts.pingInterval <= 0) return;
-    this.pingTimer = setInterval(() => {
-      this.request(OpCode.Ping, Buffer.alloc(0)).catch(() => {});
-    }, this.opts.pingInterval);
-  }
-
-  private stopPing(): void {
-    if (this.pingTimer) {
-      clearInterval(this.pingTimer);
-      this.pingTimer = null;
+    this.subs.clear();
+    for (const p of pending) {
+      if (p.timer) clearTimeout(p.timer);
+      p.reject(err instanceof ConnectionError ? err : new ConnectionError(err.message));
     }
+    if (!this.closedByUser) this.handlers.onClose(err);
   }
+}
+
+function openSocket(opts: ConnectionOptions): Promise<net.Socket> {
+  return new Promise((resolve, reject) => {
+    const port = opts.port ?? DEFAULT_PORT;
+    const useTls = opts.tls !== undefined && opts.tls !== false;
+    let socket: net.Socket;
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new ConnectionError(`connect to ${opts.host}:${port} timed out`));
+    }, opts.requestTimeoutMs);
+    const onError = (err: Error) => {
+      clearTimeout(timer);
+      reject(new ConnectionError(`connect to ${opts.host}:${port} failed: ${err.message}`));
+    };
+    const onReady = () => {
+      clearTimeout(timer);
+      socket.removeListener("error", onError);
+      socket.setNoDelay(true);
+      socket.setKeepAlive(true, 10_000);
+      resolve(socket);
+    };
+    if (useTls) {
+      const extra = typeof opts.tls === "object" ? opts.tls : {};
+      const servername = extra.servername ?? (net.isIP(opts.host) ? undefined : opts.host);
+      socket = tls.connect({ host: opts.host, port, servername, ...extra }, onReady);
+    } else {
+      socket = net.createConnection({ host: opts.host, port }, onReady);
+    }
+    socket.once("error", onError);
+  });
 }

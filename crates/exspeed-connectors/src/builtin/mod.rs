@@ -1,56 +1,62 @@
+//! Built-in plugins.
+
+pub mod http;
 pub mod http_poll;
 pub mod http_sink;
 pub mod http_webhook;
 pub mod jdbc;
 pub mod jdbc_poll;
 pub mod mssql_cdc;
+pub mod pg;
 pub mod pgoutput;
-pub mod postgres;
+pub mod postgres_cdc;
 pub mod postgres_outbox;
+pub mod postgres_poll;
 pub mod rabbitmq_sink;
 pub mod rabbitmq_source;
 pub mod s3_sink;
 
-use std::sync::Arc;
+use crate::registry::Registry;
 
-use exspeed_common::Metrics;
+/// Register every built-in plugin.
+pub fn register(r: &mut Registry) {
+    // Sources
+    r.register_passive_source("http_webhook", |init| {
+        http_webhook::WebhookEndpoint::from_init(init).map(drop)
+    });
+    r.register_source("postgres_cdc", |init| {
+        Ok(Box::new(postgres_cdc::PostgresCdcSource::new(init)?))
+    });
+    r.register_source("postgres_poll", |init| {
+        Ok(Box::new(postgres_poll::PostgresPollSource::new(init)?))
+    });
+    r.register_source("postgres_outbox", |init| {
+        Ok(Box::new(postgres_outbox::PostgresOutboxSource::new(init)?))
+    });
+    r.register_source("jdbc_poll", |init| {
+        Ok(Box::new(jdbc_poll::JdbcPollSource::new(init)?))
+    });
+    r.register_source("mssql_cdc", |init| {
+        Ok(Box::new(mssql_cdc::MssqlCdcSource::new(init)?))
+    });
+    r.register_source("rabbitmq", |init| {
+        Ok(Box::new(rabbitmq_source::RabbitmqSource::new(init)?))
+    });
+    r.register_source("http_poll", |init| {
+        Ok(Box::new(http_poll::HttpPollSource::new(init)?))
+    });
 
-use crate::config::ConnectorConfig;
-use crate::traits::{ConnectorError, SinkConnector, SourceConnector};
-
-pub fn create_source(
-    plugin: &str,
-    config: &ConnectorConfig,
-) -> Result<Box<dyn SourceConnector>, ConnectorError> {
-    match plugin {
-        "postgres_outbox" => Ok(Box::new(postgres_outbox::PostgresOutboxSource::new(
-            config,
-        )?)),
-        "postgres" => Ok(Box::new(postgres::PostgresSource::new(config)?)),
-        "jdbc_poll" => Ok(Box::new(jdbc_poll::JdbcPollSource::new(config)?)),
-        "mssql_cdc" => Ok(Box::new(mssql_cdc::MssqlCdcSource::new(config)?)),
-        "rabbitmq" => Ok(Box::new(rabbitmq_source::RabbitmqSource::new(config)?)),
-        "http_poll" => Ok(Box::new(http_poll::HttpPollSource::new(config)?)),
-        other => Err(ConnectorError::Config(format!(
-            "unknown source plugin: {other}"
-        ))),
-    }
-}
-
-pub fn create_sink(
-    plugin: &str,
-    config: &ConnectorConfig,
-    metrics: Arc<Metrics>,
-) -> Result<Box<dyn SinkConnector>, ConnectorError> {
-    match plugin {
-        "http_sink" => Ok(Box::new(http_sink::HttpSinkConnector::new(config)?)),
-        "jdbc" => Ok(Box::new(
-            jdbc::JdbcSinkConnector::new(config)?.with_metrics(metrics),
-        )),
-        "rabbitmq" => Ok(Box::new(rabbitmq_sink::RabbitmqSink::new(config)?)),
-        "s3" => Ok(Box::new(s3_sink::S3SinkConnector::new(config)?)),
-        other => Err(ConnectorError::Config(format!(
-            "unknown sink plugin: {other}"
-        ))),
-    }
+    // Sinks
+    r.register_sink("jdbc", |init| {
+        Ok(Box::new(jdbc::JdbcSinkConnector::new(init)?))
+    });
+    r.register_sink("http_sink", |init| {
+        Ok(Box::new(http_sink::HttpSinkConnector::new(init)?))
+    });
+    r.register_sink("rabbitmq", |init| {
+        Ok(Box::new(rabbitmq_sink::RabbitmqSink::new(init)?))
+    });
+    r.register_sink("s3", |init| {
+        Ok(Box::new(s3_sink::S3SinkConnector::new(init)?))
+    });
 }

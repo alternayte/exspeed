@@ -5,98 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[tokio::test]
-async fn publisher_coalesces_concurrent_publishes_into_batches() {
-    let srv = start().await;
-    let mut setup = ExspeedClient::connect(&srv.tcp_addr).await.unwrap();
-    setup.ensure_stream("coal-stream").await.unwrap();
-
-    let publisher = exspeed_bench::driver::publisher::PublisherBuilder::new(&srv.tcp_addr)
-        .batch_window(Duration::from_millis(1))
-        .max_batch_records(256)
-        .build()
-        .await
-        .unwrap();
-
-    let mut handles = Vec::new();
-    for i in 0..100 {
-        let p = publisher.clone();
-        handles.push(tokio::spawn(async move {
-            let req = exspeed_protocol::messages::publish::PublishRequest {
-                stream: "coal-stream".into(),
-                subject: "s".into(),
-                key: None,
-                msg_id: None,
-                value: bytes::Bytes::from(format!("rec-{i}").into_bytes()),
-                headers: vec![],
-            };
-            p.publish(req).await
-        }));
-    }
-    let mut offsets = Vec::with_capacity(100);
-    for h in handles {
-        offsets.push(h.await.unwrap().unwrap().0);
-    }
-    offsets.sort();
-    assert_eq!(offsets, (0..100).collect::<Vec<u64>>());
-    publisher.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn publisher_batch_window_zero_disables_coalescing() {
-    let srv = start().await;
-    let mut setup = ExspeedClient::connect(&srv.tcp_addr).await.unwrap();
-    setup.ensure_stream("zw-stream").await.unwrap();
-
-    let publisher = exspeed_bench::driver::publisher::PublisherBuilder::new(&srv.tcp_addr)
-        .batch_window(Duration::ZERO)
-        .build()
-        .await
-        .unwrap();
-
-    let offset = publisher
-        .publish(exspeed_protocol::messages::publish::PublishRequest {
-            stream: "zw-stream".into(),
-            subject: "s".into(),
-            key: None,
-            msg_id: None,
-            value: bytes::Bytes::from_static(b"x"),
-            headers: vec![],
-        })
-        .await
-        .unwrap();
-    assert_eq!(offset.0, 0);
-    publisher.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn publisher_explicit_publish_batch() {
-    let srv = start().await;
-    let mut setup = ExspeedClient::connect(&srv.tcp_addr).await.unwrap();
-    setup.ensure_stream("eb-stream").await.unwrap();
-
-    let publisher = exspeed_bench::driver::publisher::Publisher::new(&srv.tcp_addr)
-        .await
-        .unwrap();
-    let reqs: Vec<_> = (0..10)
-        .map(|i| exspeed_protocol::messages::publish::PublishRequest {
-            stream: "eb-stream".into(),
-            subject: "s".into(),
-            key: None,
-            msg_id: None,
-            value: bytes::Bytes::from(format!("r{i}").into_bytes()),
-            headers: vec![],
-        })
-        .collect();
-    let results = publisher.publish_batch(reqs).await;
-    assert_eq!(results.len(), 10);
-    for (i, r) in results.iter().enumerate() {
-        assert_eq!(r.as_ref().unwrap().0, i as u64);
-    }
-    publisher.close().await.unwrap();
-}
-
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connects_and_ensures_stream_is_idempotent() {
     let srv = start().await;
     let mut client = ExspeedClient::connect(&srv.tcp_addr).await.unwrap();
@@ -106,7 +15,7 @@ async fn connects_and_ensures_stream_is_idempotent() {
     client.ensure_stream("bench-stream").await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn producer_sends_at_least_some_records_in_2s() {
     let srv = start().await;
     let mut setup = ExspeedClient::connect(&srv.tcp_addr).await.unwrap();
@@ -129,7 +38,7 @@ async fn producer_sends_at_least_some_records_in_2s() {
     assert_eq!(stats.messages, count.load(Ordering::Relaxed));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn consumer_records_latency_for_pushed_records() {
     let srv = start().await;
     let mut setup = ExspeedClient::connect(&srv.tcp_addr).await.unwrap();
@@ -177,96 +86,72 @@ async fn consumer_records_latency_for_pushed_records() {
     );
 }
 
-#[tokio::test]
-async fn publisher_pipelines_in_order_acks() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn publisher_coalesces_concurrent_publishes_in_order() {
     let srv = start().await;
-    // Pre-create the stream via the low-level client.
     let mut setup = ExspeedClient::connect(&srv.tcp_addr).await.unwrap();
-    setup.ensure_stream("pipe-stream").await.unwrap();
+    setup.ensure_stream("coal-stream").await.unwrap();
+    let publisher = setup
+        .client
+        .publisher()
+        .batch_window(Duration::from_millis(1))
+        .max_batch_records(64)
+        .max_in_flight(16)
+        .build();
 
-    let publisher = exspeed_bench::driver::publisher::Publisher::new(&srv.tcp_addr)
-        .await
-        .unwrap();
-    let origin = Instant::now();
-
-    // Fire 200 in-flight publishes.
-    let mut futs = Vec::with_capacity(200);
+    // Enqueue 200 records from one task, in order; they must land in order.
+    let mut futs = Vec::new();
     for i in 0..200 {
-        let bytes = bytes::Bytes::from(vec![b'x'; 256]);
-        let req = exspeed_protocol::messages::publish::PublishRequest {
-            stream: "pipe-stream".into(),
-            subject: "bench".into(),
-            key: None,
-            msg_id: None,
-            value: bytes,
-            headers: vec![("seq".into(), format!("{i}"))],
-        };
-        futs.push(publisher.publish(req));
+        let p = publisher.clone();
+        futs.push(tokio::spawn(async move {
+            (
+                i,
+                p.publish(
+                    "coal-stream",
+                    exspeed_client::PublishRecord::new("s", format!("rec-{i}")),
+                )
+                .await
+                .unwrap()
+                .offset,
+            )
+        }));
     }
-    // Await all concurrently — exercises actual pipelined demux under load.
-    let results = futures_util::future::join_all(futs).await;
-    let mut offsets: Vec<u64> = results.into_iter().map(|r| r.unwrap().0).collect();
+    let mut offsets = Vec::new();
+    for f in futs {
+        offsets.push(f.await.unwrap().1);
+    }
     offsets.sort();
     assert_eq!(offsets, (0..200).collect::<Vec<u64>>());
-    let _ = origin.elapsed();
     publisher.close().await.unwrap();
-}
 
-#[tokio::test]
-async fn publisher_blocks_on_max_in_flight() {
-    let srv = start().await;
-    let mut setup = ExspeedClient::connect(&srv.tcp_addr).await.unwrap();
-    setup.ensure_stream("bp-stream").await.unwrap();
-
-    let publisher = exspeed_bench::driver::publisher::PublisherBuilder::new(&srv.tcp_addr)
-        .max_in_flight(2)
-        .build()
+    let r = setup
+        .client
+        .read("coal-stream", 0, 1000, Duration::ZERO, "")
         .await
         .unwrap();
+    assert_eq!(r.records.len(), 200);
+}
 
-    let bytes = bytes::Bytes::from(vec![b'x'; 64]);
-    let mk = |i: u32, b: bytes::Bytes| exspeed_protocol::messages::publish::PublishRequest {
-        stream: "bp-stream".into(),
-        subject: "bench".into(),
-        key: None,
-        msg_id: None,
-        value: b,
-        headers: vec![("seq".into(), format!("{i}"))],
-    };
-
-    // Spawn f1 and f2 — these actively hold the two permits.
-    let p1 = publisher.clone();
-    let b1 = bytes.clone();
-    let h1 = tokio::spawn(async move { p1.publish(mk(1, b1)).await });
-    let p2 = publisher.clone();
-    let b2 = bytes.clone();
-    let h2 = tokio::spawn(async move { p2.publish(mk(2, b2)).await });
-
-    // Give the broker time to NOT yet ack — we want both permits held.
-    // Use a server stub that delays acks if needed; here, just give a brief
-    // moment for the spawn to register. Then the 3rd publish must block.
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-
-    let p3 = publisher.clone();
-    let b3 = bytes.clone();
-    let h3 = tokio::spawn(async move { p3.publish(mk(3, b3)).await });
-
-    // Wait 50ms. h3 should NOT be finished — it's blocked on the semaphore.
-    // (h1 and h2 may have finished by now if the broker is fast — that's
-    // fine; the test point is that h3 didn't preempt them by acquiring a
-    // permit out of turn. If h1/h2 finish before h3 is spawned, h3 just
-    // proceeds normally and we can't observe blocking. Add a slight buffer
-    // so h3 spawns while permits are still held.)
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    // At this point either: (a) all three completed (broker is very fast,
-    // permits cycled), or (b) h3 is still blocked. We can't make a hard
-    // assertion either way without a slow broker. The test now at least
-    // exercises real semaphore acquisition under contention; the strict
-    // blocking assertion would need a deterministic slow-server fixture.
-
-    // Await all three to ensure no errors.
-    h1.await.unwrap().unwrap();
-    h2.await.unwrap().unwrap();
-    h3.await.unwrap().unwrap();
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn publisher_with_zero_window_sends_singles() {
+    let srv = start().await;
+    let mut setup = ExspeedClient::connect(&srv.tcp_addr).await.unwrap();
+    setup.ensure_stream("zw-stream").await.unwrap();
+    let publisher = setup
+        .client
+        .publisher()
+        .batch_window(Duration::ZERO)
+        .build();
+    let ack = publisher
+        .publish("zw-stream", exspeed_client::PublishRecord::new("s", "x"))
+        .await
+        .unwrap();
+    assert_eq!(ack.offset, 0);
+    // Errors are reported per record.
+    let err = publisher
+        .publish("missing", exspeed_client::PublishRecord::new("s", "x"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Some(404));
     publisher.close().await.unwrap();
 }

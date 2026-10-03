@@ -19,19 +19,13 @@ pub async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl Into
         state.metrics.set_storage_bytes(&stream, bytes);
     }
 
-    // 3. Update consumer lag per stream/consumer.
-    {
-        let consumers = state.broker.consumers.read().unwrap();
-        for consumer_state in consumers.values() {
-            let stream = &consumer_state.config.stream;
-            let consumer = &consumer_state.config.name;
-            let consumer_offset = consumer_state.config.offset;
-            let head_offset = state
-                .storage
-                .stream_head_offset(stream)
-                .unwrap_or(consumer_offset);
-            let lag = (head_offset as i64) - (consumer_offset as i64);
-            state.metrics.set_consumer_lag(stream, consumer, lag);
+    // 3. Update consumer lag per stream/consumer (leader only; followers
+    // don't run consumers).
+    if let Ok(list) = state.broker.consumers.list(None).await {
+        for info in list {
+            state
+                .metrics
+                .set_consumer_lag(&info.spec.stream, &info.spec.name, info.lag as i64);
         }
     }
 

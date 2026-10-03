@@ -2,7 +2,7 @@
 //!
 //! Wave 5 ships the single-pod behavior: the handler returns 503 with a
 //! machine-readable error body when the pod was started without a
-//! replication coordinator (i.e. `EXSPEED_CONSUMER_STORE` is unset or
+//! replication coordinator (i.e. `EXSPEED_LEASE_BACKEND` is unset or
 //! `file`). The happy-path — a live leader with connected followers —
 //! belongs to Wave 6's end-to-end multi-pod tests.
 
@@ -24,13 +24,7 @@ async fn start_server(auth_token: Option<String>) -> (u16, TempDir) {
         credentials_file: None,
         tls_cert: None,
         tls_key: None,
-        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-        storage_flush_window_us: 500,
-        storage_flush_threshold_records: 256,
-        storage_flush_threshold_bytes: 1_048_576,
-        storage_sync_interval_ms: 10,
-        storage_sync_bytes: 4 * 1024 * 1024,
-        delivery_buffer: 8192,
+        ..Default::default()
     };
 
     tokio::spawn(async move {
@@ -89,13 +83,7 @@ async fn start_server_with_creds(creds_path: PathBuf) -> (u16, TempDir) {
         credentials_file: Some(creds_path),
         tls_cert: None,
         tls_key: None,
-        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-        storage_flush_window_us: 500,
-        storage_flush_threshold_records: 256,
-        storage_flush_threshold_bytes: 1_048_576,
-        storage_sync_interval_ms: 10,
-        storage_sync_bytes: 4 * 1024 * 1024,
-        delivery_buffer: 8192,
+        ..Default::default()
     };
 
     tokio::spawn(async move {
@@ -125,7 +113,7 @@ async fn cluster_followers_endpoint_returns_503_in_single_pod_mode() {
         body["hint"]
             .as_str()
             .unwrap_or_default()
-            .contains("EXSPEED_CONSUMER_STORE"),
+            .contains("EXSPEED_LEASE_BACKEND"),
         "hint should mention the env var the operator needs to set; got {body:?}"
     );
 }

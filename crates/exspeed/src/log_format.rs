@@ -18,11 +18,24 @@ impl LogFormat {
     }
 }
 
-/// Initialize the global tracing subscriber. Call once at process start.
+/// Initialize the global tracing subscriber from the environment
+/// (`LOG_FORMAT`, `RUST_LOG`, default level `warn`). Call once.
 pub fn init_logging() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    init_logging_with(None, None);
+}
 
-    let format = LogFormat::from_env();
+/// Initialize with explicit settings; `None` falls back to the environment.
+/// `level` is a tracing filter (`info`, `exspeed=debug,warn`, ...).
+pub fn init_logging_with(format: Option<&str>, level: Option<&str>) {
+    let filter = match level {
+        Some(l) => EnvFilter::try_new(l).unwrap_or_else(|_| EnvFilter::new("info")),
+        None => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+    };
+    let format = match format {
+        Some("json") | Some("JSON") => LogFormat::Json,
+        Some(_) => LogFormat::Text,
+        None => LogFormat::from_env(),
+    };
     match format {
         LogFormat::Json => tracing_subscriber::fmt()
             .json()

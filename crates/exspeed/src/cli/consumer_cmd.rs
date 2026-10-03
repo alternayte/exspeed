@@ -18,24 +18,27 @@ pub async fn list(client: &CliClient, json_output: bool) -> Result<()> {
         .cloned()
         .unwrap_or_default();
 
-    let columns = vec![
-        "name".to_string(),
-        "stream".to_string(),
-        "group".to_string(),
-        "offset".to_string(),
-    ];
-
+    let columns = [
+        "name",
+        "stream",
+        "ack_floor",
+        "unacked",
+        "lag",
+        "subscribers",
+    ]
+    .map(String::from)
+    .to_vec();
+    let num = |v: &serde_json::Value| v.as_u64().map(|n| n.to_string()).unwrap_or_default();
     let rows: Vec<Vec<String>> = consumers
         .iter()
         .map(|c| {
             vec![
-                c["name"].as_str().unwrap_or("").to_string(),
-                c["stream"].as_str().unwrap_or("").to_string(),
-                c["group"].as_str().unwrap_or("").to_string(),
-                c["offset"]
-                    .as_u64()
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| c["offset"].as_str().unwrap_or("").to_string()),
+                c["spec"]["name"].as_str().unwrap_or("").to_string(),
+                c["spec"]["stream"].as_str().unwrap_or("").to_string(),
+                num(&c["ack_floor"]),
+                num(&c["num_unacked"]),
+                num(&c["lag"]),
+                num(&c["subscribers"]),
             ]
         })
         .collect();
@@ -56,19 +59,28 @@ pub async fn info(client: &CliClient, name: &str, json_output: bool) -> Result<(
         return Ok(());
     }
 
-    println!("Consumer: {}", resp["name"].as_str().unwrap_or(name));
-    if let Some(stream) = resp["stream"].as_str() {
-        println!("  Stream:  {}", stream);
+    let spec = &resp["spec"];
+    println!("Consumer: {}", spec["name"].as_str().unwrap_or(name));
+    println!("  Stream:        {}", spec["stream"].as_str().unwrap_or(""));
+    if let Some(f) = spec["filter_subjects"].as_array().filter(|f| !f.is_empty()) {
+        let f: Vec<&str> = f.iter().filter_map(|v| v.as_str()).collect();
+        println!("  Filters:       {}", f.join(", "));
     }
-    if let Some(group) = resp["group"].as_str() {
-        println!("  Group:   {}", group);
+    for (label, key) in [
+        ("Next offset", "next_offset"),
+        ("Ack floor", "ack_floor"),
+        ("Unacked", "num_unacked"),
+        ("Waiting redel.", "num_waiting"),
+        ("Lag", "lag"),
+        ("Subscribers", "subscribers"),
+        ("Pull waiters", "pull_waiters"),
+    ] {
+        if let Some(v) = resp[key].as_u64() {
+            println!("  {label:<14} {v}");
+        }
     }
-    if let Some(offset) = resp["offset"].as_u64() {
-        println!("  Offset:  {}", offset);
+    if let Some(dlq) = spec["dlq_stream"].as_str() {
+        println!("  DLQ stream:    {dlq}");
     }
-    if let Some(lag) = resp["lag"].as_u64() {
-        println!("  Lag:     {}", lag);
-    }
-
     Ok(())
 }

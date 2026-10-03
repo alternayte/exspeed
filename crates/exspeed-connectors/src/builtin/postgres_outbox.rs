@@ -1,734 +1,487 @@
-use std::collections::HashMap;
+//! `postgres_outbox`: the transactional-outbox pattern.
+//!
+//! Applications insert events into an outbox table in the same transaction
+//! as their state change; this source publishes them.
+//!
+//! - `mode = "poll"` (default) reads the table; `mode = "cdc"` streams its
+//!   inserts through a replication slot.
+//! - Column types: the id may be int4/int8/uuid/text, the payload text,
+//!   json or jsonb — everything is cast to text in SQL.
+//! - Every record carries `x-idempotency-key` = the outbox id, so a replay
+//!   after a crash is dropped by the broker (effectively-once within the
+//!   stream's dedup window).
+//! - `cleanup = "delete"` (default) deletes published rows in `ack()`, i.e.
+//!   only after the records are durable.
+//!
+//! Commit-order caveat (poll mode with `cleanup = "none"`): the cursor is
+//! `id > last_id`, so a row from a transaction that commits after a row
+//! with a higher id was already polled is skipped. With `cleanup =
+//! "delete"` there is no cursor (every remaining row is unpublished), so
+//! late commits are picked up on the next poll; CDC mode delivers in commit
+//! order. Prefer either for strict completeness.
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use pgwire_replication::{Lsn, ReplicationClient, ReplicationConfig, ReplicationEvent};
-use tokio_postgres::NoTls;
-use tracing::{debug, error, info, warn};
+use serde::Deserialize;
+use serde_json::Value;
+use tokio::time::Instant;
+use tokio_postgres::Client;
+use tracing::{info, warn};
 
-use crate::builtin::pgoutput;
-use crate::config::ConnectorConfig;
-use crate::traits::{ConnectorError, HealthStatus, SourceBatch, SourceConnector, SourceRecord};
+use crate::builtin::pg::{self, quote_ident, TableRef};
+use crate::builtin::postgres_cdc::{tuple_object, CdcStream, ChangeKind, Step};
+use crate::registry::PluginInit;
+use crate::settings::{self, de};
+use crate::traits::{ConnectorError, Lag, SourceBatch, SourceConnector, SourceRecord};
 
-#[derive(Debug, Clone, PartialEq)]
-enum OutboxMode {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboxMode {
     Poll,
     Cdc,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-enum CleanupMode {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Cleanup {
     Delete,
     None,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutboxSettings {
+    pub connection: String,
+    #[serde(default = "default_mode")]
+    pub mode: OutboxMode,
+    #[serde(default = "default_table", alias = "outbox_table")]
+    pub table: String,
+    #[serde(default = "default_id")]
+    pub id_column: String,
+    #[serde(default = "default_key")]
+    pub key_column: String,
+    #[serde(default = "default_agg")]
+    pub aggregate_type_column: String,
+    #[serde(default = "default_evt")]
+    pub event_type_column: String,
+    #[serde(default = "default_payload")]
+    pub payload_column: String,
+    /// Poll mode with `cleanup = "delete"`: delivery order (default: the id).
+    #[serde(default)]
+    pub order_column: Option<String>,
+    #[serde(default = "default_cleanup", alias = "cleanup_mode")]
+    pub cleanup: Cleanup,
+    #[serde(default)]
+    pub slot_name: Option<String>,
+    #[serde(default)]
+    pub publication_name: Option<String>,
+    #[serde(default, deserialize_with = "de::bool")]
+    pub drop_slot_on_delete: bool,
+}
+
+fn default_mode() -> OutboxMode {
+    OutboxMode::Poll
+}
+fn default_table() -> String {
+    "outbox_events".into()
+}
+fn default_id() -> String {
+    "id".into()
+}
+fn default_key() -> String {
+    "aggregate_id".into()
+}
+fn default_agg() -> String {
+    "aggregate_type".into()
+}
+fn default_evt() -> String {
+    "event_type".into()
+}
+fn default_payload() -> String {
+    "payload".into()
+}
+fn default_cleanup() -> Cleanup {
+    Cleanup::Delete
+}
+
+/// One outbox row, decoded.
+struct OutboxRow {
+    id: String,
+    key: Option<String>,
+    aggregate_type: String,
+    event_type: String,
+    payload: String,
+}
+
 pub struct PostgresOutboxSource {
-    connection_string: String,
-    outbox_table: String,
-    id_column: String,
-    aggregate_type_column: String,
-    event_type_column: String,
-    payload_column: String,
-    key_column: String,
+    s: OutboxSettings,
+    table: TableRef,
     subject_template: String,
-    mode: OutboxMode,
-    cleanup_mode: CleanupMode,
-    slot_name: String,
-    publication_name: String,
-    /// Regular tokio-postgres client for slot/publication management and DELETE queries.
-    client: Option<tokio_postgres::Client>,
-    /// pgwire-replication CDC streaming client (CDC mode only).
-    repl_client: Option<ReplicationClient>,
-    /// Relation schemas received from the WAL (CDC mode only).
-    relations: HashMap<u32, pgoutput::Relation>,
-    /// Last committed LSN position (CDC mode only).
-    last_lsn: Option<Lsn>,
-    last_position: Option<String>,
-    /// Row IDs from the last poll/CDC batch, used for DELETE on commit.
-    pending_ids: Vec<String>,
-}
-
-/// Sanitize connector name to valid Postgres identifier chars (alphanumeric + underscore).
-pub fn sanitize_pg_name(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-/// Parse a postgres connection string into components for ReplicationConfig.
-///
-/// Supports the URI format: `postgres://user:password@host:port/database`
-fn parse_connection_string(
-    conn_str: &str,
-) -> Result<(String, u16, String, String, String), ConnectorError> {
-    // Parse using tokio_postgres::Config to handle all valid formats.
-    let pg_config: tokio_postgres::Config = conn_str
-        .parse()
-        .map_err(|e| ConnectorError::Config(format!("invalid connection string: {e}")))?;
-
-    let host = pg_config
-        .get_hosts()
-        .first()
-        .map(|h| match h {
-            tokio_postgres::config::Host::Tcp(s) => s.clone(),
-            #[cfg(unix)]
-            tokio_postgres::config::Host::Unix(p) => p.to_string_lossy().into_owned(),
-        })
-        .unwrap_or_else(|| "127.0.0.1".to_string());
-
-    let port = pg_config.get_ports().first().copied().unwrap_or(5432);
-
-    let user = pg_config.get_user().unwrap_or("postgres").to_string();
-
-    let password = pg_config
-        .get_password()
-        .map(|p| String::from_utf8_lossy(p).into_owned())
-        .unwrap_or_default();
-
-    let database = pg_config.get_dbname().unwrap_or("postgres").to_string();
-
-    Ok((host, port, user, password, database))
-}
-
-/// Column name configuration for outbox record extraction.
-struct OutboxColumns<'a> {
-    id: &'a str,
-    aggregate_type: &'a str,
-    event_type: &'a str,
-    payload: &'a str,
-    key: &'a str,
-    subject_template: &'a str,
-}
-
-/// Extract outbox columns from a CDC insert event using the relation schema.
-/// Free function to avoid borrow conflicts with &mut self in poll_cdc.
-fn extract_outbox_record(
-    relation: &pgoutput::Relation,
-    tuple: &[pgoutput::ColValue],
-    cols: &OutboxColumns<'_>,
-) -> Result<(String, SourceRecord), ConnectorError> {
-    let col_map = pgoutput::tuple_to_map(relation, tuple);
-
-    let id = col_map
-        .get(cols.id)
-        .and_then(|v| v.clone())
-        .ok_or_else(|| ConnectorError::Data(format!("CDC insert missing '{}' column", cols.id)))?;
-
-    let agg_type = col_map
-        .get(cols.aggregate_type)
-        .and_then(|v| v.clone())
-        .unwrap_or_default();
-
-    let evt_type = col_map
-        .get(cols.event_type)
-        .and_then(|v| v.clone())
-        .unwrap_or_default();
-
-    let payload_str = col_map
-        .get(cols.payload)
-        .and_then(|v| v.clone())
-        .unwrap_or_default();
-
-    let key_str = col_map
-        .get(cols.key)
-        .and_then(|v| v.clone())
-        .unwrap_or_default();
-
-    let subject = cols
-        .subject_template
-        .replace("{aggregate_type}", &agg_type)
-        .replace("{event_type}", &evt_type);
-
-    let record = SourceRecord {
-        key: Some(Bytes::from(key_str.into_bytes())),
-        value: Bytes::from(payload_str.into_bytes()),
-        subject,
-        headers: vec![
-            ("x-idempotency-key".to_string(), id.clone()),
-            ("x-aggregate-type".to_string(), agg_type),
-            ("x-event-type".to_string(), evt_type),
-        ],
-    };
-
-    Ok((id, record))
+    client: Option<Client>,
+    /// SQL type of the id column (`bigint`, `uuid`, …).
+    id_type: String,
+    select_sql: String,
+    cursor: Option<String>,
+    pending: Vec<String>,
+    cdc: Option<CdcStream>,
+    publication_is_derived: bool,
 }
 
 impl PostgresOutboxSource {
-    pub fn new(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
-        let connection_string = config
-            .setting("connection")
-            .map_err(ConnectorError::Config)?
-            .to_string();
-
-        let outbox_table = config.setting_or("outbox_table", "outbox_events");
-        let id_column = config.setting_or("id_column", "id");
-        let aggregate_type_column = config.setting_or("aggregate_type_column", "aggregate_type");
-        let event_type_column = config.setting_or("event_type_column", "event_type");
-        let payload_column = config.setting_or("payload_column", "payload");
-        let key_column = config.setting_or("key_column", "aggregate_id");
-        let subject_template = config.subject_template.clone();
-
-        let mode = match config.setting_or("mode", "poll").as_str() {
-            "cdc" => OutboxMode::Cdc,
-            _ => OutboxMode::Poll,
-        };
-
-        let cleanup_mode = match config.setting_or("cleanup_mode", "delete").as_str() {
-            "none" => CleanupMode::None,
-            _ => CleanupMode::Delete,
-        };
-
-        let sanitized = sanitize_pg_name(&config.name);
-        let slot_name = {
-            let configured = config.setting_or("slot_name", "");
-            if configured.is_empty() {
-                format!("exspeed_{sanitized}_slot")
-            } else {
-                configured
-            }
-        };
-        let publication_name = {
-            let configured = config.setting_or("publication_name", "");
-            if configured.is_empty() {
-                format!("exspeed_{sanitized}_pub")
-            } else {
-                configured
-            }
-        };
-
+    pub fn new(init: &PluginInit) -> Result<Self, ConnectorError> {
+        let s: OutboxSettings = settings::parse("postgres_outbox", &init.settings)?;
+        pg::validate_connection_string(&s.connection)?;
+        let table = TableRef::parse(&s.table)?;
+        let slot = s
+            .slot_name
+            .clone()
+            .unwrap_or_else(|| pg::default_slot_name(&init.config.name));
+        pg::validate_slot_name(&slot)?;
+        let publication_is_derived = s.publication_name.is_none();
+        let publication = s
+            .publication_name
+            .clone()
+            .unwrap_or_else(|| pg::default_publication_name(&init.config.name));
+        let cdc = (s.mode == OutboxMode::Cdc)
+            .then(|| CdcStream::new(s.connection.clone(), slot, publication, vec![table.clone()]));
         Ok(Self {
-            connection_string,
-            outbox_table,
-            id_column,
-            aggregate_type_column,
-            event_type_column,
-            payload_column,
-            key_column,
-            subject_template,
-            mode,
-            cleanup_mode,
-            slot_name,
-            publication_name,
+            subject_template: if init.config.subject_template.is_empty() {
+                "{aggregate_type}.{event_type}".into()
+            } else {
+                init.config.subject_template.clone()
+            },
+            table,
+            s,
             client: None,
-            repl_client: None,
-            relations: HashMap::new(),
-            last_lsn: None,
-            last_position: None,
-            pending_ids: Vec::new(),
+            id_type: String::new(),
+            select_sql: String::new(),
+            cursor: None,
+            pending: Vec::new(),
+            cdc,
+            publication_is_derived,
         })
     }
 
-    // -----------------------------------------------------------------------
-    // CDC mode: start / poll / commit / stop
-    // -----------------------------------------------------------------------
-
-    async fn start_cdc(&mut self, last_position: Option<String>) -> Result<(), ConnectorError> {
-        // 1. Open a regular client for slot/publication management + DELETE queries
-        let (client, connection) = tokio_postgres::connect(&self.connection_string, NoTls)
-            .await
-            .map_err(|e| ConnectorError::Connection(e.to_string()))?;
-
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                error!("postgres management connection error: {}", e);
-            }
-        });
-
-        // 2. Ensure publication and replication slot exist
-        pgoutput::ensure_publication(
-            &client,
-            &self.publication_name,
-            std::slice::from_ref(&self.outbox_table),
-        )
-        .await?;
-        pgoutput::ensure_replication_slot(&client, &self.slot_name).await?;
-
-        self.client = Some(client);
-
-        // 3. Parse the last_position as an LSN to resume from
-        let start_lsn = match &last_position {
-            Some(pos) => Lsn::parse(pos)
-                .map_err(|e| ConnectorError::Data(format!("invalid LSN position '{pos}': {e}")))?,
-            None => Lsn::ZERO,
-        };
-
-        // 4. Parse connection string components for ReplicationConfig
-        let (host, port, user, password, database) =
-            parse_connection_string(&self.connection_string)?;
-
-        let repl_config = ReplicationConfig {
-            host,
-            port,
-            user,
-            password,
-            database,
-            slot: self.slot_name.clone(),
-            publication: self.publication_name.clone(),
-            start_lsn,
-            ..Default::default()
-        };
-
-        info!(
-            slot = self.slot_name.as_str(),
-            publication = self.publication_name.as_str(),
-            start_lsn = %start_lsn,
-            "starting CDC replication for outbox"
+    fn record(&self, row: OutboxRow) -> SourceRecord {
+        let payload_json: Option<Value> = serde_json::from_str(&row.payload).ok();
+        let subject = crate::subject::render(
+            &self.subject_template,
+            &[
+                ("aggregate_type", &row.aggregate_type),
+                ("event_type", &row.event_type),
+                ("table", &self.table.table),
+            ],
+            payload_json.as_ref(),
         );
+        SourceRecord {
+            key: row.key.map(|k| Bytes::from(k.into_bytes())),
+            value: Bytes::from(row.payload.into_bytes()),
+            subject,
+            headers: vec![
+                ("x-idempotency-key".into(), row.id),
+                ("x-aggregate-type".into(), row.aggregate_type),
+                ("x-event-type".into(), row.event_type),
+                ("x-exspeed-source".into(), "postgres_outbox".into()),
+            ],
+        }
+    }
 
-        let repl_client = ReplicationClient::connect(repl_config)
+    async fn column_type(&self, client: &Client, column: &str) -> Result<String, ConnectorError> {
+        let row = client
+            .query_opt(
+                "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a \
+                 WHERE a.attrelid = ($1::text)::regclass AND a.attname = $2 AND NOT a.attisdropped",
+                &[&self.table.quoted(), &column],
+            )
             .await
-            .map_err(|e| ConnectorError::Connection(format!("replication connect failed: {e}")))?;
+            .map_err(|e| pg::classify(&e, "read outbox columns"))?;
+        row.map(|r| r.get::<_, String>(0)).ok_or_else(|| {
+            ConnectorError::fatal(format!(
+                "postgres_outbox: column '{column}' not found in {}",
+                self.table
+            ))
+        })
+    }
 
-        self.repl_client = Some(repl_client);
-        self.last_lsn = if start_lsn.is_zero() {
-            None
-        } else {
-            Some(start_lsn)
+    async fn poll_table(&mut self, max_batch: usize) -> Result<SourceBatch, ConnectorError> {
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| ConnectorError::connection("postgres_outbox: not started"))?;
+        let limit = max_batch.max(1) as i64;
+        let rows = match (&self.cursor, self.s.cleanup) {
+            (Some(c), Cleanup::None) => client
+                .query(&self.select_sql, &[c, &limit])
+                .await
+                .map_err(|e| pg::classify(&e, "poll outbox"))?,
+            (None, Cleanup::None) => client
+                .query(&self.select_sql, &[&None::<String>, &limit])
+                .await
+                .map_err(|e| pg::classify(&e, "poll outbox"))?,
+            (_, Cleanup::Delete) => client
+                .query(&self.select_sql, &[&limit])
+                .await
+                .map_err(|e| pg::classify(&e, "poll outbox"))?,
         };
-        self.last_position = last_position;
-
-        Ok(())
-    }
-
-    async fn poll_cdc(&mut self, max_batch: usize) -> Result<SourceBatch, ConnectorError> {
-        let repl_client = match &mut self.repl_client {
-            Some(c) => c,
-            None => {
-                return Err(ConnectorError::Connection(
-                    "replication client not connected".to_string(),
-                ))
-            }
-        };
-
-        let mut records = Vec::new();
-        let mut commit_lsn: Option<Lsn> = None;
-        self.pending_ids.clear();
-
-        // Collect events until we hit a Commit, reach max_batch, or timeout
-        loop {
-            if records.len() >= max_batch {
-                break;
-            }
-
-            // Use a timeout to avoid blocking forever when no events are available
-            let event =
-                match tokio::time::timeout(std::time::Duration::from_secs(1), repl_client.recv())
-                    .await
-                {
-                    Ok(Ok(Some(ev))) => ev,
-                    Ok(Ok(None)) => {
-                        // Stream ended
-                        debug!("CDC replication stream ended");
-                        break;
-                    }
-                    Ok(Err(e)) => {
-                        return Err(ConnectorError::Connection(format!(
-                            "replication error: {e}"
-                        )));
-                    }
-                    Err(_) => {
-                        // Timeout — return what we have so far
-                        break;
-                    }
-                };
-
-            match event {
-                ReplicationEvent::XLogData { data, .. } => {
-                    // Parse the pgoutput message using our existing parser
-                    let wal_event = match pgoutput::parse_pgoutput_message(&data) {
-                        Ok(ev) => ev,
-                        Err(e) => {
-                            warn!(error = %e, "failed to parse pgoutput message, skipping");
-                            continue;
-                        }
-                    };
-
-                    match wal_event {
-                        pgoutput::WalEvent::Relation(rel) => {
-                            debug!(
-                                relation_id = rel.id,
-                                table = %rel.table,
-                                "received relation schema"
-                            );
-                            self.relations.insert(rel.id, rel);
-                        }
-                        pgoutput::WalEvent::Insert {
-                            relation_id,
-                            new_tuple,
-                        } => {
-                            let relation = match self.relations.get(&relation_id) {
-                                Some(r) => r,
-                                None => {
-                                    warn!(
-                                        relation_id,
-                                        "received insert for unknown relation, skipping"
-                                    );
-                                    continue;
-                                }
-                            };
-
-                            let cols = OutboxColumns {
-                                id: &self.id_column,
-                                aggregate_type: &self.aggregate_type_column,
-                                event_type: &self.event_type_column,
-                                payload: &self.payload_column,
-                                key: &self.key_column,
-                                subject_template: &self.subject_template,
-                            };
-                            match extract_outbox_record(relation, &new_tuple, &cols) {
-                                Ok((id, record)) => {
-                                    self.pending_ids.push(id);
-                                    records.push(record);
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, "failed to extract outbox record, skipping");
-                                }
-                            }
-
-                            // Report progress for this WAL position
-                        }
-                        pgoutput::WalEvent::Update { .. } | pgoutput::WalEvent::Delete { .. } => {
-                            // Outbox pattern only cares about inserts — skip
-                            debug!("skipping non-insert WAL event in outbox CDC");
-                        }
-                        pgoutput::WalEvent::Begin { .. } => {
-                            // Transaction boundary — continue collecting
-                        }
-                        pgoutput::WalEvent::Commit { end_lsn, .. } => {
-                            // Transaction boundary — record the LSN and stop this batch
-                            commit_lsn = Some(Lsn::from_u64(end_lsn));
-                            break;
-                        }
-                        pgoutput::WalEvent::Unknown(tag) => {
-                            debug!(tag, "unknown pgoutput message type, skipping");
-                        }
-                    }
-                }
-                ReplicationEvent::Commit { end_lsn, .. } => {
-                    // High-level commit event from pgwire-replication
-                    commit_lsn = Some(end_lsn);
-                    break;
-                }
-                ReplicationEvent::Begin { .. } => {
-                    // Transaction start — continue
-                }
-                ReplicationEvent::KeepAlive { .. } => {
-                    // Heartbeat — if we already have records, yield them
-                    if !records.is_empty() {
-                        break;
-                    }
-                }
-                ReplicationEvent::StoppedAt { .. } => {
-                    debug!("CDC replication reached stop LSN");
-                    break;
-                }
-                ReplicationEvent::Message { .. } => {
-                    // Logical decoding messages — not relevant for outbox
-                }
-            }
-        }
-
-        // Determine position from commit LSN or keep existing
-        let position = commit_lsn
-            .map(|lsn| lsn.to_string())
-            .or_else(|| self.last_lsn.map(|lsn| lsn.to_string()));
-
-        Ok(SourceBatch { records, position })
-    }
-
-    async fn commit_cdc(&mut self, position: String) -> Result<(), ConnectorError> {
-        // Parse and store the LSN
-        let lsn = Lsn::parse(&position).map_err(|e| {
-            ConnectorError::Data(format!("invalid LSN in commit position '{position}': {e}"))
-        })?;
-        self.last_lsn = Some(lsn);
-        // Only now — after the manager has durably appended every record up
-        // to `lsn` — may Postgres advance the slot's confirmed_flush_lsn.
-        // Confirming earlier (inside poll) loses data on a crash because
-        // Postgres refuses to replay WAL older than the confirmed position.
-        if let Some(repl_client) = self.repl_client.as_ref() {
-            repl_client.update_applied_lsn(lsn);
-        }
-        self.last_position = Some(position);
-
-        // If cleanup_mode=delete, DELETE the processed rows using the regular client
-        if self.cleanup_mode == CleanupMode::Delete && !self.pending_ids.is_empty() {
-            let client = match &self.client {
-                Some(c) => c,
-                None => {
-                    self.pending_ids.clear();
-                    return Ok(());
-                }
-            };
-
-            // Build a DELETE ... WHERE id IN ($1, $2, ...) query
-            let placeholders: Vec<String> = self
-                .pending_ids
-                .iter()
-                .enumerate()
-                .map(|(i, _)| format!("${}", i + 1))
-                .collect();
-
-            let delete_sql = format!(
-                "DELETE FROM {} WHERE {} IN ({})",
-                self.outbox_table,
-                self.id_column,
-                placeholders.join(", ")
-            );
-
-            let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = self
-                .pending_ids
-                .iter()
-                .map(|id| id as &(dyn tokio_postgres::types::ToSql + Sync))
-                .collect();
-
-            if let Err(e) = client.execute(&delete_sql, &params).await {
-                warn!(
-                    table = self.outbox_table.as_str(),
-                    error = %e,
-                    "failed to delete processed outbox rows (CDC)"
-                );
-            }
-        }
-
-        self.pending_ids.clear();
-        Ok(())
-    }
-
-    async fn stop_cdc(&mut self) -> Result<(), ConnectorError> {
-        // Stop the replication client
-        if let Some(repl_client) = self.repl_client.take() {
-            repl_client.stop();
-            // Drop will clean up the background worker
-        }
-        self.client = None;
-        self.relations.clear();
-        Ok(())
-    }
-
-    // -----------------------------------------------------------------------
-    // Poll mode: start / poll / commit / stop (original implementation)
-    // -----------------------------------------------------------------------
-
-    async fn start_poll(&mut self, last_position: Option<String>) -> Result<(), ConnectorError> {
-        let (client, connection) = tokio_postgres::connect(&self.connection_string, NoTls)
-            .await
-            .map_err(|e| ConnectorError::Connection(e.to_string()))?;
-
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                error!("postgres connection error: {}", e);
-            }
-        });
-
-        self.client = Some(client);
-        self.last_position = last_position;
-        Ok(())
-    }
-
-    async fn poll_poll(&mut self, max_batch: usize) -> Result<SourceBatch, ConnectorError> {
-        let client = match &self.client {
-            Some(c) => c,
-            None => return Err(ConnectorError::Connection("not connected".to_string())),
-        };
-
-        let (query, params): (String, Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>) =
-            match &self.last_position {
-                Some(pos) => {
-                    // Parse position as i64 for typed comparison
-                    let pos_i64: i64 = pos
-                        .parse()
-                        .map_err(|e| ConnectorError::Data(format!("invalid position: {e}")))?;
-                    (
-                        format!(
-                            "SELECT {id}, {agg_type}, {evt_type}, {payload}, {key} FROM {table} WHERE {id} > $1 ORDER BY {id} LIMIT $2",
-                            id = self.id_column,
-                            agg_type = self.aggregate_type_column,
-                            evt_type = self.event_type_column,
-                            payload = self.payload_column,
-                            key = self.key_column,
-                            table = self.outbox_table,
-                        ),
-                        vec![Box::new(pos_i64), Box::new(max_batch as i64)],
-                    )
-                }
-                None => (
-                    format!(
-                        "SELECT {id}, {agg_type}, {evt_type}, {payload}, {key} FROM {table} ORDER BY {id} LIMIT $1",
-                        id = self.id_column,
-                        agg_type = self.aggregate_type_column,
-                        evt_type = self.event_type_column,
-                        payload = self.payload_column,
-                        key = self.key_column,
-                        table = self.outbox_table,
-                    ),
-                    vec![Box::new(max_batch as i64)],
-                ),
-            };
-
-        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-            .iter()
-            .map(|p| &**p as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-
-        let rows = client
-            .query(&query, &params_ref)
-            .await
-            .map_err(|e| ConnectorError::Data(e.to_string()))?;
-
         let mut records = Vec::with_capacity(rows.len());
-        let mut last_id: Option<String> = None;
-        self.pending_ids.clear();
-
-        for row in &rows {
-            let id: String = row
-                .try_get::<_, String>(0)
-                .or_else(|_| row.try_get::<_, i64>(0).map(|v| v.to_string()))
-                .map_err(|e| ConnectorError::Data(format!("id column: {e}")))?;
-
-            let agg_type: String = row
-                .try_get::<_, String>(1)
-                .or_else(|_| row.try_get::<_, i64>(1).map(|v| v.to_string()))
-                .map_err(|e| ConnectorError::Data(format!("aggregate_type column: {e}")))?;
-
-            let evt_type: String = row
-                .try_get::<_, String>(2)
-                .or_else(|_| row.try_get::<_, i64>(2).map(|v| v.to_string()))
-                .map_err(|e| ConnectorError::Data(format!("event_type column: {e}")))?;
-
-            let payload_bytes: Bytes = row
-                .try_get::<_, String>(3)
-                .map(|s| Bytes::from(s.into_bytes()))
-                .or_else(|_| row.try_get::<_, Vec<u8>>(3).map(Bytes::from))
-                .map_err(|e| ConnectorError::Data(format!("payload column: {e}")))?;
-
-            let key_str: String = row
-                .try_get::<_, String>(4)
-                .or_else(|_| row.try_get::<_, i64>(4).map(|v| v.to_string()))
-                .map_err(|e| ConnectorError::Data(format!("key column: {e}")))?;
-
-            let subject = self
-                .subject_template
-                .replace("{aggregate_type}", &agg_type)
-                .replace("{event_type}", &evt_type);
-
-            let record = SourceRecord {
-                key: Some(Bytes::from(key_str.into_bytes())),
-                value: payload_bytes,
-                subject,
-                headers: vec![
-                    ("x-idempotency-key".to_string(), id.clone()),
-                    ("x-aggregate-type".to_string(), agg_type),
-                    ("x-event-type".to_string(), evt_type),
-                ],
+        self.pending.clear();
+        for r in rows {
+            let row = OutboxRow {
+                id: r.get::<_, Option<String>>(0).unwrap_or_default(),
+                key: r.get(1),
+                aggregate_type: r.get::<_, Option<String>>(2).unwrap_or_default(),
+                event_type: r.get::<_, Option<String>>(3).unwrap_or_default(),
+                payload: r
+                    .get::<_, Option<String>>(4)
+                    .unwrap_or_else(|| "null".into()),
             };
-
-            self.pending_ids.push(id.clone());
-            last_id = Some(id);
-            records.push(record);
+            self.pending.push(row.id.clone());
+            records.push(self.record(row));
         }
-
+        let checkpoint = match (self.s.cleanup, self.pending.last()) {
+            (Cleanup::None, Some(last)) => {
+                self.cursor = Some(last.clone());
+                Some(last.clone())
+            }
+            _ => None,
+        };
         Ok(SourceBatch {
             records,
-            position: last_id,
+            checkpoint,
         })
     }
 
-    async fn commit_poll(&mut self, position: String) -> Result<(), ConnectorError> {
-        self.last_position = Some(position.clone());
-
-        if self.cleanup_mode == CleanupMode::Delete && !self.pending_ids.is_empty() {
-            let client = match &self.client {
-                Some(c) => c,
-                None => return Ok(()), // Can't delete if not connected
-            };
-
-            // DELETE processed rows by ID
-            // For poll mode, we can use WHERE id <= position (simpler, single query)
-            let pos_i64: i64 = position
-                .parse()
-                .map_err(|e| ConnectorError::Data(format!("invalid position for delete: {e}")))?;
-
-            let delete_sql = format!(
-                "DELETE FROM {} WHERE {} <= $1",
-                self.outbox_table, self.id_column
-            );
-
-            if let Err(e) = client.execute(&delete_sql, &[&pos_i64]).await {
-                // Log but don't fail -- broker dedup is the safety net
-                warn!(
-                    table = self.outbox_table.as_str(),
-                    error = %e,
-                    "failed to delete processed outbox rows"
-                );
-            }
-
-            self.pending_ids.clear();
-        }
-
-        Ok(())
-    }
-
-    async fn stop_poll(&mut self) -> Result<(), ConnectorError> {
-        self.client = None;
-        Ok(())
+    fn cdc_row(&self, c: &crate::builtin::postgres_cdc::Change) -> Option<OutboxRow> {
+        let ChangeKind::Insert { new } = &c.kind else {
+            return None; // the outbox only publishes inserts
+        };
+        let (obj, _) = tuple_object(&c.relation, new, false);
+        let text = |col: &str| -> Option<String> {
+            obj.get(col).and_then(|v| match v {
+                Value::Null => None,
+                Value::String(s) => Some(s.clone()),
+                other => Some(other.to_string()),
+            })
+        };
+        Some(OutboxRow {
+            id: text(&self.s.id_column)?,
+            key: text(&self.s.key_column),
+            aggregate_type: text(&self.s.aggregate_type_column).unwrap_or_default(),
+            event_type: text(&self.s.event_type_column).unwrap_or_default(),
+            payload: text(&self.s.payload_column).unwrap_or_else(|| "null".into()),
+        })
     }
 }
 
 #[async_trait]
 impl SourceConnector for PostgresOutboxSource {
-    async fn start(&mut self, last_position: Option<String>) -> Result<(), ConnectorError> {
-        match self.mode {
-            OutboxMode::Cdc => self.start_cdc(last_position).await,
-            OutboxMode::Poll => self.start_poll(last_position).await,
+    async fn start(&mut self, checkpoint: Option<String>) -> Result<(), ConnectorError> {
+        let client = pg::connect(&self.s.connection).await?;
+        self.id_type = self.column_type(&client, &self.s.id_column).await?;
+        for col in [
+            &self.s.key_column,
+            &self.s.aggregate_type_column,
+            &self.s.event_type_column,
+            &self.s.payload_column,
+        ] {
+            self.column_type(&client, col).await?;
         }
+        let t = self.table.quoted();
+        let id = quote_ident(&self.s.id_column);
+        let cols = format!(
+            "{id}::text, {}::text, {}::text, {}::text, {}::text",
+            quote_ident(&self.s.key_column),
+            quote_ident(&self.s.aggregate_type_column),
+            quote_ident(&self.s.event_type_column),
+            quote_ident(&self.s.payload_column),
+        );
+        self.select_sql = match self.s.cleanup {
+            Cleanup::Delete => {
+                let order =
+                    quote_ident(self.s.order_column.as_deref().unwrap_or(&self.s.id_column));
+                format!("SELECT {cols} FROM {t} ORDER BY {order} LIMIT $1")
+            }
+            Cleanup::None => {
+                if !matches!(self.id_type.as_str(), "integer" | "bigint" | "smallint")
+                    && self.s.mode == OutboxMode::Poll
+                {
+                    return Err(ConnectorError::fatal(format!(
+                        "postgres_outbox: cleanup = \"none\" polls by `id > last_id`, which needs an \
+                         increasing integer id, but '{}' is {}; use cleanup = \"delete\" or mode = \"cdc\"",
+                        self.s.id_column, self.id_type
+                    )));
+                }
+                format!(
+                    "SELECT {cols} FROM {t} WHERE ($1::text IS NULL OR {id} > ($1::text)::{}) \
+                     ORDER BY {id} LIMIT $2",
+                    self.id_type
+                )
+            }
+        };
+        self.client = Some(client);
+        self.pending.clear();
+        match &mut self.cdc {
+            Some(cdc) => cdc.start(checkpoint.as_deref()).await?,
+            None => self.cursor = checkpoint,
+        }
+        info!(table = %self.table, mode = ?self.s.mode, "postgres_outbox started");
+        Ok(())
     }
 
     async fn poll(&mut self, max_batch: usize) -> Result<SourceBatch, ConnectorError> {
-        match self.mode {
-            OutboxMode::Cdc => self.poll_cdc(max_batch).await,
-            OutboxMode::Poll => self.poll_poll(max_batch).await,
+        if self.cdc.is_none() {
+            return self.poll_table(max_batch).await;
         }
+        let started = Instant::now();
+        let mut records = Vec::new();
+        let mut checkpoint = None;
+        loop {
+            if records.len() >= max_batch {
+                break;
+            }
+            let deadline = if records.is_empty() && checkpoint.is_none() {
+                started + std::time::Duration::from_secs(1)
+            } else {
+                (Instant::now() + std::time::Duration::from_millis(20))
+                    .min(started + std::time::Duration::from_secs(1))
+            };
+            let step = self.cdc.as_mut().unwrap().next(deadline).await?;
+            match step {
+                Step::Change(c) => {
+                    if let Some(row) = self.cdc_row(&c) {
+                        self.pending.push(row.id.clone());
+                        records.push(self.record(row));
+                    }
+                }
+                Step::Commit(lsn) | Step::Idle(lsn) => checkpoint = Some(lsn.to_string()),
+                Step::Timeout => break,
+            }
+        }
+        Ok(SourceBatch {
+            records,
+            checkpoint,
+        })
     }
 
-    async fn commit(&mut self, position: String) -> Result<(), ConnectorError> {
-        match self.mode {
-            OutboxMode::Cdc => self.commit_cdc(position).await,
-            OutboxMode::Poll => self.commit_poll(position).await,
+    async fn ack(&mut self, checkpoint: Option<&str>) -> Result<(), ConnectorError> {
+        if self.s.cleanup == Cleanup::Delete && !self.pending.is_empty() {
+            let client = self
+                .client
+                .as_ref()
+                .ok_or_else(|| ConnectorError::connection("postgres_outbox: not started"))?;
+            let sql = format!(
+                "DELETE FROM {} WHERE {} = ANY(($1::text[])::{}[])",
+                self.table.quoted(),
+                quote_ident(&self.s.id_column),
+                self.id_type
+            );
+            client.execute(&sql, &[&self.pending]).await.map_err(|e| {
+                match pg::classify(&e, "delete published outbox rows") {
+                    ConnectorError::Poison(_) => ConnectorError::fatal(e.to_string()),
+                    other => other,
+                }
+            })?;
+            self.pending.clear();
+        } else {
+            self.pending.clear();
         }
+        if let Some(cdc) = &mut self.cdc {
+            cdc.ack(checkpoint)?;
+        }
+        Ok(())
     }
 
     async fn stop(&mut self) -> Result<(), ConnectorError> {
-        match self.mode {
-            OutboxMode::Cdc => self.stop_cdc().await,
-            OutboxMode::Poll => self.stop_poll().await,
+        if let Some(cdc) = &mut self.cdc {
+            cdc.stop().await;
+        }
+        self.client = None;
+        Ok(())
+    }
+
+    fn lag(&self) -> Option<Lag> {
+        self.cdc.as_ref().and_then(|c| c.lag())
+    }
+
+    async fn dry_run(&mut self, max: usize) -> Result<Vec<SourceRecord>, ConnectorError> {
+        if let Some(cdc) = &self.cdc {
+            let changes = cdc.peek(max.max(1) * 4).await?;
+            return Ok(changes
+                .iter()
+                .filter_map(|c| self.cdc_row(c))
+                .map(|r| self.record(r))
+                .take(max)
+                .collect());
+        }
+        // Poll mode is read-only until ack(); never ack here.
+        self.start(None).await?;
+        let batch = self.poll_table(max).await;
+        self.pending.clear();
+        let _ = self.stop().await;
+        Ok(batch?.records.into_iter().take(max).collect())
+    }
+
+    async fn cleanup(&mut self) -> Result<(), ConnectorError> {
+        if let (Some(cdc), true) = (&self.cdc, self.s.drop_slot_on_delete) {
+            if let Err(e) = cdc.drop_slot(self.publication_is_derived).await {
+                warn!(error = %e, "postgres_outbox: dropping the slot failed");
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ConnectorConfig, ConnectorType};
+    use serde_json::json;
+
+    fn init(settings: Value) -> PluginInit {
+        let (m, _) = exspeed_common::Metrics::new();
+        PluginInit {
+            config: ConnectorConfig::new("o", ConnectorType::Source, "postgres_outbox", "s"),
+            settings: settings.as_object().unwrap().clone(),
+            metrics: std::sync::Arc::new(m),
         }
     }
 
-    async fn health(&self) -> HealthStatus {
-        match self.mode {
-            OutboxMode::Cdc => {
-                if self.repl_client.is_some() && self.client.is_some() {
-                    HealthStatus::Healthy
-                } else if self.client.is_some() {
-                    HealthStatus::Degraded("replication client not connected".to_string())
-                } else {
-                    HealthStatus::Unhealthy("not connected".to_string())
-                }
-            }
-            OutboxMode::Poll => {
-                if self.client.is_some() {
-                    HealthStatus::Healthy
-                } else {
-                    HealthStatus::Unhealthy("not connected".to_string())
-                }
-            }
-        }
+    #[test]
+    fn settings() {
+        let s = PostgresOutboxSource::new(&init(json!({"connection": "postgres://h/db", "outbox_table": "app.outbox", "cleanup_mode": "none"}))).unwrap();
+        assert_eq!(s.table.to_string(), "app.outbox");
+        assert_eq!(s.s.cleanup, Cleanup::None);
+        assert!(s.cdc.is_none());
+        let c = PostgresOutboxSource::new(&init(
+            json!({"connection": "postgres://h/db", "mode": "cdc"}),
+        ))
+        .unwrap();
+        assert!(c.cdc.is_some());
+        assert!(PostgresOutboxSource::new(&init(
+            json!({"connection": "postgres://h/db", "mode": "stream"})
+        ))
+        .is_err());
+        assert!(PostgresOutboxSource::new(&init(
+            json!({"connection": "postgres://h/db", "outbx_table": "x"})
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn record_shape() {
+        let s = PostgresOutboxSource::new(&init(json!({"connection": "postgres://h/db"}))).unwrap();
+        let r = s.record(OutboxRow {
+            id: "7".into(),
+            key: Some("order-1".into()),
+            aggregate_type: "order".into(),
+            event_type: "created".into(),
+            payload: r#"{"total": 5}"#.into(),
+        });
+        assert_eq!(r.subject, "order.created");
+        assert_eq!(r.key.as_deref(), Some(&b"order-1"[..]));
+        assert!(r
+            .headers
+            .contains(&("x-idempotency-key".into(), "7".into())));
     }
 }

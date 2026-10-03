@@ -1,3 +1,4 @@
+/** Base class of every error this SDK throws. */
 export class ExspeedError extends Error {
   constructor(message: string) {
     super(message);
@@ -5,30 +6,38 @@ export class ExspeedError extends Error {
   }
 }
 
+/**
+ * The server answered a request with an `Error` frame.
+ *
+ * `code` is HTTP-like (see {@link ErrorCode}); `detail` is the optional
+ * machine-readable JSON the server attached, for example
+ * `{"leader": "host:5933"}` (503), `{"stored_offset": 7}` (409) or
+ * `{"retry_after_secs": 30}` (429). It is passed through as the server sent
+ * it (snake_case keys).
+ */
 export class ServerError extends ExspeedError {
   readonly code: number;
+  readonly detail: unknown;
 
-  constructor(code: number, message: string) {
+  constructor(code: number, message: string, detail: unknown = null) {
     super(message);
     this.name = "ServerError";
     this.code = code;
+    this.detail = detail ?? null;
+  }
+
+  /** `detail.leader` of a 503 "not the leader" error: the leader's client address, when known. */
+  get leaderHint(): string | null {
+    const d = this.detail as { leader?: unknown } | null;
+    return d && typeof d === "object" && typeof d.leader === "string" ? d.leader : null;
+  }
+
+  override toString(): string {
+    return `ServerError ${this.code}: ${this.message}`;
   }
 }
 
-export class ProtocolError extends ExspeedError {
-  constructor(message: string) {
-    super(message);
-    this.name = "ProtocolError";
-  }
-}
-
-export class TimeoutError extends ExspeedError {
-  constructor(message: string = "Request timed out") {
-    super(message);
-    this.name = "TimeoutError";
-  }
-}
-
+/** The connection is closed, was lost, or is being re-established. */
 export class ConnectionError extends ExspeedError {
   constructor(message: string) {
     super(message);
@@ -36,94 +45,18 @@ export class ConnectionError extends ExspeedError {
   }
 }
 
-export class ValidationError extends ExspeedError {
+/** No response arrived within the request timeout. */
+export class TimeoutError extends ExspeedError {
+  constructor(message = "request timed out") {
+    super(message);
+    this.name = "TimeoutError";
+  }
+}
+
+/** The peer sent bytes this SDK cannot decode, or a reply of the wrong type. */
+export class ProtocolError extends ExspeedError {
   constructor(message: string) {
     super(message);
-    this.name = "ValidationError";
-  }
-}
-
-export class BufferFullError extends ExspeedError {
-  constructor(message: string = "Publish buffer full") {
-    super(message);
-    this.name = "BufferFullError";
-  }
-}
-
-/**
- * Thrown when a publish with a msgId is rejected because the broker already
- * has a record with the same msgId but a different body. This indicates a
- * bug — the same msgId must always carry the same payload.
- * The SDK does NOT retry this error.
- */
-export class KeyCollisionError extends ExspeedError {
-  readonly storedOffset: bigint;
-  readonly msgId: string;
-
-  constructor(msgId: string, storedOffset: bigint) {
-    super(
-      `key collision for msgId=${msgId}: body differs from stored record at offset ${storedOffset}`,
-    );
-    this.name = "KeyCollisionError";
-    this.msgId = msgId;
-    this.storedOffset = storedOffset;
-  }
-}
-
-/**
- * Thrown when the broker's per-stream dedup map is at capacity.
- * The SDK auto-retries up to 3 times, waiting `retryAfterSecs` between attempts.
- * If this error reaches the caller, retries were exhausted.
- */
-export class DedupMapFullError extends ExspeedError {
-  readonly retryAfterSecs: number;
-  readonly stream: string;
-
-  constructor(stream: string, retryAfterSecs: number) {
-    super(`dedup map full for stream=${stream}: retry after ${retryAfterSecs}s`);
-    this.name = "DedupMapFullError";
-    this.stream = stream;
-    this.retryAfterSecs = retryAfterSecs;
-  }
-}
-
-/**
- * Thrown by Subscription.push (when overflowPolicy === 'error') and emitted
- * as the "overflow" event payload (when overflowPolicy === 'drop-oldest')
- * to surface that a record was dropped.
- */
-export class QueueOverflowError extends ExspeedError {
-  readonly offset: bigint;
-  readonly subject: string;
-  readonly droppedCount: number;
-
-  constructor(offset: bigint, subject: string, droppedCount: number = 1) {
-    super(
-      `Subscription queue overflow: dropped record offset=${offset} subject=${subject}`,
-    );
-    this.name = "QueueOverflowError";
-    this.offset = offset;
-    this.subject = subject;
-    this.droppedCount = droppedCount;
-  }
-}
-
-export class QueryError extends ExspeedError {
-  readonly code: string;
-  readonly line?: number;
-  readonly column?: number;
-  readonly hint?: string;
-
-  constructor(
-    message: string,
-    code: string,
-    options?: { line?: number; column?: number; hint?: string },
-  ) {
-    super(message);
-    this.name = "QueryError";
-    this.code = code;
-    this.line = options?.line;
-    this.column = options?.column;
-    this.hint = options?.hint;
+    this.name = "ProtocolError";
   }
 }

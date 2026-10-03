@@ -20,8 +20,9 @@ exspeed server        # that's the whole deployment
   `order.*.created` or `order.>`.
 - **Replayable and retained.** Records are kept by time and size. You can
   seek by offset or timestamp and replay from anywhere.
-- **SQL built in.** Run one-shot queries, continuous queries into new streams,
-  materialized views, tumbling windows and stream-stream joins.
+- **SQL built in.** Run one-shot queries (on Apache DataFusion), continuous
+  queries into new streams, materialized tables, event-time windows and
+  stream joins.
 - **Connectors built in.** Postgres CDC and outbox, webhooks, JDBC, S3,
   RabbitMQ and HTTP, configured with TOML files that hot-reload.
 - **Simple to operate.** It is a single static binary with a Docker image,
@@ -43,20 +44,23 @@ exspeed query "SELECT key, subject, payload->>'region' AS region FROM orders"
 ```
 
 Applications connect through the [TypeScript SDK](sdks/typescript/README.md)
-on TCP port 5933. The HTTP API is on port 8080.
+or the Rust [`exspeed-client`](crates/exspeed-client) on TCP port 5933
+([protocol](docs/protocol.md)). The HTTP API is on port 8080.
 
 ## Feature status
 
 | Area | Status |
 |------|--------|
-| Durable streams, subjects, retention, publish, fetch, seek | ✅ works · ⚠️ storage edge cases ([§3.1](docs/REVIEW.md#31-storage-exspeed-storage)) |
-| Push consumers, ack/nack | ⚠️ cursor semantics only; no redelivery or ack timeout yet |
-| Consumer groups | ⚠️ only with a Postgres or Redis coordinator; broadcast on single node |
+| Durable streams, subjects, retention, compaction, publish, read | ✅ rewritten storage engine (crash-safe, lock-free reads) |
+| Consumers: push + pull, ack/nack/term, ack timeout, redelivery, backoff, DLQ | ✅ JetStream-style, state in the log |
+| Work sharing across app instances (one consumer, many subscribers) | ✅ |
 | Idempotent publish (`msg_id`) | ✅ single node · ⚠️ gaps in batches and on failover |
-| Auth (scoped tokens) and TLS | ✅ · ⚠️ scoped admins can list all streams |
-| ExQL bounded queries | ✅ filter/project · ⚠️ joins, JSON numerics, many clauses ([§3.5](docs/REVIEW.md#35-exql-exspeed-processing)) |
-| ExQL continuous queries, windows, joins, views | ⚠️ partial; state is not durable |
-| Connectors | ⚠️ see per-plugin status in [docs/connectors.md](docs/connectors.md) |
+| Auth (scoped tokens) and TLS | ✅ |
+| ExQL bounded queries | ✅ full SQL on DataFusion (joins, HAVING, window functions, subqueries), JSON numerics, pushdown, timeouts/limits ([exql.md](docs/exql.md)) |
+| ExQL continuous queries, windows, joins, tables | ✅ event-time windows, stream-stream/stream-table joins, durable tables, checkpointed state, effectively-once output · ⚠️ query registry not replicated ([exql.md](docs/exql.md#state-recovery-and-delivery-guarantees)) |
+| Connectors: framework (checkpoint protocol, supervisor, typed settings, DLQ, replicated offsets) | ✅ tested with fault injection |
+| Connectors: Postgres CDC, outbox, poll; JDBC sink; HTTP poll/sink/webhook | ✅ at-least-once or effectively-once, tested against real services ([guarantees](docs/connectors.md#delivery-guarantees)) |
+| Connectors: RabbitMQ, S3, SQL Server CDC | ⚠️ implemented to the same protocol; unit-tested only, no service tests in CI yet |
 | Multi-pod HA with replication | ❌ not safe yet ([§3.4](docs/REVIEW.md#34-ha-leadership--replication)) |
 
 ## Documentation
@@ -64,7 +68,7 @@ on TCP port 5933. The HTTP API is on port 8080.
 | | |
 |---|---|
 | **Learn** | [Getting started](docs/getting-started.md) · [Concepts](docs/concepts.md) |
-| **Use** | [CLI](docs/cli.md) · [HTTP API](docs/http-api.md) · [ExQL](docs/exql.md) · [Connectors](docs/connectors.md) · [Idempotent publish](docs/idempotent-publish.md) · [TypeScript SDK](sdks/typescript/README.md) |
+| **Use** | [CLI](docs/cli.md) · [HTTP API](docs/http-api.md) · [ExQL](docs/exql.md) · [Connectors](docs/connectors.md) · [Idempotent publish](docs/idempotent-publish.md) · [TypeScript SDK](sdks/typescript/README.md) · [Protocol](docs/protocol.md) |
 | **Run** | [Configuration](docs/configuration.md) · [Operations](docs/operations.md) · [Security](docs/security.md) · [High availability](docs/high-availability.md) |
 | **Contribute** | [Architecture](docs/architecture.md) · [Development](docs/development.md) · [Review & roadmap](docs/REVIEW.md) · [Benchmarks](BENCHMARKS.md) · [Changelog](CHANGELOG.md) |
 

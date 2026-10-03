@@ -1,53 +1,14 @@
 use std::time::Duration;
 
-use bytes::BytesMut;
-use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use tokio::net::TcpStream;
-use tokio::time::timeout;
-use tokio_util::codec::{FramedRead, FramedWrite};
 
-use exspeed_protocol::codec::ExspeedCodec;
-use exspeed_protocol::frame::Frame;
-use exspeed_protocol::messages::connect::{AuthType, ConnectRequest};
-use exspeed_protocol::messages::consumer::{CreateConsumerRequest, StartFrom};
-use exspeed_protocol::opcodes::OpCode;
+use crate::common::TestServer;
 
-async fn start_server() -> (String, String) {
-    let tcp_port = exspeed_testkit::pick_unused_port().unwrap();
-    let http_port = exspeed_testkit::pick_unused_port().unwrap();
-    let tcp_addr = format!("127.0.0.1:{}", tcp_port);
-    let http_addr = format!("127.0.0.1:{}", http_port);
-
-    let dir = tempfile::TempDir::new().unwrap();
-    let data_dir = dir.path().to_path_buf();
-    let tcp_addr_clone = tcp_addr.clone();
-    let http_addr_clone = http_addr.clone();
-
-    tokio::spawn(async move {
-        let _keep = dir;
-        exspeed::cli::server::run(exspeed::cli::server::ServerArgs {
-            bind: tcp_addr_clone,
-            api_bind: http_addr_clone,
-            data_dir,
-            auth_token: None,
-            credentials_file: None,
-            tls_cert: None,
-            tls_key: None,
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
-        })
-        .await
-        .unwrap();
-    });
-
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    (tcp_addr, format!("http://127.0.0.1:{}", http_port))
+/// Returns the server (keep it alive) and its HTTP base URL.
+async fn start_server() -> (TestServer, String) {
+    let server = TestServer::start().await;
+    let http = format!("http://{}", server.api_addr);
+    (server, http)
 }
 
 #[tokio::test]
@@ -98,49 +59,12 @@ async fn delete_with_no_references_succeeds() {
     assert_eq!(resp.status(), 404, "stream should be gone");
 }
 
-async fn create_consumer_via_tcp(tcp_addr: &str, consumer: &str, stream: &str) {
-    let sock = TcpStream::connect(tcp_addr).await.unwrap();
-    let (reader, writer) = sock.into_split();
-    let mut reader = FramedRead::new(reader, ExspeedCodec::new());
-    let mut writer = FramedWrite::new(writer, ExspeedCodec::new());
-
-    // Handshake.
-    let mut buf = BytesMut::new();
-    ConnectRequest {
-        client_id: "stream-delete-test".into(),
-        auth_type: AuthType::None,
-        auth_payload: bytes::Bytes::new(),
-    }
-    .encode(&mut buf);
-    writer
-        .send(Frame::new(OpCode::Connect, 1, buf.freeze()))
+async fn create_consumer_via_tcp(server: &TestServer, consumer: &str, stream: &str) {
+    server
+        .client()
         .await
-        .unwrap();
-    let _ = timeout(Duration::from_secs(5), reader.next())
+        .create_consumer(exspeed_client::ConsumerSpec::new(consumer, stream))
         .await
-        .expect("timeout waiting for connect ack")
-        .unwrap()
-        .unwrap();
-
-    // CreateConsumer.
-    let mut buf = BytesMut::new();
-    CreateConsumerRequest {
-        name: consumer.into(),
-        stream: stream.into(),
-        group: String::new(),
-        subject_filter: String::new(),
-        start_from: StartFrom::Earliest,
-        start_offset: 0,
-    }
-    .encode(&mut buf);
-    writer
-        .send(Frame::new(OpCode::CreateConsumer, 2, buf.freeze()))
-        .await
-        .unwrap();
-    let _ = timeout(Duration::from_secs(5), reader.next())
-        .await
-        .expect("timeout waiting for create-consumer ack")
-        .unwrap()
         .unwrap();
 }
 
@@ -248,6 +172,15 @@ async fn force_delete_cascades() {
         .await
         .unwrap();
 
+    // A consumer created over HTTP is cascaded too.
+    let resp = client
+        .post(format!("{}/api/v1/consumers", http))
+        .json(&serde_json::json!({"name": "casc-cons", "stream": "cascade-target"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
     let resp = client
         .delete(format!("{}/api/v1/streams/cascade-target?force=true", http))
         .send()
@@ -273,6 +206,13 @@ async fn force_delete_cascades() {
         "hook-c should have been removed, got: {:?}",
         arr
     );
+
+    let resp = client
+        .get(format!("{}/api/v1/consumers/casc-cons", http))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "consumer should be cascaded");
 
     // Stream should be gone.
     let resp = client

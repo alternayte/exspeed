@@ -1,75 +1,115 @@
-pub mod file;
-pub mod postgres;
-pub mod redis;
-pub mod s3;
-pub mod stream;
+//! Connector offsets (source checkpoints and sink positions).
+//!
+//! - [`log_store::LogOffsetStore`] (default, `EXSPEED_CONNECTOR_OFFSET_STORE=log`): records
+//!   in the internal `__connector_offsets` stream, written through the
+//!   broker `Log`, so offsets replicate with the data.
+//! - [`file::FileOffsetStore`] (`EXSPEED_CONNECTOR_OFFSET_STORE=file`): one JSON file
+//!   per connector under `{data_dir}/connector-offsets/`, written atomically.
+//!
+//! A load error is an error, never "no offset": the supervisor marks the
+//! connector `failed` instead of silently restarting from scratch.
 
-use async_trait::async_trait;
-use exspeed_streams::StorageEngine;
+pub mod file;
+pub mod log_store;
+
 use std::path::Path;
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use exspeed_broker::log::Log;
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, thiserror::Error)]
 pub enum OffsetStoreError {
-    #[error("connection error: {0}")]
-    Connection(String),
-    #[error("I/O error: {0}")]
+    #[error("offset store I/O error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("serialization error: {0}")]
-    Serialization(String),
+    #[error("offset store write failed: {0}")]
+    Write(String),
+    #[error("offset store read failed: {0}")]
+    Read(String),
+    #[error("corrupt offset for connector '{connector}': {detail}")]
+    Corrupt { connector: String, detail: String },
+}
+
+/// What is stored per connector.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StoredOffset {
+    /// Opaque source checkpoint (an LSN, a cursor, …).
+    Source { checkpoint: String },
+    /// Next stream offset a sink will read.
+    Sink { offset: u64 },
 }
 
 #[async_trait]
 pub trait OffsetStore: Send + Sync {
-    /// Save a source connector's opaque position string.
-    async fn save_source_offset(
-        &self,
-        connector: &str,
-        position: &str,
-    ) -> Result<(), OffsetStoreError>;
-
-    /// Load a source connector's last saved position. None = fresh start.
-    async fn load_source_offset(&self, connector: &str)
-        -> Result<Option<String>, OffsetStoreError>;
-
-    /// Save a sink connector's stream offset.
-    async fn save_sink_offset(&self, connector: &str, offset: u64) -> Result<(), OffsetStoreError>;
-
-    /// Load a sink connector's last saved offset. 0 = start of stream.
-    async fn load_sink_offset(&self, connector: &str) -> Result<u64, OffsetStoreError>;
-
-    /// Delete all offsets for a connector.
+    async fn load(&self, connector: &str) -> Result<Option<StoredOffset>, OffsetStoreError>;
+    async fn save(&self, connector: &str, offset: &StoredOffset) -> Result<(), OffsetStoreError>;
     async fn delete(&self, connector: &str) -> Result<(), OffsetStoreError>;
+
+    async fn load_source(&self, connector: &str) -> Result<Option<String>, OffsetStoreError> {
+        match self.load(connector).await? {
+            None => Ok(None),
+            Some(StoredOffset::Source { checkpoint }) => Ok(Some(checkpoint)),
+            Some(StoredOffset::Sink { .. }) => Err(OffsetStoreError::Corrupt {
+                connector: connector.into(),
+                detail: "stored offset belongs to a sink, but the connector is a source".into(),
+            }),
+        }
+    }
+
+    async fn load_sink(&self, connector: &str) -> Result<Option<u64>, OffsetStoreError> {
+        match self.load(connector).await? {
+            None => Ok(None),
+            Some(StoredOffset::Sink { offset }) => Ok(Some(offset)),
+            Some(StoredOffset::Source { .. }) => Err(OffsetStoreError::Corrupt {
+                connector: connector.into(),
+                detail: "stored offset belongs to a source, but the connector is a sink".into(),
+            }),
+        }
+    }
+
+    async fn save_source(&self, connector: &str, checkpoint: &str) -> Result<(), OffsetStoreError> {
+        self.save(
+            connector,
+            &StoredOffset::Source {
+                checkpoint: checkpoint.to_string(),
+            },
+        )
+        .await
+    }
+
+    async fn save_sink(&self, connector: &str, offset: u64) -> Result<(), OffsetStoreError> {
+        self.save(connector, &StoredOffset::Sink { offset }).await
+    }
 }
 
-/// Build an OffsetStore from the `EXSPEED_OFFSET_STORE` env var.
-/// Defaults to file-based storage if unset.
-pub async fn from_env(
-    data_dir: &Path,
-    storage: Arc<dyn StorageEngine>,
-) -> Result<Arc<dyn OffsetStore>, OffsetStoreError> {
-    let backend = std::env::var("EXSPEED_OFFSET_STORE").unwrap_or_else(|_| "file".to_string());
+/// Environment variable selecting the connector offset store.
+pub const ENV_VAR: &str = "EXSPEED_CONNECTOR_OFFSET_STORE";
 
-    match backend.as_str() {
-        "postgres" => {
-            let store = postgres::PostgresOffsetStore::from_env().await?;
-            Ok(Arc::new(store))
-        }
-        "redis" => {
-            let store = redis::RedisOffsetStore::from_env().await?;
-            Ok(Arc::new(store))
-        }
-        "s3" => {
-            let store = s3::S3OffsetStore::from_env()?;
-            Ok(Arc::new(store))
-        }
-        "stream" => {
-            let store = stream::StreamOffsetStore::new(storage).await?;
-            Ok(Arc::new(store))
-        }
-        _ => {
-            let store = file::FileOffsetStore::new(data_dir.to_path_buf());
-            Ok(Arc::new(store))
-        }
+/// The backend name `from_env` will use.
+pub fn backend_from_env() -> String {
+    std::env::var(ENV_VAR).unwrap_or_else(|_| "log".to_string())
+}
+
+/// Build the offset store selected by `EXSPEED_CONNECTOR_OFFSET_STORE`
+/// (`log`, the default, or `file`). `EXSPEED_OFFSET_STORE` is not consulted:
+/// it selects the consumer/lease backends.
+pub fn from_env(data_dir: &Path, log: Arc<Log>) -> Result<Arc<dyn OffsetStore>, String> {
+    build(&backend_from_env(), data_dir, log)
+}
+
+/// Build the named offset store: `log` (default) or `file`.
+pub fn build(
+    backend: &str,
+    data_dir: &Path,
+    log: Arc<Log>,
+) -> Result<Arc<dyn OffsetStore>, String> {
+    match backend {
+        "" | "log" => Ok(Arc::new(log_store::LogOffsetStore::new(log))),
+        "file" => Ok(Arc::new(file::FileOffsetStore::new(data_dir.to_path_buf()))),
+        other => Err(format!(
+            "unknown {ENV_VAR} '{other}' (expected 'log' or 'file')"
+        )),
     }
 }

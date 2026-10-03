@@ -104,7 +104,7 @@ struct PodHandle {
 }
 
 fn set_shared_env(schema: &str) {
-    std::env::set_var("EXSPEED_CONSUMER_STORE", "postgres");
+    std::env::set_var("EXSPEED_LEASE_BACKEND", "postgres");
     std::env::set_var("EXSPEED_OFFSET_STORE_POSTGRES_SCHEMA", schema);
     std::env::set_var("EXSPEED_LEASE_TTL_SECS", "5");
     std::env::set_var("EXSPEED_LEASE_HEARTBEAT_SECS", "1");
@@ -114,7 +114,7 @@ fn set_shared_env(schema: &str) {
 
 fn clear_shared_env() {
     for k in [
-        "EXSPEED_CONSUMER_STORE",
+        "EXSPEED_LEASE_BACKEND",
         "EXSPEED_OFFSET_STORE_POSTGRES_SCHEMA",
         "EXSPEED_LEASE_TTL_SECS",
         "EXSPEED_LEASE_HEARTBEAT_SECS",
@@ -147,13 +147,7 @@ async fn spawn_pod() -> PodHandle {
         credentials_file: Some(cred_path.clone()),
         tls_cert: None,
         tls_key: None,
-        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-        storage_flush_window_us: 500,
-        storage_flush_threshold_records: 256,
-        storage_flush_threshold_bytes: 1_048_576,
-        storage_sync_interval_ms: 10,
-        storage_sync_bytes: 4 * 1024 * 1024,
-        delivery_buffer: 8192,
+        ..Default::default()
     };
     let task = tokio::spawn(async move {
         let _ = exspeed::cli::server::run(args).await;
@@ -410,13 +404,7 @@ async fn multipod_e2e_bootstrap_failover_rejoin() {
         credentials_file: Some(dying_cred_path),
         tls_cert: None,
         tls_key: None,
-        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-        storage_flush_window_us: 500,
-        storage_flush_threshold_records: 256,
-        storage_flush_threshold_bytes: 1_048_576,
-        storage_sync_interval_ms: 10,
-        storage_sync_bytes: 4 * 1024 * 1024,
-        delivery_buffer: 8192,
+        ..Default::default()
     };
     let rejoined_api_port: u16 = dying_api_bind.rsplit(':').next().unwrap().parse().unwrap();
     let _rejoined_task = tokio::spawn(async move {

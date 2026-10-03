@@ -9,6 +9,9 @@ impl Dialect for SqliteDialect {
     fn placeholder(&self, _n: usize) -> String {
         "?".to_string()
     }
+    fn max_params(&self) -> usize {
+        999
+    }
     fn json_blob_type(&self) -> &'static str {
         "TEXT"
     }

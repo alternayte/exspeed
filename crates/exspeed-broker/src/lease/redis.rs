@@ -18,7 +18,6 @@
 //! acquire. No operator action required — just expect a brief leadership
 //! re-election at the upgrade boundary.
 
-use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -84,21 +83,28 @@ struct Inner {
 }
 
 impl RedisLeaseBackend {
+    /// Connect using `EXSPEED_LEASE_REDIS_URL` (or the legacy
+    /// `EXSPEED_OFFSET_STORE_REDIS_URL`) and friends.
     pub async fn from_env() -> Result<Self, LeaseError> {
-        let url = env::var("EXSPEED_OFFSET_STORE_REDIS_URL").map_err(|_| {
-            LeaseError::Connection("EXSPEED_OFFSET_STORE_REDIS_URL is required".to_string())
+        let cfg = super::LeaseConfig::from_env();
+        let url = cfg.redis_url.ok_or_else(|| {
+            LeaseError::Connection("EXSPEED_LEASE_REDIS_URL is required".to_string())
         })?;
-        let prefix = env::var("EXSPEED_LEASE_REDIS_KEY_PREFIX")
-            .unwrap_or_else(|_| "exspeed:lease:".to_string());
+        Self::connect(&url, &cfg.redis_key_prefix, cfg.heartbeat).await
+    }
 
-        let client = redis::Client::open(url.as_str())
+    pub async fn connect(
+        url: &str,
+        prefix: &str,
+        heartbeat_interval: Duration,
+    ) -> Result<Self, LeaseError> {
+        let prefix = prefix.to_string();
+        let client = redis::Client::open(url)
             .map_err(|e| LeaseError::Connection(format!("redis client: {e}")))?;
         let conn = client
             .get_multiplexed_async_connection()
             .await
             .map_err(|e| LeaseError::Connection(format!("redis connect: {e}")))?;
-
-        let heartbeat_interval = super::heartbeat_interval_from_env();
 
         Ok(Self {
             inner: Arc::new(Inner {

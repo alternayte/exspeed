@@ -1,0 +1,585 @@
+//! Continuous-query tests: results, event time, joins, tables, recovery
+//! and lifecycle, all asserting concrete output values.
+
+use std::collections::HashSet;
+use std::time::Duration;
+
+use serde_json::{json, Value as Json};
+
+use crate::continuous::runner::H_QUERY;
+use crate::test_util::{eventually, test_config, Node, World};
+
+const T0: i64 = 1_700_000_000_000; // a multiple of 10 s
+
+fn sorted(mut v: Vec<Json>) -> Vec<Json> {
+    v.sort_by_key(|a| a.to_string());
+    v
+}
+
+fn qid(created: &Json) -> String {
+    created["query_id"].as_str().unwrap().to_string()
+}
+
+async fn clicks(w: &World) {
+    w.stream("clicks").await;
+    for (u, dt, amount) in [
+        ("a", 1_000, 5),
+        ("b", 2_000, 7),
+        ("a", 3_000, 1),
+        ("a", 12_000, 2),
+        ("b", 15_000, 4),
+        ("b", 21_000, 10),
+        ("a", 35_000, 1),
+    ] {
+        w.publish(
+            "clicks",
+            None,
+            "c",
+            json!({"user": u, "ts": T0 + dt, "amount": amount}),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn tumbling_emit_final_once_per_window_on_replay() {
+    let w = World::new().await;
+    clicks(&w).await;
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::start(&w, dir.path(), test_config()).await;
+    let q = node
+        .sql(
+            "CREATE STREAM w AS SELECT payload->>'user' AS usr, window_start, window_end, \
+             COUNT(*) AS n, SUM(payload->>'amount') AS total, MAX(payload->>'amount') AS mx \
+             FROM clicks TIMESTAMP BY payload->>'ts' \
+             WINDOW TUMBLING (SIZE 10 SECONDS) GROUP BY payload->>'user' EMIT FINAL",
+        )
+        .await;
+    let id = qid(&q);
+    node.wait_input(&id, 7).await;
+    let ts = |d: i64| crate::convert::format_ts_millis(T0 + d);
+    let row = |u: &str, s: i64, n: i64, total: f64, mx: f64| json!({"usr": u, "window_start": ts(s), "window_end": ts(s + 10_000), "n": n, "total": total, "mx": mx});
+    let expected = vec![
+        row("a", 0, 2, 6.0, 5.0),
+        row("b", 0, 1, 7.0, 7.0),
+        row("a", 10_000, 1, 2.0, 2.0),
+        row("b", 10_000, 1, 4.0, 4.0),
+        row("b", 20_000, 1, 10.0, 10.0),
+    ];
+    assert_eq!(w.payloads("w").await, expected);
+
+    // A record for a closed window is late: dropped and counted.
+    w.publish(
+        "clicks",
+        None,
+        "c",
+        json!({"user": "a", "ts": T0 + 5_000, "amount": 100}),
+    )
+    .await;
+    node.wait_input(&id, 8).await;
+    assert_eq!(w.payloads("w").await, expected);
+    let info = node.engine.get_query(&id).unwrap();
+    assert_eq!(info.stats["late_records_dropped"], 1);
+
+    // Output records carry the group key and query id.
+    let recs = w.read_all("w").await;
+    assert_eq!(recs[0].key.as_deref(), Some(&b"a"[..]));
+    assert!(recs[0]
+        .headers
+        .iter()
+        .any(|(k, v)| k == H_QUERY && v == &id));
+    node.stop().await;
+}
+
+#[tokio::test]
+async fn hopping_window_table() {
+    let w = World::new().await;
+    clicks(&w).await;
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::start(&w, dir.path(), test_config()).await;
+    let q = node
+        .sql(
+            "CREATE TABLE h AS SELECT window_start, COUNT(*) AS n FROM clicks \
+             TIMESTAMP BY payload->>'ts' WINDOW HOPPING (SIZE 10 SECONDS, ADVANCE BY 5 SECONDS)",
+        )
+        .await;
+    node.wait_input(&qid(&q), 7).await;
+    let res = node.sql("SELECT n FROM h ORDER BY window_start").await;
+    let ns: Vec<i64> = res["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r[0].as_i64().unwrap())
+        .collect();
+    // windows starting -5, 0, 5, 10, 15, 20, 30, 35 (s)
+    assert_eq!(ns, vec![3, 3, 1, 2, 2, 1, 1, 1]);
+    node.stop().await;
+}
+
+#[tokio::test]
+async fn tables_group_by_global_and_having() {
+    let w = World::new().await;
+    w.stream("orders").await;
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::start(&w, dir.path(), test_config()).await;
+    let by_region = qid(&node
+        .sql(
+            "CREATE TABLE by_region AS SELECT payload->>'region' AS region, COUNT(*) AS n, \
+             SUM(payload->>'amount') AS total FROM orders GROUP BY payload->>'region'",
+        )
+        .await);
+    let totals = qid(&node
+        .sql("CREATE MATERIALIZED VIEW totals AS SELECT COUNT(*) AS n, AVG(payload->>'amount') AS avg FROM orders")
+        .await);
+    let big = qid(&node
+        .sql(
+            "CREATE TABLE big AS SELECT payload->>'region' AS region, COUNT(*) AS n FROM orders \
+             GROUP BY payload->>'region' HAVING COUNT(*) >= 2",
+        )
+        .await);
+    let changes = qid(&node
+        .sql(
+            "CREATE STREAM region_changes AS SELECT payload->>'region' AS region, COUNT(*) AS n \
+             FROM orders GROUP BY payload->>'region' EMIT CHANGES",
+        )
+        .await);
+    // A global aggregate has its one row before any input.
+    eventually("global row", || async {
+        node.engine
+            .table_rows("totals")
+            .map(|v| v["row_count"] == 1)
+            .unwrap_or(false)
+    })
+    .await;
+    assert_eq!(
+        node.engine.table_rows("totals").unwrap()["rows"],
+        json!([[0, null]])
+    );
+
+    for (r, a) in [("eu", 100), ("us", 300), ("eu", 50)] {
+        w.publish("orders", None, "o", json!({"region": r, "amount": a}))
+            .await;
+    }
+    for id in [&by_region, &totals, &big, &changes] {
+        node.wait_input(id, 3).await;
+    }
+    let res = node
+        .sql("SELECT region, n, total FROM by_region ORDER BY region")
+        .await;
+    assert_eq!(res["rows"], json!([["eu", 2, 150.0], ["us", 1, 300.0]]));
+    assert_eq!(
+        node.engine.table_rows("totals").unwrap()["rows"],
+        json!([[3, 150.0]])
+    );
+    assert_eq!(
+        node.engine.table_rows("big").unwrap()["rows"],
+        json!([["eu", 2]])
+    );
+    assert_eq!(
+        node.engine.table_row("by_region", "us").unwrap(),
+        json!({"columns": ["region", "n", "total"], "row": ["us", 1, 300.0]})
+    );
+    assert!(node.engine.table_row("by_region", "xx").is_err());
+    // One micro-batch (3 records) → one update per changed key.
+    assert_eq!(
+        sorted(w.payloads("region_changes").await),
+        sorted(vec![
+            json!({"region": "eu", "n": 2}),
+            json!({"region": "us", "n": 1})
+        ])
+    );
+    let keys: Vec<_> = w
+        .read_all("region_changes")
+        .await
+        .iter()
+        .map(|r| String::from_utf8(r.key.clone().unwrap().to_vec()).unwrap())
+        .collect();
+    assert_eq!(
+        sorted(keys.iter().map(|k| json!(k)).collect()),
+        vec![json!("eu"), json!("us")]
+    );
+    // The changelog stream backs the table.
+    assert_eq!(w.read_all("by_region").await.len(), 2);
+    node.stop().await;
+
+    // Tables survive a restart (restored from checkpoint + changelog).
+    let node = Node::start(&w, dir.path(), test_config()).await;
+    let res = node
+        .sql("SELECT region, n, total FROM by_region ORDER BY region")
+        .await;
+    assert_eq!(res["rows"], json!([["eu", 2, 150.0], ["us", 1, 300.0]]));
+    w.publish("orders", None, "o", json!({"region": "us", "amount": 1}))
+        .await;
+    node.wait_input(&by_region, 4).await;
+    let res = node
+        .sql("SELECT region, n FROM by_region ORDER BY region")
+        .await;
+    assert_eq!(res["rows"], json!([["eu", 2], ["us", 2]]));
+    node.wait_input(&big, 4).await;
+    assert_eq!(
+        node.engine.table_rows("big").unwrap()["rows"],
+        json!([["eu", 2], ["us", 2]])
+    );
+    node.stop().await;
+}
+
+async fn join_data(w: &World) {
+    w.stream("orders").await;
+    w.stream("payments").await;
+    for (id, dt) in [("o1", 1_000), ("o2", 2_000), ("o3", 3_000)] {
+        w.publish("orders", Some("k"), "o", json!({"id": id, "ts": T0 + dt}))
+            .await;
+    }
+    // Out of order: p(o1) is older than p(o2) but arrives later.
+    for (oid, dt, amt) in [("o2", 4_000, 20), ("o1", 0, 10), ("o3", 20_000, 30)] {
+        w.publish(
+            "payments",
+            Some("k"),
+            "p",
+            json!({"order_id": oid, "ts": T0 + dt, "amt": amt}),
+        )
+        .await;
+    }
+    w.publish(
+        "orders",
+        Some("k"),
+        "o",
+        json!({"id": "o4", "ts": T0 + 30_000}),
+    )
+    .await;
+    w.publish(
+        "payments",
+        Some("k"),
+        "p",
+        json!({"order_id": "x", "ts": T0 + 31_000, "amt": 1}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn stream_stream_inner_and_left_joins() {
+    let w = World::new().await;
+    join_data(&w).await;
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::start(&w, dir.path(), test_config()).await;
+    let inner = qid(&node
+        .sql(
+            "CREATE STREAM paid AS SELECT o.payload->>'id' AS oid, p.payload->>'amt' AS amt \
+             FROM orders o TIMESTAMP BY o.payload->>'ts' \
+             JOIN payments p TIMESTAMP BY p.payload->>'ts' WITHIN 5 SECONDS \
+             ON o.payload->>'id' = p.payload->>'order_id' AND o.key = p.key AND p.payload->>'amt' > 0 \
+             GRACE PERIOD 10 SECONDS",
+        )
+        .await);
+    let left = qid(&node
+        .sql(
+            "CREATE STREAM unpaid AS SELECT o.payload->>'id' AS oid, p.payload->>'amt' AS amt \
+             FROM orders o TIMESTAMP BY o.payload->>'ts' \
+             LEFT JOIN payments p TIMESTAMP BY p.payload->>'ts' WITHIN 5 SECONDS \
+             ON p.payload->>'order_id' = o.payload->>'id' \
+             GRACE PERIOD 10 SECONDS",
+        )
+        .await);
+    node.wait_input(&inner, 8).await;
+    node.wait_input(&left, 8).await;
+    assert_eq!(
+        sorted(w.payloads("paid").await),
+        vec![
+            json!({"oid": "o1", "amt": "10"}),
+            json!({"oid": "o2", "amt": "20"})
+        ]
+    );
+    // o3's payment is 17 s away (> WITHIN); it is emitted unmatched once the
+    // watermark (min(30, 31) - 10 = 20 s) passes 3 + 5 s. o4 is still open.
+    assert_eq!(
+        sorted(w.payloads("unpaid").await),
+        vec![
+            json!({"oid": "o1", "amt": "10"}),
+            json!({"oid": "o2", "amt": "20"}),
+            json!({"oid": "o3", "amt": null}),
+        ]
+    );
+    // A payment older than the watermark is late.
+    w.publish(
+        "payments",
+        Some("k"),
+        "p",
+        json!({"order_id": "o4", "ts": T0 + 2_000, "amt": 5}),
+    )
+    .await;
+    node.wait_input(&inner, 9).await;
+    assert_eq!(w.payloads("paid").await.len(), 2);
+    assert_eq!(
+        node.engine.get_query(&inner).unwrap().stats["late_records_dropped"],
+        1
+    );
+    // Advancing both sides past o4 + WITHIN emits o4 unmatched.
+    w.publish(
+        "orders",
+        Some("k"),
+        "o",
+        json!({"id": "o5", "ts": T0 + 60_000}),
+    )
+    .await;
+    w.publish(
+        "payments",
+        Some("k"),
+        "p",
+        json!({"order_id": "y", "ts": T0 + 60_000, "amt": 1}),
+    )
+    .await;
+    node.wait_input(&left, 11).await;
+    let un = w.payloads("unpaid").await;
+    assert_eq!(un.last().unwrap(), &json!({"oid": "o4", "amt": null}));
+    assert_eq!(un.len(), 4);
+    node.stop().await;
+}
+
+#[tokio::test]
+async fn stream_table_join_sees_live_updates() {
+    let w = World::new().await;
+    w.stream("regions").await;
+    w.stream("orders").await;
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::start(&w, dir.path(), test_config()).await;
+    let rn = qid(&node
+        .sql(
+            "CREATE TABLE rn AS SELECT payload->>'id' AS id, LAST_VALUE(payload->>'name') AS name \
+             FROM regions GROUP BY payload->>'id'",
+        )
+        .await);
+    let en = qid(&node
+        .sql(
+            "CREATE STREAM enriched AS SELECT o.payload->>'oid' AS oid, r.name AS region_name \
+             FROM orders o LEFT JOIN rn r ON o.payload->>'region' = r.id",
+        )
+        .await);
+    w.publish("regions", None, "r", json!({"id": "eu", "name": "Europe"}))
+        .await;
+    node.wait_input(&rn, 1).await;
+    w.publish("orders", None, "o", json!({"oid": "o1", "region": "eu"}))
+        .await;
+    node.wait_input(&en, 1).await;
+    w.publish("regions", None, "r", json!({"id": "eu", "name": "EU"}))
+        .await;
+    node.wait_input(&rn, 2).await;
+    w.publish("orders", None, "o", json!({"oid": "o2", "region": "eu"}))
+        .await;
+    w.publish("orders", None, "o", json!({"oid": "o3", "region": "xx"}))
+        .await;
+    node.wait_input(&en, 3).await;
+    assert_eq!(
+        w.payloads("enriched").await,
+        vec![
+            json!({"oid": "o1", "region_name": "Europe"}),
+            json!({"oid": "o2", "region_name": "EU"}),
+            json!({"oid": "o3", "region_name": null}),
+        ]
+    );
+    node.stop().await;
+}
+
+const RECOVERY_QUERIES: &[&str] = &[
+    "CREATE STREAM c AS SELECT payload->>'k' AS k, window_start, COUNT(*) AS n, SUM(payload->>'v') AS s \
+     FROM src TIMESTAMP BY payload->>'ts' WINDOW TUMBLING (SIZE 10 SECONDS) GROUP BY payload->>'k'",
+    "CREATE STREAM f AS SELECT payload->>'k' AS k, window_start, COUNT(*) AS n \
+     FROM src TIMESTAMP BY payload->>'ts' WINDOW TUMBLING (SIZE 10 SECONDS) GROUP BY payload->>'k' EMIT FINAL",
+    "CREATE TABLE t AS SELECT payload->>'k' AS k, COUNT(*) AS n, SUM(payload->>'v') AS s FROM src GROUP BY payload->>'k'",
+    "CREATE STREAM j AS SELECT a.payload->>'v' AS av, b.payload->>'v' AS bv FROM src a TIMESTAMP BY a.payload->>'ts' \
+     JOIN src b TIMESTAMP BY b.payload->>'ts' WITHIN 6 SECONDS ON a.payload->>'k' = b.payload->>'k' AND a.offset < b.offset",
+    "CREATE STREAM lj AS SELECT a.payload->>'v' AS av, b.payload->>'v' AS bv FROM src a TIMESTAMP BY a.payload->>'ts' \
+     LEFT JOIN src b TIMESTAMP BY b.payload->>'ts' WITHIN 1 SECONDS ON a.payload->>'k' = b.payload->>'k' AND a.offset < b.offset",
+];
+const OUTPUTS: &[&str] = &["c", "f", "t", "j", "lj"];
+
+async fn publish_src(w: &World, from: i64, to: i64) {
+    for i in from..to {
+        let k = ["x", "y", "z"][(i % 3) as usize];
+        // Mostly increasing event time with some disorder.
+        let dt = i * 1_700 - if i % 4 == 0 { 900 } else { 0 };
+        w.publish("src", None, "s", json!({"k": k, "v": i, "ts": T0 + dt}))
+            .await;
+    }
+}
+
+/// Run the recovery queries over 20 records, stop the node (crash or
+/// graceful), publish 10 more and restart with a larger micro-batch.
+/// The crashed run must replay its last micro-batch with the original
+/// boundaries to match the graceful one.
+async fn recovery_run(crash: bool) -> (Vec<Vec<Json>>, Json, Vec<Vec<String>>) {
+    let w = World::new().await;
+    w.stream("src").await;
+    publish_src(&w, 0, 20).await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = |batch: usize| crate::session::ExqlConfig {
+        micro_batch_records: batch,
+        checkpoint_every_batches: 3,
+        ..test_config()
+    };
+    let node = Node::start(&w, dir.path(), cfg(2)).await;
+    let mut ids = vec![];
+    for q in RECOVERY_QUERIES {
+        ids.push(qid(&node.sql(q).await));
+    }
+    for id in &ids {
+        node.wait_input(id, 20).await;
+    }
+    if crash {
+        node.crash().await;
+    } else {
+        node.stop().await;
+    }
+    publish_src(&w, 20, 30).await;
+    let node = Node::start(&w, dir.path(), cfg(10)).await;
+    for id in &ids {
+        node.wait_input(id, 30).await;
+    }
+    let mut outs = vec![];
+    let mut keys = vec![];
+    for o in OUTPUTS {
+        outs.push(w.payloads(o).await);
+        keys.push(
+            w.read_all(o)
+                .await
+                .iter()
+                .flat_map(|r| {
+                    r.headers
+                        .iter()
+                        .filter(|(k, _)| k == "x-idempotency-key")
+                        .map(|(_, v)| v.clone())
+                })
+                .collect(),
+        );
+    }
+    let table = node.sql("SELECT k, n, s FROM t ORDER BY k").await["rows"].clone();
+    node.stop().await;
+    (outs, table, keys)
+}
+
+#[tokio::test]
+async fn crash_recovery_gives_identical_output_without_duplicates() {
+    let (reference, ref_table, _) = recovery_run(false).await;
+    let (recovered, table, keys) = recovery_run(true).await;
+    for (i, name) in OUTPUTS.iter().enumerate() {
+        assert!(!reference[i].is_empty(), "{name} produced no output");
+        assert_eq!(
+            recovered[i], reference[i],
+            "output '{name}' differs after a crash"
+        );
+        let unique: HashSet<&String> = keys[i].iter().collect();
+        assert_eq!(unique.len(), keys[i].len(), "duplicate records in '{name}'");
+    }
+    assert_eq!(table, ref_table);
+    assert_eq!(
+        table,
+        json!([["x", 10, 135.0], ["y", 10, 145.0], ["z", 10, 155.0]])
+    );
+}
+
+#[tokio::test]
+async fn pause_resume_and_stopped_queries_stay_stopped() {
+    let w = World::new().await;
+    w.stream("ev").await;
+    w.stream("tmp").await;
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::start(&w, dir.path(), test_config()).await;
+    let id = qid(&node
+        .sql("CREATE STREAM ev2 AS SELECT payload->>'n' AS n FROM ev WHERE payload->>'n' >= 0")
+        .await);
+    for n in 0..3 {
+        w.publish("ev", Some("k"), "e", json!({"n": n})).await;
+    }
+    node.wait_input(&id, 3).await;
+    let p = node.sql(&format!("PAUSE QUERY {id}")).await;
+    assert_eq!(p["status"], "paused");
+    for n in 3..6 {
+        w.publish("ev", Some("k"), "e", json!({"n": n})).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(w.payloads("ev2").await.len(), 3);
+
+    // A query that fails (its source disappears) is stopped with an error.
+    let bad = qid(&node.sql("CREATE STREAM tmp2 AS SELECT * FROM tmp").await);
+    w.log
+        .delete_stream(&exspeed_common::StreamName::try_from("tmp").unwrap())
+        .await
+        .unwrap();
+    eventually("query failure", || async {
+        node.engine.get_query(&bad).unwrap().status == "failed"
+    })
+    .await;
+    node.stop().await;
+
+    // After a restart neither the paused nor the failed query runs.
+    let node = Node::start(&w, dir.path(), test_config()).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let q = node.engine.get_query(&id).unwrap();
+    assert_eq!(
+        (q.status.as_str(), q.desired_state),
+        ("paused", crate::DesiredState::Paused)
+    );
+    let b = node.engine.get_query(&bad).unwrap();
+    assert_eq!(b.status, "failed");
+    assert_eq!(b.desired_state, crate::DesiredState::Stopped);
+    assert!(b.error.unwrap().contains("not found"));
+    assert_eq!(w.payloads("ev2").await.len(), 3);
+
+    // Resume continues from the checkpoint, without duplicates.
+    let r = node.sql(&format!("RESUME QUERY {id}")).await;
+    assert_eq!(r["status"], "running");
+    node.wait_input(&id, 6).await;
+    let got: Vec<Json> = w.payloads("ev2").await;
+    assert_eq!(
+        got,
+        (0..6)
+            .map(|n| json!({"n": n.to_string()}))
+            .collect::<Vec<_>>()
+    );
+    // Output records keep the source key and subject.
+    let recs = w.read_all("ev2").await;
+    assert_eq!(recs[0].subject, "e");
+    assert_eq!(recs[0].key.as_deref(), Some(&b"k"[..]));
+
+    // DROP STREAM removes the query and the stream.
+    node.sql("DROP STREAM ev2").await;
+    assert!(node.engine.get_query(&id).is_none());
+    assert!(w.read_all("ev2").await.is_empty());
+    node.stop().await;
+}
+
+#[tokio::test]
+async fn invalid_queries_are_rejected_before_anything_is_persisted() {
+    let w = World::new().await;
+    w.stream("s").await;
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::start(&w, dir.path(), test_config()).await;
+    for (sql, code) in [
+        ("CREATE STREAM o AS SELECT * FROM nope", "PLAN_ERROR"),
+        ("CREATE STREAM o AS SELECT nope FROM s", "PLAN_ERROR"),
+        (
+            "CREATE STREAM o AS SELECT * FROM s ORDER BY offset",
+            "UNSUPPORTED",
+        ),
+        (
+            "CREATE STREAM o AS SELECT * FROM s a JOIN s b ON a.key = b.key",
+            "PLAN_ERROR",
+        ),
+        ("CREATE TABLE o AS SELECT * FROM s", "PLAN_ERROR"),
+        (
+            "CREATE STREAM o AS SELECT COUNT(*) FROM s EMIT FINAL",
+            "PLAN_ERROR",
+        ),
+        ("CREATE STREAM s AS SELECT * FROM s", "PLAN_ERROR"),
+        ("CREATE STREAM ../x AS SELECT * FROM s", "PARSE_ERROR"),
+        ("CREATE STREAM __x AS SELECT * FROM s", "PLAN_ERROR"),
+        ("CREATE INDEX i ON s (key)", "UNSUPPORTED"),
+    ] {
+        let e = node.engine.execute(sql).await.unwrap_err();
+        assert_eq!(e.code(), code, "{sql}: {e}");
+    }
+    assert!(node.engine.list_queries().is_empty());
+    assert!(std::fs::read_dir(dir.path().join("exql").join("queries"))
+        .map(|d| d.count() == 0)
+        .unwrap_or(true));
+    node.stop().await;
+}

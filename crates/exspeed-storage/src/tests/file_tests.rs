@@ -1,17 +1,12 @@
-use std::thread;
-use std::time::Duration;
+//! FileStorage behaviour: persistence, rolling, retention, trim, truncate.
 
 use bytes::Bytes;
 use exspeed_common::{Offset, StreamName};
-use exspeed_streams::{Record, StorageEngine, StorageError};
+use exspeed_streams::{Record, StorageEngine, StorageError, StreamConfig};
 use tempfile::TempDir;
 
-use crate::file::partition::Partition;
+use super::util::*;
 use crate::file::FileStorage;
-
-fn stream(name: &str) -> StreamName {
-    StreamName::try_from(name).unwrap()
-}
 
 fn record(value: &[u8]) -> Record {
     Record {
@@ -23,701 +18,483 @@ fn record(value: &[u8]) -> Record {
     }
 }
 
-/// Create FileStorage, create stream, write 10 records, drop (simulate crash),
-/// reopen with FileStorage::open, read all 10, verify offsets 0-9.
-#[tokio::test]
-async fn crash_recovery_replays_wal() {
-    let dir = TempDir::new().unwrap();
-
-    // Phase 1: write records, then drop to simulate crash.
-    {
-        let storage = FileStorage::new(dir.path()).unwrap();
-        storage.create_stream(&stream("crash"), 0, 0).await.unwrap();
-        for i in 0u64..10 {
-            let val = format!("val-{}", i);
-            let (offset, _) = storage
-                .append(&stream("crash"), &record(val.as_bytes()))
-                .await
-                .unwrap();
-            assert_eq!(offset, Offset(i));
-        }
-        // drop storage — simulates a crash
-    }
-
-    // Phase 2: reopen and verify all records survived.
-    {
-        let storage = FileStorage::open(dir.path()).unwrap();
-        let records = storage
-            .read(&stream("crash"), Offset(0), 100)
-            .await
-            .unwrap();
-        assert_eq!(records.len(), 10);
-        for i in 0u64..10 {
-            assert_eq!(records[i as usize].offset, Offset(i));
-            let expected = format!("val-{}", i);
-            assert_eq!(records[i as usize].value, Bytes::from(expected));
-        }
-    }
+async fn offsets(s: &FileStorage, st: &StreamName, from: u64) -> Vec<u64> {
+    read_all(s, st, from)
+        .await
+        .iter()
+        .map(|r| r.offset.0)
+        .collect()
 }
 
-/// Create storage, create stream, write 1 record,
-/// drop, reopen with FileStorage::open, read back, verify data.
 #[tokio::test]
 async fn data_persists_across_restart() {
     let dir = TempDir::new().unwrap();
-
+    let s = stream("persist");
     {
         let storage = FileStorage::new(dir.path()).unwrap();
-        storage
-            .create_stream(&stream("persist"), 0, 0)
-            .await
-            .unwrap();
-        storage
-            .append(&stream("persist"), &record(b"p0-data"))
-            .await
-            .unwrap();
-    }
-
-    {
-        let storage = FileStorage::open(dir.path()).unwrap();
-
-        let p0 = storage
-            .read(&stream("persist"), Offset(0), 10)
-            .await
-            .unwrap();
-        assert_eq!(p0.len(), 1);
-        assert_eq!(p0[0].offset, Offset(0));
-        assert_eq!(p0[0].value, Bytes::from_static(b"p0-data"));
-    }
-}
-
-/// Create storage, create stream, write 1000 records, read all 1000 back,
-/// verify offsets 0-999 and first/last values.
-#[tokio::test]
-async fn segment_rolling() {
-    let dir = TempDir::new().unwrap();
-    let storage = FileStorage::new(dir.path()).unwrap();
-    storage
-        .create_stream(&stream("rolling"), 0, 0)
-        .await
-        .unwrap();
-
-    for i in 0u64..1000 {
-        let val = format!("rec-{:04}", i);
-        let (offset, _) = storage
-            .append(&stream("rolling"), &record(val.as_bytes()))
-            .await
-            .unwrap();
-        assert_eq!(offset, Offset(i));
-    }
-
-    let records = storage
-        .read(&stream("rolling"), Offset(0), 1000)
-        .await
-        .unwrap();
-    assert_eq!(records.len(), 1000);
-    assert_eq!(records[0].offset, Offset(0));
-    assert_eq!(records[0].value, Bytes::from(String::from("rec-0000")));
-    assert_eq!(records[999].offset, Offset(999));
-    assert_eq!(records[999].value, Bytes::from(String::from("rec-0999")));
-}
-
-/// THE MILESTONE TEST: 10,000 records, crash, recover, verify everything.
-#[tokio::test]
-async fn milestone_10k_records_crash_recover() {
-    let dir = TempDir::new().unwrap();
-
-    // Phase 1: write 10,000 records then drop (crash).
-    {
-        let storage = FileStorage::new(dir.path()).unwrap();
-        storage
-            .create_stream(&stream("milestone"), 0, 0)
-            .await
-            .unwrap();
-
-        for i in 0u64..10_000 {
-            let val = format!("record-{:05}", i);
-            let (offset, _) = storage
-                .append(&stream("milestone"), &record(val.as_bytes()))
+        storage.create_stream(&s, 0, 0).await.unwrap();
+        for i in 0u64..10 {
+            let (o, _) = storage
+                .append(&s, &record(format!("val-{i}").as_bytes()))
                 .await
                 .unwrap();
-            assert_eq!(offset, Offset(i));
+            assert_eq!(o, Offset(i));
         }
     }
+    let storage = FileStorage::open(dir.path()).unwrap();
+    let recs = storage.read(&s, Offset(0), 100).await.unwrap();
+    assert_eq!(recs.len(), 10);
+    for (i, r) in recs.iter().enumerate() {
+        assert_eq!(r.offset, Offset(i as u64));
+        assert_eq!(r.value, Bytes::from(format!("val-{i}")));
+        assert_eq!(r.key.as_deref(), Some(&b"key"[..]));
+    }
+    let (o, _) = storage.append(&s, &record(b"next")).await.unwrap();
+    assert_eq!(o, Offset(10));
+}
 
-    // Phase 2: reopen and verify all 10,000 records.
+#[tokio::test]
+async fn many_segments_read_back_in_order_and_survive_restart() {
+    let dir = TempDir::new().unwrap();
+    let s = stream("rolling");
     {
-        let storage = FileStorage::open(dir.path()).unwrap();
-        let records = storage
-            .read(&stream("milestone"), Offset(0), 10_000)
-            .await
-            .unwrap();
-
+        let storage = small_segments(dir.path(), 512);
+        storage.create_stream(&s, 0, 0).await.unwrap();
+        append_n(&storage, &s, 0, 1000).await;
+        assert!(segment_count(&storage, "rolling") > 20);
         assert_eq!(
-            records.len(),
-            10_000,
-            "expected 10000 records after recovery"
+            offsets(&storage, &s, 0).await,
+            (0..1000).collect::<Vec<_>>()
         );
-
-        // First record
-        assert_eq!(records[0].offset, Offset(0));
-        assert_eq!(records[0].value, Bytes::from("record-00000"));
-
-        // Middle record
-        assert_eq!(records[5000].offset, Offset(5000));
-        assert_eq!(records[5000].value, Bytes::from("record-05000"));
-
-        // Last record
-        assert_eq!(records[9999].offset, Offset(9999));
-        assert_eq!(records[9999].value, Bytes::from("record-09999"));
     }
+    let storage = small_segments(dir.path(), 512);
+    assert_eq!(
+        offsets(&storage, &s, 0).await,
+        (0..1000).collect::<Vec<_>>()
+    );
+    // Reads starting mid-way, in every segment.
+    for from in [1u64, 37, 500, 998, 999] {
+        assert_eq!(
+            offsets(&storage, &s, from).await,
+            (from..1000).collect::<Vec<_>>()
+        );
+    }
+    let (o, _) = storage.append(&s, &plain(1000)).await.unwrap();
+    assert_eq!(o, Offset(1000));
 }
 
-/// Test age-based retention: create a partition, write records, force a segment
-/// roll, wait for the records to age past the cutoff, then enforce retention.
-#[test]
-fn retention_deletes_old_segments_by_age() {
+#[tokio::test]
+async fn startup_reads_sealed_metadata_not_data() {
     let dir = TempDir::new().unwrap();
-    let part_dir = dir.path().join("part0");
-
-    let mut partition = Partition::create(&part_dir, "test-stream", 0).unwrap();
-
-    // Set a very small segment max so that writes trigger rolling.
-    partition.set_segment_max_bytes(64);
-
-    // Write enough records to fill at least 2 sealed segments.
-    for i in 0u64..20 {
-        let val = format!("age-{:04}", i);
-        partition
-            .append(&Record {
-                key: None,
-                value: Bytes::from(val),
-                subject: "test.subject".into(),
-                headers: vec![],
-                timestamp_ns: None,
-            })
-            .unwrap();
+    let s = stream("meta");
+    {
+        let storage = small_segments(dir.path(), 512);
+        storage.create_stream(&s, 0, 0).await.unwrap();
+        append_n(&storage, &s, 0, 200).await;
     }
-
-    // At this point there should be at least 1 sealed segment.
-    let total_before = partition.total_bytes();
-    assert!(total_before > 0, "partition should have some bytes written");
-
-    // Wait just over 1 second so the sealed segments age out.
-    thread::sleep(Duration::from_millis(1500));
-
-    // Enforce retention with 1-second max age and very large max bytes.
-    let stats = partition.enforce_retention(1, u64::MAX).unwrap();
+    let part = dir.path().join("streams/meta/partitions/0");
+    let metas = std::fs::read_dir(&part)
+        .unwrap()
+        .filter(|e| e.as_ref().unwrap().path().extension().unwrap() == "meta")
+        .count();
+    let segs = std::fs::read_dir(&part)
+        .unwrap()
+        .filter(|e| e.as_ref().unwrap().path().extension().unwrap() == "seg")
+        .count();
+    assert_eq!(metas, segs - 1, "every sealed segment has a .meta sidecar");
+    // Corrupt the *data* of the first sealed segment in a way that only a
+    // full decode would notice; open must not decode sealed data.
+    let first = part.join(format!("{:020}.seg", 0));
+    let mut bytes = std::fs::read(&first).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    std::fs::write(&first, &bytes).unwrap();
+    let storage = small_segments(dir.path(), 512);
+    let (_, next) = storage.stream_bounds(&s).await.unwrap();
+    assert_eq!(next, Offset(200));
+    // Reading the damaged record reports corruption instead of garbage.
+    let err = storage.read(&s, Offset(0), 1000).await.unwrap_err();
     assert!(
-        stats.segments_deleted > 0,
-        "expected at least one sealed segment to be deleted by age retention"
-    );
-    assert!(stats.bytes_reclaimed > 0, "expected bytes to be reclaimed");
-
-    // Total bytes should have decreased.
-    let total_after = partition.total_bytes();
-    assert!(
-        total_after < total_before,
-        "total bytes should decrease after retention: before={}, after={}",
-        total_before,
-        total_after
-    );
-}
-
-/// Test size-based retention: create sealed segments and enforce with a small
-/// max_bytes limit.
-#[test]
-fn retention_deletes_oldest_segments_by_size() {
-    let dir = TempDir::new().unwrap();
-    let part_dir = dir.path().join("part0");
-
-    let mut partition = Partition::create(&part_dir, "test-stream", 0).unwrap();
-
-    // Set a very small segment max so writes trigger rolling.
-    partition.set_segment_max_bytes(64);
-
-    // Write enough records to create multiple sealed segments.
-    for i in 0u64..30 {
-        let val = format!("size-{:04}", i);
-        partition
-            .append(&Record {
-                key: None,
-                value: Bytes::from(val),
-                subject: "test.subject".into(),
-                headers: vec![],
-                timestamp_ns: None,
-            })
-            .unwrap();
-    }
-
-    let total_before = partition.total_bytes();
-
-    // Set max_bytes to a small value that should trigger size-based deletion.
-    // Use a max_bytes just slightly larger than the active segment.
-    let active_size = partition.total_bytes();
-    let max_bytes = active_size / 3; // force deletion of most sealed segments
-
-    // Enforce retention with very large max_age (so age-based won't trigger) and small max_bytes.
-    let stats = partition.enforce_retention(999_999_999, max_bytes).unwrap();
-    assert!(
-        stats.segments_deleted > 0,
-        "expected at least one segment deleted by size retention"
-    );
-
-    let total_after = partition.total_bytes();
-    assert!(
-        total_after <= max_bytes,
-        "total bytes ({}) should be at or below max_bytes ({})",
-        total_after,
-        max_bytes
-    );
-    assert!(
-        total_after < total_before,
-        "total bytes should decrease after size retention"
+        matches!(err, StorageError::CorruptedRecord { .. }),
+        "{err:?}"
     );
 }
 
 #[tokio::test]
-async fn list_streams() {
+async fn stale_meta_is_rebuilt_by_scan() {
+    let dir = TempDir::new().unwrap();
+    let s = stream("stale");
+    {
+        let storage = small_segments(dir.path(), 512);
+        storage.create_stream(&s, 0, 0).await.unwrap();
+        append_n(&storage, &s, 0, 100).await;
+    }
+    let part = dir.path().join("streams/stale/partitions/0");
+    std::fs::remove_file(part.join(format!("{:020}.meta", 0))).unwrap();
+    std::fs::remove_file(part.join(format!("{:020}.idx", 0))).unwrap();
+    let storage = small_segments(dir.path(), 512);
+    assert_eq!(offsets(&storage, &s, 0).await, (0..100).collect::<Vec<_>>());
+    assert!(part.join(format!("{:020}.meta", 0)).exists());
+}
+
+#[tokio::test]
+async fn list_streams_and_metrics_helpers() {
     let dir = TempDir::new().unwrap();
     let storage = FileStorage::new(dir.path()).unwrap();
-    storage.create_stream(&stream("alpha"), 0, 0).await.unwrap();
     storage.create_stream(&stream("beta"), 0, 0).await.unwrap();
-    let names = storage.list_streams();
-    assert_eq!(names, vec!["alpha", "beta"]);
-}
-
-#[tokio::test]
-async fn stream_storage_bytes_and_head_offset() {
-    let dir = TempDir::new().unwrap();
-    let storage = FileStorage::new(dir.path()).unwrap();
+    storage.create_stream(&stream("alpha"), 0, 0).await.unwrap();
+    assert_eq!(storage.list_streams(), vec!["alpha", "beta"]);
+    assert_eq!(storage.stream_head_offset("alpha"), Some(0));
     storage
-        .create_stream(&stream("metrics-test"), 0, 0)
+        .append(&stream("alpha"), &record(b"data"))
         .await
         .unwrap();
-    assert_eq!(storage.stream_head_offset("metrics-test"), Some(0));
-    storage
-        .append(&stream("metrics-test"), &record(b"data"))
-        .await
-        .unwrap();
-    assert_eq!(storage.stream_head_offset("metrics-test"), Some(1));
-    assert!(storage.stream_storage_bytes("metrics-test").unwrap() > 0);
-}
-
-#[tokio::test]
-async fn nonexistent_stream_query_returns_none() {
-    let dir = TempDir::new().unwrap();
-    let storage = FileStorage::new(dir.path()).unwrap();
+    assert_eq!(storage.stream_head_offset("alpha"), Some(1));
+    assert!(storage.stream_storage_bytes("alpha").unwrap() > 16);
     assert!(storage.stream_storage_bytes("nope").is_none());
     assert!(storage.stream_head_offset("nope").is_none());
 }
 
-/// `truncate_from` with `drop_from` inside a sealed segment: the
-/// straddling sealed segment is rewritten, later sealed segments + the
-/// old active are deleted, and subsequent appends resume at `drop_from`.
-#[test]
-fn truncate_from_inside_sealed_segment() {
-    let dir = TempDir::new().unwrap();
-    let part_dir = dir.path().join("part0");
-
-    let mut partition = Partition::create(&part_dir, "test-stream", 0).unwrap();
-    partition.set_segment_max_bytes(64);
-
-    // Write enough records to produce several sealed segments + an active.
-    for i in 0u64..20 {
-        let val = format!("seg-{:04}", i);
-        partition
-            .append(&Record {
-                key: None,
-                value: Bytes::from(val),
-                subject: "test.subject".into(),
-                headers: vec![],
-                timestamp_ns: None,
-            })
-            .unwrap();
-    }
-    assert_eq!(partition.next_offset(), 20);
-
-    // Truncate at offset 7 — somewhere inside a sealed segment.
-    partition.truncate_from(7).unwrap();
-    assert_eq!(partition.next_offset(), 7);
-
-    // All surviving records should read back cleanly.
-    let records = partition.read(Offset(0), 100).unwrap();
-    assert_eq!(records.len(), 7);
-    for (i, r) in records.iter().enumerate() {
-        assert_eq!(r.offset, Offset(i as u64));
-        let expected = format!("seg-{:04}", i);
-        assert_eq!(r.value, Bytes::from(expected));
-    }
-
-    // Next append assigns exactly 7.
-    let (new_off, _) = partition
-        .append(&Record {
-            key: None,
-            value: Bytes::from_static(b"post-truncate"),
-            subject: "test.subject".into(),
-            headers: vec![],
-            timestamp_ns: None,
-        })
-        .unwrap();
-    assert_eq!(new_off, Offset(7));
-
-    // read_from(Offset(7)) returns the newly-appended record.
-    let tail = partition.read(Offset(7), 10).unwrap();
-    assert_eq!(tail.len(), 1);
-    assert_eq!(tail[0].offset, Offset(7));
-    assert_eq!(tail[0].value, Bytes::from_static(b"post-truncate"));
-}
-
-/// `truncate_from` with `drop_from` inside the active segment: old active
-/// is rewritten in place (same base_offset, records `< drop_from`
-/// preserved); next append resumes at `drop_from`.
-#[test]
-fn truncate_from_inside_active_segment() {
-    let dir = TempDir::new().unwrap();
-    let part_dir = dir.path().join("part0");
-
-    let mut partition = Partition::create(&part_dir, "test-stream", 0).unwrap();
-    // Large enough that all 10 records land in the active segment.
-    for i in 0u64..10 {
-        let val = format!("act-{:04}", i);
-        partition
-            .append(&Record {
-                key: None,
-                value: Bytes::from(val),
-                subject: "test.subject".into(),
-                headers: vec![],
-                timestamp_ns: None,
-            })
-            .unwrap();
-    }
-
-    partition.truncate_from(4).unwrap();
-    assert_eq!(partition.next_offset(), 4);
-
-    let records = partition.read(Offset(0), 100).unwrap();
-    assert_eq!(records.len(), 4);
-    assert_eq!(records[3].offset, Offset(3));
-
-    // Appending resumes at 4.
-    let (new_off, _) = partition
-        .append(&Record {
-            key: None,
-            value: Bytes::from_static(b"tail"),
-            subject: "test.subject".into(),
-            headers: vec![],
-            timestamp_ns: None,
-        })
-        .unwrap();
-    assert_eq!(new_off, Offset(4));
-}
-
-/// `truncate_from(0)` with sealed segments: all segments are rebuilt
-/// empty and the next append starts at 0.
-#[test]
-fn truncate_from_zero_wipes_all_segments() {
-    let dir = TempDir::new().unwrap();
-    let part_dir = dir.path().join("part0");
-
-    let mut partition = Partition::create(&part_dir, "test-stream", 0).unwrap();
-    partition.set_segment_max_bytes(64);
-
-    for i in 0u64..20 {
-        let val = format!("wipe-{:04}", i);
-        partition
-            .append(&Record {
-                key: None,
-                value: Bytes::from(val),
-                subject: "test.subject".into(),
-                headers: vec![],
-                timestamp_ns: None,
-            })
-            .unwrap();
-    }
-
-    partition.truncate_from(0).unwrap();
-    assert_eq!(partition.next_offset(), 0);
-
-    let records = partition.read(Offset(0), 100).unwrap();
-    assert!(records.is_empty());
-
-    // Append resumes at 0.
-    let (new_off, _) = partition
-        .append(&Record {
-            key: None,
-            value: Bytes::from_static(b"fresh"),
-            subject: "test.subject".into(),
-            headers: vec![],
-            timestamp_ns: None,
-        })
-        .unwrap();
-    assert_eq!(new_off, Offset(0));
-}
-
-/// `truncate_from` is durable: after a rewrite, closing and re-opening
-/// the storage replays WAL (which has been truncated) and the stream
-/// bounds reflect `next == drop_from`.
 #[tokio::test]
-async fn truncate_from_survives_reopen() {
+async fn retention_by_age_deletes_old_sealed_segments_only() {
     let dir = TempDir::new().unwrap();
-
-    {
-        let storage = FileStorage::new(dir.path()).unwrap();
+    let storage = small_segments(dir.path(), 256);
+    let s = stream("age");
+    let cfg = StreamConfig {
+        max_age_secs: 1,
+        dedup_window_secs: 1,
+        ..StreamConfig::default()
+    };
+    storage.create_stream_with(&s, &cfg).await.unwrap();
+    // Old records (timestamps far in the past) fill sealed segments...
+    let old = now_ns() - 3_600_000_000_000;
+    for i in 0..30u64 {
+        storage.append(&s, &plain_at(i, old + i)).await.unwrap();
+    }
+    // ...and fresh ones stay.
+    let base_fresh = 30u64;
+    for i in 0..30u64 {
         storage
-            .create_stream(&stream("trunc-reopen"), 0, 0)
-            .await
-            .unwrap();
-        for i in 0u64..10 {
-            let val = format!("val-{}", i);
-            storage
-                .append(&stream("trunc-reopen"), &record(val.as_bytes()))
-                .await
-                .unwrap();
-        }
-        storage
-            .truncate_from(&stream("trunc-reopen"), Offset(6))
+            .append(&s, &plain_at(base_fresh + i, now_ns()))
             .await
             .unwrap();
     }
-
-    {
-        let storage = FileStorage::open(dir.path()).unwrap();
-        let (earliest, next) = storage
-            .stream_bounds(&stream("trunc-reopen"))
-            .await
-            .unwrap();
-        assert_eq!(earliest, Offset(0));
-        assert_eq!(next, Offset(6));
-
-        let records = storage
-            .read(&stream("trunc-reopen"), Offset(0), 100)
-            .await
-            .unwrap();
-        assert_eq!(records.len(), 6);
-        assert_eq!(records.last().unwrap().offset, Offset(5));
-
-        let (new_off, _) = storage
-            .append(&stream("trunc-reopen"), &record(b"post-reopen"))
-            .await
-            .unwrap();
-        assert_eq!(new_off, Offset(6));
-    }
+    let before = storage.stream_storage_bytes("age").unwrap();
+    storage.enforce_all_retention().unwrap();
+    let after = storage.stream_storage_bytes("age").unwrap();
+    assert!(after < before);
+    let (earliest, next) = storage.stream_bounds(&s).await.unwrap();
+    assert!(
+        earliest.0 > 0 && earliest.0 <= base_fresh,
+        "earliest={earliest:?}"
+    );
+    assert_eq!(next, Offset(60));
+    // Every fresh record survives.
+    let got = offsets(&storage, &s, earliest.0).await;
+    assert_eq!(got, (earliest.0..60).collect::<Vec<_>>());
 }
 
-/// Test that retention never deletes the active segment.
-#[test]
-fn retention_never_deletes_active_segment() {
+#[tokio::test]
+async fn retention_by_age_only_removes_a_prefix() {
     let dir = TempDir::new().unwrap();
-    let part_dir = dir.path().join("part0");
+    let storage = small_segments(dir.path(), 256);
+    let s = stream("prefix");
+    let cfg = StreamConfig {
+        max_age_secs: 1,
+        dedup_window_secs: 1,
+        ..StreamConfig::default()
+    };
+    storage.create_stream_with(&s, &cfg).await.unwrap();
+    // Fresh records first, then old (producer-supplied) timestamps, then
+    // fresh again: the old segments in the middle must not be deleted.
+    let old = now_ns() - 3_600_000_000_000;
+    for i in 0..20u64 {
+        storage.append(&s, &plain_at(i, now_ns())).await.unwrap();
+    }
+    for i in 20..40u64 {
+        storage.append(&s, &plain_at(i, old + i)).await.unwrap();
+    }
+    for i in 40..60u64 {
+        storage.append(&s, &plain_at(i, now_ns())).await.unwrap();
+    }
+    storage.enforce_all_retention().unwrap();
+    let (earliest, next) = storage.stream_bounds(&s).await.unwrap();
+    assert_eq!(earliest, Offset(0));
+    assert_eq!(next, Offset(60));
+    assert_eq!(offsets(&storage, &s, 0).await, (0..60).collect::<Vec<_>>());
+}
 
-    let mut partition = Partition::create(&part_dir, "test-stream", 0).unwrap();
-
-    // Write a record to the active segment.
-    partition
-        .append(&Record {
-            key: None,
-            value: Bytes::from("active-data"),
-            subject: "test.subject".into(),
-            headers: vec![],
-            timestamp_ns: None,
-        })
-        .unwrap();
-
-    // Enforce very aggressive retention -- 0 max age, 0 max bytes.
-    // With no sealed segments, nothing should be deleted.
-    let stats = partition.enforce_retention(0, 0).unwrap();
+#[tokio::test]
+async fn retention_by_size_keeps_newest_and_never_the_active_segment() {
+    let dir = TempDir::new().unwrap();
+    let storage = small_segments(dir.path(), 256);
+    let s = stream("size");
+    storage.create_stream(&s, 0, 0).await.unwrap();
+    append_n(&storage, &s, 0, 60).await;
+    let total = storage.stream_storage_bytes("size").unwrap();
+    let cfg = StreamConfig {
+        max_bytes: total / 3,
+        ..StreamConfig::default()
+    };
+    storage.update_stream_config(&s, &cfg).await.unwrap();
+    storage.enforce_all_retention().unwrap();
+    assert!(storage.stream_storage_bytes("size").unwrap() <= total / 3);
+    let (earliest, next) = storage.stream_bounds(&s).await.unwrap();
+    assert!(earliest.0 > 0);
+    assert_eq!(next, Offset(60));
     assert_eq!(
-        stats.segments_deleted, 0,
-        "should not delete the active segment"
+        offsets(&storage, &s, earliest.0).await,
+        (earliest.0..60).collect::<Vec<_>>()
     );
 
-    // Active segment data should still be readable.
-    let records = partition.read(Offset(0), 10).unwrap();
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].value, Bytes::from("active-data"));
+    // Most aggressive retention: only the active segment is left.
+    let cfg = StreamConfig {
+        max_bytes: 1,
+        max_age_secs: 1,
+        dedup_window_secs: 1,
+        ..StreamConfig::default()
+    };
+    storage.update_stream_config(&s, &cfg).await.unwrap();
+    storage.enforce_all_retention().unwrap();
+    assert_eq!(segment_count(&storage, "size"), 1);
+    let (earliest, next) = storage.stream_bounds(&s).await.unwrap();
+    assert_eq!(next, Offset(60));
+    assert_eq!(
+        offsets(&storage, &s, earliest.0).await,
+        (earliest.0..60).collect::<Vec<_>>()
+    );
 }
 
-/// End-to-end check: after size-based retention drops leading sealed
-/// segments, `FileStorage::read` from an offset below the new earliest must
-/// return `StorageError::OffsetOutOfRange` — not silently jump forward.
-/// Uses size-based retention (deterministic) rather than age (timing-sensitive).
 #[tokio::test]
 async fn read_below_earliest_after_retention_returns_out_of_range() {
     let dir = TempDir::new().unwrap();
-    let part_dir = dir.path().join("streams/retain-test/partitions/0");
-    std::fs::create_dir_all(&part_dir).unwrap();
-
-    // Force multiple small sealed segments. Each record is ~80 bytes framed,
-    // so a 256-byte cap gives roughly 3 records per segment — enough to have
-    // both deleted and surviving sealed segments after retention.
-    let mut partition = Partition::create(&part_dir, "retain-test", 0).unwrap();
-    partition.set_segment_max_bytes(256);
-
-    for i in 0u64..30 {
-        partition
-            .append(&Record {
-                key: None,
-                value: Bytes::from(format!("retain-value-{i:04}")),
-                subject: "test.subject".into(),
-                headers: vec![],
-                timestamp_ns: None,
-            })
-            .unwrap();
-    }
-    assert_eq!(partition.earliest_offset(), 0);
-
-    // Size-based retention: keep only ~1/3 of the data. Drops oldest sealed
-    // segments one at a time until total_bytes <= max_bytes. Leaves some
-    // sealed segments + the active segment.
-    let max_bytes = partition.total_bytes() / 3;
-    // Use 999_999_999 secs (≈31 years) for "effectively disabled" age-based
-    // retention without overflowing `age_cutoff_nanos = secs * 1e9`.
-    let stats = partition.enforce_retention(999_999_999, max_bytes).unwrap();
-    assert!(
-        stats.segments_deleted > 0,
-        "expected retention to delete some sealed segments"
-    );
-    let new_earliest = partition.earliest_offset();
-    assert!(
-        new_earliest > 0,
-        "earliest must advance past trimmed offsets"
-    );
-
-    // Reopen via FileStorage — this is the public surface broker uses.
-    drop(partition);
-    let storage = FileStorage::open(dir.path()).unwrap();
-    let s = stream("retain-test");
-
-    // Read from a trimmed-away offset must error, not silently skip.
-    let err = storage.read(&s, Offset(0), 10).await.unwrap_err();
-    match err {
+    let storage = small_segments(dir.path(), 256);
+    let s = stream("oor");
+    storage.create_stream(&s, 0, 0).await.unwrap();
+    append_n(&storage, &s, 0, 30).await;
+    storage.trim_up_to(&s, Offset(15)).await.unwrap();
+    let (earliest, _) = storage.stream_bounds(&s).await.unwrap();
+    assert!(earliest.0 > 0 && earliest.0 <= 15);
+    match storage.read(&s, Offset(0), 10).await.unwrap_err() {
         StorageError::OffsetOutOfRange {
             requested,
-            earliest,
+            earliest: e,
         } => {
             assert_eq!(requested, 0);
-            assert_eq!(earliest, new_earliest);
+            assert_eq!(e, earliest.0);
         }
         other => panic!("expected OffsetOutOfRange, got {other:?}"),
     }
-
-    // Reading at the new earliest succeeds.
-    let recs = storage.read(&s, Offset(new_earliest), 100).await.unwrap();
-    assert!(!recs.is_empty());
-    assert_eq!(recs[0].offset.0, new_earliest);
+    // read_batch clamps instead.
+    let b = storage
+        .read_batch(&s, Offset(0), exspeed_streams::ReadLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(b.records[0].offset, earliest);
 }
 
-#[test]
-fn append_batch_assigns_sequential_offsets_and_persists_via_one_wal_sync() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut p = Partition::create(tmp.path(), "test-stream", 0).unwrap();
-
-    let mk = |body: &'static [u8]| Record {
-        subject: "bench".into(),
-        key: None,
-        value: Bytes::from_static(body),
-        headers: vec![],
-        timestamp_ns: None,
-    };
-    let records = vec![mk(b"a"), mk(b"b"), mk(b"c")];
-    let results = p.append_batch(&records, /*sync_now=*/ true).unwrap();
-    assert_eq!(results.len(), 3);
-    assert_eq!(results[0].0, Offset(0));
-    assert_eq!(results[1].0, Offset(1));
-    assert_eq!(results[2].0, Offset(2));
-    assert!(results[0].1 <= results[1].1);
-    assert!(results[1].1 <= results[2].1);
-
-    let read = p.read(Offset(0), 10).unwrap();
-    assert_eq!(read.len(), 3);
-    assert_eq!(read[0].value, Bytes::from_static(b"a"));
-    assert_eq!(read[1].value, Bytes::from_static(b"b"));
-    assert_eq!(read[2].value, Bytes::from_static(b"c"));
-}
-
-#[test]
-fn append_batch_empty_is_noop() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut p = Partition::create(tmp.path(), "s", 0).unwrap();
-    let results = p.append_batch(&[], /*sync_now=*/ true).unwrap();
-    assert!(results.is_empty());
-    // No state should have changed — first real append still gets Offset(0).
-    let r = Record {
-        subject: "x".into(),
-        key: None,
-        value: Bytes::from_static(b"x"),
-        headers: vec![],
-        timestamp_ns: None,
-    };
-    let (offset, _ts) = p.append(&r).unwrap();
-    assert_eq!(offset, Offset(0));
-}
-
-fn plain(i: u64) -> Record {
-    Record {
-        key: None,
-        value: Bytes::from(format!("v-{i}")),
-        subject: "test.subject".into(),
-        headers: vec![],
-        timestamp_ns: None,
-    }
-}
-
-/// Regression: an empty active segment left after a roll + retention must
-/// keep pinning the next offset across a restart (offsets used to restart
-/// at 0).
-#[test]
-fn restart_with_empty_active_segment_keeps_offsets_monotonic() {
+/// Regression (blocker 1): retention deleting every sealed segment leaves an
+/// empty active segment; the next offset must survive a restart.
+#[tokio::test]
+async fn restart_after_retention_with_empty_active_segment_keeps_offsets_monotonic() {
     let dir = TempDir::new().unwrap();
-    let part_dir = dir.path().join("part0");
+    let s = stream("mono");
     {
-        let mut p = Partition::create(&part_dir, "s", 0).unwrap();
-        for i in 0..12 {
-            p.append(&plain(i)).unwrap();
-        }
-        // Rolls the active segment (it is non-empty), leaving an empty one.
-        p.register_secondary_index("idx".into(), "f".into());
-        // Delete every sealed segment.
-        p.trim_up_to(12).unwrap();
-        assert_eq!(p.next_offset(), 12);
+        // A 1-byte limit rolls after every commit: the active segment is
+        // always empty.
+        let storage = small_segments(dir.path(), 1);
+        storage.create_stream(&s, 0, 0).await.unwrap();
+        append_n(&storage, &s, 0, 20).await;
+        storage.trim_up_to(&s, Offset(1_000)).await.unwrap();
+        // The writer rolled before handling the trim (same queue).
+        assert_eq!(segment_count(&storage, "mono"), 1);
+        let shared = storage.shared("mono").unwrap();
+        assert_eq!(shared.segments()[0].stats().records, 0);
+        assert_eq!(shared.segments()[0].base_offset, 20);
     }
-    let mut p = Partition::open(&part_dir, "s", 0).unwrap();
-    assert_eq!(p.next_offset(), 12, "next offset must survive restart");
-    let (off, _) = p.append(&plain(12)).unwrap();
-    assert_eq!(off, Offset(12));
+    for round in 0..3u64 {
+        let storage = small_segments(dir.path(), 1);
+        let (earliest, next) = storage.stream_bounds(&s).await.unwrap();
+        assert_eq!(next.0, 20 + round, "next offset must survive restart");
+        assert!(earliest <= next);
+        let (o, _) = storage.append(&s, &plain(next.0)).await.unwrap();
+        assert_eq!(o, next);
+        storage.trim_up_to(&s, Offset(u64::MAX)).await.unwrap();
+    }
 }
 
-/// Regression: rolling an already-empty active segment used to register the
-/// same file as both sealed and active, so every record was read twice.
-#[test]
-fn second_index_registration_does_not_duplicate_records() {
+#[tokio::test]
+async fn truncate_from_inside_sealed_segment() {
     let dir = TempDir::new().unwrap();
-    let part_dir = dir.path().join("part0");
-    let mut p = Partition::create(&part_dir, "s", 0).unwrap();
-    for i in 0..8 {
-        p.append(&plain(i)).unwrap();
-    }
-    p.register_secondary_index("a".into(), "f".into());
-    p.register_secondary_index("b".into(), "g".into());
-    for i in 8..11 {
-        p.append(&plain(i)).unwrap();
-    }
-    let offsets: Vec<u64> = p
-        .read(Offset(0), 100)
-        .unwrap()
-        .iter()
-        .map(|r| r.offset.0)
-        .collect();
-    assert_eq!(offsets, (0..11).collect::<Vec<_>>());
+    let storage = small_segments(dir.path(), 128);
+    let s = stream("t1");
+    storage.create_stream(&s, 0, 0).await.unwrap();
+    append_n(&storage, &s, 0, 40).await;
+    assert!(segment_count(&storage, "t1") > 4);
+    storage.truncate_from(&s, Offset(7)).await.unwrap();
+    assert_eq!(storage.stream_bounds(&s).await.unwrap().1, Offset(7));
+    assert_eq!(offsets(&storage, &s, 0).await, (0..7).collect::<Vec<_>>());
+    let (o, _) = storage.append(&s, &plain(7)).await.unwrap();
+    assert_eq!(o, Offset(7));
+    drop(storage);
+    let storage = small_segments(dir.path(), 128);
+    assert_eq!(offsets(&storage, &s, 0).await, (0..8).collect::<Vec<_>>());
+    check_values(&read_all(&storage, &s, 0).await);
+}
 
-    drop(p);
-    let p = Partition::open(&part_dir, "s", 0).unwrap();
-    let offsets: Vec<u64> = p
-        .read(Offset(0), 100)
-        .unwrap()
-        .iter()
-        .map(|r| r.offset.0)
-        .collect();
-    assert_eq!(offsets, (0..11).collect::<Vec<_>>());
+#[tokio::test]
+async fn truncate_from_inside_active_segment_and_reopen() {
+    let dir = TempDir::new().unwrap();
+    let s = stream("t2");
+    {
+        let storage = FileStorage::new(dir.path()).unwrap();
+        storage.create_stream(&s, 0, 0).await.unwrap();
+        append_n(&storage, &s, 0, 10).await;
+        storage.truncate_from(&s, Offset(6)).await.unwrap();
+        // At or past next is a no-op.
+        storage.truncate_from(&s, Offset(6)).await.unwrap();
+        storage.truncate_from(&s, Offset(100)).await.unwrap();
+    }
+    let storage = FileStorage::open(dir.path()).unwrap();
+    assert_eq!(
+        storage.stream_bounds(&s).await.unwrap(),
+        (Offset(0), Offset(6))
+    );
+    assert_eq!(offsets(&storage, &s, 0).await, (0..6).collect::<Vec<_>>());
+    let (o, _) = storage.append(&s, &plain(6)).await.unwrap();
+    assert_eq!(o, Offset(6));
+}
+
+#[tokio::test]
+async fn truncate_from_zero_wipes_all_segments() {
+    let dir = TempDir::new().unwrap();
+    let storage = small_segments(dir.path(), 128);
+    let s = stream("t3");
+    storage.create_stream(&s, 0, 0).await.unwrap();
+    append_n(&storage, &s, 0, 20).await;
+    storage.truncate_from(&s, Offset(0)).await.unwrap();
+    assert_eq!(
+        storage.stream_bounds(&s).await.unwrap(),
+        (Offset(0), Offset(0))
+    );
+    assert!(read_all(&storage, &s, 0).await.is_empty());
+    assert_eq!(segment_count(&storage, "t3"), 1);
+    let (o, _) = storage.append(&s, &plain(0)).await.unwrap();
+    assert_eq!(o, Offset(0));
+}
+
+/// A crash in the middle of `truncate_from` (marker written, files half
+/// processed) is finished by recovery.
+#[tokio::test]
+async fn truncate_from_is_crash_safe() {
+    let dir = TempDir::new().unwrap();
+    let s = stream("tcrash");
+    {
+        let storage = small_segments(dir.path(), 128);
+        storage.create_stream(&s, 0, 0).await.unwrap();
+        append_n(&storage, &s, 0, 40).await;
+    }
+    let part = dir.path().join("streams/tcrash/partitions/0");
+    // Simulate a crash right after the intent marker was written and the
+    // newest segment was deleted.
+    crate::file::partition::write_truncate_marker(&part, 9).unwrap();
+    let mut bases = crate::file::partition::list_segment_bases(&part).unwrap();
+    let newest = bases.pop().unwrap();
+    std::fs::remove_file(part.join(format!("{newest:020}.seg"))).unwrap();
+
+    let storage = small_segments(dir.path(), 128);
+    assert!(!part.join("truncate.json").exists());
+    assert_eq!(storage.stream_bounds(&s).await.unwrap().1, Offset(9));
+    assert_eq!(offsets(&storage, &s, 0).await, (0..9).collect::<Vec<_>>());
+    let (o, _) = storage.append(&s, &plain(9)).await.unwrap();
+    assert_eq!(o, Offset(9));
+}
+
+#[tokio::test]
+async fn delete_and_recreate_stream() {
+    let dir = TempDir::new().unwrap();
+    let storage = small_segments(dir.path(), 128);
+    let s = stream("del");
+    storage.create_stream(&s, 0, 0).await.unwrap();
+    append_n(&storage, &s, 0, 20).await;
+    storage.delete_stream(&s).await.unwrap();
+    assert!(!dir.path().join("streams/del").exists());
+    assert!(matches!(
+        storage.append(&s, &plain(0)).await,
+        Err(StorageError::StreamNotFound(_))
+    ));
+    storage.create_stream(&s, 0, 0).await.unwrap();
+    assert_eq!(
+        storage.stream_bounds(&s).await.unwrap(),
+        (Offset(0), Offset(0))
+    );
+    drop(storage);
+    let storage = small_segments(dir.path(), 128);
+    assert_eq!(
+        storage.stream_bounds(&s).await.unwrap(),
+        (Offset(0), Offset(0))
+    );
+}
+
+#[tokio::test]
+async fn corrupt_stream_json_only_affects_that_stream() {
+    let dir = TempDir::new().unwrap();
+    {
+        let storage = small_segments(dir.path(), 128);
+        for name in ["good", "bad"] {
+            let cfg = StreamConfig {
+                max_age_secs: 1,
+                dedup_window_secs: 1,
+                ..StreamConfig::default()
+            };
+            storage
+                .create_stream_with(&stream(name), &cfg)
+                .await
+                .unwrap();
+            let old = now_ns() - 3_600_000_000_000;
+            for i in 0..20 {
+                storage
+                    .append(&stream(name), &plain_at(i, old))
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+    std::fs::write(dir.path().join("streams/bad/stream.json"), b"{not json").unwrap();
+    let storage = small_segments(dir.path(), 128);
+    storage.enforce_all_retention().unwrap();
+    assert_eq!(
+        segment_count(&storage, "good"),
+        1,
+        "good stream was trimmed"
+    );
+    assert!(
+        segment_count(&storage, "bad") > 1,
+        "bad stream is left alone"
+    );
+    assert!(storage.stream_config(&stream("bad")).await.is_err());
+    // The broken stream is still readable and writable.
+    assert_eq!(
+        offsets(&storage, &stream("bad"), 0).await,
+        (0..20).collect::<Vec<_>>()
+    );
+    storage.append(&stream("bad"), &plain(20)).await.unwrap();
+}
+
+#[tokio::test]
+async fn stream_config_roundtrip_with_compaction_fields() {
+    let dir = TempDir::new().unwrap();
+    let s = stream("cfg");
+    let cfg = StreamConfig {
+        compaction: true,
+        tombstone_retention_secs: 42,
+        ..StreamConfig::default()
+    };
+    {
+        let storage = FileStorage::new(dir.path()).unwrap();
+        storage.create_stream_with(&s, &cfg).await.unwrap();
+        assert_eq!(storage.stream_config(&s).await.unwrap(), cfg);
+    }
+    let storage = FileStorage::open(dir.path()).unwrap();
+    assert_eq!(storage.stream_config(&s).await.unwrap(), cfg);
 }

@@ -1,163 +1,42 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use bytes::{Bytes, BytesMut};
-use futures_util::{SinkExt, StreamExt};
 use tempfile::tempdir;
-use tokio::net::TcpStream;
-use tokio::time::timeout;
-use tokio_util::codec::{FramedRead, FramedWrite};
 
-use exspeed_protocol::codec::ExspeedCodec;
-use exspeed_protocol::frame::Frame;
-use exspeed_protocol::messages::connect::{AuthType, ConnectRequest};
-use exspeed_protocol::messages::consumer::{CreateConsumerRequest, StartFrom};
-use exspeed_protocol::messages::stream_mgmt::CreateStreamRequest;
-use exspeed_protocol::opcodes::OpCode;
+use crate::common::{create_stream, publish_n, TestServer};
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-async fn start_server() -> (String, u16, tempfile::TempDir) {
-    let tcp_port = exspeed_testkit::pick_unused_port().unwrap();
-    let api_port = exspeed_testkit::pick_unused_port().unwrap();
-    let tcp_addr = format!("127.0.0.1:{tcp_port}");
-    let api_addr = format!("127.0.0.1:{api_port}");
-
-    let dir = tempdir().unwrap();
-    let data_dir = dir.path().to_path_buf();
-
-    let args = exspeed::cli::server::ServerArgs {
-        bind: tcp_addr.clone(),
-        api_bind: api_addr,
-        data_dir,
-        auth_token: None,
-        credentials_file: None,
-        tls_cert: None,
-        tls_key: None,
-        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-        storage_flush_window_us: 500,
-        storage_flush_threshold_records: 256,
-        storage_flush_threshold_bytes: 1_048_576,
-        storage_sync_interval_ms: 10,
-        storage_sync_bytes: 4 * 1024 * 1024,
-        delivery_buffer: 8192,
-    };
-
-    tokio::spawn(async move {
-        exspeed::cli::server::run(args).await.unwrap();
-    });
-
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    (tcp_addr, api_port, dir)
+async fn start_server() -> (TestServer, u16) {
+    let server = TestServer::start().await;
+    let port = server.api_addr.rsplit(':').next().unwrap().parse().unwrap();
+    (server, port)
 }
-
-type FramedReader = FramedRead<tokio::net::tcp::OwnedReadHalf, ExspeedCodec>;
-type FramedWriter = FramedWrite<tokio::net::tcp::OwnedWriteHalf, ExspeedCodec>;
-
-async fn connect_to(addr: &str) -> (FramedReader, FramedWriter) {
-    let stream = TcpStream::connect(addr).await.unwrap();
-    let (reader, writer) = stream.into_split();
-    (
-        FramedRead::new(reader, ExspeedCodec::new()),
-        FramedWrite::new(writer, ExspeedCodec::new()),
-    )
-}
-
-async fn send_recv(writer: &mut FramedWriter, reader: &mut FramedReader, frame: Frame) -> Frame {
-    let corr = frame.correlation_id;
-    writer.send(frame).await.unwrap();
-    loop {
-        let resp = timeout(Duration::from_secs(5), reader.next())
-            .await
-            .expect("timeout waiting for response")
-            .unwrap()
-            .unwrap();
-        if resp.correlation_id == corr {
-            return resp;
-        }
-    }
-}
-
-fn connect_frame(corr: u32) -> Frame {
-    let req = ConnectRequest {
-        client_id: "observability-test".into(),
-        auth_type: AuthType::None,
-        auth_payload: Bytes::new(),
-    };
-    let mut buf = BytesMut::new();
-    req.encode(&mut buf);
-    Frame::new(OpCode::Connect, corr, buf.freeze())
-}
-
-fn create_stream_frame(stream: &str, corr: u32) -> Frame {
-    let req = CreateStreamRequest {
-        stream_name: stream.into(),
-        max_age_secs: 0,
-        max_bytes: 0,
-    };
-    let mut buf = BytesMut::new();
-    req.encode(&mut buf);
-    Frame::new(OpCode::CreateStream, corr, buf.freeze())
-}
-
-fn create_consumer_frame(
-    name: &str,
-    stream: &str,
-    group: &str,
-    subject_filter: &str,
-    corr: u32,
-) -> Frame {
-    let req = CreateConsumerRequest {
-        name: name.into(),
-        stream: stream.into(),
-        group: group.into(),
-        subject_filter: subject_filter.into(),
-        start_from: StartFrom::Earliest,
-        start_offset: 0,
-    };
-    let mut buf = BytesMut::new();
-    req.encode(&mut buf);
-    Frame::new(OpCode::CreateConsumer, corr, buf.freeze())
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn over_long_consumer_name_rejected() {
-    let (addr, _api_port, _tmp) = start_server().await;
-    let (mut reader, mut writer) = connect_to(&addr).await;
-
-    let resp = send_recv(&mut writer, &mut reader, connect_frame(1)).await;
-    assert_eq!(
-        resp.opcode,
-        OpCode::ConnectOk,
-        "CONNECT should return ConnectOk"
-    );
-
-    let resp = send_recv(&mut writer, &mut reader, create_stream_frame("events", 2)).await;
-    assert_eq!(resp.opcode, OpCode::Ok, "CREATE_STREAM should return Ok");
-
-    let too_long = "x".repeat(256);
-    let resp = send_recv(
-        &mut writer,
-        &mut reader,
-        create_consumer_frame(&too_long, "events", "", "", 3),
-    )
-    .await;
-    assert_eq!(
-        resp.opcode,
-        OpCode::Error,
-        "over-long consumer name should return Error"
-    );
+async fn consumer_lag_reported_via_metrics() {
+    let (server, api_port) = start_server().await;
+    let c = server.client().await;
+    create_stream(&c, "lagging").await;
+    c.create_consumer(exspeed_client::ConsumerSpec::new("slowpoke", "lagging"))
+        .await
+        .unwrap();
+    publish_n(&c, "lagging", "x", 7).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let metrics = reqwest::get(format!("http://127.0.0.1:{api_port}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let line = metrics
+        .lines()
+        .find(|l| l.contains("consumer_lag") && l.contains("consumer=\"slowpoke\""))
+        .unwrap_or_else(|| panic!("no consumer_lag line for slowpoke:\n{metrics}"));
+    assert!(line.trim_end().ends_with(" 7"), "lag should be 7: {line}");
 }
 
 #[tokio::test]
 async fn publish_latency_histogram_reported_via_metrics() {
-    let (_addr, api_port, _tmp) = start_server().await;
+    let (_server, api_port) = start_server().await;
 
     let client = reqwest::Client::new();
 

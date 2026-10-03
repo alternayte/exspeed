@@ -1,10 +1,6 @@
 use std::time::Duration;
 
-use bytes::{Bytes, BytesMut};
-use exspeed_protocol::codec::ExspeedCodec;
-use exspeed_protocol::frame::Frame;
-use exspeed_protocol::messages::connect::{AuthType, ConnectRequest};
-use exspeed_protocol::opcodes::OpCode;
+use exspeed_client::{Client, ConnectOptions, Request, Response};
 use futures_util::{SinkExt, StreamExt};
 use tempfile::TempDir;
 use tokio::net::TcpStream;
@@ -12,151 +8,63 @@ use tokio::time::timeout;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 async fn start_server(auth_token: Option<String>) -> (String, TempDir) {
-    let port = exspeed_testkit::pick_unused_port().unwrap();
-    let api_port = exspeed_testkit::pick_unused_port().unwrap();
-    let bind = format!("127.0.0.1:{port}");
-    let api_bind = format!("127.0.0.1:{api_port}");
-    let tmp = tempfile::tempdir().unwrap();
-    let data_dir = tmp.path().to_path_buf();
-
-    let args = exspeed::cli::server::ServerArgs {
-        bind: bind.clone(),
-        api_bind,
-        data_dir,
-        auth_token,
-        credentials_file: None,
-        tls_cert: None,
-        tls_key: None,
-        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-        storage_flush_window_us: 500,
-        storage_flush_threshold_records: 256,
-        storage_flush_threshold_bytes: 1_048_576,
-        storage_sync_interval_ms: 10,
-        storage_sync_bytes: 4 * 1024 * 1024,
-        delivery_buffer: 8192,
-    };
-
-    tokio::spawn(async move {
-        exspeed::cli::server::run(args).await.unwrap();
-    });
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (bind, _api, tmp) = start_server_with_api(auth_token).await;
     (bind, tmp)
 }
 
-fn encode_connect(client_id: &str, auth_type: AuthType, token: &[u8]) -> Frame {
-    let mut payload = BytesMut::new();
-    ConnectRequest {
-        client_id: client_id.to_string(),
-        auth_type,
-        auth_payload: Bytes::copy_from_slice(token),
-    }
-    .encode(&mut payload);
-    Frame::new(OpCode::Connect, 1, payload.freeze())
+async fn connect(addr: &str, token: Option<&str>) -> exspeed_client::Result<Client> {
+    let opts = ConnectOptions {
+        token: token.map(str::to_string),
+        ..Default::default()
+    };
+    Client::connect(addr, opts).await
 }
 
 #[tokio::test]
 async fn auth_disabled_accepts_any_connect() {
     let (addr, _tmp) = start_server(None).await;
-    let stream = TcpStream::connect(&addr).await.unwrap();
-    let (r, w) = stream.into_split();
-    let mut fr = FramedRead::new(r, ExspeedCodec::new());
-    let mut fw = FramedWrite::new(w, ExspeedCodec::new());
-
-    // AuthType::None is accepted.
-    fw.send(encode_connect("c", AuthType::None, b""))
-        .await
-        .unwrap();
-    let resp = timeout(Duration::from_secs(1), fr.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert_eq!(resp.opcode, OpCode::ConnectOk);
+    connect(&addr, None).await.unwrap().ping().await.unwrap();
+    // A token is ignored when auth is off.
+    connect(&addr, Some("whatever")).await.unwrap();
 }
 
 #[tokio::test]
 async fn auth_enabled_rejects_missing_token() {
     let (addr, _tmp) = start_server(Some("secret123".into())).await;
-    let stream = TcpStream::connect(&addr).await.unwrap();
-    let (r, w) = stream.into_split();
-    let mut fr = FramedRead::new(r, ExspeedCodec::new());
-    let mut fw = FramedWrite::new(w, ExspeedCodec::new());
-
-    fw.send(encode_connect("c", AuthType::None, b""))
-        .await
-        .unwrap();
-    let resp = timeout(Duration::from_secs(1), fr.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert_eq!(resp.opcode, OpCode::Error);
+    let err = connect(&addr, None).await.err().unwrap();
+    assert_eq!(err.code(), Some(401));
 }
 
 #[tokio::test]
 async fn auth_enabled_rejects_wrong_token() {
     let (addr, _tmp) = start_server(Some("secret123".into())).await;
-    let stream = TcpStream::connect(&addr).await.unwrap();
-    let (r, w) = stream.into_split();
-    let mut fr = FramedRead::new(r, ExspeedCodec::new());
-    let mut fw = FramedWrite::new(w, ExspeedCodec::new());
-
-    fw.send(encode_connect("c", AuthType::Token, b"wrong"))
-        .await
-        .unwrap();
-    let resp = timeout(Duration::from_secs(1), fr.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert_eq!(resp.opcode, OpCode::Error);
+    let err = connect(&addr, Some("wrong")).await.err().unwrap();
+    assert_eq!(err.code(), Some(401));
 }
 
 #[tokio::test]
 async fn auth_enabled_accepts_correct_token() {
     let (addr, _tmp) = start_server(Some("secret123".into())).await;
-    let stream = TcpStream::connect(&addr).await.unwrap();
-    let (r, w) = stream.into_split();
-    let mut fr = FramedRead::new(r, ExspeedCodec::new());
-    let mut fw = FramedWrite::new(w, ExspeedCodec::new());
-
-    fw.send(encode_connect("c", AuthType::Token, b"secret123"))
-        .await
-        .unwrap();
-    let resp = timeout(Duration::from_secs(1), fr.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert_eq!(resp.opcode, OpCode::ConnectOk);
-
-    // Can Ping now.
-    fw.send(Frame::empty(OpCode::Ping, 99)).await.unwrap();
-    let pong = timeout(Duration::from_secs(1), fr.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert_eq!(pong.opcode, OpCode::Pong);
+    let c = connect(&addr, Some("secret123")).await.unwrap();
+    c.ping().await.unwrap();
 }
 
 #[tokio::test]
 async fn auth_enabled_blocks_ops_before_connect() {
     let (addr, _tmp) = start_server(Some("secret123".into())).await;
-    let stream = TcpStream::connect(&addr).await.unwrap();
-    let (r, w) = stream.into_split();
-    let mut fr = FramedRead::new(r, ExspeedCodec::new());
-    let mut fw = FramedWrite::new(w, ExspeedCodec::new());
-
-    // Try to Ping without authenticating first.
-    fw.send(Frame::empty(OpCode::Ping, 7)).await.unwrap();
-    let resp = timeout(Duration::from_secs(1), fr.next())
+    let (r, w) = TcpStream::connect(&addr).await.unwrap().into_split();
+    let mut fr = FramedRead::new(r, exspeed_protocol::codec::ExspeedCodec::new());
+    let mut fw = FramedWrite::new(w, exspeed_protocol::codec::ExspeedCodec::new());
+    fw.send(Request::Ping.into_frame(7)).await.unwrap();
+    let resp = timeout(Duration::from_secs(2), fr.next())
         .await
         .unwrap()
         .unwrap()
         .unwrap();
-    assert_eq!(resp.opcode, OpCode::Error);
+    assert!(matches!(
+        Response::from_frame(&resp).unwrap(),
+        Response::Error { code: 401, .. }
+    ));
 }
 
 async fn start_server_with_api(auth_token: Option<String>) -> (String, u16, TempDir) {
@@ -175,13 +83,7 @@ async fn start_server_with_api(auth_token: Option<String>) -> (String, u16, Temp
         credentials_file: None,
         tls_cert: None,
         tls_key: None,
-        storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-        storage_flush_window_us: 500,
-        storage_flush_threshold_records: 256,
-        storage_flush_threshold_bytes: 1_048_576,
-        storage_sync_interval_ms: 10,
-        storage_sync_bytes: 4 * 1024 * 1024,
-        delivery_buffer: 8192,
+        ..Default::default()
     };
 
     tokio::spawn(async move {

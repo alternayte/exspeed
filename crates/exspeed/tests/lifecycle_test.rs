@@ -31,10 +31,6 @@ async fn start_test_server(max_conns: u32) -> (String, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().to_path_buf();
 
-    // NOTE: env var is process-global and not serialized — only one consumer (this test) exists today.
-    // If a sibling test reads EXSPEED_MAX_CONNS, add Mutex serialization (see log_format.rs tests).
-    std::env::set_var("EXSPEED_MAX_CONNS", max_conns.to_string());
-
     let bind_clone = bind.clone();
     let api_clone = api_bind.clone();
     let data_clone = data_dir.clone();
@@ -47,13 +43,8 @@ async fn start_test_server(max_conns: u32) -> (String, tempfile::TempDir) {
             credentials_file: None,
             tls_cert: None,
             tls_key: None,
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
+            max_connections: max_conns as usize,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -86,14 +77,7 @@ async fn connection_cap_rejects_overflow() {
     drop(c2);
 }
 
-use bytes::{Bytes, BytesMut};
-use exspeed_protocol::codec::ExspeedCodec;
-use exspeed_protocol::frame::Frame;
-use exspeed_protocol::messages::connect::{AuthType, ConnectRequest};
-use exspeed_protocol::opcodes::OpCode;
-use futures_util::{SinkExt, StreamExt};
 use tokio::sync::oneshot;
-use tokio_util::codec::{FramedRead, FramedWrite};
 
 #[tokio::test]
 async fn sigterm_signal_token_stops_accept_loop() {
@@ -115,13 +99,7 @@ async fn sigterm_signal_token_stops_accept_loop() {
                 credentials_file: None,
                 tls_cert: None,
                 tls_key: None,
-                storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-                storage_flush_window_us: 500,
-                storage_flush_threshold_records: 256,
-                storage_flush_threshold_bytes: 1_048_576,
-                storage_sync_interval_ms: 10,
-                storage_sync_bytes: 4 * 1024 * 1024,
-                delivery_buffer: 8192,
+                ..Default::default()
             },
             async {
                 let _ = rx.await;
@@ -133,25 +111,15 @@ async fn sigterm_signal_token_stops_accept_loop() {
     // Give the server a moment to bind the listener.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Open a connection, send CONNECT, then trigger shutdown.
-    let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
-        .await
-        .unwrap();
-    let (reader, writer) = stream.into_split();
-    let mut framed_read = FramedRead::new(reader, ExspeedCodec::new());
-    let mut framed_write = FramedWrite::new(writer, ExspeedCodec::new());
-    let mut payload = BytesMut::new();
-    ConnectRequest {
-        client_id: "shutdown-test".into(),
-        auth_type: AuthType::None,
-        auth_payload: Bytes::new(),
-    }
-    .encode(&mut payload);
-    framed_write
-        .send(Frame::new(OpCode::Connect, 1, payload.freeze()))
-        .await
-        .unwrap();
-    let _ = framed_read.next().await.unwrap().unwrap(); // OK
+    // Open a connection (with a live subscription), then trigger shutdown:
+    // the server must not wait on idle clients beyond the drain deadline.
+    let client = exspeed_client::Client::connect(
+        &format!("127.0.0.1:{port}"),
+        exspeed_client::ConnectOptions::default(),
+    )
+    .await
+    .unwrap();
+    client.ping().await.unwrap();
 
     let _ = tx.send(());
 
@@ -159,6 +127,9 @@ async fn sigterm_signal_token_stops_accept_loop() {
     let outer = result.expect("server should exit within 15s");
     let inner = outer.expect("server task should not panic");
     inner.expect("server should return Ok on graceful shutdown");
+    // The client sees the connection close.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(client.ping().await.is_err());
 }
 
 #[tokio::test]
@@ -180,13 +151,7 @@ async fn readyz_returns_503_when_data_dir_unwritable() {
             credentials_file: None,
             tls_cert: None,
             tls_key: None,
-            storage_sync: exspeed::cli::server::StorageSyncArg::Sync,
-            storage_flush_window_us: 500,
-            storage_flush_threshold_records: 256,
-            storage_flush_threshold_bytes: 1_048_576,
-            storage_sync_interval_ms: 10,
-            storage_sync_bytes: 4 * 1024 * 1024,
-            delivery_buffer: 8192,
+            ..Default::default()
         })
         .await
         .unwrap();

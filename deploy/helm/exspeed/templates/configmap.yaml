@@ -1,0 +1,10 @@
+{{- if .Values.config }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "exspeed.fullname" . }}-config
+  labels: {{- include "exspeed.labels" . | nindent 4 }}
+data:
+  exspeed.toml: |
+{{ .Values.config | indent 4 }}
+{{- end }}
