@@ -21,9 +21,10 @@
 //! # Ok(()) }
 //! ```
 //!
-//! Not (yet) included: automatic reconnection and leader redirects. A
-//! closed connection fails pending requests with [`Error::Closed`]; create
-//! a new client to continue.
+//! In a cluster, [`Client::connect_cluster`] finds the leader from a list of
+//! seed addresses. There is no automatic reconnection: a closed connection
+//! fails pending requests with [`Error::Closed`]; create a new client (with
+//! `connect_cluster` after a failover) to continue.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -221,6 +222,51 @@ impl Client {
         let socket = TcpStream::connect(addr).await?;
         socket.set_nodelay(true)?;
         Self::connect_with(socket, opts).await
+    }
+
+    /// Connect to the leader of a cluster. Tries `seeds` in order and
+    /// follows the leader hints followers return, until a node that is the
+    /// leader accepts the connection or `wait` elapses (useful while a
+    /// failover is in progress). Plain TCP only.
+    pub async fn connect_cluster<S: AsRef<str>>(
+        seeds: &[S],
+        opts: ConnectOptions,
+        wait: Duration,
+    ) -> Result<Self> {
+        let deadline = tokio::time::Instant::now() + wait;
+        let mut last_err = Error::Protocol("no seed addresses".into());
+        loop {
+            let mut queue: std::collections::VecDeque<String> =
+                seeds.iter().map(|s| s.as_ref().to_string()).collect();
+            let mut tried = std::collections::HashSet::new();
+            while let Some(addr) = queue.pop_front() {
+                if !tried.insert(addr.clone()) {
+                    continue;
+                }
+                let client = match Self::connect(&addr, opts.clone()).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        last_err = e;
+                        continue;
+                    }
+                };
+                match client.metadata().await {
+                    Ok(m) if m["is_leader"].as_bool() == Some(true) => return Ok(client),
+                    Ok(m) => {
+                        if let Some(l) = m["leader"].as_str() {
+                            queue.push_front(l.to_string());
+                        }
+                        last_err = Error::Protocol(format!("{addr} is not the leader"));
+                    }
+                    Err(e) => last_err = e,
+                }
+                client.close();
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(last_err);
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
 
     /// Connect over TLS. `server_name` is checked against the certificate.

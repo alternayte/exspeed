@@ -123,8 +123,9 @@ stream out to external systems, for example JDBC databases, HTTP endpoints,
 S3, or RabbitMQ. They are configured as TOML files in `connectors.d/` or via
 the HTTP API. See [connectors.md](connectors.md).
 
-## Leadership (multi-pod)
+## Clusters
 
-In multi-pod mode exactly one pod holds the cluster lease and serves traffic.
-The others replicate asynchronously and wait. See
-[high-availability.md](high-availability.md).
+In a cluster exactly one node holds the lease: the leader takes writes and
+runs consumers, connectors and continuous queries. The other nodes replicate
+its whole log and take over on failure. With `acks = all`, acknowledged
+writes survive a failover. See [high-availability.md](high-availability.md).

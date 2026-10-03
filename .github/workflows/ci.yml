@@ -46,6 +46,8 @@ jobs:
       EXSPEED_POSTGRES_URL: postgres://testuser:testpass@127.0.0.1:5432/testdb
       EXSPEED_OFFSET_STORE_POSTGRES_URL: postgres://testuser:testpass@127.0.0.1:5432/testdb
       EXSPEED_OFFSET_STORE_REDIS_URL: redis://127.0.0.1:6379
+      EXSPEED_LEASE_POSTGRES_URL: postgres://testuser:testpass@127.0.0.1:5432/testdb
+      EXSPEED_LEASE_REDIS_URL: redis://127.0.0.1:6379
       EXSPEED_MYSQL_URL: mysql://exspeed:exspeed@127.0.0.1:3306/exspeed
     steps:
       - uses: actions/checkout@v4
@@ -70,14 +72,11 @@ jobs:
               && break
             sleep 2
           done
-      # The multi-pod replication tests (separate binaries under
-      # crates/exspeed/tests/replication_*, multipod_*, lease_api_test) are
-      # known broken and are being replaced in Phase 6 of docs/REVIEW.md.
       - name: Run service-backed tests
         run: >
           cargo test --workspace --lib --bins
           --test it --test leadership_test --test postgres_lease_test
-          --test redis_lease_test --test replication_client_test
+          --test redis_lease_test
           -- --include-ignored
 
   sdk:

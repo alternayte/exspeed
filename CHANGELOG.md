@@ -72,6 +72,44 @@ connector config and SDK API all change.
   - batched JDBC inserts, HTTP status taxonomy
   - S3 sink idempotent object keys, RabbitMQ confirms
 
+### High availability (Phase 6)
+
+- Clusters are now safe to run: Kafka-style pull replication with leader
+  epochs replaces the old push replication. Every stream replicates,
+  internal ones included, with original offsets, timestamps, keys and
+  headers. Stream metadata (create, config, delete) and retention trims
+  replicate too. See [docs/high-availability.md](docs/high-availability.md).
+- Lease records carry an epoch (fencing token), the holder's replication
+  and client endpoints, and the in-sync replica set. Releasing a lease
+  expires it rather than deleting it. Node ids are stable
+  (`{data_dir}/node_id`). The Postgres table is now `exspeed_cluster_leases`.
+  The heartbeat bounds every backend call and steps down before the lease
+  can expire elsewhere.
+- `cluster.acks = "all"` (default) acknowledges writes once every in-sync
+  replica has them. `cluster.min_insync_replicas` rejects writes when too
+  few replicas are in sync. Only ISR members can be elected unless
+  `cluster.unclean_leader_election = true`.
+- A deposed leader truncates writes it never replicated when it rejoins
+  (per-stream epoch history, KIP-101).
+- Promotion rebuilds the dedup state from the replicated log, so retried
+  `msg_id` publishes stay idempotent across failover.
+- Leader hints: followers name the leader in `ConnectOk`, `Metadata`, 503
+  errors (TCP and HTTP) and `/healthz`. New `cluster.client_advertise`.
+  The Rust client gained `Client::connect_cluster`. The TypeScript SDK takes
+  `servers: [...]` and finds the leader again after a failover.
+- `GET /api/v1/cluster` (any node) shows the role, epoch, ISR and follower
+  progress. It replaces `/api/v1/cluster/followers`.
+- New settings: `cluster.client_advertise`, `node_id`, `acks`,
+  `min_insync_replicas`, `replica_lag_max_ms`, `ack_timeout_ms`,
+  `unclean_leader_election`. Removed: `follower_queue_records`. Lease
+  defaults are now a 15 s TTL and a 3 s heartbeat. A replicator credential is
+  only required when auth is on.
+- Tests: in-process multi-node clusters over an in-memory lease backend.
+  They cover replication of every write kind, failover without losing
+  acknowledged writes, divergent-leader truncation, follower restart and
+  `min_insync_replicas`. A shared conformance suite runs against the
+  memory, Postgres and Redis lease backends.
+
 ## [0.5.0] — 2026-04-24
 
 Indexing release. Queries on timestamp, key, and payload fields are now

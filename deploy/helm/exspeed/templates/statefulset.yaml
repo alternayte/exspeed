@@ -92,6 +92,12 @@ spec:
               value: {{ .Values.cluster.leaseTtlSecs | quote }}
             - name: EXSPEED_LEASE_HEARTBEAT_SECS
               value: {{ .Values.cluster.leaseHeartbeatSecs | quote }}
+            - name: EXSPEED_CLIENT_ADVERTISE
+              value: "$(POD_NAME).{{ include "exspeed.fullname" . }}-headless.$(POD_NAMESPACE).svc.cluster.local:{{ .Values.ports.tcp }}"
+            - name: EXSPEED_ACKS
+              value: {{ .Values.cluster.acks | quote }}
+            - name: EXSPEED_MIN_INSYNC_REPLICAS
+              value: {{ .Values.cluster.minInsyncReplicas | quote }}
             {{- end }}
           startupProbe:
             httpGet: { path: /readyz, port: http, scheme: {{ if .Values.tls.secretName }}HTTPS{{ else }}HTTP{{ end }} }

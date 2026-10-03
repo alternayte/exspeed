@@ -151,8 +151,9 @@ Only `name` and `stream` are required.
 | 0x8A | SubscriptionEnded | `u32 sub_id`, `u16 code`, `str message` (push, corr 0) |
 | 0xF1 | Pong | — |
 
-Opcodes 0x30, 0x31 and 0xA0–0xA6 are reserved for replication between
-servers.
+Opcodes 0x30, 0x31 and 0xA0–0xA6 are reserved. Replication between
+servers uses its own protocol on the cluster port (see
+`crates/exspeed-broker/src/cluster/wire.rs`).
 
 ## Error codes
 
@@ -165,7 +166,7 @@ servers.
 | 409 | Exists with different settings; stream still has consumers; `msg_id` reused with a different body | `{"stored_offset": n}`, `{"consumers": [...]}` |
 | 429 | Retry later: dedup map full, or too many concurrent waiting requests on this connection (max 64) | `{"retry_after_secs": n}` |
 | 500 | Internal error | |
-| 503 | Not the leader, or still starting | `{"leader": "host:port"}` when known |
+| 503 | Not the leader, still starting, or (cluster with `acks = all`) not enough in-sync replicas / replication timed out | `{"leader": "host:port"}` when known; `{"in_sync": n, "required": m}` |
 
 ## Consumers
 

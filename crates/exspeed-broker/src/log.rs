@@ -10,8 +10,8 @@
 //! 3. **Dedup** — records carrying an idempotency key
 //!    (`x-idempotency-key`) are deduplicated by [`BrokerAppend`].
 //! 4. **Storage append**.
-//! 5. **Replication feed** — the written records are handed to the
-//!    replication coordinator, if one is attached.
+//! 5. **Replication** — in a cluster, wait until the in-sync followers have
+//!    the records (`acks = all`; see `crate::cluster`).
 //! 6. **Metrics**.
 //!
 //! Reads go straight to [`Log::storage`].
@@ -23,7 +23,27 @@ use exspeed_common::{Metrics, StreamName};
 use exspeed_streams::{Record, StorageEngine, StorageError, StreamConfig};
 
 use crate::broker_append::{AppendResult, BrokerAppend, IDEMPOTENCY_HEADER};
-use crate::replication::{ReplicationCoordinator, ReplicationEvent};
+
+/// A stream-metadata change, reported to [`ReplicaSync`].
+#[derive(Debug, Clone, Copy)]
+pub enum MetadataChange<'a> {
+    Created(&'a StreamName),
+    Updated(&'a StreamName),
+    Deleted(&'a StreamName),
+}
+
+/// Hooks the cluster layer installs on the write path.
+#[async_trait::async_trait]
+pub trait ReplicaSync: Send + Sync {
+    /// Fail before writing when the write can't be acknowledged (too few
+    /// in-sync replicas).
+    fn precheck(&self) -> Result<(), LogError>;
+    /// Called after records up to `last_offset` (inclusive) of `stream` were
+    /// written locally; returns once they are replicated as configured.
+    async fn wait_replicated(&self, stream: &StreamName, last_offset: u64) -> Result<(), LogError>;
+    /// A stream was created, reconfigured or deleted.
+    fn metadata_changed(&self, change: MetadataChange<'_>);
+}
 
 /// Size limits enforced on every record before it is written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +161,10 @@ pub enum LogError {
     InvalidConfig(String),
     #[error("dedup state is still loading after startup; retry shortly")]
     DedupNotReady,
+    #[error("not enough in-sync replicas ({in_sync} of the required {required})")]
+    NotEnoughReplicas { in_sync: usize, required: usize },
+    #[error("the write was not replicated to the in-sync replicas in time; it may or may not be durable")]
+    ReplicationTimeout,
     #[error(transparent)]
     Storage(#[from] StorageError),
 }
@@ -149,7 +173,10 @@ impl LogError {
     /// Whether the caller can expect the same write to succeed later.
     pub fn is_retryable(&self) -> bool {
         match self {
-            LogError::NotLeader | LogError::DedupNotReady => true,
+            LogError::NotLeader
+            | LogError::DedupNotReady
+            | LogError::NotEnoughReplicas { .. }
+            | LogError::ReplicationTimeout => true,
             LogError::InvalidRecord(_) | LogError::InvalidConfig(_) => false,
             LogError::Storage(e) => matches!(
                 e,
@@ -169,7 +196,11 @@ pub struct Log {
     limits: RecordLimits,
     dedup_ready: Arc<AtomicBool>,
     gate: OnceLock<Arc<dyn WriteGate>>,
-    replication: OnceLock<Arc<ReplicationCoordinator>>,
+    sync: OnceLock<Arc<dyn ReplicaSync>>,
+    /// Bumped after every write that stored at least one record.
+    appended: tokio::sync::watch::Sender<u64>,
+    /// Bumped on every stream create / update / delete.
+    metadata: tokio::sync::watch::Sender<u64>,
 }
 
 impl Log {
@@ -189,7 +220,9 @@ impl Log {
             limits: RecordLimits::default(),
             dedup_ready,
             gate: OnceLock::new(),
-            replication: OnceLock::new(),
+            sync: OnceLock::new(),
+            appended: tokio::sync::watch::channel(0).0,
+            metadata: tokio::sync::watch::channel(0).0,
         }
     }
 
@@ -204,9 +237,24 @@ impl Log {
         let _ = self.gate.set(gate);
     }
 
-    /// Feed every write to `coordinator`. Can be set once.
-    pub fn set_replication(&self, coordinator: Arc<ReplicationCoordinator>) {
-        let _ = self.replication.set(coordinator);
+    /// Install the cluster hooks. Can be set once.
+    pub fn set_replica_sync(&self, sync: Arc<dyn ReplicaSync>) {
+        let _ = self.sync.set(sync);
+    }
+
+    /// Changes after every write that stored records.
+    pub fn watch_appends(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.appended.subscribe()
+    }
+
+    /// Changes after every stream create / update / delete.
+    pub fn watch_metadata(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.metadata.subscribe()
+    }
+
+    /// Number of metadata changes so far (process-local).
+    pub fn metadata_counter(&self) -> u64 {
+        *self.metadata.borrow()
     }
 
     pub fn storage(&self) -> &Arc<dyn StorageEngine> {
@@ -234,6 +282,14 @@ impl Log {
         }
     }
 
+    fn check_appendable(&self) -> Result<(), LogError> {
+        self.check_writable()?;
+        match self.sync.get() {
+            Some(s) => s.precheck(),
+            None => Ok(()),
+        }
+    }
+
     fn check_record(&self, record: &Record) -> Result<(), LogError> {
         self.limits.check(record).map_err(LogError::InvalidRecord)?;
         if !self.dedup_ready.load(Ordering::Acquire)
@@ -250,13 +306,14 @@ impl Log {
         stream: &StreamName,
         record: Record,
     ) -> Result<AppendResult, LogError> {
-        self.check_writable()?;
+        self.check_appendable()?;
         self.check_record(&record)?;
         let result = self.dedup.append(stream, &record).await?;
-        if let AppendResult::Written(offset, ts) = result {
+        if let AppendResult::Written(..) = result {
             self.metrics.record_publish(stream.as_str());
-            self.replicate_records(stream, offset.0, std::slice::from_ref(&(record, ts)));
         }
+        self.replicated(stream, std::slice::from_ref(&result))
+            .await?;
         Ok(result)
     }
 
@@ -267,31 +324,17 @@ impl Log {
         stream: &StreamName,
         records: Vec<Record>,
     ) -> Result<Vec<AppendResult>, LogError> {
-        self.check_writable()?;
+        self.check_appendable()?;
         for r in &records {
             self.check_record(r)?;
         }
-        let results = self.dedup.append_batch(stream, records.clone()).await?;
-
-        // Replicate written records, in runs of consecutive offsets.
-        let mut run: Vec<(Record, u64)> = Vec::new();
-        let mut run_base = 0u64;
-        for (record, result) in records.into_iter().zip(results.iter()) {
-            if let AppendResult::Written(offset, ts) = result {
-                if run.is_empty() || run_base + run.len() as u64 != offset.0 {
-                    if !run.is_empty() {
-                        self.replicate_records(stream, run_base, &run);
-                        run.clear();
-                    }
-                    run_base = offset.0;
-                }
-                run.push((record, *ts));
+        let results = self.dedup.append_batch(stream, records).await?;
+        for r in &results {
+            if let AppendResult::Written(..) = r {
                 self.metrics.record_publish(stream.as_str());
             }
         }
-        if !run.is_empty() {
-            self.replicate_records(stream, run_base, &run);
-        }
+        self.replicated(stream, &results).await?;
         Ok(results)
     }
 
@@ -307,14 +350,7 @@ impl Log {
         self.dedup
             .configure_stream(stream, config.dedup_window_secs, config.dedup_max_entries)
             .await;
-        self.replicate(|| {
-            use exspeed_protocol::messages::replicate::StreamCreatedEvent;
-            ReplicationEvent::StreamCreated(StreamCreatedEvent {
-                name: stream.as_str().to_string(),
-                max_age_secs: config.max_age_secs,
-                max_bytes: config.max_bytes,
-            })
-        });
+        self.metadata_changed(MetadataChange::Created(stream));
         Ok(())
     }
 
@@ -344,14 +380,7 @@ impl Log {
         self.dedup
             .configure_stream(stream, config.dedup_window_secs, config.dedup_max_entries)
             .await;
-        self.replicate(|| {
-            use exspeed_protocol::messages::replicate::RetentionUpdatedEvent;
-            ReplicationEvent::RetentionUpdated(RetentionUpdatedEvent {
-                stream: stream.as_str().to_string(),
-                max_age_secs: config.max_age_secs,
-                max_bytes: config.max_bytes,
-            })
-        });
+        self.metadata_changed(MetadataChange::Updated(stream));
         Ok(())
     }
 
@@ -360,51 +389,35 @@ impl Log {
         self.check_writable()?;
         self.storage.delete_stream(stream).await?;
         self.dedup.forget_stream(stream).await;
-        self.replicate(|| {
-            use exspeed_protocol::messages::replicate::StreamDeletedEvent;
-            ReplicationEvent::StreamDeleted(StreamDeletedEvent {
-                name: stream.as_str().to_string(),
-            })
-        });
+        self.metadata_changed(MetadataChange::Deleted(stream));
         Ok(())
     }
 
-    fn replicate(&self, make: impl FnOnce() -> ReplicationEvent) {
-        if let Some(coord) = self.replication.get() {
-            coord.emit(make());
+    async fn replicated(
+        &self,
+        stream: &StreamName,
+        results: &[AppendResult],
+    ) -> Result<(), LogError> {
+        if results
+            .iter()
+            .any(|r| matches!(r, AppendResult::Written(..)))
+        {
+            self.appended.send_modify(|v| *v += 1);
         }
+        let Some(sync) = self.sync.get() else {
+            return Ok(());
+        };
+        let Some(last) = results.iter().map(|r| r.offset().0).max() else {
+            return Ok(());
+        };
+        sync.wait_replicated(stream, last).await
     }
 
-    fn replicate_records(&self, stream: &StreamName, base_offset: u64, records: &[(Record, u64)]) {
-        self.replicate(|| {
-            use exspeed_protocol::messages::replicate::{RecordsAppended, ReplicatedRecord};
-            ReplicationEvent::RecordsAppended(RecordsAppended {
-                stream: stream.as_str().to_string(),
-                base_offset,
-                records: records
-                    .iter()
-                    .map(|(r, ts)| {
-                        let mut headers = r.headers.clone();
-                        let mut msg_id = None;
-                        headers.retain(|(k, v)| {
-                            if k.eq_ignore_ascii_case(IDEMPOTENCY_HEADER) {
-                                msg_id = Some(v.clone());
-                                false
-                            } else {
-                                true
-                            }
-                        });
-                        ReplicatedRecord {
-                            subject: r.subject.clone(),
-                            payload: r.value.to_vec(),
-                            headers,
-                            timestamp_ms: ts / 1_000_000,
-                            msg_id,
-                        }
-                    })
-                    .collect(),
-            })
-        });
+    fn metadata_changed(&self, change: MetadataChange<'_>) {
+        if let Some(sync) = self.sync.get() {
+            sync.metadata_changed(change);
+        }
+        self.metadata.send_modify(|v| *v += 1);
     }
 }
 

@@ -10,10 +10,10 @@ use crate::state::AppState;
 
 /// `GET /healthz` — leader-aware readiness probe.
 ///
-/// Returns `200` with `{"leader": true, "holder": "<uuid>"}` when this pod
-/// holds the cluster-leader lease, `503` with `{"leader": false}`
-/// otherwise. Load balancers should probe this endpoint and route traffic
-/// only to pods returning 200.
+/// Returns `200` with `{"leader": true, "node_id": ".."}` when this node is
+/// the leader, `503` with `{"leader": false, "leader_hint": ..}` otherwise.
+/// Load balancers should probe this endpoint and route traffic only to
+/// nodes returning 200.
 pub async fn healthz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let leader = state.leadership.is_currently_leader();
     let status = if leader {
@@ -25,7 +25,8 @@ pub async fn healthz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         status,
         Json(json!({
             "leader": leader,
-            "holder": state.leadership.holder_id.to_string(),
+            "node_id": state.leadership.node_id,
+            "leader_hint": state.leadership.leader_hint(),
         })),
     )
 }
@@ -46,7 +47,8 @@ pub async fn readyz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         );
     }
 
-    if !state.broker.is_dedup_ready() {
+    // Only the leader rebuilds dedup state (followers don't take writes).
+    if state.leadership.is_currently_leader() && !state.broker.is_dedup_ready() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"status": "dedup_rebuild_in_progress"})),

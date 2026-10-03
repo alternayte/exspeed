@@ -71,23 +71,29 @@ With `--storage-sync=async`, a crash can lose up to
 writes. This matches NATS JetStream's default. A failed background fsync
 marks the stream failed (read-only until restart).
 
-### Multi-pod coordination (`[cluster]`)
+### Cluster (`[cluster]`)
 
 None of this is needed for a single node. See [high-availability.md](high-availability.md).
 
 | File key | Env | Default | Description |
 |----------|-----|---------|-------------|
-| `cluster.lease` | `EXSPEED_LEASE_BACKEND` (alias `EXSPEED_CONSUMER_STORE`) | `none` | `postgres` or `redis` turns on multi-pod mode: one pod holds the cluster lease and serves writes, the others follow |
-| `cluster.postgres_url` | `EXSPEED_LEASE_POSTGRES_URL` (alias `EXSPEED_OFFSET_STORE_POSTGRES_URL`) | — | Postgres for the lease |
+| `cluster.lease` | `EXSPEED_LEASE_BACKEND` (alias `EXSPEED_CONSUMER_STORE`) | `none` | `postgres` or `redis` turns on cluster mode: one node holds the lease and serves writes, the others replicate |
+| `cluster.postgres_url` | `EXSPEED_LEASE_POSTGRES_URL` (alias `EXSPEED_OFFSET_STORE_POSTGRES_URL`) | — | Postgres for the lease (table `exspeed_cluster_leases`) |
 | `cluster.postgres_schema` | `EXSPEED_LEASE_POSTGRES_SCHEMA` | `public` | |
 | `cluster.redis_url` | `EXSPEED_LEASE_REDIS_URL` (alias `EXSPEED_OFFSET_STORE_REDIS_URL`) | — | Redis for the lease |
 | `cluster.redis_key_prefix` | `EXSPEED_LEASE_REDIS_KEY_PREFIX` | `exspeed:lease:` | |
-| `cluster.lease_ttl_secs` | `EXSPEED_LEASE_TTL_SECS` | `30` | |
-| `cluster.lease_heartbeat_secs` | `EXSPEED_LEASE_HEARTBEAT_SECS` | `10` | At most `lease_ttl_secs / 2` |
+| `cluster.lease_ttl_secs` | `EXSPEED_LEASE_TTL_SECS` | `15` | A crashed leader is replaced within about this long |
+| `cluster.lease_heartbeat_secs` | `EXSPEED_LEASE_HEARTBEAT_SECS` | `3` | At most `lease_ttl_secs / 3` |
 | `cluster.bind` | `EXSPEED_CLUSTER_BIND` | `0.0.0.0:5934` | Replication listener |
-| `cluster.advertise` | `EXSPEED_CLUSTER_ADVERTISE` | the bind address | Address peers dial |
-| `cluster.replicator_credential` | `EXSPEED_REPLICATOR_CREDENTIAL` | — | Token followers present. Required in multi-pod mode. |
-| `cluster.follower_queue_records` | `EXSPEED_REPLICATION_FOLLOWER_QUEUE_RECORDS` | `100000` | |
+| `cluster.advertise` | `EXSPEED_CLUSTER_ADVERTISE` | the bind address | Address peers replicate from. Set it when `bind` is a wildcard. |
+| `cluster.client_advertise` | `EXSPEED_CLIENT_ADVERTISE` | `bind` when it is a specific address | Client-protocol address sent to clients as the leader hint |
+| `cluster.node_id` | `EXSPEED_NODE_ID` | generated into `{data_dir}/node_id` | Stable node identity |
+| `cluster.replicator_credential` | `EXSPEED_REPLICATOR_CREDENTIAL` | — | Token followers present (needs the `replicate` action). Required when auth is on. |
+| `cluster.acks` | `EXSPEED_ACKS` | `all` | `all`: acknowledge once every in-sync replica has the write. `leader`: after the leader's local write. |
+| `cluster.min_insync_replicas` | `EXSPEED_MIN_INSYNC_REPLICAS` | `1` | With `acks = all`, writes fail with 503 while fewer replicas (leader included) are in sync |
+| `cluster.replica_lag_max_ms` | `EXSPEED_REPLICA_LAG_MAX_MS` | `10000` | A follower that hasn't caught up for this long leaves the ISR |
+| `cluster.ack_timeout_ms` | `EXSPEED_ACK_TIMEOUT_MS` | `10000` | How long an `acks = all` write waits for replication before a retryable 503 |
+| `cluster.unclean_leader_election` | `EXSPEED_UNCLEAN_LEADER_ELECTION` | `false` | `true` lets a node outside the ISR take over (availability over durability) |
 | `connectors.offset_store` | `EXSPEED_CONNECTOR_OFFSET_STORE` | `log` | `log` (the `__connector_offsets` stream; replicates with the data) or `file`. See [connectors.md](connectors.md#offsets). |
 
 Consumer state needs no backend: it lives in the internal `__consumers`

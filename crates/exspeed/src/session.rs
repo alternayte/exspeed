@@ -282,7 +282,14 @@ fn not_leader(ctx: &SessionContext) -> Response {
 pub fn log_error_response(ctx: &SessionContext, e: LogError) -> Response {
     match e {
         LogError::NotLeader => not_leader(ctx),
-        LogError::DedupNotReady => Response::error(code::UNAVAILABLE, e.to_string()),
+        LogError::DedupNotReady | LogError::ReplicationTimeout => {
+            Response::error(code::UNAVAILABLE, e.to_string())
+        }
+        LogError::NotEnoughReplicas { in_sync, required } => Response::error_with(
+            code::UNAVAILABLE,
+            e.to_string(),
+            serde_json::json!({ "in_sync": in_sync, "required": required }),
+        ),
         LogError::InvalidRecord(_) | LogError::InvalidConfig(_) => {
             Response::error(code::BAD_REQUEST, e.to_string())
         }

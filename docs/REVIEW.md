@@ -17,7 +17,7 @@
 | 3. Ops | 🚧 Done: `exspeed.toml` (defaults < file < env < flags, `exspeed config print-default/validate/show`, one `[cluster]` section), ordered shutdown (drain → connectors → queries → resign + lease release → consumer state → dedup snapshot → fsync), TLS/handshake/idle timeouts, Helm chart (config map, probes, ServiceMonitor), cargo-chef Docker build, `exspeed healthcheck`. Still to do: online backup/restore, OpenAPI, Linux benchmark refresh vs Kafka/NATS. |
 | 4. ExQL v2 | ✅ DataFusion bounded engine, continuous dataflow (event-time windows, joins, durable tables, checkpoints, effectively-once output), indexes removed, differential tests — see [exql.md](exql.md) |
 | 5. Connectors v2 | ✅ checkpoint protocol, supervisor, typed settings, error taxonomy, log-backed offsets, plugin fixes; PG CDC/outbox/poll tested against Postgres in CI. RabbitMQ/S3/MySQL/MSSQL service tests still to do |
-| 6. HA | — |
+| 6. HA | ✅ Epoch-fenced lease (stable node ids, ISR in the lease, bounded heartbeat with local deadline; Postgres, Redis, in-memory backends sharing one conformance suite), pull replication of every stream with KIP-101 divergence truncation, metadata and retention mirroring, `acks = all` + `min_insync_replicas` + ISR-gated election, promotion that rebuilds dedup state, leader hints in the protocol/HTTP/SDKs, `GET /api/v1/cluster`, in-process multi-node failover tests — see [high-availability.md](high-availability.md). Not done: TLS on the cluster port, per-stream replication factor. |
 
 ## Contents
 

@@ -140,8 +140,8 @@ been removed.
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/api/v1/whoami` | Identity and permissions of the caller's token |
-| `GET` | `/api/v1/leases` | Current `cluster:leader` lease row, including `replication_endpoint` |
-| `GET` | `/api/v1/cluster/followers` | Leader only. Connected followers. |
+| `GET` | `/api/v1/leases` | The live `cluster:leader` lease record: holder, epoch, endpoints, ISR |
+| `GET` | `/api/v1/cluster` | Any node. Role, epoch, leader endpoints; ISR and follower lag on the leader, replication session on a follower |
 
 ### Webhooks
 

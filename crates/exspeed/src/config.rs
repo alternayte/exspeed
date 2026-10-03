@@ -92,8 +92,14 @@ pub struct ClusterSection {
     pub lease_heartbeat_secs: Option<u64>,
     pub bind: Option<String>,
     pub advertise: Option<String>,
+    pub client_advertise: Option<String>,
+    pub node_id: Option<String>,
     pub replicator_credential: Option<String>,
-    pub follower_queue_records: Option<usize>,
+    pub acks: Option<String>,
+    pub min_insync_replicas: Option<usize>,
+    pub replica_lag_max_ms: Option<u64>,
+    pub ack_timeout_ms: Option<u64>,
+    pub unclean_leader_election: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -236,8 +242,14 @@ struct Layer {
     lease_heartbeat_secs: Option<u64>,
     cluster_bind: Option<String>,
     cluster_advertise: Option<String>,
+    client_advertise: Option<String>,
+    node_id: Option<String>,
     replicator_credential: Option<String>,
-    follower_queue_records: Option<usize>,
+    acks: Option<String>,
+    min_insync_replicas: Option<usize>,
+    replica_lag_max_ms: Option<u64>,
+    ack_timeout_ms: Option<u64>,
+    unclean_leader_election: Option<bool>,
     connector_offset_store: Option<String>,
     log_format: Option<String>,
     log_level: Option<String>,
@@ -279,8 +291,14 @@ impl Layer {
             lease_heartbeat_secs: f.cluster.lease_heartbeat_secs,
             cluster_bind: f.cluster.bind,
             cluster_advertise: f.cluster.advertise,
+            client_advertise: f.cluster.client_advertise,
+            node_id: f.cluster.node_id,
             replicator_credential: f.cluster.replicator_credential,
-            follower_queue_records: f.cluster.follower_queue_records,
+            acks: f.cluster.acks,
+            min_insync_replicas: f.cluster.min_insync_replicas,
+            replica_lag_max_ms: f.cluster.replica_lag_max_ms,
+            ack_timeout_ms: f.cluster.ack_timeout_ms,
+            unclean_leader_election: f.cluster.unclean_leader_election,
             connector_offset_store: f.connectors.offset_store,
             log_format: f.log.format,
             log_level: f.log.level,
@@ -346,10 +364,22 @@ impl Layer {
             )?,
             cluster_bind: s("EXSPEED_CLUSTER_BIND"),
             cluster_advertise: s("EXSPEED_CLUSTER_ADVERTISE"),
+            client_advertise: s("EXSPEED_CLIENT_ADVERTISE"),
+            node_id: s("EXSPEED_NODE_ID"),
             replicator_credential: s("EXSPEED_REPLICATOR_CREDENTIAL"),
-            follower_queue_records: num(
-                "EXSPEED_REPLICATION_FOLLOWER_QUEUE_RECORDS",
-                s("EXSPEED_REPLICATION_FOLLOWER_QUEUE_RECORDS"),
+            acks: s("EXSPEED_ACKS"),
+            min_insync_replicas: num(
+                "EXSPEED_MIN_INSYNC_REPLICAS",
+                s("EXSPEED_MIN_INSYNC_REPLICAS"),
+            )?,
+            replica_lag_max_ms: num(
+                "EXSPEED_REPLICA_LAG_MAX_MS",
+                s("EXSPEED_REPLICA_LAG_MAX_MS"),
+            )?,
+            ack_timeout_ms: num("EXSPEED_ACK_TIMEOUT_MS", s("EXSPEED_ACK_TIMEOUT_MS"))?,
+            unclean_leader_election: num(
+                "EXSPEED_UNCLEAN_LEADER_ELECTION",
+                s("EXSPEED_UNCLEAN_LEADER_ELECTION"),
             )?,
             connector_offset_store: s("EXSPEED_CONNECTOR_OFFSET_STORE"),
             log_format: s("LOG_FORMAT"),
@@ -424,10 +454,20 @@ impl Layer {
         if self.cluster_advertise.is_some() {
             t.cluster.advertise = self.cluster_advertise;
         }
+        if self.client_advertise.is_some() {
+            t.cluster.client_advertise = self.client_advertise;
+        }
+        if self.node_id.is_some() {
+            t.cluster.node_id = self.node_id;
+        }
         if self.replicator_credential.is_some() {
             t.cluster.replicator_credential = self.replicator_credential;
         }
-        set!(follower_queue_records => cluster.follower_queue_records);
+        set!(acks => cluster.acks);
+        set!(min_insync_replicas => cluster.min_insync_replicas);
+        set!(replica_lag_max_ms => cluster.replica_lag_max_ms);
+        set!(ack_timeout_ms => cluster.ack_timeout_ms);
+        set!(unclean_leader_election => cluster.unclean_leader_election);
         set!(connector_offset_store => connector_offset_store);
         if self.log_format.is_some() {
             t.log_format = self.log_format;
@@ -457,7 +497,6 @@ fn resolve_with(flags: &ServeArgs, env: &dyn Fn(&str) -> Option<String>) -> Resu
     Layer::from_flags(flags).apply(&mut args);
     // Normalize: empty token = unset.
     args.auth_token = args.auth_token.filter(|t| !t.is_empty());
-    args.cluster.follower_queue_records = args.cluster.follower_queue_records.min(10_000_000);
     Ok(args)
 }
 
@@ -497,11 +536,33 @@ pub fn validate(a: &ServerArgs) -> Result<()> {
                 .bind
                 .parse::<SocketAddr>()
                 .with_context(|| format!("cluster.bind `{}` is not host:port", a.cluster.bind))?;
-            if a.cluster.replicator_credential.is_none() {
-                bail!("multi-pod mode needs cluster.replicator_credential");
+            let auth_on = a.auth_token.is_some()
+                || a.credentials_file.is_some()
+                || a.data_dir.join("credentials.toml").exists();
+            if auth_on && a.cluster.replicator_credential.is_none() {
+                bail!(
+                    "with auth enabled, a cluster needs cluster.replicator_credential \
+                     (a token with the `replicate` action)"
+                );
             }
-            if a.cluster.lease_heartbeat_secs * 2 > a.cluster.lease_ttl_secs {
-                bail!("cluster.lease_heartbeat_secs must be at most lease_ttl_secs / 2");
+            if a.cluster.lease_heartbeat_secs == 0
+                || a.cluster.lease_heartbeat_secs * 3 > a.cluster.lease_ttl_secs
+            {
+                bail!("cluster.lease_heartbeat_secs must be between 1 and lease_ttl_secs / 3");
+            }
+            if a.cluster.acks != "all" && a.cluster.acks != "leader" {
+                bail!(
+                    "cluster.acks must be `all` or `leader`, got `{}`",
+                    a.cluster.acks
+                );
+            }
+            if a.cluster.min_insync_replicas == 0 {
+                bail!("cluster.min_insync_replicas must be at least 1");
+            }
+            if let Some(c) = &a.cluster.client_advertise {
+                if !c.contains(':') {
+                    bail!("cluster.client_advertise `{c}` must be host:port");
+                }
             }
         }
         other => bail!("cluster.lease must be none, postgres or redis, got `{other}`"),
@@ -576,8 +637,14 @@ lease_ttl_secs = {ttl}
 lease_heartbeat_secs = {hb}
 bind = {cbind:?}
 advertise = {adv}
+client_advertise = {cadv}
+node_id = {nid}
 replicator_credential = {repl}
-follower_queue_records = {fq}
+acks = {acks:?}
+min_insync_replicas = {misr}
+replica_lag_max_ms = {lag}
+ack_timeout_ms = {ackt}
+unclean_leader_election = {unclean}
 
 [connectors]
 offset_store = {os:?}
@@ -615,8 +682,14 @@ level = {ll}
         hb = a.cluster.lease_heartbeat_secs,
         cbind = a.cluster.bind,
         adv = opt(&a.cluster.advertise),
+        cadv = opt(&a.cluster.client_advertise),
+        nid = opt(&a.cluster.node_id),
         repl = secret(&a.cluster.replicator_credential),
-        fq = a.cluster.follower_queue_records,
+        acks = a.cluster.acks,
+        misr = a.cluster.min_insync_replicas,
+        lag = a.cluster.replica_lag_max_ms,
+        ackt = a.cluster.ack_timeout_ms,
+        unclean = a.cluster.unclean_leader_election,
         os = a.connector_offset_store,
         lf = opt(&a.log_format),
         ll = opt(&a.log_level),
@@ -659,12 +732,18 @@ lease = "none"                   # "none" (single node), "postgres" or "redis" (
 postgres_schema = "public"       # (EXSPEED_LEASE_POSTGRES_SCHEMA)
 # redis_url = "redis://host:6379"                 # (EXSPEED_LEASE_REDIS_URL)
 redis_key_prefix = "exspeed:lease:"               # (EXSPEED_LEASE_REDIS_KEY_PREFIX)
-lease_ttl_secs = 30              # (EXSPEED_LEASE_TTL_SECS)
-lease_heartbeat_secs = 10        # at most ttl/2 (EXSPEED_LEASE_HEARTBEAT_SECS)
+lease_ttl_secs = 15              # a dead leader is replaced within about this long (EXSPEED_LEASE_TTL_SECS)
+lease_heartbeat_secs = 3         # at most ttl/3 (EXSPEED_LEASE_HEARTBEAT_SECS)
 bind = "0.0.0.0:5934"            # replication listener (EXSPEED_CLUSTER_BIND)
-# advertise = "exspeed-0.exspeed:5934"            # address peers dial (EXSPEED_CLUSTER_ADVERTISE)
-# replicator_credential = "..."  # token followers present; required in multi-pod mode (EXSPEED_REPLICATOR_CREDENTIAL)
-follower_queue_records = 100000  # (EXSPEED_REPLICATION_FOLLOWER_QUEUE_RECORDS)
+# advertise = "exspeed-0.exspeed:5934"            # address peers replicate from; default: bind (EXSPEED_CLUSTER_ADVERTISE)
+# client_advertise = "exspeed-0.exspeed:5933"     # address clients are redirected to when this node leads (EXSPEED_CLIENT_ADVERTISE)
+# node_id = "..."                # default: generated once and kept in {data_dir}/node_id (EXSPEED_NODE_ID)
+# replicator_credential = "..."  # token followers present (needs the `replicate` action); required with auth (EXSPEED_REPLICATOR_CREDENTIAL)
+acks = "all"                     # "all": ack once every in-sync replica has the write; "leader": ack after the local write (EXSPEED_ACKS)
+min_insync_replicas = 1          # acks=all writes fail with 503 while fewer replicas (leader included) are in sync (EXSPEED_MIN_INSYNC_REPLICAS)
+replica_lag_max_ms = 10000       # a follower that hasn't caught up for this long leaves the ISR (EXSPEED_REPLICA_LAG_MAX_MS)
+ack_timeout_ms = 10000           # how long an acks=all write waits for replication (EXSPEED_ACK_TIMEOUT_MS)
+unclean_leader_election = false  # true: any node may take over, even one missing acknowledged writes (EXSPEED_UNCLEAN_LEADER_ELECTION)
 
 [connectors]
 offset_store = "log"             # "log" (__connector_offsets stream) or "file" (EXSPEED_CONNECTOR_OFFSET_STORE)

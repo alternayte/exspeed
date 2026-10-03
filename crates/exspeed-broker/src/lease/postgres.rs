@@ -1,113 +1,152 @@
-//! Postgres lease backend. Stores leases as rows in `{schema}.exspeed_leases`
-//! with `name` (PK), `holder` (UUID), and `expires_at` (TIMESTAMPTZ). All
-//! state transitions are single atomic SQL statements — no application-level
-//! locking needed.
+//! Postgres lease backend: one row per lease in
+//! `{schema}.exspeed_cluster_leases`. Every transition is a single
+//! conditional statement evaluated against the database clock (`now()`), so
+//! node clocks don't matter. Calls are bounded by a timeout and the
+//! connection is re-established after an error.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::{oneshot, watch, Mutex};
-use tokio_postgres::{Client, NoTls};
-use tracing::{debug, error, trace, warn};
-use uuid::Uuid;
+use tokio::sync::Mutex;
+use tokio_postgres::{Client, NoTls, Row};
+use tracing::{error, warn};
 
-use super::{LeaderLease, LeaseError, LeaseGuard, LeaseInfo};
+use super::{AcquireRequest, LeaderLease, LeaseError, LeaseRecord, Refresh};
 
 pub struct PostgresLeaseBackend {
-    inner: Arc<Inner>,
+    url: String,
+    table: String,
+    schema: String,
+    call_timeout: Duration,
+    client: Mutex<Option<Client>>,
 }
 
-struct Inner {
-    client: Mutex<Client>,
-    schema: String,
-    heartbeat_interval: Duration,
-}
+const COLUMNS: &str = "name, holder, epoch, expires_at, replication_endpoint, client_endpoint, isr";
 
 impl PostgresLeaseBackend {
-    /// Connect using `EXSPEED_LEASE_POSTGRES_URL` (or the legacy
-    /// `EXSPEED_OFFSET_STORE_POSTGRES_URL`) and friends.
-    pub async fn from_env() -> Result<Self, LeaseError> {
-        let cfg = super::LeaseConfig::from_env();
-        let url = cfg.postgres_url.ok_or_else(|| {
-            LeaseError::Connection("EXSPEED_LEASE_POSTGRES_URL is required".to_string())
-        })?;
-        Self::connect(&url, &cfg.postgres_schema, cfg.heartbeat).await
-    }
-
     pub async fn connect(
         url: &str,
         schema: &str,
-        heartbeat_interval: Duration,
+        call_timeout: Duration,
     ) -> Result<Self, LeaseError> {
-        let schema = schema.to_string();
-        let (client, connection) = tokio_postgres::connect(url, NoTls)
-            .await
-            .map_err(|e| LeaseError::Connection(format!("postgres connect failed: {e}")))?;
+        if !schema
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || schema.is_empty()
+        {
+            return Err(LeaseError::Connection(format!(
+                "invalid postgres schema name `{schema}`"
+            )));
+        }
+        let b = Self {
+            url: url.to_string(),
+            table: format!("{schema}.exspeed_cluster_leases"),
+            schema: schema.to_string(),
+            call_timeout,
+            client: Mutex::new(None),
+        };
+        let client = b.open().await?;
+        b.ensure_schema(&client).await?;
+        *b.client.lock().await = Some(client);
+        Ok(b)
+    }
 
+    async fn open(&self) -> Result<Client, LeaseError> {
+        let fut = tokio_postgres::connect(&self.url, NoTls);
+        let (client, connection) = tokio::time::timeout(self.call_timeout, fut)
+            .await
+            .map_err(|_| LeaseError::Timeout)?
+            .map_err(|e| LeaseError::Connection(format!("postgres connect failed: {e}")))?;
         tokio::spawn(async move {
             if let Err(e) = connection.await {
-                error!(error = %e, "postgres lease backend connection error");
+                error!(error = %e, "postgres lease connection closed");
             }
         });
+        Ok(client)
+    }
 
-        let inner = Arc::new(Inner {
-            client: Mutex::new(client),
-            schema,
-            heartbeat_interval,
-        });
+    async fn ensure_schema(&self, client: &Client) -> Result<(), LeaseError> {
+        let ddl = format!(
+            "CREATE SCHEMA IF NOT EXISTS {schema};
+             CREATE TABLE IF NOT EXISTS {table} (
+                 name                 TEXT PRIMARY KEY,
+                 holder               TEXT NOT NULL,
+                 epoch                BIGINT NOT NULL,
+                 expires_at           TIMESTAMPTZ NOT NULL,
+                 replication_endpoint TEXT,
+                 client_endpoint      TEXT,
+                 isr                  TEXT[] NOT NULL DEFAULT '{{}}'
+             );",
+            schema = self.schema,
+            table = self.table
+        );
+        client
+            .batch_execute(&ddl)
+            .await
+            .map_err(|e| LeaseError::Connection(format!("create lease table: {e}")))
+    }
 
-        ensure_schema(&inner).await?;
-        Ok(Self { inner })
+    /// Run one statement with a timeout, reconnecting first if the previous
+    /// call broke the connection.
+    async fn query_opt(
+        &self,
+        sql: &str,
+        params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+    ) -> Result<Option<Row>, LeaseError> {
+        let mut guard = self.client.lock().await;
+        if guard.as_ref().is_none_or(|c| c.is_closed()) {
+            *guard = Some(self.open().await?);
+        }
+        let client = guard.as_ref().expect("connected above");
+        match tokio::time::timeout(self.call_timeout, client.query_opt(sql, params)).await {
+            Ok(Ok(row)) => Ok(row),
+            Ok(Err(e)) => {
+                warn!(error = %e, "postgres lease query failed");
+                *guard = None;
+                Err(LeaseError::Backend(e.to_string()))
+            }
+            Err(_) => {
+                *guard = None;
+                Err(LeaseError::Timeout)
+            }
+        }
+    }
+
+    async fn query(
+        &self,
+        sql: &str,
+        params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+    ) -> Result<Vec<Row>, LeaseError> {
+        let mut guard = self.client.lock().await;
+        if guard.as_ref().is_none_or(|c| c.is_closed()) {
+            *guard = Some(self.open().await?);
+        }
+        let client = guard.as_ref().expect("connected above");
+        match tokio::time::timeout(self.call_timeout, client.query(sql, params)).await {
+            Ok(Ok(rows)) => Ok(rows),
+            Ok(Err(e)) => {
+                *guard = None;
+                Err(LeaseError::Backend(e.to_string()))
+            }
+            Err(_) => {
+                *guard = None;
+                Err(LeaseError::Timeout)
+            }
+        }
     }
 }
 
-async fn ensure_schema(inner: &Inner) -> Result<(), LeaseError> {
-    let client = inner.client.lock().await;
-    let create_schema = format!("CREATE SCHEMA IF NOT EXISTS {}", inner.schema);
-    client
-        .execute(&create_schema, &[])
-        .await
-        .map_err(|e| LeaseError::Connection(format!("create schema: {e}")))?;
-
-    let create_table = format!(
-        "CREATE TABLE IF NOT EXISTS {}.exspeed_leases (
-            name                 TEXT PRIMARY KEY,
-            holder               UUID NOT NULL,
-            expires_at           TIMESTAMPTZ NOT NULL,
-            replication_endpoint TEXT
-         )",
-        inner.schema
-    );
-    client
-        .execute(&create_table, &[])
-        .await
-        .map_err(|e| LeaseError::Connection(format!("create table: {e}")))?;
-
-    // Live upgrade: pre-Plan-G tables don't have `replication_endpoint`.
-    // `ADD COLUMN IF NOT EXISTS` is PG 9.6+; existing rows land on NULL,
-    // which matches the "not configured" semantics we want.
-    let add_column = format!(
-        "ALTER TABLE {}.exspeed_leases \
-             ADD COLUMN IF NOT EXISTS replication_endpoint TEXT",
-        inner.schema
-    );
-    client
-        .execute(&add_column, &[])
-        .await
-        .map_err(|e| LeaseError::Connection(format!("add column: {e}")))?;
-
-    let create_idx = format!(
-        "CREATE INDEX IF NOT EXISTS exspeed_leases_expires_idx
-             ON {}.exspeed_leases (expires_at)",
-        inner.schema
-    );
-    client
-        .execute(&create_idx, &[])
-        .await
-        .map_err(|e| LeaseError::Connection(format!("create index: {e}")))?;
-
-    Ok(())
+fn record(row: &Row) -> LeaseRecord {
+    let epoch: i64 = row.get(2);
+    LeaseRecord {
+        name: row.get(0),
+        holder: row.get(1),
+        epoch: epoch as u64,
+        expires_at: row.get(3),
+        replication_endpoint: row.get(4),
+        client_endpoint: row.get(5),
+        isr: row.get(6),
+    }
 }
 
 #[async_trait]
@@ -116,177 +155,106 @@ impl LeaderLease for PostgresLeaseBackend {
         true
     }
 
-    async fn try_acquire(
+    async fn try_acquire(&self, req: &AcquireRequest) -> Result<Option<LeaseRecord>, LeaseError> {
+        let sql = format!(
+            "INSERT INTO {table} AS l ({COLUMNS})
+             VALUES ($1, $2, 1, now() + make_interval(secs => $3), $4, $5, '{{}}')
+             ON CONFLICT (name) DO UPDATE
+             SET holder = EXCLUDED.holder,
+                 epoch = l.epoch + 1,
+                 expires_at = EXCLUDED.expires_at,
+                 replication_endpoint = EXCLUDED.replication_endpoint,
+                 client_endpoint = EXCLUDED.client_endpoint
+             WHERE (l.expires_at < now() OR l.holder = EXCLUDED.holder)
+               AND (NOT $6 OR cardinality(l.isr) = 0 OR EXCLUDED.holder = ANY(l.isr))
+             RETURNING {COLUMNS}",
+            table = self.table
+        );
+        let ttl = req.ttl.as_secs_f64();
+        let row = self
+            .query_opt(
+                &sql,
+                &[
+                    &req.name,
+                    &req.holder,
+                    &ttl,
+                    &req.replication_endpoint,
+                    &req.client_endpoint,
+                    &req.require_isr,
+                ],
+            )
+            .await?;
+        Ok(row.as_ref().map(record))
+    }
+
+    async fn refresh(
         &self,
         name: &str,
+        holder: &str,
+        epoch: u64,
         ttl: Duration,
-        replication_endpoint: Option<&str>,
-    ) -> Result<Option<LeaseGuard>, LeaseError> {
-        let holder_id = Uuid::new_v4();
-        let ttl_secs = ttl.as_secs_f64();
-
-        // On acquire we overwrite `replication_endpoint` with whatever the
-        // caller passed — the new holder is always the authoritative source
-        // for its own endpoint. A `None` here clears a stale endpoint from
-        // a prior tenure, which is the right thing for a leader restarted
-        // without a cluster-bind.
+    ) -> Result<Refresh, LeaseError> {
         let sql = format!(
-            "INSERT INTO {schema}.exspeed_leases \
-                 (name, holder, expires_at, replication_endpoint)
-             VALUES ($1, $2, now() + make_interval(secs => $3), $4)
-             ON CONFLICT (name) DO UPDATE
-             SET holder               = EXCLUDED.holder,
-                 expires_at           = EXCLUDED.expires_at,
-                 replication_endpoint = EXCLUDED.replication_endpoint
-             WHERE {schema}.exspeed_leases.expires_at < now()
-             RETURNING holder",
-            schema = self.inner.schema
+            "UPDATE {table} SET expires_at = now() + make_interval(secs => $4)
+             WHERE name = $1 AND holder = $2 AND epoch = $3 AND expires_at > now()
+             RETURNING name",
+            table = self.table
         );
-
-        let endpoint_owned: Option<String> = replication_endpoint.map(|s| s.to_string());
-        let client = self.inner.client.lock().await;
-        let row = client
-            .query_opt(&sql, &[&name, &holder_id, &ttl_secs, &endpoint_owned])
-            .await
-            .map_err(|e| LeaseError::Backend(format!("acquire query: {e}")))?;
-        drop(client);
-
-        let returned_holder: Option<Uuid> = row.map(|r| r.get(0));
-
-        if returned_holder == Some(holder_id) {
-            Ok(Some(spawn_heartbeat(
-                self.inner.clone(),
-                name.to_string(),
-                holder_id,
-                ttl,
-            )))
+        let row = self
+            .query_opt(&sql, &[&name, &holder, &(epoch as i64), &ttl.as_secs_f64()])
+            .await?;
+        Ok(if row.is_some() {
+            Refresh::Held
         } else {
-            Ok(None)
-        }
+            Refresh::Lost
+        })
     }
 
-    async fn list_all(&self) -> Result<Vec<LeaseInfo>, LeaseError> {
+    async fn release(&self, name: &str, holder: &str, epoch: u64) -> Result<(), LeaseError> {
         let sql = format!(
-            "SELECT name, holder, expires_at, replication_endpoint \
-             FROM {}.exspeed_leases \
-             WHERE expires_at > now() ORDER BY name",
-            self.inner.schema
+            "UPDATE {table} SET expires_at = now() - interval '1 millisecond'
+             WHERE name = $1 AND holder = $2 AND epoch = $3
+             RETURNING name",
+            table = self.table
         );
-
-        let client = self.inner.client.lock().await;
-        let rows = client
-            .query(&sql, &[])
-            .await
-            .map_err(|e| LeaseError::Backend(format!("list query: {e}")))?;
-
-        Ok(rows
-            .into_iter()
-            .map(|r| LeaseInfo {
-                name: r.get(0),
-                holder: r.get(1),
-                expires_at: r.get(2),
-                replication_endpoint: r.get(3),
-            })
-            .collect())
+        self.query_opt(&sql, &[&name, &holder, &(epoch as i64)])
+            .await?;
+        Ok(())
     }
-}
 
-/// Spawn a heartbeat task that refreshes the lease every
-/// `heartbeat_interval` and releases on drop. Returns the LeaseGuard.
-fn spawn_heartbeat(inner: Arc<Inner>, name: String, holder_id: Uuid, ttl: Duration) -> LeaseGuard {
-    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-    let (lost_tx, lost_rx) = watch::channel(false);
-
-    let inner_hb = inner.clone();
-    let name_hb = name.clone();
-    tokio::spawn(async move {
-        let mut consecutive_failures = 0u32;
-        let mut interval = tokio::time::interval(inner_hb.heartbeat_interval);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Skip the immediate tick — don't heartbeat at t=0, only after interval elapses.
-        interval.tick().await;
-
-        tokio::pin!(cancel_rx);
-        loop {
-            tokio::select! {
-                _ = &mut cancel_rx => {
-                    // Graceful release: compare-and-delete.
-                    let sql = format!(
-                        "DELETE FROM {}.exspeed_leases WHERE name = $1 AND holder = $2",
-                        inner_hb.schema
-                    );
-                    let client = inner_hb.client.lock().await;
-                    if let Err(e) = client.execute(&sql, &[&name_hb, &holder_id]).await {
-                        warn!(error = %e, lease = %name_hb, "lease release failed");
-                    }
-                    trace!(lease = %name_hb, "lease released");
-                    break;
-                }
-                _ = interval.tick() => {
-                    match refresh(&inner_hb, &name_hb, &holder_id, ttl).await {
-                        Ok(true) => {
-                            consecutive_failures = 0;
-                            trace!(lease = %name_hb, "heartbeat ok");
-                        }
-                        Ok(false) => {
-                            consecutive_failures += 1;
-                            debug!(
-                                lease = %name_hb,
-                                consecutive_failures,
-                                "heartbeat found lease stolen or missing"
-                            );
-                        }
-                        Err(e) => {
-                            consecutive_failures += 1;
-                            warn!(
-                                lease = %name_hb,
-                                consecutive_failures,
-                                error = %e,
-                                "heartbeat backend error"
-                            );
-                        }
-                    }
-                    if consecutive_failures >= 2 {
-                        warn!(lease = %name_hb, "lease lost after 2 consecutive heartbeat failures");
-                        let _ = lost_tx.send(true);
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    LeaseGuard {
-        name,
-        holder_id,
-        on_lost: lost_rx,
-        // Sender is owned by the heartbeat task (moved into `tokio::spawn`
-        // above); the guard keeps nothing here.
-        _lost_tx: None,
-        _cancel_heartbeat: cancel_tx,
+    async fn set_isr(
+        &self,
+        name: &str,
+        holder: &str,
+        epoch: u64,
+        isr: &[String],
+    ) -> Result<bool, LeaseError> {
+        let sql = format!(
+            "UPDATE {table} SET isr = $4
+             WHERE name = $1 AND holder = $2 AND epoch = $3 AND expires_at > now()
+             RETURNING name",
+            table = self.table
+        );
+        let isr: Vec<String> = isr.to_vec();
+        let row = self
+            .query_opt(&sql, &[&name, &holder, &(epoch as i64), &isr])
+            .await?;
+        Ok(row.is_some())
     }
-}
 
-/// Refresh returns Ok(true) if we still own the lease, Ok(false) if not,
-/// Err on backend failure.
-async fn refresh(
-    inner: &Inner,
-    name: &str,
-    holder_id: &Uuid,
-    ttl: Duration,
-) -> Result<bool, LeaseError> {
-    let ttl_secs = ttl.as_secs_f64();
-    let sql = format!(
-        "UPDATE {}.exspeed_leases
-         SET expires_at = now() + make_interval(secs => $3)
-         WHERE name = $1 AND holder = $2
-         RETURNING name",
-        inner.schema
-    );
-    let client = inner.client.lock().await;
-    let row = client
-        .query_opt(&sql, &[&name, holder_id, &ttl_secs])
-        .await
-        .map_err(|e| LeaseError::Backend(format!("heartbeat query: {e}")))?;
-    Ok(row.is_some())
+    async fn get(&self, name: &str) -> Result<Option<LeaseRecord>, LeaseError> {
+        let sql = format!(
+            "SELECT {COLUMNS} FROM {table} WHERE name = $1",
+            table = self.table
+        );
+        Ok(self.query_opt(&sql, &[&name]).await?.as_ref().map(record))
+    }
+
+    async fn list_all(&self) -> Result<Vec<LeaseRecord>, LeaseError> {
+        let sql = format!(
+            "SELECT {COLUMNS} FROM {table} WHERE expires_at > now() ORDER BY name",
+            table = self.table
+        );
+        Ok(self.query(&sql, &[]).await?.iter().map(record).collect())
+    }
 }

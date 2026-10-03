@@ -26,8 +26,8 @@ async fn healthz_returns_200_when_leader() {
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(json["leader"], serde_json::json!(true));
     assert!(
-        json["holder"].is_string(),
-        "holder UUID should be present; got: {:?}",
+        json["node_id"].is_string(),
+        "node_id should be present; got: {:?}",
         json
     );
 }

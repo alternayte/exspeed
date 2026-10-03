@@ -396,3 +396,46 @@ describe("keepalive", () => {
     await server.until(() => server.last.of("Ping").length >= 2, 1000);
   });
 });
+
+describe("cluster leader discovery", () => {
+  it("connects to the leader by following hints from a seed", async () => {
+    let leaderPort = 0;
+    const metadata = (conn: import("./fake-server.js").FakeConn, corr: number, isLeader: boolean, leader: string | null) =>
+      conn.reply(corr, {
+        type: "Json",
+        json: Buffer.from(JSON.stringify({ node_id: "x", is_leader: isLeader, leader, server_version: "t" })),
+      });
+    const follower = await FakeServer.start((conn, corr, req) => {
+      if (req.type === "Connect") {
+        conn.reply(corr, { type: "ConnectOk", serverVersion: "t", nodeId: "f", leader: `127.0.0.1:${leaderPort}` });
+        return true;
+      }
+      if (req.type === "Metadata") {
+        metadata(conn, corr, false, `127.0.0.1:${leaderPort}`);
+        return true;
+      }
+    });
+    const leader = await FakeServer.start((conn, corr, req) => {
+      if (req.type === "Connect") {
+        conn.reply(corr, { type: "ConnectOk", serverVersion: "t", nodeId: "l", leader: null });
+        return true;
+      }
+      if (req.type === "Metadata") {
+        metadata(conn, corr, true, null);
+        return true;
+      }
+    });
+    leaderPort = leader.port;
+    server = follower; // closed by afterEach
+    try {
+      client = await ExspeedClient.connect({
+        servers: [`127.0.0.1:${follower.port}`],
+        keepaliveMs: 0,
+        reconnect: { initialDelayMs: 10, maxDelayMs: 20, maxAttempts: 20 },
+      });
+      expect(client.serverInfo.nodeId).toBe("l");
+    } finally {
+      await leader.close();
+    }
+  });
+});

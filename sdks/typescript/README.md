@@ -349,6 +349,24 @@ The client pings every `keepaliveMs` (20 s) so the server, which drops
 connections idle for 120 s, keeps the connection open. A ping that times out
 is treated as a dead connection.
 
+## Clusters
+
+Against a cluster ([High availability](../../docs/high-availability.md)),
+give the client some seed addresses. It connects to whichever node is the
+leader, following the leader hints followers return. After a failover it
+reconnects to the new leader and restores subscriptions as described above.
+
+```ts
+const client = await ExspeedClient.connect({
+  servers: ["exspeed-0.exspeed:5933", "exspeed-1.exspeed:5933", "exspeed-2.exspeed:5933"],
+});
+```
+
+Without `servers`, a node that names another node as leader in its handshake
+is still followed, so connecting through a Service that routes to any node
+works too. A write that reaches a follower anyway fails with `ServerError`
+503, and `err.detail.leader` names the leader.
+
 ## TLS and authentication
 
 ```ts
@@ -379,6 +397,7 @@ operation gets 403. With scoped credentials, `listStreams` and
 |--------|---------|---|
 | `host` | `"127.0.0.1"` | |
 | `port` | `5933` | |
+| `servers` | none | Cluster seeds (`"host:port"`); connects to the leader. Overrides `host`/`port`. |
 | `token` | none | Bearer token |
 | `tls` | off | `true` or `tls.connect` options |
 | `clientId` | `"exspeed-ts"` | Shown in server logs |

@@ -693,6 +693,57 @@ impl BrokerAppend {
         // Determine where to start scanning the log.
         let cutoff_unix_ms = snapshot_covers_through_unix_ms
             .unwrap_or_else(|| now_ms.saturating_sub(window_secs.saturating_mul(1000)));
+        self.scan_tail(stream, cutoff_unix_ms, window_secs, max_entries, now_ms)
+            .await?;
+
+        let elapsed = rebuild_start.elapsed();
+        let source = if snapshot_covers_through_unix_ms.is_some() {
+            "snapshot"
+        } else {
+            "full_scan"
+        };
+        tracing::info!(
+            stream = %stream,
+            window_secs = window_secs,
+            max_entries = max_entries,
+            rebuild_source = source,
+            rebuild_ms = elapsed.as_millis(),
+            "dedup rebuilt"
+        );
+        if let Some(m) = &self.metrics {
+            m.observe_dedup_rebuild_duration(stream.as_str(), source, elapsed.as_secs_f64());
+        }
+
+        Ok(())
+    }
+
+    /// Rebuild the dedup map of `stream` from the log alone (no snapshot):
+    /// scans the records inside the dedup window. Used after a cluster
+    /// promotion, when local snapshots don't describe the replicated log.
+    pub async fn rebuild_stream_from_log(&self, stream: &StreamName) -> Result<(), StorageError> {
+        let (window_secs, max_entries) = {
+            let maps = self.dedup_maps.read().await;
+            maps.get(stream)
+                .map(|m| (m.window.as_secs(), m.max_entries))
+                .unwrap_or((self.default_window.as_secs(), self.default_max_entries))
+        };
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let cutoff = now_ms.saturating_sub(window_secs.saturating_mul(1000));
+        self.scan_tail(stream, cutoff, window_secs, max_entries, now_ms)
+            .await
+    }
+
+    async fn scan_tail(
+        &self,
+        stream: &StreamName,
+        cutoff_unix_ms: u64,
+        window_secs: u64,
+        max_entries: u64,
+        now_ms: u64,
+    ) -> Result<(), StorageError> {
         let cutoff_ns = cutoff_unix_ms.saturating_mul(1_000_000);
 
         let start_offset = match self.storage.seek_by_time(stream, cutoff_ns).await {
@@ -736,24 +787,6 @@ impl BrokerAppend {
                 }
             }
             cursor = Offset(batch.last().unwrap().offset.0 + 1);
-        }
-
-        let elapsed = rebuild_start.elapsed();
-        let source = if snapshot_covers_through_unix_ms.is_some() {
-            "snapshot"
-        } else {
-            "full_scan"
-        };
-        tracing::info!(
-            stream = %stream,
-            window_secs = window_secs,
-            max_entries = max_entries,
-            rebuild_source = source,
-            rebuild_ms = elapsed.as_millis(),
-            "dedup rebuilt"
-        );
-        if let Some(m) = &self.metrics {
-            m.observe_dedup_rebuild_duration(stream.as_str(), source, elapsed.as_secs_f64());
         }
 
         Ok(())
