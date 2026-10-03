@@ -105,7 +105,7 @@ impl OffsetStore for GateCheckedOffsets {
     }
 }
 
-/// REVIEW §3.6 #6: a retryable `LogError` (here `NotLeader` from the write
+/// 2026-10 review §3.6 #6: a retryable `LogError` (here `NotLeader` from the write
 /// gate, twice) during a source append is retried in place: nothing goes to
 /// the DLQ, the checkpoint isn't saved while the append is failing, no
 /// restart, and the batch then lands exactly once.
@@ -756,7 +756,7 @@ async fn invalid_toml_connector_is_registered_failed_and_secrets_stay_unresolved
     ));
 }
 
-/// REVIEW §3.6 #3 / blocker 15: editing the `connectors.d` TOML of a running
+/// 2026-10 review §3.6 #3 / blocker 15: editing the `connectors.d` TOML of a running
 /// connector restarts it with the new config but keeps its committed
 /// offsets — nothing already delivered is replayed.
 #[tokio::test]

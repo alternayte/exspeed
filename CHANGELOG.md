@@ -7,7 +7,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-The rebuild from [docs/REVIEW.md](docs/REVIEW.md). Breaking changes
+The rebuild from the [October 2026 review](docs/history/2026-10-review.md). Breaking changes
 throughout. Nothing is compatible with 0.5.x: wire protocol, on-disk format,
 connector config and SDK API all change.
 
@@ -211,7 +211,7 @@ connector config and SDK API all change.
 
 ### Re-audit fixes
 
-Every finding in `docs/REVIEW.md` was re-checked; §7 there lists each one
+Every finding in `docs/history/2026-10-review.md` was re-checked; §7 there lists each one
 with the test that proves it.
 
 **Breaking**

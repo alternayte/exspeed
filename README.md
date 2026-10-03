@@ -7,10 +7,9 @@ subjects, SQL over streams, and built-in connectors.**
 exspeed server        # that's the whole deployment
 ```
 
-> **Status: pre-1.0.** An October 2026 deep review found correctness gaps in
-> delivery, HA, ExQL and the connectors; the rebuild that followed fixed
-> them. [docs/REVIEW.md](docs/REVIEW.md) lists every finding with its
-> status and the test that proves the fix.
+Exspeed is 0.x software: the wire protocol and the on-disk format can change
+between minor versions (the [changelog](CHANGELOG.md) says when and how to
+upgrade).
 
 ## Why Exspeed
 
@@ -47,42 +46,37 @@ Applications connect through the [TypeScript SDK](sdks/typescript/README.md)
 or the Rust [`exspeed-client`](crates/exspeed-client) on TCP port 5933
 ([protocol](docs/protocol.md)). The HTTP API is on port 8080.
 
-## Feature status
+## Features
 
-| Area | Status |
-|------|--------|
-| Durable streams, subjects, retention, compaction, publish, read | ✅ rewritten storage engine (crash-safe, lock-free reads) |
-| Consumers: push + pull, ack/nack/term, ack timeout, redelivery, backoff, DLQ | ✅ JetStream-style, state in the log |
-| Work sharing across app instances (one consumer, many subscribers) | ✅ |
-| Idempotent publish (`msg_id`) | ✅ on every write path, within batches, enforced from startup, rebuilt on failover ([idempotent-publish.md](docs/idempotent-publish.md)) |
-| Auth (scoped tokens) and TLS | ✅ |
-| ExQL bounded queries | ✅ full SQL on DataFusion (joins, HAVING, window functions, subqueries), JSON numerics, pushdown, timeouts/limits ([exql.md](docs/exql.md)) |
-| ExQL continuous queries, windows, joins, tables | ✅ event-time windows, stream-stream/stream-table joins, durable tables, checkpointed state, effectively-once output; query and connection definitions live in the replicated `__exql_queries` / `__exql_connections` streams ([exql.md](docs/exql.md#state-recovery-and-delivery-guarantees)) |
-| Connectors: framework (checkpoint protocol, supervisor, typed settings, DLQ, replicated offsets) | ✅ tested with fault injection |
-| Connectors: Postgres CDC, outbox, poll; JDBC sink; HTTP poll/sink/webhook | ✅ at-least-once or effectively-once, tested against real services ([guarantees](docs/connectors.md#delivery-guarantees)) |
-| Connectors: RabbitMQ, S3, MySQL / SQL Server (JDBC sink, `jdbc_poll`, `mssql_cdc`) | ✅ same guarantees, crash/resume tests against real services in CI |
-| Operations: config file, Helm chart, graceful shutdown, online backup + restore, OpenAPI spec | ✅ ([operations.md](docs/operations.md), [http-api.md](docs/http-api.md)) |
-| Multi-pod HA with replication | ✅ epoch-fenced lease, pull replication with divergence truncation, `acks = all`/`quorum`, TLS between nodes; partition and kill -9 tests ([high-availability.md](docs/high-availability.md)) |
+| Area | What you get |
+|------|--------------|
+| Streams | Durable, crash-safe append-only logs with subjects, retention by time and size, compaction, and reads by offset or timestamp |
+| Consumers | Push (credit flow control) and pull, per-message ack / nack / term / in-progress, ack timeout, redelivery with backoff, `max_deliver` and dead-letter streams; one consumer can be shared by many subscribers to split work across app instances. State lives in the log |
+| Idempotent publish | `msg_id` deduplication on every write path, within batches, from startup and across failover ([idempotent-publish.md](docs/idempotent-publish.md)) |
+| ExQL | SQL on Apache DataFusion: bounded queries (joins, aggregates, window functions, subqueries, JSON numerics, offset/time pushdown) and continuous queries (event-time windows, stream-stream and stream-table joins, durable tables, checkpointed state, effectively-once output) ([exql.md](docs/exql.md)) |
+| Connectors | Postgres CDC, outbox and poll; JDBC sink and poll (Postgres, MySQL, SQL Server); SQL Server CDC; RabbitMQ source and sink; S3 sink; HTTP poll, sink and webhook. Supervised, checkpointed, at-least-once or effectively-once, each tested against the real service ([guarantees](docs/connectors.md#delivery-guarantees)) |
+| High availability | Epoch-fenced leader lease (Postgres or Redis), pull replication of every stream with divergence truncation, `acks = all` / `quorum`, TLS between nodes ([high-availability.md](docs/high-availability.md)) |
+| Operations | One config file, Helm chart, ordered graceful shutdown, online backup and restore, Prometheus metrics, OpenAPI spec, scoped tokens and TLS ([operations.md](docs/operations.md), [security.md](docs/security.md)) |
+
+Each stream is a single partition, so one stream's write rate is bounded by
+one node; spread load across streams and nodes. Clients speak Exspeed's own
+protocol (TypeScript SDK, Rust client) or HTTP; there is no Kafka, AMQP or
+NATS wire compatibility.
 
 ## Performance
 
-Single node, broker and benchmark driver on one 4-vCPU cloud VM (virtio
-disk, ext4), default durable mode (fsync before every acknowledgement):
+One 4-vCPU cloud VM (virtio disk, ext4), broker and load generator on the same
+host, every broker fsyncing before it acknowledges, 1 KiB records:
 
-| Workload | Result |
-|----------|--------|
-| Publish, 1 KiB records, 4 producers | ~62k msg/s (63 MB/s); ~67k msg/s with `--storage-sync async` |
-| Publish, 10 KiB records | ~13k msg/s (137 MB/s) |
-| Drain a 1M-record backlog | ~354k msg/s with reads, ~285k msg/s with a push consumer |
-| End-to-end latency at 5k msg/s | p50 5.3 ms, p99 11.2 ms |
+| Workload | Exspeed | Kafka 3.8 | NATS JetStream 2.10 |
+|----------|--------:|----------:|--------------------:|
+| Publish, 4 publishers | 51.7k msg/s | 11.4k msg/s | 2.3k msg/s (synchronous one-at-a-time publishing) |
+| Drain a 1M-record backlog | 411k msg/s | 117k msg/s | 75k msg/s |
+| End-to-end latency, p50 / p99 | 6.0 / 10.1 ms (at 1k msg/s) | 1 / 7 ms (one message at a time) | — |
 
-On the same VM, with every broker fsyncing before it acknowledges, Exspeed
-published 51.7k msg/s against Kafka's 11.4k and drained a backlog at 411k
-msg/s against Kafka's 117k; Kafka's one-at-a-time end-to-end latency (p50
-1 ms) beat Exspeed's (p50 6 ms). The tools and their caveats (JetStream's
-numbers are for synchronous one-at-a-time publishing) are in
-[BENCHMARKS.md](BENCHMARKS.md#comparison-with-kafka-and-nats-jetstream),
-with machine details, all results and the exact commands.
+The tools differ in how they drive each workload; the caveats, the async-mode
+numbers, the machine details and the exact commands are in
+[BENCHMARKS.md](BENCHMARKS.md).
 
 ## Documentation
 
@@ -91,7 +85,7 @@ with machine details, all results and the exact commands.
 | **Learn** | [Getting started](docs/getting-started.md) · [Concepts](docs/concepts.md) |
 | **Use** | [CLI](docs/cli.md) · [HTTP API](docs/http-api.md) · [ExQL](docs/exql.md) · [Connectors](docs/connectors.md) · [Idempotent publish](docs/idempotent-publish.md) · [TypeScript SDK](sdks/typescript/README.md) · [Protocol](docs/protocol.md) |
 | **Run** | [Configuration](docs/configuration.md) · [Operations](docs/operations.md) · [Security](docs/security.md) · [High availability](docs/high-availability.md) |
-| **Contribute** | [Architecture](docs/architecture.md) · [Development](docs/development.md) · [Review & roadmap](docs/REVIEW.md) · [Benchmarks](BENCHMARKS.md) · [Changelog](CHANGELOG.md) |
+| **Contribute** | [Architecture](docs/architecture.md) · [Development](docs/development.md) · [Benchmarks](BENCHMARKS.md) · [Changelog](CHANGELOG.md) · [2026-10 design review](docs/history/2026-10-review.md) |
 
 ## License
 

@@ -1014,7 +1014,7 @@ token_sha256 = "{}"
     );
 }
 
-// Regression (REVIEW blocker 10) ---------------------------------------------
+// Regression (2026-10 review, blocker 10) -------------------------------------
 #[tokio::test]
 async fn tcp_query_requires_global_admin() {
     let creds = write_creds(&format!(
@@ -1042,7 +1042,7 @@ permissions = [{{ streams = "*", actions = ["admin", "publish", "subscribe"] }}]
     admin.query("SELECT * FROM payments").await.unwrap();
 }
 
-// Regression (REVIEW blocker 10) ---------------------------------------------
+// Regression (2026-10 review, blocker 10) -------------------------------------
 #[tokio::test]
 async fn consumer_ops_are_scoped_to_the_consumers_stream() {
     let creds = write_creds(&format!(

@@ -73,8 +73,8 @@ cd sdks/typescript && npm publish   # prepublishOnly runs typecheck + test + bui
 - Settings resolve as defaults < `exspeed.toml` (`--config` / `EXSPEED_CONFIG`) < env < flags into `ServerArgs` (`crates/exspeed/src/config.rs`); `exspeed config validate|show|print-default`. Tests and embedders build `ServerArgs { .., ..Default::default() }` directly — `run_with_shutdown` reads no env vars itself.
 - `[cluster]` selects multi-pod mode (`EXSPEED_LEASE_BACKEND=postgres|redis`); see `docs/configuration.md`.
 - Server takes an exclusive `flock` on `{data_dir}/.exspeed.lock` (released when `run_with_shutdown` returns); a second process on the same dir fails fast.
-- `SIGTERM`/`SIGINT`: ordered shutdown — drain sessions, stop connectors, stop queries, `leadership.resign()` (stops consumers, releases the lease), wait for consumer state, final dedup snapshot, `FileStorage::close()`.
-- `/healthz` = leader-only (Plan E); `/readyz` = startup-complete + `data_dir` writable.
+- `SIGTERM`/`SIGINT`: ordered shutdown — drain sessions and the HTTP API, stop connectors, stop queries, `leadership.resign_after(..)` (cancels leader work, waits for consumers to save their final state, then closes writes and releases the lease), final dedup snapshot, `FileStorage::close()`.
+- `/healthz` = 200 only on the leader; `/readyz` = startup complete, both listeners bound, `data_dir` writable (reports `degraded` with `failed_streams` when a partition is fenced).
 - Docker image runs as `uid 1000` — k8s pods need `fsGroup: 1000` for PV writes.
 
 ## Architecture
@@ -125,7 +125,7 @@ The SDK (`@exspeed/sdk`, `sdks/typescript/`) implements protocol v2 over TCP; se
 
 ## Documentation
 
-User docs live in `docs/` (index: `docs/README.md`); the root README is a short landing page. Diagrams in any Markdown doc must be Mermaid (` ```mermaid ` blocks, rendered by GitHub), never ASCII art. Check them with `npx -y @mermaid-js/mermaid-cli -i x.mmd -o x.svg` (a `;` inside a sequence-diagram message ends the statement). `docs/REVIEW.md` holds the October 2026 deep review, the target architecture and the phased plan — read it before making structural changes, and keep the per-feature status notes in `docs/` honest when fixing or adding features.
+User docs live in `docs/` (index: `docs/README.md`); the root README is a short landing page. Diagrams in any Markdown doc must be Mermaid (` ```mermaid ` blocks, rendered by GitHub), never ASCII art. Check them with `npx -y @mermaid-js/mermaid-cli -i x.mmd -o x.svg` (a `;` inside a sequence-diagram message ends the statement). Docs are evergreen: describe what the system does in the present tense, state limitations as plain facts, and keep project history (what changed, migrations, renamed settings) in `CHANGELOG.md`. `docs/architecture.md` is the design reference; `docs/history/2026-10-review.md` is the October 2026 deep review kept as a historical record (its §7 maps every finding to the test that proves the fix).
 
 ## Integration Tests
 
