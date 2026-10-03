@@ -10,20 +10,20 @@ You can define a connector in two ways:
 - **As a TOML file** in `<data-dir>/connectors.d/`. The file is the source of
   truth: it is hot-reloaded, `${VAR}` references are resolved when the
   connector starts, and nothing (in particular no resolved secret) is
-  written to disk.
-- **Through the HTTP API** at `POST /api/v1/connectors`. The config (with
-  any `${VAR}` left as written) is stored in the compacted internal stream
-  `__connectors`, keyed by connector name, so it replicates with the log and
-  any node that becomes leader runs it. Creating, updating or deleting one
-  needs the leader (`503` elsewhere). Older versions kept these configs as
-  JSON under `<data-dir>/connectors/`; the first leader to start imports
-  them into `__connectors` and renames the directory to
-  `connectors.migrated/`. If a `connectors.d/` file defines a connector
-  with the same name, the file wins and the API copy is deleted.
+  written to disk. Removing the file deletes the connector.
+- **Through the HTTP API** at `POST /api/v1/connectors`. The config is stored
+  as written in the compacted internal stream `__connectors`, keyed by
+  connector name, so it replicates with the log and any node that becomes
+  leader runs it. `${VAR}` references are not resolved for API-created
+  connectors. If a `connectors.d/` file defines a connector with the same
+  name, the file wins and the API copy is deleted. A `connectors.migrated/`
+  directory in the data directory holds JSON configs that were imported into
+  `__connectors`; the server doesn't read it.
 
-Connectors run on the leader. Each one has its own **supervisor** that
-restarts it with backoff, reports its status, and implements the checkpoint
-protocol described below.
+Connectors run on the leader, and every `/api/v1/connectors` endpoint is
+served by the leader (`503` on other nodes). Each connector has its own
+**supervisor** that restarts it with backoff, reports its status, and
+implements the checkpoint protocol described below.
 
 ## Contents
 
@@ -59,22 +59,23 @@ the stream's dedup window (see [idempotent publish](idempotent-publish.md)).
 
 | Plugin | Type | Guarantee | Tested against |
 |--------|------|-----------|----------------|
-| `postgres_cdc` | source | at-least-once; effectively-once for replays within the dedup window | real Postgres: envelope and keys, crash + restart without loss or duplicates, non-destructive dry run |
-| `postgres_outbox` | source | effectively-once within the dedup window (`x-idempotency-key` = `pgoutbox:<table>:<id>`); at-least-once beyond it | real Postgres: poll mode with delete cleanup, CDC mode, two crashes before the delete leave each event exactly once |
+| `postgres_cdc` | source | at-least-once; effectively-once for replays within the dedup window | real Postgres: envelope and keys, a crash between append and checkpoint followed by a restart without loss or duplicates, non-destructive dry run |
+| `postgres_outbox` | source | effectively-once within the dedup window (`x-idempotency-key` = `pgoutbox:<schema.table>:<id>`); at-least-once beyond it | real Postgres: poll mode with delete cleanup, CDC mode, two crashes before the delete leave each event exactly once |
 | `postgres_poll` | source | at-least-once (a crash replays the last batch); rows committed late with an older tracking value are missed | real Postgres: timestamp/numeric/uuid/json decoding, tied tracking values, resume |
-| `jdbc_poll` | source | at-least-once (a crash replays the last batch; no idempotency key); integer cursor, so late commits below the cursor are missed | SQLite; real MySQL and SQL Server: a crash between append and checkpoint replays exactly that batch, resume after a restart |
+| `jdbc_poll` | source | at-least-once (a crash replays the last batch; no idempotency key); integer cursor, so late commits below the cursor are missed | SQLite; real Postgres, MySQL and SQL Server: column type decoding, a crash between append and checkpoint replays exactly that batch, resume after a restart |
 | `mssql_cdc` | source | at-least-once; effectively-once for replays within the dedup window | real SQL Server: two crashes + restart without loss or duplicates, update/delete/insert while stopped |
 | `rabbitmq` | source | at-least-once (ack after the append); effectively-once with `dedup_on_message_id` | real RabbitMQ: a crash before the ack redelivers (duplicates, nothing lost, queue drained); exactly once with `dedup_on_message_id` across two crashes and a restart |
-| `http_poll` | source | at-least-once per response; effectively-once with `idempotent_items` | in-process HTTP server: no truncation, pagination |
-| `http_webhook` | source | `200` only after the record is stored: at-least-once from the sender's side; effectively-once with `Idempotency-Key` | HTTP API tests |
-| `jdbc` | sink | effectively-once in `upsert` mode; at-least-once in `insert` mode (a duplicate-key error on replay counts as written) | Postgres, MySQL, SQLite, SQL Server; real MySQL and SQL Server: two crashes before the commit leave every row exactly once in `upsert` mode and in `insert` mode with a key, nothing in the DLQ |
+| `http_poll` | source | at-least-once per response; effectively-once with `idempotent_items` | in-process HTTP server: no truncation, pagination, no ETag kept from a response that wasn't delivered |
+| `http_webhook` | source | `200` only after the record is stored: at-least-once from the sender's side; effectively-once with `Idempotency-Key` | HTTP API tests, including creation of a missing target stream |
+| `jdbc` | sink | effectively-once in `upsert` mode; at-least-once in `insert` mode (a duplicate-key error on replay counts as written) | real Postgres (`upsert`), MySQL and SQL Server (`upsert` and `insert` with a key): two crashes before the commit leave every row exactly once, nothing in the DLQ; SQLite: a record stuck on an unclassified error is dead-lettered and the rest are written |
 | `http_sink` | sink | at-least-once; every request carries `Idempotency-Key` | in-process HTTP server: retries, 401, poison → DLQ |
-| `rabbitmq` | sink | at-least-once (publisher confirms, persistent messages); `message_id` = idempotency key | real RabbitMQ: a crash before the commit republishes the batch with the same `message_id`s; a clean restart publishes only new records |
+| `rabbitmq` | sink | at-least-once (publisher confirms, persistent messages); `message_id` = idempotency key | real RabbitMQ: a crash before the commit republishes the batch with the same `message_id`s; a clean restart publishes only new records; an unroutable record goes to the DLQ and its neighbours are published once |
 | `s3` | sink | effectively-once: one object per buffer, keyed by its first offset, so a retry overwrites the same object | S3-compatible store (moto in CI): two crashes before the commit overwrite the same objects (each record exactly once); a graceful stop flushes the partial buffer |
 
 The framework itself (checkpoint ordering, crash between append and
-checkpoint, crash before ack, sink flush failures, restarts, panics) is
-tested with fake plugins in `crates/exspeed-connectors/tests/it/`.
+checkpoint, crash before ack, sink flush failures, restarts, panics,
+`max_restarts`, offset load errors) is tested with fake plugins in
+`crates/exspeed-connectors/tests/it/`.
 
 ### Testing against real services
 
@@ -88,7 +89,7 @@ promises effectively-once.
 
 | Variable | Service | Tests |
 |----------|---------|-------|
-| `EXSPEED_POSTGRES_URL` | Postgres with `wal_level = logical` | `postgres_cdc`, `postgres_outbox`, `postgres_poll` |
+| `EXSPEED_POSTGRES_URL` | Postgres with `wal_level = logical` | `postgres_cdc`, `postgres_outbox`, `postgres_poll`, `jdbc` sink, `jdbc_poll` |
 | `EXSPEED_MYSQL_URL` | MySQL or MariaDB | `jdbc` sink, `jdbc_poll` |
 | `EXSPEED_MSSQL_URL` | SQL Server with SQL Server Agent and a user database | `jdbc` sink, `jdbc_poll`, `mssql_cdc` |
 | `EXSPEED_RABBITMQ_URL` | RabbitMQ | `rabbitmq` source and sink |
@@ -120,14 +121,14 @@ plugin = "postgres_cdc"      # see the plugin lists below
 stream = "orders"            # stream to write to (source) or read from (sink)
 
 # Optional, common to all connectors
-subject_template = ""        # sources: subject of produced records (see each plugin)
+subject_template = ""        # sources: subject of produced records (default per plugin)
 subject_filter = ""          # sinks: only deliver matching subjects (NATS wildcards)
-key_field = ""               # sources: JSON field used as the key when the plugin sets none
+key_field = ""               # sources: JSON field (dotted path) used as the key when the plugin sets none
 batch_size = 100             # max records per poll / per sink write
 poll_interval_ms = 50        # sleep when there is nothing to do
 flush_interval_ms = 1000     # sinks: flush + commit at most this often (default is per plugin)
 dlq_stream = "orders-dlq"    # poison records go here; unset = drop and count
-on_transient_exhausted = "loop_forever"   # "loop_forever" | "fail" | "dlq_batch"
+on_transient_exhausted = "loop_forever"   # "loop_forever" | "fail" (alias "halt") | "dlq_batch"
 
 [settings]                   # plugin-specific, typed
 connection = "${DATABASE_URL}"
@@ -151,13 +152,18 @@ max_restarts = 0             # consecutive failed runs before "failed"; 0 = neve
 sql = "SELECT payload->>'id' AS id, payload->>'total' AS total"
 ```
 
+`name`, `type`, `plugin` and `stream` are required. The values shown for
+`batch_size`, `poll_interval_ms`, `on_transient_exhausted`, `[retry]` and
+`[restart]` are the defaults.
+
 **Settings are typed.** Each plugin declares its settings and rejects
 unknown keys, so a misspelled key is an error that names the key. Use native
 TOML types: numbers (`interval_secs = 60`), booleans, arrays
 (`tables = ["a", "b"]`) and inline tables
-(`headers = { Authorization = "Bearer x" }`). Strings are accepted wherever
-a number or boolean is expected, so `port = "${PG_PORT}"` works; lists also
-accept a comma-separated string.
+(`headers = { Authorization = "Bearer x" }`). Numeric and boolean settings
+also accept strings, so `prefetch_count = "${PREFETCH}"` works; lists also
+accept a comma-separated string, and `headers` also accepts
+`"Name: value, Name2: value2"`.
 
 **`${VAR}` and `${VAR:-default}`** are replaced with values from the
 server's environment, in strings at any depth of `[settings]`. This applies
@@ -165,12 +171,25 @@ only to files in `connectors.d/`. An unset variable without a default is a
 config error. Resolved values are used to build the plugin and are never
 persisted.
 
+**`subject_template`** placeholders are `{name}` (a plugin variable, listed
+with each plugin) and `{$.field}` (a dotted path into the record's JSON
+value). Substituted values are made subject-safe: whitespace, `*` and `>`
+become `_`, empty tokens are dropped, and an empty or missing value becomes
+`unknown`. Unknown placeholders are left as written.
+
+**`subject_filter`** is parsed with the same rules as consumer filters, so
+an invalid filter such as `a.>.c`, `a..b` or `a.b*` is rejected when the
+config is validated. Records that don't match are skipped, and the sink's
+offset still moves past them.
+
 A file whose plugin or `[settings]` are invalid (unknown plugin, unknown
 setting, bad value) is still listed, with status `failed` and the error in
 `last_error`. A file that doesn't parse at all (bad TOML, unknown key in
 `[connector]`) is skipped with a warning in the server log; if it already
 defined a connector, the previous config keeps running and the parse error
-is reported in that connector's `last_error`.
+is reported in that connector's `last_error`. Editing a file restarts the
+connector with the new config and keeps its offsets; a file edited to name
+a different connector deletes the old one and creates the new one.
 
 **Names** become file names, slot names and metric labels. Names that would
 collide once lowercased with `-` mapped to `_` (for example `Orders-CDC` and
@@ -183,11 +202,15 @@ Every connector is in one of these states:
 ```mermaid
 stateDiagram-v2
   [*] --> Starting
+  [*] --> Failed: invalid config
   Starting --> Running
+  Starting --> Backoff: start failed (connection, transient)
+  Starting --> Failed: fatal start error or unreadable offset
   Running --> Backoff: transient error (retries exhausted), lost connection, panic
   Backoff --> Starting
-  Running --> Failed: fatal error (config, credentials) or max_restarts reached
+  Running --> Failed: fatal error (config, credentials), retries exhausted with fail, or max_restarts reached
   Running --> Stopped: stopped, deleted, demoted or shut down
+  Backoff --> Stopped: stopped, deleted, demoted or shut down
   Failed --> [*]
   Stopped --> [*]
 ```
@@ -196,7 +219,7 @@ stateDiagram-v2
   instance never races the old one (for example for a replication slot).
 - Restarts back off exponentially with jitter (`[restart]`), always bounded
   by `max_backoff_ms`. A run that commits at least one batch resets the
-  backoff.
+  backoff and the `max_restarts` count.
 - Panics inside a plugin are caught and handled like a lost connection.
 - `failed` is sticky: fix the cause, then `POST /api/v1/connectors/<name>/restart`
   or edit the config.
@@ -205,10 +228,11 @@ stateDiagram-v2
 
 | Field | Meaning |
 |-------|---------|
+| `name`, `connector_type`, `plugin`, `stream` | from the config |
 | `status` | `starting`, `running`, `backoff`, `failed` or `stopped` |
-| `last_error` | the most recent error (kept while backing off; cleared when running again) |
+| `last_error` | the most recent error, including one being retried in place (kept while backing off; cleared when running again) |
 | `restart_count` | supervisor restarts since the server started |
-| `lag`, `lag_unit` | sinks: records behind the stream head (`records`); Postgres CDC/outbox: WAL bytes not yet confirmed (`bytes`) |
+| `lag`, `lag_unit` | sinks: records behind the stream head (`records`); `postgres_cdc` and `postgres_outbox` in CDC mode: WAL bytes the slot hasn't confirmed (`bytes`) |
 | `last_success_ms` | Unix ms of the last committed batch |
 | `checkpoint` | last persisted position (source checkpoint or sink offset) |
 | `records` | records moved since the server started |
@@ -228,8 +252,10 @@ Prometheus metrics (label `connector`):
 | `exspeed_connector_retry_attempts_total{outcome}` | in-place retries (`retried`) and exhaustions (`exhausted`) |
 | `exspeed_connector_transient_exhausted_total{action}` | `restart`, `fail`, `dlq_batch` or `dlq_record` (a stuck record isolated under `loop_forever`) |
 | `exspeed_connector_dlq_total{reason}` | records written to the DLQ |
-| `exspeed_connector_records_skipped_total{stream,reason}` | poison records dropped (no `dlq_stream`) |
+| `exspeed_connector_records_skipped_total{stream,reason}` | poison records dropped because no `dlq_stream` is set (the `jdbc` sink also counts every record it can't bind here) |
 | `exspeed_connector_dlq_failures_total` | DLQ appends that failed permanently |
+| `exspeed_connector_write_errors_total{stream,sqlstate}` | `jdbc` sink: SQL errors from writes |
+| `exspeed_connector_start_errors_total{stream}` | `jdbc` sink: failures to connect or to create the table |
 
 ## Errors, retries and the DLQ
 
@@ -242,8 +268,8 @@ checkpoint instead of skipping those changes.
 | Class | Examples | What happens |
 |-------|----------|--------------|
 | **Transient** | timeout, HTTP 408/425/429/5xx, deadlock, serialization failure | retried in place with `[retry]` (honouring `Retry-After`); when exhausted, `on_transient_exhausted` applies |
-| **Connection** | socket closed, server restart, RabbitMQ channel closed, malformed replication message (CDC) | supervisor restart with backoff (reconnect from the last saved checkpoint) |
-| **Poison** | bad JSON, type mismatch, constraint violation, HTTP 4xx, unroutable AMQP message | the record goes to `dlq_stream`, or is dropped and counted; the connector continues |
+| **Connection** | socket closed, server restart, RabbitMQ channel closed, malformed or unexpected replication message (CDC) | supervisor restart with backoff (reconnect from the last saved checkpoint) |
+| **Poison** | bad JSON, type mismatch, constraint violation, HTTP 4xx (sinks), unroutable AMQP message | the record goes to `dlq_stream`, or is dropped and counted; the connector continues |
 | **Fatal** | bad config, HTTP 401/403, missing table, auth failure | connector → `failed` with a clear `last_error` |
 
 `on_transient_exhausted`:
@@ -252,14 +278,15 @@ checkpoint instead of skipping those changes.
 |-------|-----------|
 | `loop_forever` (default) | hand the error to the supervisor, which restarts the connector with bounded backoff (status `backoff`), forever. Sinks with a `dlq_stream`: when a write starting at the same offset exhausts its retries 3 times in a row, the runtime retries that batch one record at a time and dead-letters the first record that still fails (`retries_exhausted`), so one record behind an unclassified error can't stall the sink forever |
 | `fail` (alias `halt`) | move the connector to `failed` |
-| `dlq_batch` | sinks only: send the remaining batch to `dlq_stream` and move on (`fail` without a `dlq_stream`) |
+| `dlq_batch` | sinks with a `dlq_stream`: send the rest of the failing write to `dlq_stream` (`retries_exhausted`) and move on. Without a `dlq_stream`, and on sources, it behaves like `loop_forever` |
 
 JDBC errors are classified per dialect: Postgres SQLSTATE classes, MySQL
 vendor codes (1062 duplicate, 1213 deadlock, 1205 lock timeout, …), SQLite
 extended result codes, and SQL Server error numbers (2601/2627 duplicate
-key, 515 NULL, 1205 deadlock, …). Unknown errors are not retried forever:
-data errors are poison, everything unrecognised is transient with the
-bounded `[retry]` policy.
+key, 515 NULL, 1205 deadlock, …). Data errors are poison. Anything
+unrecognised is transient with the bounded `[retry]` policy, and under
+`loop_forever` with a `dlq_stream` a record that keeps failing that way is
+isolated and dead-lettered as described above.
 
 A DLQ record keeps the original key and body byte for byte and adds these
 headers:
@@ -267,31 +294,34 @@ headers:
 | Header | Value |
 |--------|-------|
 | `exspeed-dlq-origin` | name of the connector that rejected the record |
-| `exspeed-dlq-reason` | stable label: `invalid_record`, `type_mismatch`, `http_client_error`, `sink_rejected`, `retries_exhausted`, … |
-| `exspeed-dlq-detail` | human-readable error |
+| `exspeed-dlq-reason` | stable label: `invalid_record`, `non_json_record`, `type_mismatch`, `missing_required_field`, `timestamp_parse_failed`, `http_client_error`, `sink_rejected`, `retries_exhausted` |
+| `exspeed-dlq-detail` | human-readable error (at most 4 KiB) |
 | `exspeed-dlq-original-offset` | offset on the source stream (sinks) |
-| `exspeed-dlq-timestamp` | timestamp of the original record (sinks) |
+| `exspeed-dlq-timestamp` | timestamp of the original record in Unix nanoseconds (sinks) |
+| `exspeed-dlq-original-idempotency-key` | the record's own `x-idempotency-key`, if it had one |
 
 DLQ writes carry their own idempotency key, so a replayed batch doesn't
-duplicate DLQ entries.
+duplicate DLQ entries. A record whose subject the DLQ stream can't accept
+is stored with an empty subject and the original in
+`exspeed-dlq-original-subject`.
 
 ## Offsets
 
-Source checkpoints and sink positions are stored per connector.
+Source checkpoints and sink positions are stored per connector. The store is
+chosen with `[connectors] offset_store` in `exspeed.toml` or
+`EXSPEED_CONNECTOR_OFFSET_STORE` (see [configuration](configuration.md)).
 
-- **Default (`EXSPEED_CONNECTOR_OFFSET_STORE=log`):** records keyed by
-  connector name in the internal stream `__connector_offsets`, written
-  through the broker's write path, so offsets live and replicate with the
-  data. Loading reads backwards from the end of the stream, so it costs only
-  the distance to the connector's last save.
-- **`EXSPEED_CONNECTOR_OFFSET_STORE=file`:** one JSON file per connector in
+- **`log` (default):** records keyed by connector name in the internal stream
+  `__connector_offsets`, written through the broker's write path, so offsets
+  live and replicate with the data. Loading reads backwards from the end of
+  the stream, so it costs only the distance to the connector's last save.
+- **`file`:** one JSON file per connector in
   `<data-dir>/connector-offsets/`, written atomically (tmp file, fsync,
   rename, directory fsync). Local to one node.
 
 If an offset can't be loaded (I/O error, corrupt record), the connector goes
 to `failed` instead of silently starting over. Editing a connector keeps its
-offsets; deleting it deletes them. The Postgres, Redis and S3 connector
-offset stores were removed.
+offsets; deleting it deletes them.
 
 ## Sources
 
@@ -322,12 +352,15 @@ subject_template = "{schema}.{table}.{op}"   # default; {op} = insert | update |
 
 [settings]
 connection = "postgresql://user:pass@localhost:5432/app"
-tables = ["public.users", "public.accounts"]
+tables = ["public.users", "public.accounts"] # required; "users" means "public.users"
 operations = ["insert", "update", "delete"]  # default
-slot_name = "exspeed_users_cdc_slot"         # default: exspeed_<name>_slot
+slot_name = "exspeed_users_cdc_slot"         # default: exspeed_<name>_slot (name lowercased, - → _)
 publication_name = "exspeed_users_cdc_pub"   # default: exspeed_<name>_pub
 drop_slot_on_delete = false                  # drop the slot (and a derived publication) on delete
 ```
+
+`slot_name` must be 1–63 lowercase letters, digits or `_`. An existing slot
+that uses another output plugin than `pgoutput` is a fatal error.
 
 Each change becomes one record:
 
@@ -352,10 +385,15 @@ Each change becomes one record:
 - **Key**: the replica-identity key columns in column order — the raw value
   for a single column, a JSON array for a composite key, none for
   `REPLICA IDENTITY NOTHING`.
-- Each record carries `x-idempotency-key = pgcdc:<slot>:<commit LSN>:<n>`.
+- Each record carries `x-idempotency-key = pgcdc:<slot>:<commit LSN>:<n>`,
+  plus `x-exspeed-source`, `x-op` and `x-table` (`schema.table`).
+- `TRUNCATE` is not emitted.
 - The slot's position is confirmed only in `ack()`, after the records are
   durable. When nothing is in flight, keepalives advance it too, so an idle
   table doesn't pin WAL. Slot lag (`lag_unit = bytes`) is exported.
+- A replication error or a pgoutput message the connector can't decode is a
+  Connection error: the supervisor restarts the stream from the last
+  confirmed LSN, so no change is skipped.
 - `exspeed connector dry-run` peeks at an existing slot without consuming
   it, and creates nothing.
 
@@ -383,7 +421,9 @@ key_columns = ["id"]                    # tie-breaker; default: the primary key
 Rows are emitted as `row_to_json`, so timestamps, numerics, uuids and json
 decode correctly. Each table keeps its own cursor
 `(tracking_column, key columns…)`, so rows that share a tracking value are
-never skipped. The checkpoint is a JSON map of table → cursor.
+never skipped. The record key is the key columns (the raw value for one
+column, a JSON array for several). The checkpoint is a JSON map of
+table → cursor. A table without a primary key needs `key_columns`.
 
 Caveat: a row whose tracking value is lower than rows already polled (a
 transaction that committed late, a clock going backwards) is missed. Use
@@ -397,13 +437,13 @@ name = "pg-outbox"
 type = "source"
 plugin = "postgres_outbox"
 stream = "domain_events"
-subject_template = "{aggregate_type}.{event_type}"   # default
+subject_template = "{aggregate_type}.{event_type}"   # default; also {table}
 
 [settings]
 connection = "postgresql://user:pass@localhost:5432/app"
 mode = "poll"                    # "poll" (default) | "cdc"
-table = "outbox_events"          # default
-id_column = "id"                 # int4, int8, uuid or text
+table = "outbox_events"          # default; "schema.table" works
+id_column = "id"                 # int2, int4, int8, uuid or text
 key_column = "aggregate_id"      # becomes the record key
 aggregate_type_column = "aggregate_type"
 event_type_column = "event_type"
@@ -415,23 +455,26 @@ cleanup = "delete"               # "delete" (default) | "none"
 
 - Every record carries `x-idempotency-key = pgoutbox:<schema.table>:<id>`
   (namespaced by table, so two outbox tables with overlapping ids never
-  dedupe each other in one stream).
+  dedupe each other in one stream), plus `x-aggregate-type`,
+  `x-event-type` and `x-exspeed-source`.
 - `slot_name`, `publication_name` and `drop_slot_on_delete` are rejected
-  in poll mode (they only apply with `mode = "cdc"`).
+  in poll mode (they only apply with `mode = "cdc"`). In CDC mode they work
+  as for `postgres_cdc`, with the same defaults.
 - With `cleanup = "delete"`, published rows are deleted in `ack()`, after
   the records are durable. Every remaining row is unpublished, so rows from
   transactions that commit late are picked up on the next poll.
 - **Commit-order caveat:** poll mode with `cleanup = "none"` uses an
-  `id > last_id` cursor, which needs an increasing integer id and can skip a
-  row whose transaction commits after a row with a higher id was polled.
-  Use `cleanup = "delete"` or `mode = "cdc"` (commit order) when that
-  matters.
+  `id > last_id` cursor, which needs an increasing integer id (a non-integer
+  id is a fatal error at start) and can skip a row whose transaction commits
+  after a row with a higher id was polled. Use `cleanup = "delete"` or
+  `mode = "cdc"` (commit order) when that matters.
 - CDC mode publishes inserts only.
 
 ### `jdbc_poll`
 
 Works with Postgres, MySQL, SQLite (via sqlx) and SQL Server (via tiberius).
-The `tracking_column` must be an **increasing integer**.
+The `tracking_column` must be an **increasing integer** and must appear in
+`schema`.
 
 ```toml
 [connector]
@@ -443,7 +486,7 @@ poll_interval_ms = 10000
 
 [settings]
 connection = "postgresql://user:pass@localhost:5432/app"   # or mysql://, sqlite:, mssql://
-table = "orders"
+table = "orders"                                            # a plain identifier
 tracking_column = "id"
 schema = "id:bigint, customer:text, total:double, paid:boolean"   # required
 ```
@@ -452,8 +495,10 @@ The `schema` DSL is a list of `name:type` pairs. The supported types are
 `text`, `bigint`, `double`, `boolean`, `timestamptz` and `jsonb`. Each
 column is cast in SQL to its schema type, so native types such as
 `DECIMAL`, `DATETIME`, `JSON`, `TINYINT(1)` or `BIT` decode; `timestamptz`
-values are the database's text form (ISO 8601 on SQL Server). The
-checkpoint is the last tracking value. For Postgres, prefer `postgres_poll`.
+values are the database's text form (ISO 8601 on SQL Server). Records have
+no key (set `key_field` to pick one) and the default subject
+`jdbc_poll.<table>` (`subject_template` variable: `{table}`). The checkpoint
+is the last tracking value. For Postgres, prefer `postgres_poll`.
 
 ### `mssql_cdc`
 
@@ -463,21 +508,25 @@ name = "cdc-orders"
 type = "source"
 plugin = "mssql_cdc"
 stream = "orders-cdc"
-subject_template = "mssql_cdc.{capture_instance}.{op}"   # default
+subject_template = "mssql_cdc.{capture_instance}.{op}"   # default; {op} = insert | update | delete
 
 [settings]
-connection = "mssql://sa:Password1@localhost:1433/app?trust_server_certificate=true"
+connection = "mssql://sa:Password1@localhost:1433/app?trust_server_certificate=true"   # or sqlserver://
 capture_instance = "dbo_orders"
 schema = "id:bigint, total:double, status:text, placed_at:timestamptz"
-key_columns = ["id"]             # optional record key
+key_columns = ["id"]             # optional record key; must be in schema
 ```
 
 Records use the same envelope as `postgres_cdc` (`op`, `before`, `after`,
-`source.lsn`, `source.seqval`); NULL is JSON `null`. The cursor is
-`(__$start_lsn, __$seqval)`, so a transaction larger than `batch_size` is
-paged through; once caught up, the cursor moves past the transaction with
-`sys.fn_cdc_increment_lsn`. If the CDC cleanup job has removed changes past
-the stored cursor, the connector fails instead of skipping them.
+`source.lsn`, `source.seqval`): `after` holds the new row for inserts and
+updates, `before` holds the deleted row for deletes, and NULL is JSON
+`null`. Each record carries
+`x-idempotency-key = mssqlcdc:<capture_instance>:<lsn>:<seqval>`. The
+cursor is `(__$start_lsn, __$seqval)`, so a transaction larger than
+`batch_size` is paged through; once caught up, the cursor moves past the
+transaction with `sys.fn_cdc_increment_lsn`. If the CDC cleanup job has
+removed changes past the stored cursor, the connector fails instead of
+skipping them.
 
 Before you start this connector, enable CDC on the database and the table,
 and make sure SQL Server Agent is running.
@@ -493,8 +542,9 @@ stream = "incoming"
 subject_template = "{routing_key}"   # default; also {exchange}, {queue}, {$.field}
 
 [settings]
-url = "amqp://guest:guest@localhost:5672/%2f"
+url = "amqp://guest:guest@localhost:5672/%2f"   # amqp:// or amqps://
 queue = "my-queue"
+consumer_tag = "exspeed-rmq-ingest"   # default: exspeed-<name>
 prefetch_count = 100
 declare_queue = true
 queue_durable = true
@@ -506,7 +556,10 @@ poll_wait_ms = 500
 Deliveries are acknowledged only after the batch is durable; anything
 unacked when the connector stops or crashes is redelivered by RabbitMQ.
 AMQP headers and properties are copied into record headers
-(`x-amqp-routing-key`, `x-amqp-exchange`, `x-message-id`, …).
+(`x-amqp-routing-key`, `x-amqp-exchange`, `x-message-id`,
+`x-correlation-id`, `content-type`, and `x-amqp-redelivered` on a
+redelivery). A message with an empty routing key gets the queue name as
+`{routing_key}`.
 
 ### `http_poll`
 
@@ -516,17 +569,17 @@ name = "weather-poller"
 type = "source"
 plugin = "http_poll"
 stream = "weather"
-subject_template = "weather.{$.kind}"
+subject_template = "weather.{$.kind}"   # read from each item
 
 [settings]
 url = "https://api.example.com/v1/items"
 interval_secs = 60
 method = "GET"
 headers = { "X-API-Key" = "${WEATHER_API_KEY}" }
-auth_type = "none"            # "none" | "bearer" | "basic" (with auth_token)
+auth_type = "none"            # "none" | "bearer" | "basic"; bearer/basic need auth_token
 items_path = "data.items"     # one record per array element; unset = whole body
 item_key = "id"               # record key
-idempotent_items = true       # item_key → x-idempotency-key
+idempotent_items = true       # x-idempotency-key = http_poll:<name>:<item_key value>
 next_page_path = "next"       # next page: a URL, or a token for page_param
 page_param = "page"
 timeout_secs = 30
@@ -535,8 +588,14 @@ timeout_secs = 30
 Every item of every response is emitted (no truncation). With
 `next_page_path`, all pages are fetched back to back, then the connector
 waits for the next interval. Conditional requests (ETag, Last-Modified) are
-used for the first page. HTTP 401/403 and other 4xx responses fail the
-connector; 408/425/429/5xx are retried.
+used for the first page; the validators are kept only once the response
+has been turned into records, so a retried poll never receives a `304` for
+data it didn't deliver. `bearer` sends `Authorization: Bearer <auth_token>`
+and `basic` sends `Authorization: Basic <auth_token>` (the token is the
+base64 `user:password`). `idempotent_items` requires `item_key`. HTTP
+401/403 and other 4xx responses fail the connector; 408/425/429/5xx,
+timeouts and a body that isn't JSON are retried. There is no durable
+cursor: after a restart the endpoint is polled from the first page.
 
 ### `http_webhook`
 
@@ -552,7 +611,7 @@ subject_template = "stripe.{$.type}"   # {$.field} is read from the JSON body
 path = "stripe"                        # served at POST /webhooks/stripe
 auth_type = "hmac_sha256"              # required: "none" | "bearer" | "hmac_sha256"
 auth_secret = "${STRIPE_WEBHOOK_SECRET}"
-signature_header = "X-Signature-256"   # hmac_sha256: hex HMAC of the raw body …
+signature_header = "X-Signature-256"   # default; hmac_sha256: hex HMAC of the raw body …
 signature_prefix = "sha256="           # … optionally after this prefix
 ```
 
@@ -564,14 +623,21 @@ curl -X POST localhost:8080/webhooks/stripe -H "X-Signature-256: sha256=$sig" \
 # {"offset": 0}
 ```
 
+- The target stream is created when the connector starts.
+- The body is stored unchanged as the record value, with no key and the
+  headers `x-exspeed-source` and `x-exspeed-connector`. `key_field` and
+  `[transform]` are not applied to webhooks.
+- `path` may contain `/`; a leading `/` or `webhooks/` is ignored.
 - `bearer` checks `Authorization: Bearer <secret>` in constant time.
+  `bearer` and `hmac_sha256` require `auth_secret`.
 - `Idempotency-Key` (or `x-idempotency-key`) makes retries by the sender
   return the original offset instead of a duplicate.
 - `/webhooks/*` is never covered by the server's bearer-token auth, so
   `auth_type` must be chosen explicitly.
-- Responses: `200 {"offset": N}` once stored; `401` bad credentials; `409`
-  same idempotency key with a different body; `503` not the leader or still
-  starting (retry).
+- Responses: `200 {"offset": N}` once stored; `400` record rejected (for
+  example an invalid subject); `401` bad credentials; `404` no webhook
+  connector for the path; `409` same idempotency key with a different body;
+  `503` not the leader or still starting (retry).
 
 ## Sinks
 
@@ -594,21 +660,27 @@ subject_filter = "event.>"
 
 [settings]
 connection = "postgresql://user:pass@localhost:5432/analytics"   # or mysql://, sqlite:, mssql://
-table = "events"
+table = "events"                # a plain identifier
 mode = "upsert"                 # "upsert" (default) | "insert"
-upsert_keys = ["id"]            # required for upsert with a schema
+upsert_keys = ["id"]            # required for upsert with a schema; must be in schema
 schema = "id:bigint, name:text, amount:double, at:timestamptz, raw:jsonb"
 auto_create_table = false
-max_rows_per_statement = 500    # multi-row statements, capped by the dialect's parameter limit
+max_rows_per_statement = 500    # default; multi-row statements, capped by the dialect's parameter limit
 ```
 
-- **Typed mode** (`schema` set): each JSON field maps to its own column. A
-  field with the wrong type, or a missing required field, is poison.
+- **Typed mode** (`schema` set): each JSON field maps to its own column.
+  Columns are NOT NULL unless the type ends in `?` (`name:text?`). A field
+  with the wrong type, a missing required field or an unparseable
+  `timestamptz` is poison.
 - **Blob mode** (no `schema`): `(offset, subject, key, value)` rows, upserted
-  on `offset`.
+  on `offset`. The value must be JSON; anything else is poison.
+- With `auto_create_table`, the table is created on start if it doesn't
+  exist.
 
-Rows are written with multi-row statements. When one fails with a data
-error, the chunk is retried row by row so only the bad row goes to the DLQ.
+Rows are written with multi-row statements. In `upsert` mode a key repeated
+within one statement keeps its last occurrence. When a statement fails with
+a data error, the chunk is retried row by row so only the bad row goes to
+the DLQ.
 
 | Database | Upsert statement |
 |----------|------------------|
@@ -628,14 +700,15 @@ stream = "notifications"
 
 [settings]
 url = "https://api.example.com/notify"
-method = "POST"
-content_type = "application/json"
+method = "POST"                     # default
+content_type = "application/json"   # default
 headers = { Authorization = "Bearer ${API_TOKEN}" }
-timeout_secs = 30
+timeout_secs = 30                   # default
 ```
 
-Each request carries `Idempotency-Key` (the record's `x-idempotency-key`,
-or `<stream>:<offset>`), `X-Exspeed-Subject` and `X-Exspeed-Offset`.
+Each record is one request whose body is the record value. Each request
+carries `Idempotency-Key` (the record's `x-idempotency-key`, or
+`<stream>:<offset>`), `X-Exspeed-Subject` and `X-Exspeed-Offset`.
 Responses: 2xx success; 408/425/429/5xx and timeouts retried (honouring
 `Retry-After`); 401/403 fail the connector; other 4xx are poison.
 
@@ -651,18 +724,19 @@ stream = "outgoing"
 [settings]
 url = "amqp://guest:guest@localhost:5672/%2f"
 exchange = "events"
-exchange_type = "topic"         # default
+exchange_type = "topic"         # default; also direct, fanout, headers
 declare_exchange = true
 exchange_durable = true
-routing_key = "{subject}"       # template: {subject}, {key}, {stream}, {$.field}, or a literal
+routing_key = "{subject}"       # default; template: {subject}, {key}, {stream}, {$.field}, or a literal
 persistent = true               # delivery_mode = 2
 mandatory = true                # unroutable messages are returned → poison
 propagate_headers = true
 ```
 
 Publisher confirms are always on: a record counts as written only once the
-broker has confirmed it. Messages carry the record headers, `message_id` =
-idempotency key, `x-exspeed-offset` and `x-exspeed-subject`. With
+broker has confirmed it. Messages carry the record headers (with
+`propagate_headers`), `message_id` = idempotency key (`x-idempotency-key`
+or `<stream>:<offset>`), `x-exspeed-offset` and `x-exspeed-subject`. With
 `mandatory`, a record the exchange can't route goes to the DLQ; the records
 after it in the same batch are not published again.
 
@@ -678,31 +752,51 @@ flush_interval_ms = 60000       # default for s3
 
 [settings]
 bucket = "order-archive"
-region = "us-east-1"
+region = "us-east-1"            # default
 endpoint = "http://minio:9000"   # MinIO / S3-compatible stores
 path_style = true                # usually needed for MinIO
 access_key = "${AWS_ACCESS_KEY_ID}"      # both unset = the standard AWS credential chain
 secret_key = "${AWS_SECRET_ACCESS_KEY}"
 prefix = "archive/"
-max_records = 10000              # flush early when the buffer is this big …
-max_bytes = 16777216             # … or this many bytes
-timeout_secs = 60
+max_records = 10000              # default; flush early when the buffer is this big …
+max_bytes = 16777216             # default; … or this many bytes
+timeout_secs = 60                # default
 ```
 
 Objects are written to
 `{prefix}{stream}/{YYYY}/{MM}/{DD}/{HH}/part-{first_offset:020}.ndjson`,
-where the date is the first record's timestamp. Each line is
-`{"offset", "timestamp", "subject", "key", "value", "headers"}` (key and
-value as UTF-8, or base64 for binary).
+where the date is the first record's timestamp (UTC). Each line is
+`{"offset", "timestamp", "subject", "key", "value", "headers"}`, with the
+timestamp in Unix nanoseconds and key and value as UTF-8, or base64 for
+binary. Set both `access_key` and `secret_key`, or neither. HTTP 408, 429
+and 5xx from the store are retried; other HTTP errors (credentials, missing
+bucket) fail the connector.
 
 ## Transforms
 
 A `[transform]` section on a **source** runs an ExQL projection or filter
-over each record before it is appended. Sinks reject transforms.
+over each record before it is appended: a `SELECT … [WHERE …]` without a
+`FROM` clause, over the columns `key`, `subject`, `payload`, `headers`,
+`offset` and `timestamp`, with the same functions and JSON rules as
+[ExQL](exql.md). The projected columns become the record's JSON value; key,
+subject and headers are kept. `SELECT *` passes matching records unchanged.
+A record the `WHERE` rejects, or one the expressions fail on, is dropped.
+`key_field` is applied after the transform. Sinks reject transforms, and
+`http_webhook` doesn't apply them.
 
 ```toml
+[connector]
+name = "active-users"
+type = "source"
+plugin = "postgres_cdc"
+stream = "active_users"
+
+[settings]
+connection = "${DATABASE_URL}"
+tables = ["public.users"]
+
 [transform]
-sql = "SELECT payload->>'id' AS id, payload->>'email' AS email WHERE payload->>'status' = 'active'"
+sql = "SELECT payload->'after'->>'id' AS id, payload->'after'->>'email' AS email WHERE payload->'after'->>'status' = 'active'"
 ```
 
 ## Validating configs
@@ -713,18 +807,23 @@ exspeed connector dry-run  connectors.d/orders-cdc.toml --max 3
 ```
 
 - `validate` builds the plugin through the same registry as the server:
-  syntax, name, stream, transform, `${VAR}` resolution and every plugin
-  setting (a misspelled key fails).
-- `dry-run` also connects and prints sample records **without side
-  effects**: CDC sources peek at an existing slot and create nothing, queue
-  sources don't ack, outbox sources don't delete, sinks only connect.
+  syntax, name, stream, `subject_filter`, transform, `${VAR}` resolution and
+  every plugin setting (a misspelled key fails).
+- `dry-run` also connects and prints up to `--max` (default 3) sample
+  records. It has no side effects on the data: CDC sources peek at an
+  existing slot and create nothing, queue sources don't ack (the messages
+  are requeued), outbox sources don't delete, and `http_webhook` only
+  validates. Sinks only connect; their start-up still runs, so
+  `auto_create_table`, `declare_exchange` and `declare_queue` take effect.
 
 ## HTTP API
 
 Connectors created over HTTP use the same fields as the `[connector]`
-table at the top level, plus `settings`, `retry`, `restart` and
-`transform_sql`. Unknown fields are rejected. `${VAR}` substitution is
-**not** applied to API-created connectors.
+table at the top level (`connector_type` is accepted as an alias of
+`type`), plus `settings`, `retry`, `restart` and `transform_sql`. Unknown
+fields are rejected. `${VAR}` substitution is **not** applied to
+API-created connectors. Every endpoint needs a global admin credential when
+auth is enabled.
 
 ```bash
 curl -X POST localhost:8080/api/v1/connectors -H 'Content-Type: application/json' -d '{
@@ -737,14 +836,15 @@ curl -X POST localhost:8080/api/v1/connectors -H 'Content-Type: application/json
 
 curl localhost:8080/api/v1/connectors                         # list with status
 curl localhost:8080/api/v1/connectors/my-webhook              # status + config
-curl -X PUT localhost:8080/api/v1/connectors/my-webhook -d @config.json   # replace, keeps offsets
+curl -X PUT localhost:8080/api/v1/connectors/my-webhook -H 'Content-Type: application/json' \
+  -d @config.json                                             # replace, keeps offsets
 curl -X POST localhost:8080/api/v1/connectors/my-webhook/restart          # also revives "failed"
-curl -X DELETE localhost:8080/api/v1/connectors/my-webhook
+curl -X DELETE localhost:8080/api/v1/connectors/my-webhook                # also deletes offsets
 ```
 
 | Status | When |
 |--------|------|
-| `400` | invalid config (the message names the field or setting) |
+| `400` | invalid config (the message names the field or setting); a name that collides with another connector's; `PUT` body name differs from the path |
 | `404` | no such connector |
-| `409` | name already exists or collides; `PUT` on a file-defined connector |
-| `503` | restart requested on a non-leader |
+| `409` | name already exists (API or file connector); `PUT` on a file-defined connector |
+| `503` | this node isn't the leader |
