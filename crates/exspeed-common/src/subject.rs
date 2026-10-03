@@ -98,6 +98,11 @@ impl SubjectFilters {
     pub fn matches(&self, subject: &str) -> bool {
         self.0.is_empty() || self.0.iter().any(|f| f.matches(subject))
     }
+
+    /// True when every subject matches (no filters).
+    pub fn is_all(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 #[cfg(test)]

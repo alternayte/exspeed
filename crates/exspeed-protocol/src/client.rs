@@ -20,8 +20,10 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 
+use exspeed_common::record_format;
+
 use crate::error::ProtocolError;
-use crate::frame::Frame;
+use crate::frame::{Frame, OutFrame};
 use crate::opcodes::OpCode;
 
 // ---------------------------------------------------------------------------
@@ -99,12 +101,14 @@ impl StreamSpec {
     }
 }
 
-/// A record as delivered to a client.
+/// A record as delivered to a client. On the wire it uses the record
+/// encoding of segment files ([`exspeed_common::record_format`]): length,
+/// CRC32C, delivery count, then the fields below.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WireRecord {
     pub offset: u64,
-    /// Append time, milliseconds since the Unix epoch.
-    pub timestamp_ms: u64,
+    /// Append time, nanoseconds since the Unix epoch.
+    pub timestamp_ns: u64,
     /// 1 on first delivery, incremented on each redelivery. 0 for stateless
     /// reads.
     pub delivery_count: u16,
@@ -112,6 +116,91 @@ pub struct WireRecord {
     pub key: Option<Bytes>,
     pub value: Bytes,
     pub headers: Vec<(String, String)>,
+}
+
+impl WireRecord {
+    /// Append time, milliseconds since the Unix epoch.
+    pub fn timestamp_ms(&self) -> u64 {
+        self.timestamp_ns / 1_000_000
+    }
+}
+
+/// Records already in wire encoding, ready to be written into a
+/// `Deliver`, `Messages` or `ReadResult` frame without re-encoding. The
+/// bytes are held as a list of chunks, typically zero-copy slices of a
+/// segment read, so building a response never decodes a record.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EncodedRecords {
+    chunks: Vec<Bytes>,
+    count: u32,
+    len: usize,
+}
+
+impl EncodedRecords {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append `count` back-to-back encoded records. The caller guarantees
+    /// that `chunk` holds exactly that many valid records (they come from
+    /// storage, which verified them).
+    pub fn push_chunk(&mut self, chunk: Bytes, count: u32) {
+        if count == 0 {
+            return;
+        }
+        self.len += chunk.len();
+        self.count += count;
+        self.chunks.push(chunk);
+    }
+
+    /// Encode and append one record.
+    pub fn push_record(&mut self, r: &WireRecord) {
+        let mut w = Writer::default();
+        w.record(r);
+        self.push_chunk(w.finish(), 1);
+    }
+
+    /// Number of records.
+    pub fn count(&self) -> u32 {
+        self.count
+    }
+
+    /// Total encoded size in bytes.
+    pub fn byte_len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    pub fn chunks(&self) -> &[Bytes] {
+        &self.chunks
+    }
+
+    /// Decode every record (tests and tools; the server never needs this).
+    pub fn decode(&self) -> Result<Vec<WireRecord>, ProtocolError> {
+        let mut out = Vec::with_capacity(self.count as usize);
+        for c in &self.chunks {
+            let mut r = Reader::new(c.clone());
+            while r.buf.has_remaining() {
+                out.push(r.record()?);
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl From<&[WireRecord]> for EncodedRecords {
+    fn from(records: &[WireRecord]) -> Self {
+        let mut w = Writer::default();
+        for r in records {
+            w.record(r);
+        }
+        let mut out = Self::new();
+        out.push_chunk(w.finish(), records.len() as u32);
+        out
+    }
 }
 
 /// Stream creation/update parameters. Zero means "default" for every field.
@@ -655,6 +744,40 @@ impl Response {
         }
     }
 
+    /// A `Deliver` push (correlation id 0) carrying already-encoded records.
+    pub fn deliver_frame(sub_id: u32, records: EncodedRecords) -> OutFrame {
+        let mut w = Writer::default();
+        w.u32(sub_id);
+        w.u32(records.count());
+        OutFrame::new(OpCode::Deliver, 0, w.finish(), records.chunks)
+    }
+
+    /// A `Messages` reply carrying already-encoded records.
+    pub fn messages_frame(correlation_id: u32, records: EncodedRecords) -> OutFrame {
+        let mut w = Writer::default();
+        w.u32(records.count());
+        OutFrame::new(OpCode::Messages, correlation_id, w.finish(), records.chunks)
+    }
+
+    /// A `ReadResult` reply carrying already-encoded records.
+    pub fn read_result_frame(
+        correlation_id: u32,
+        next_offset: u64,
+        high_watermark: u64,
+        records: EncodedRecords,
+    ) -> OutFrame {
+        let mut w = Writer::default();
+        w.u64(next_offset);
+        w.u64(high_watermark);
+        w.u32(records.count());
+        OutFrame::new(
+            OpCode::ReadResult,
+            correlation_id,
+            w.finish(),
+            records.chunks,
+        )
+    }
+
     pub fn json(value: &impl Serialize) -> Self {
         Response::Json(Bytes::from(
             serde_json::to_vec(value).expect("JSON-serializable response"),
@@ -890,14 +1013,22 @@ impl Writer {
         self.u64(s.dedup_max_entries);
         self.u8(s.compaction as u8);
     }
+    /// Encode one record. Panics if a field exceeds its width (the
+    /// broker's write path rejects such records before they are stored).
     pub fn record(&mut self, r: &WireRecord) {
-        self.u64(r.offset);
-        self.u64(r.timestamp_ms);
-        self.u16(r.delivery_count);
-        self.str(&r.subject);
-        self.opt(r.key.as_ref(), |w, k| w.bytes(k));
-        self.bytes(&r.value);
-        self.headers(&r.headers);
+        record_format::encode(
+            &mut self.buf,
+            &record_format::Fields {
+                offset: r.offset,
+                timestamp_ns: r.timestamp_ns,
+                delivery_count: r.delivery_count,
+                subject: &r.subject,
+                key: r.key.as_deref(),
+                value: &r.value,
+                headers: &r.headers,
+            },
+        )
+        .expect("record fits the wire format");
     }
     fn records(&mut self, records: &[WireRecord]) {
         self.u32(records.len() as u32);
@@ -1026,20 +1157,26 @@ impl Reader {
             compaction: self.u8()? != 0,
         })
     }
+    /// Decode one record, verifying its length field, structure and CRC.
     pub fn record(&mut self) -> Result<WireRecord, ProtocolError> {
+        let bad = |e: record_format::FormatError| ProtocolError::Decode(format!("record: {}", e.0));
+        self.need(4)?;
+        let size = record_format::record_size(&self.buf[..4]).map_err(bad)?;
+        let rec = self.take(size)?;
+        record_format::check_crc(&rec).map_err(bad)?;
+        let l = record_format::layout(&rec).map_err(bad)?;
         Ok(WireRecord {
-            offset: self.u64()?,
-            timestamp_ms: self.u64()?,
-            delivery_count: self.u16()?,
-            subject: self.str()?,
-            key: self.opt(|r| r.bytes())?,
-            value: self.bytes()?,
-            headers: self.headers()?,
+            offset: l.offset,
+            timestamp_ns: l.timestamp_ns,
+            delivery_count: l.delivery_count,
+            subject: l.subject(&rec).to_owned(),
+            key: l.key.clone().map(|r| rec.slice(r)),
+            value: rec.slice(l.value.clone()),
+            headers: l.headers(&rec),
         })
     }
     fn records(&mut self) -> Result<Vec<WireRecord>, ProtocolError> {
-        // Smallest record: 8+8+2 + 2 + 1 + 4 + 2 = 27 bytes.
-        let n = self.count(27)?;
+        let n = self.count(record_format::MIN_RECORD_LEN)?;
         let mut out = Vec::with_capacity(n);
         for _ in 0..n {
             out.push(self.record()?);
@@ -1055,7 +1192,7 @@ mod tests {
     fn rec(i: u64) -> WireRecord {
         WireRecord {
             offset: i,
-            timestamp_ms: 1_700_000_000_000 + i,
+            timestamp_ns: 1_700_000_000_000_000_000 + i,
             delivery_count: (i % 3) as u16,
             subject: format!("orders.{i}"),
             key: if i.is_multiple_of(2) {
@@ -1230,6 +1367,75 @@ mod tests {
         ] {
             roundtrip_resp(resp);
         }
+    }
+
+    #[test]
+    fn encoded_record_frames_match_decoded_responses() {
+        let records: Vec<WireRecord> = (0..4).map(rec).collect();
+        // Split over several chunks, as the server does.
+        let mut enc = EncodedRecords::new();
+        enc.push_chunk(EncodedRecords::from(&records[..1]).chunks[0].clone(), 1);
+        enc.push_chunk(EncodedRecords::from(&records[1..]).chunks[0].clone(), 3);
+        assert_eq!(enc.count(), 4);
+        assert_eq!(enc.decode().unwrap(), records);
+
+        let a = Response::deliver_frame(3, enc.clone()).into_frame();
+        let b = Response::Deliver {
+            sub_id: 3,
+            records: records.clone(),
+        }
+        .into_frame(0);
+        assert_eq!(a, b);
+        let a = Response::messages_frame(5, enc.clone()).into_frame();
+        assert_eq!(
+            a,
+            Response::Messages {
+                records: records.clone()
+            }
+            .into_frame(5)
+        );
+        let a = Response::read_result_frame(6, 4, 9, enc).into_frame();
+        assert_eq!(
+            Response::from_frame(&a).unwrap(),
+            Response::ReadResult {
+                next_offset: 4,
+                high_watermark: 9,
+                records,
+            }
+        );
+    }
+
+    #[test]
+    fn record_encoding_matches_the_typescript_fixture() {
+        // Same bytes as the `Deliver` fixture in
+        // sdks/typescript/test/unit/protocol.test.ts.
+        let mut w = Writer::default();
+        w.record(&rec(2));
+        let hex: String = w.finish().iter().map(|b| format!("{b:02x}")).collect();
+        let want = "36000000 06760cef 0200 0200000000000000 02002a36fe9c9717 \
+                    0800 6f72646572732e32 01 02000000 6b32 02000000 0202 \
+                    0100 0100 68 0200 7632";
+        assert_eq!(hex, want.replace(' ', ""));
+    }
+
+    #[test]
+    fn record_crc_and_delivery_count_patch() {
+        let mut w = Writer::default();
+        w.u32(1);
+        w.record(&rec(2));
+        let mut payload = BytesMut::from(&w.finish()[..]);
+        // Patching delivery_count (bytes 8..10 of the record) keeps the CRC valid.
+        let at = 4 + record_format::DELIVERY_COUNT_AT;
+        payload[at..at + 2].copy_from_slice(&9u16.to_le_bytes());
+        match Response::decode(OpCode::Messages, payload.clone().freeze()).unwrap() {
+            Response::Messages { records } => assert_eq!(records[0].delivery_count, 9),
+            other => panic!("{other:?}"),
+        }
+        // Any other bit flip is caught.
+        let last = payload.len() - 1;
+        payload[last] ^= 1;
+        let err = Response::decode(OpCode::Messages, payload.freeze()).unwrap_err();
+        assert!(err.to_string().contains("CRC"), "{err}");
     }
 
     #[test]

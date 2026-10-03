@@ -55,6 +55,9 @@ pub struct QueryStats {
     pub records_in: AtomicU64,
     pub records_out: AtomicU64,
     pub late_dropped: AtomicU64,
+    /// `TIMESTAMP BY` values replaced by the record timestamp because they
+    /// were out of range.
+    pub invalid_event_times: AtomicU64,
     pub checkpoints: AtomicU64,
     /// `i64::MIN` when there is no watermark yet.
     pub watermark: AtomicI64,
@@ -68,6 +71,7 @@ impl Default for QueryStats {
             records_in: AtomicU64::new(0),
             records_out: AtomicU64::new(0),
             late_dropped: AtomicU64::new(0),
+            invalid_event_times: AtomicU64::new(0),
             checkpoints: AtomicU64::new(0),
             watermark: AtomicI64::new(i64::MIN),
             last_checkpoint_ms: AtomicI64::new(0),
@@ -83,6 +87,7 @@ impl QueryStats {
             "records_in": self.records_in.load(Ordering::Relaxed),
             "records_out": self.records_out.load(Ordering::Relaxed),
             "late_records_dropped": self.late_dropped.load(Ordering::Relaxed),
+            "invalid_event_times": self.invalid_event_times.load(Ordering::Relaxed),
             "checkpoints": self.checkpoints.load(Ordering::Relaxed),
             "watermark": if wm == i64::MIN { Json::Null } else { Json::String(crate::convert::format_ts_millis(wm)) },
             "last_checkpoint": if ck == 0 { Json::Null } else { Json::String(crate::convert::format_ts_millis(ck)) },
@@ -200,6 +205,20 @@ fn parse_ts_text(s: &str) -> Option<i64> {
         }
     }
     None
+}
+
+/// Replace event times before 1970 or more than `max_skew_ms` ahead of the
+/// record timestamp with the record timestamp; returns how many were
+/// replaced.
+fn clamp_event_times(et: &mut [i64], rec_ts: &[i64], max_skew_ms: i64) -> u64 {
+    let mut n = 0;
+    for (e, &r) in et.iter_mut().zip(rec_ts) {
+        if *e < 0 || *e > r.saturating_add(max_skew_ms) {
+            *e = r;
+            n += 1;
+        }
+    }
+    n
 }
 
 /// Convert a `TIMESTAMP BY` result to epoch ms; NULL / unparseable values
@@ -582,7 +601,18 @@ impl Runner {
             .map(|r| (r.timestamp / 1_000_000) as i64)
             .collect();
         let et = match &def.ts {
-            Some(e) if !recs.is_empty() => event_times(&eval(e, &batch)?, &rec_ts)?,
+            Some(e) if !recs.is_empty() => {
+                let mut et = event_times(&eval(e, &batch)?, &rec_ts)?;
+                let invalid =
+                    clamp_event_times(&mut et, &rec_ts, self.ctx.cfg.max_event_time_skew_ms);
+                if invalid > 0 {
+                    self.ctx
+                        .stats
+                        .invalid_event_times
+                        .fetch_add(invalid, Ordering::Relaxed);
+                }
+                et
+            }
             _ => rec_ts,
         };
         Ok(Rows {

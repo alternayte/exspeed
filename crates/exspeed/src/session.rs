@@ -25,22 +25,25 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::sync::{mpsc, Semaphore};
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use exspeed_broker::broker_append::{AppendResult, IDEMPOTENCY_HEADER};
-use exspeed_broker::consumer::{to_wire, ConsumerError, SubEvent};
+use exspeed_broker::consumer::{ConsumerError, SubEvent};
 use exspeed_broker::log::LogError;
 use exspeed_broker::Broker;
 use exspeed_common::auth::{Action, CredentialStore, Identity, Permission, StreamGlob};
+use exspeed_common::record_format;
 use exspeed_common::{Metrics, Offset, StreamName, SubjectFilter};
 use exspeed_processing::ExqlEngine;
-use exspeed_protocol::client::{code, ConsumerSpec, PublishRecord, Request, Response, StreamSpec};
+use exspeed_protocol::client::{
+    code, ConsumerSpec, EncodedRecords, PublishRecord, Request, Response, StreamSpec,
+};
 use exspeed_protocol::codec::ExspeedCodec;
-use exspeed_protocol::frame::Frame;
+use exspeed_protocol::frame::OutFrame;
 use exspeed_protocol::ProtocolError;
 use exspeed_streams::{ReadLimits, Record, StorageError, StreamConfig};
 
@@ -79,12 +82,34 @@ fn anonymous_identity() -> Identity {
 /// Outbound frame sink shared by the reader loop, waiting tasks and
 /// subscription forwarders.
 #[derive(Clone)]
-struct Out(mpsc::Sender<Frame>);
+struct Out(mpsc::Sender<OutFrame>);
 
 impl Out {
     async fn send(&self, corr: u32, resp: Response) {
-        let _ = self.0.send(resp.into_frame(corr)).await;
+        let _ = self.0.send(resp.into_frame(corr).into()).await;
     }
+
+    async fn send_frame(&self, frame: OutFrame) {
+        let _ = self.0.send(frame).await;
+    }
+}
+
+/// Write buffer of the connection's writer task. Record bytes in chunks at
+/// least this large go to the socket without being copied into it.
+const WRITE_BUFFER: usize = 64 * 1024;
+
+/// Write one frame: header, head, then the body chunks (record bytes
+/// straight from a segment read).
+async fn write_frame<W: AsyncWrite + Unpin>(
+    w: &mut BufWriter<W>,
+    f: &OutFrame,
+) -> std::io::Result<()> {
+    w.write_all(&f.header()).await?;
+    w.write_all(&f.head).await?;
+    for chunk in &f.body {
+        w.write_all(chunk).await?;
+    }
+    Ok(())
 }
 
 struct SubEntry {
@@ -217,13 +242,24 @@ where
     .await?;
 
     // --- Writer task -------------------------------------------------------
-    let (out_tx, mut out_rx) = mpsc::channel::<Frame>(OUTBOUND_BUFFER);
+    // Frames queued together are written with one flush.
+    let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(OUTBOUND_BUFFER);
+    let mut w = BufWriter::with_capacity(WRITE_BUFFER, sink.into_inner());
     let writer_task = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
-            if sink.send(frame).await.is_err() {
-                break;
+            if write_frame(&mut w, &frame).await.is_err() {
+                return;
+            }
+            while let Ok(frame) = out_rx.try_recv() {
+                if write_frame(&mut w, &frame).await.is_err() {
+                    return;
+                }
+            }
+            if w.flush().await.is_err() {
+                return;
             }
         }
+        let _ = w.shutdown().await;
     });
     let out = Out(out_tx);
 
@@ -711,8 +747,8 @@ async fn dispatch(
             let fwd_out = out.clone();
             let forwarder = tokio::spawn(async move {
                 while let Some(ev) = sub.events.recv().await {
-                    let resp = match ev {
-                        SubEvent::Deliver(records) => Response::Deliver { sub_id, records },
+                    let frame = match ev {
+                        SubEvent::Deliver(records) => Response::deliver_frame(sub_id, records),
                         SubEvent::Ended { code, message } => {
                             fwd_out
                                 .send(
@@ -727,7 +763,7 @@ async fn dispatch(
                             return;
                         }
                     };
-                    if fwd_out.0.send(resp.into_frame(0)).await.is_err() {
+                    if fwd_out.0.send(frame).await.is_err() {
                         return;
                     }
                 }
@@ -799,14 +835,14 @@ async fn dispatch(
                 // consumer skips waiters whose caller is gone, so no records
                 // are stranded (any already handed out come back after
                 // ack_wait).
-                let resp = tokio::select! {
+                let frame = tokio::select! {
                     r = pull => match r {
-                        Ok(records) => Response::Messages { records },
-                        Err(e) => consumer_error_response(&ctx, e),
+                        Ok(records) => Response::messages_frame(corr, records),
+                        Err(e) => consumer_error_response(&ctx, e).into_frame(corr).into(),
                     },
                     _ = closed.cancelled() => return,
                 };
-                out.send(corr, resp).await;
+                out.send_frame(frame).await;
             });
         }
         Request::Ack { consumer, offsets } => {
@@ -897,6 +933,7 @@ async fn dispatch(
                 let _permit = permit;
                 let resp = read(
                     &ctx,
+                    corr,
                     &name,
                     from,
                     max_records,
@@ -905,7 +942,7 @@ async fn dispatch(
                     &filter,
                 );
                 tokio::select! {
-                    resp = resp => out.send(corr, resp).await,
+                    frame = resp => out.send_frame(frame).await,
                     _ = closed.cancelled() => {}
                 }
             });
@@ -984,15 +1021,23 @@ async fn run_query(ctx: &SessionContext, sql: &str) -> Response {
 }
 
 /// Stateless read with subject filtering and long-polling.
+///
+/// Records go from the segment to the socket without being decoded: the
+/// storage returns them in wire encoding ([`exspeed_streams::RawBatch`]) and
+/// the reply carries zero-copy slices of that buffer. With a subject filter
+/// only each record's subject is parsed (in place), and runs of matching
+/// records become the reply's chunks.
+#[allow(clippy::too_many_arguments)]
 async fn read(
     ctx: &SessionContext,
+    corr: u32,
     name: &StreamName,
     from: u64,
     max_records: u32,
     max_bytes: u32,
     wait: Duration,
     filter: &SubjectFilter,
-) -> Response {
+) -> OutFrame {
     let storage = &ctx.broker.storage;
     let limits = ReadLimits {
         max_records: (max_records as usize).clamp(1, 10_000),
@@ -1008,36 +1053,35 @@ async fn read(
     loop {
         // Scan forward (bounded) until something matches the filter or we
         // reach the end of the log.
-        let mut matched = Vec::new();
+        let mut matched = EncodedRecords::new();
         let mut high_watermark = cursor;
         for _ in 0..16 {
-            let batch = match storage.read_batch(name, cursor, limits).await {
+            let batch = match storage.read_raw(name, cursor, limits).await {
                 Ok(b) => b,
-                Err(e) => return log_error_response(ctx, e.into()),
+                Err(e) => return log_error_response(ctx, e.into()).into_frame(corr).into(),
             };
             high_watermark = batch.high_watermark;
             cursor = batch.next_offset;
-            for r in &batch.records {
-                if filter.matches(&r.subject) {
-                    matched.push(to_wire(r, 0));
-                    if matched.len() >= limits.max_records {
-                        // Stopped mid-batch: resume right after this record.
-                        cursor = Offset(r.offset.0 + 1);
-                        break;
-                    }
-                }
+            let count = batch.count;
+            let bytes = batch.bytes.freeze();
+            if filter.is_all() {
+                matched.push_chunk(bytes, count as u32);
+            } else {
+                take_matching(
+                    &bytes,
+                    filter,
+                    limits.max_records,
+                    &mut matched,
+                    &mut cursor,
+                );
             }
-            if !matched.is_empty() || batch.records.is_empty() || cursor >= high_watermark {
+            if !matched.is_empty() || count == 0 || cursor >= high_watermark {
                 break;
             }
         }
         let caught_up = cursor >= high_watermark;
         if !matched.is_empty() || !caught_up || tokio::time::Instant::now() >= deadline {
-            return Response::ReadResult {
-                next_offset: cursor.0,
-                high_watermark: high_watermark.0,
-                records: matched,
-            };
+            return Response::read_result_frame(corr, cursor.0, high_watermark.0, matched);
         }
         // Long-poll until new data or the deadline.
         let woke = match watch.as_mut() {
@@ -1049,11 +1093,52 @@ async fn read(
             }
         };
         if !woke && tokio::time::Instant::now() >= deadline {
-            return Response::ReadResult {
-                next_offset: cursor.0,
-                high_watermark: high_watermark.0,
-                records: Vec::new(),
-            };
+            return Response::read_result_frame(
+                corr,
+                cursor.0,
+                high_watermark.0,
+                EncodedRecords::new(),
+            );
         }
+    }
+}
+
+/// Append the records of `bytes` whose subject matches `filter` to `out`
+/// as zero-copy slices (one per run of consecutive matches), stopping at
+/// `max_records`. When it stops early, `cursor` moves to just after the
+/// last record taken.
+fn take_matching(
+    bytes: &Bytes,
+    filter: &SubjectFilter,
+    max_records: usize,
+    out: &mut EncodedRecords,
+    cursor: &mut Offset,
+) {
+    let mut run: Option<(usize, usize, u32)> = None;
+    for p in record_format::iter(bytes) {
+        let Ok(p) = p else { break };
+        let rec = &bytes[p.range()];
+        if record_format::subject(rec).is_ok_and(|s| filter.matches(s)) {
+            run = match run {
+                Some((start, end, n)) if end == p.start => Some((start, p.end(), n + 1)),
+                other => {
+                    if let Some((start, end, n)) = other {
+                        out.push_chunk(bytes.slice(start..end), n);
+                    }
+                    Some((p.start, p.end(), 1))
+                }
+            };
+            let pending = run.map_or(0, |r| r.2);
+            if out.count() as usize + pending as usize >= max_records {
+                // Stopped mid-batch: resume right after this record.
+                *cursor = Offset(p.offset + 1);
+                break;
+            }
+        } else if let Some((start, end, n)) = run.take() {
+            out.push_chunk(bytes.slice(start..end), n);
+        }
+    }
+    if let Some((start, end, n)) = run {
+        out.push_chunk(bytes.slice(start..end), n);
     }
 }

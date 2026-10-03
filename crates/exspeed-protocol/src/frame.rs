@@ -81,6 +81,73 @@ impl Frame {
     }
 }
 
+/// An outbound frame whose payload is a small `head` followed by `body`
+/// chunks written back to back. Record-carrying responses use it so record
+/// bytes read from a segment go to the socket without being copied into a
+/// contiguous payload first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutFrame {
+    pub opcode: OpCode,
+    pub correlation_id: u32,
+    pub head: Bytes,
+    pub body: Vec<Bytes>,
+}
+
+impl OutFrame {
+    pub fn new(opcode: OpCode, correlation_id: u32, head: Bytes, body: Vec<Bytes>) -> Self {
+        Self {
+            opcode,
+            correlation_id,
+            head,
+            body,
+        }
+    }
+
+    /// Payload length (head + body).
+    pub fn payload_len(&self) -> usize {
+        self.head.len() + self.body.iter().map(Bytes::len).sum::<usize>()
+    }
+
+    /// The 10-byte frame header.
+    pub fn header(&self) -> [u8; FRAME_HEADER_SIZE] {
+        let mut h = [0u8; FRAME_HEADER_SIZE];
+        h[0] = PROTOCOL_VERSION;
+        h[1] = self.opcode.as_u8();
+        h[2..6].copy_from_slice(&self.correlation_id.to_le_bytes());
+        h[6..10].copy_from_slice(&(self.payload_len() as u32).to_le_bytes());
+        h
+    }
+
+    /// Append the complete frame to `dst`.
+    pub fn encode(&self, dst: &mut BytesMut) {
+        dst.reserve(FRAME_HEADER_SIZE + self.payload_len());
+        dst.extend_from_slice(&self.header());
+        dst.extend_from_slice(&self.head);
+        for b in &self.body {
+            dst.extend_from_slice(b);
+        }
+    }
+
+    /// Collapse into a [`Frame`] with a contiguous payload (copies).
+    pub fn into_frame(self) -> Frame {
+        if self.body.is_empty() {
+            return Frame::new(self.opcode, self.correlation_id, self.head);
+        }
+        let mut p = BytesMut::with_capacity(self.payload_len());
+        p.extend_from_slice(&self.head);
+        for b in &self.body {
+            p.extend_from_slice(b);
+        }
+        Frame::new(self.opcode, self.correlation_id, p.freeze())
+    }
+}
+
+impl From<Frame> for OutFrame {
+    fn from(f: Frame) -> Self {
+        Self::new(f.opcode, f.correlation_id, f.payload, Vec::new())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,6 +235,24 @@ mod tests {
 
         let result = Frame::decode(&mut buf);
         assert!(matches!(result, Err(ProtocolError::PayloadTooLarge { .. })));
+    }
+
+    #[test]
+    fn out_frame_encodes_like_a_contiguous_frame() {
+        let out = OutFrame::new(
+            OpCode::Messages,
+            9,
+            Bytes::from_static(b"ab"),
+            vec![Bytes::from_static(b"cd"), Bytes::from_static(b"e")],
+        );
+        let mut a = BytesMut::new();
+        out.encode(&mut a);
+        let mut b = BytesMut::new();
+        out.clone().into_frame().encode(&mut b);
+        assert_eq!(a, b);
+        assert_eq!(&a[..FRAME_HEADER_SIZE], &out.header()[..]);
+        let decoded = Frame::decode(&mut a).unwrap().unwrap();
+        assert_eq!(decoded.payload, Bytes::from_static(b"abcde"));
     }
 
     #[test]

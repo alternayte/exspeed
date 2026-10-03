@@ -172,7 +172,7 @@ await client.seek("billing", { timeMs: Date.parse("2026-10-01") }); // or a Date
 const sub = await client.subscribe("billing", { window: 256 });
 
 for await (const msg of sub) {
-  // msg.offset, msg.timestamp (ms), msg.deliveryCount, msg.subject,
+  // msg.offset, msg.timestamp (ms), msg.timestampNs (bigint), msg.deliveryCount, msg.subject,
   // msg.key, msg.value (Buffer), msg.headers, msg.json(), msg.text(), msg.header(name)
   msg.ack();
 }

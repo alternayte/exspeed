@@ -6,15 +6,18 @@ import {
   Reader,
   SeekKind,
   Writer,
+  crc32c,
   decodeRequest,
   decodeResponse,
   encodeFrame,
+  encodeRecord,
   encodeRequest,
   encodeResponse,
   requestFrame,
   requestOpcode,
   responseFrame,
   responseOpcode,
+  verifyRecordCrc,
   type Request,
   type Response,
   type WirePublishRecord,
@@ -34,7 +37,7 @@ const b = (s: string) => Buffer.from(s, "utf8");
 function rec(i: number): WireRecord {
   return {
     offset: i,
-    timestampMs: 1_700_000_000_000 + i,
+    timestampNs: 1_700_000_000_000_000_000n + BigInt(i),
     deliveryCount: i % 3,
     subject: `orders.${i}`,
     key: i % 2 === 0 ? b(`k${i}`) : null,
@@ -362,7 +365,8 @@ describe("responses", () => {
       "Deliver",
       { type: "Deliver", subId: 2, records: [rec(2)] },
       `02000000 | 01000000
-       0200000000000000 0268e5cf8b010000 0200
+       36000000 06760cef 0200
+       0200000000000000 02002a36fe9c9717
        0800 6f72646572732e32
        01 02000000 6b32
        02000000 0202
@@ -372,7 +376,8 @@ describe("responses", () => {
       "Messages",
       { type: "Messages", records: [rec(0)] },
       `01000000
-       0000000000000000 0068e5cf8b010000 0000
+       34000000 b6f9c422 0000
+       0000000000000000 00002a36fe9c9717
        0800 6f72646572732e30
        01 02000000 6b30
        00000000
@@ -382,7 +387,8 @@ describe("responses", () => {
       "ReadResult",
       { type: "ReadResult", nextOffset: 10, highWatermark: 12, records: [rec(1)] },
       `0a00000000000000 0c00000000000000 01000000
-       0100000000000000 0168e5cf8b010000 0100
+       2f000000 f194cd5a 0100
+       0100000000000000 01002a36fe9c9717
        0800 6f72646572732e31
        00
        01000000 01
@@ -394,5 +400,32 @@ describe("responses", () => {
     const op = responseOpcode(resp);
     expect(norm(decodeResponse(op, hex(bytes)))).toEqual(norm(resp));
     expect(encodeResponse(resp).toString("hex")).toBe(hex(bytes).toString("hex"));
+  });
+});
+
+describe("records", () => {
+  it("carry a CRC32C that ignores delivery_count", () => {
+    const enc = encodeRecord(rec(2));
+    expect(enc.length).toBe(0x36 + 4);
+    expect(verifyRecordCrc(enc)).toBe(true);
+    // The server patches delivery_count (bytes 8..10) in place.
+    enc.writeUInt16LE(7, 8);
+    expect(verifyRecordCrc(enc)).toBe(true);
+    const payload = Buffer.concat([hex("01000000"), enc]);
+    const resp = decodeResponse(OpCode.Messages, payload);
+    expect(resp.type === "Messages" && resp.records[0]!.deliveryCount).toBe(7);
+    enc[enc.length - 1] ^= 1;
+    expect(verifyRecordCrc(enc)).toBe(false);
+  });
+
+  it("crc32c matches the standard check value", () => {
+    expect(crc32c(Buffer.from("123456789"))).toBe(0xe3069283);
+  });
+
+  it("rejects a record length that disagrees with its contents", () => {
+    const enc = encodeRecord(rec(1));
+    enc.writeUInt32LE(enc.readUInt32LE(0) + 1, 0);
+    const payload = Buffer.concat([hex("01000000"), enc, hex("00")]);
+    expect(() => decodeResponse(OpCode.Messages, payload)).toThrow(ProtocolError);
   });
 });

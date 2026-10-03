@@ -4,6 +4,8 @@ use crate::config::StreamConfig;
 use crate::error::StorageError;
 use crate::record::{Record, StoredRecord};
 use async_trait::async_trait;
+use bytes::BytesMut;
+use exspeed_common::record_format;
 use exspeed_common::{Offset, StreamName};
 
 /// Bounds for a [`StorageEngine::read_batch`] call. A batch always contains
@@ -37,6 +39,60 @@ pub struct ReadBatch {
     /// records below the high watermark are ever returned.
     /// `next_offset == high_watermark` means the reader is caught up.
     pub high_watermark: Offset,
+}
+
+/// Result of a [`StorageEngine::read_raw`] call: records in their stored
+/// (= wire) encoding, back to back, ready to be copied into a response
+/// frame. See [`exspeed_common::record_format`] for the byte layout.
+#[derive(Debug, Clone)]
+pub struct RawBatch {
+    /// `count` encoded records with strictly increasing offsets. Their
+    /// `delivery_count` is 0. Mutable so a consumer can patch the delivery
+    /// count in place before sending.
+    pub bytes: BytesMut,
+    pub count: usize,
+    /// Same meaning as [`ReadBatch::next_offset`].
+    pub next_offset: Offset,
+    /// Same meaning as [`ReadBatch::high_watermark`].
+    pub high_watermark: Offset,
+}
+
+impl RawBatch {
+    /// Iterate the records' positions (and offsets) in [`RawBatch::bytes`].
+    pub fn records(&self) -> record_format::Iter<'_> {
+        record_format::iter(&self.bytes)
+    }
+
+    /// Encode decoded records (for engines that don't store the wire
+    /// format, and for tests).
+    pub fn encode(
+        records: &[StoredRecord],
+        next_offset: Offset,
+        high_watermark: Offset,
+    ) -> Result<Self, StorageError> {
+        let mut bytes = BytesMut::new();
+        for r in records {
+            record_format::encode(
+                &mut bytes,
+                &record_format::Fields {
+                    offset: r.offset.0,
+                    timestamp_ns: r.timestamp,
+                    delivery_count: 0,
+                    subject: &r.subject,
+                    key: r.key.as_deref(),
+                    value: &r.value,
+                    headers: &r.headers,
+                },
+            )
+            .map_err(|e| StorageError::InvalidRecord(e.0))?;
+        }
+        Ok(Self {
+            bytes,
+            count: records.len(),
+            next_offset,
+            high_watermark,
+        })
+    }
 }
 
 #[async_trait]
@@ -250,6 +306,22 @@ pub trait StorageEngine: Send + Sync {
             next_offset,
             high_watermark,
         })
+    }
+
+    /// Like [`StorageEngine::read_batch`], but returns the records in their
+    /// wire encoding without decoding them. `limits.max_bytes` bounds the
+    /// encoded size (at least one record is returned when one is
+    /// available). A batch may stop early at a segment boundary; resume
+    /// from `next_offset`. The default implementation encodes the result of
+    /// `read_batch`; engines that store the wire format override it.
+    async fn read_raw(
+        &self,
+        stream: &StreamName,
+        from: Offset,
+        limits: ReadLimits,
+    ) -> Result<RawBatch, StorageError> {
+        let b = self.read_batch(stream, from, limits).await?;
+        RawBatch::encode(&b.records, b.next_offset, b.high_watermark)
     }
 
     /// Subscribe to the stream's high watermark (the offset the next append

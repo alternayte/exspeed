@@ -4,7 +4,8 @@
 //! padded to 20 digits):
 //!
 //! * `B.seg` — a 16-byte header (`"EXSG"`, version, base offset) followed by
-//!   CRC-framed records (see [`crate::encoding`]). Offsets inside a segment
+//!   records in their wire encoding, each with its own length and CRC (see
+//!   [`crate::encoding`]). Offsets inside a segment
 //!   are strictly increasing but may have gaps (compaction, `append_at`).
 //! * `B.idx` — the sparse offset + time index: one 24-byte entry
 //!   `(offset u64, file position u64, running max timestamp u64)` for the
@@ -24,15 +25,16 @@ use std::sync::RwLock;
 use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 
-use crate::encoding::{
-    check_crc, frame_payload_len, payload_offset_ts, FRAME_HEADER_LEN, MAX_FRAME_LEN,
-};
+use crate::encoding::{check_crc, frame_offset_ts, frame_size, LEN_FIELD, MAX_FRAME_LEN};
 use crate::file::fsutil::{atomic_write, fsync_dir, read_at};
 
 pub const SEGMENT_MAGIC: &[u8; 4] = b"EXSG";
-/// Version 2: sparse `.idx` with time column, `.meta` sidecars, no `.tix`,
-/// `.bloom` or `.sidx` files. Version 1 segments are refused.
-pub const SEGMENT_VERSION: u8 = 2;
+/// Version 3: records are stored in the client protocol's `WireRecord`
+/// encoding (length, CRC, delivery count, then the fields), so reads can
+/// copy them into response frames as they are. Version 2 had an 8-byte
+/// `len` + `crc` frame header and no delivery count; version 1 had dense
+/// indexes. Older segments are refused.
+pub const SEGMENT_VERSION: u8 = 3;
 pub const SEGMENT_HEADER_LEN: u64 = 16;
 /// Approximate number of data bytes between two index entries.
 pub const INDEX_INTERVAL_BYTES: u64 = 4096;
@@ -449,17 +451,15 @@ impl Segment {
     }
 }
 
-/// One frame read from a segment.
+/// One record read from a segment.
 #[derive(Debug, Clone)]
 pub struct Frame {
     pub pos: u64,
-    /// Total bytes, frame header included.
+    /// Total bytes of the record.
     pub size: u64,
     pub offset: u64,
     pub timestamp: u64,
-    /// The payload (zero-copy slice of the read buffer).
-    pub payload: Bytes,
-    /// The whole frame, header included.
+    /// The whole record (zero-copy slice of the read buffer).
     pub raw: Bytes,
 }
 
@@ -562,36 +562,29 @@ impl<'a> FrameIter<'a> {
         if self.pos >= self.end {
             return Ok(None);
         }
-        self.ensure(FRAME_HEADER_LEN)?;
+        self.ensure(LEN_FIELD)?;
         let at = (self.pos - self.buf_start) as usize;
-        let payload_len =
-            frame_payload_len(&self.buf[at..at + FRAME_HEADER_LEN]).map_err(|reason| {
-                FrameError::Corrupt {
-                    pos: self.pos,
-                    reason,
-                }
+        let size =
+            frame_size(&self.buf[at..at + LEN_FIELD]).map_err(|reason| FrameError::Corrupt {
+                pos: self.pos,
+                reason,
             })?;
-        let size = FRAME_HEADER_LEN + payload_len;
-        debug_assert!(size <= MAX_FRAME_LEN + 4);
+        debug_assert!(size <= MAX_FRAME_LEN);
         self.ensure(size)?;
         let at = (self.pos - self.buf_start) as usize;
         let raw = self.buf.slice(at..at + size);
-        let payload = raw.slice(FRAME_HEADER_LEN..);
         if self.verify_crc {
-            check_crc(&raw[..FRAME_HEADER_LEN], &payload).map_err(|reason| {
-                FrameError::Corrupt {
-                    pos: self.pos,
-                    reason,
-                }
+            check_crc(&raw).map_err(|reason| FrameError::Corrupt {
+                pos: self.pos,
+                reason,
             })?;
         }
-        let (offset, timestamp) = payload_offset_ts(&payload);
+        let (offset, timestamp) = frame_offset_ts(&raw);
         let frame = Frame {
             pos: self.pos,
             size: size as u64,
             offset,
             timestamp,
-            payload,
             raw,
         };
         self.pos += size as u64;
@@ -688,19 +681,17 @@ pub fn valid_frame_after(
     let min_offset = after_offset.map_or(0, |o| o + 1);
     for i in 1..rest.len() {
         let tail = &rest[i..];
-        if tail.len() < FRAME_HEADER_LEN {
+        if tail.len() < LEN_FIELD {
             break;
         }
-        let Ok(plen) = frame_payload_len(&tail[..FRAME_HEADER_LEN]) else {
+        let Ok(size) = frame_size(&tail[..LEN_FIELD]) else {
             continue;
         };
-        if tail.len() < FRAME_HEADER_LEN + plen {
+        if tail.len() < size {
             continue;
         }
-        let payload = &tail[FRAME_HEADER_LEN..FRAME_HEADER_LEN + plen];
-        if check_crc(&tail[..FRAME_HEADER_LEN], payload).is_ok()
-            && payload_offset_ts(payload).0 >= min_offset
-        {
+        let raw = &tail[..size];
+        if check_crc(raw).is_ok() && frame_offset_ts(raw).0 >= min_offset {
             return Ok(true);
         }
     }

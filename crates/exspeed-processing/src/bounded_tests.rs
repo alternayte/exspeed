@@ -400,3 +400,80 @@ async fn timeout_and_memory_limit() {
     .unwrap_err();
     assert_eq!(e.code(), "RESOURCES_EXHAUSTED", "{e}");
 }
+
+#[tokio::test]
+async fn order_by_offset_honours_limit_and_offset() {
+    let (_s, r, _d) = setup(&amounts()).await;
+    for (sql, want) in [
+        ("SELECT offset FROM orders ORDER BY offset LIMIT 2", vec![0, 1]),
+        ("SELECT offset FROM orders ORDER BY offset ASC LIMIT 2", vec![0, 1]),
+        ("SELECT offset FROM orders ORDER BY offset LIMIT 2 OFFSET 1", vec![1, 2]),
+        ("SELECT offset FROM orders ORDER BY offset DESC LIMIT 2", vec![4, 3]),
+        ("SELECT offset FROM orders LIMIT 3", vec![0, 1, 2]),
+        (
+            "SELECT offset FROM (SELECT offset FROM orders ORDER BY offset LIMIT 2) t",
+            vec![0, 1],
+        ),
+        (
+            "SELECT offset, (SELECT COUNT(*) FROM orders) AS n FROM orders ORDER BY offset LIMIT 2",
+            vec![0, 1],
+        ),
+    ] {
+        let res = run(&r, sql).await.unwrap();
+        let got: Vec<_> = res.rows.iter().map(|r| r[0].as_u64().unwrap()).collect();
+        assert_eq!(got, want, "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn json_arrow_and_big_integers_compare_numerically() {
+    let (_s, r, _d) = setup(&amounts()).await;
+    // `->` (a JSON value) in a numeric context behaves like `->>`.
+    let res = run(
+        &r,
+        "SELECT offset FROM orders WHERE payload->'amount' > 250 ORDER BY offset",
+    )
+    .await
+    .unwrap();
+    assert_eq!(res.rows, vec![vec![json!(1)], vec![json!(3)]]);
+    let res = run(
+        &r,
+        "SELECT offset FROM orders WHERE payload->'amount' IS NOT NULL ORDER BY payload->'amount'",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        res.rows,
+        vec![vec![json!(2)], vec![json!(0)], vec![json!(1)], vec![json!(3)]]
+    );
+
+    // Integers above 2^53 compare exactly against integers.
+    let (_s, r, _d) = setup(&[
+        ("q", r#"{"qty": 9007199254740993}"#),
+        ("q", r#"{"qty": 9007199254740992}"#),
+        ("q", r#"{"qty": 1.5}"#),
+    ])
+    .await;
+    let res = run(
+        &r,
+        "SELECT offset FROM orders WHERE payload->>'qty' = 9007199254740992",
+    )
+    .await
+    .unwrap();
+    assert_eq!(res.rows, vec![vec![json!(1)]]);
+    let res = run(&r, "SELECT offset FROM orders WHERE payload->>'qty' < 2")
+        .await
+        .unwrap();
+    assert_eq!(res.rows, vec![vec![json!(2)]]);
+
+    // MIN/MAX are numeric; the text maximum is an explicit CAST away.
+    let (_s, r, _d) = setup(&amounts()).await;
+    let res = run(
+        &r,
+        "SELECT MAX(payload->>'amount'), MIN(payload->>'amount'), \
+         MAX(CAST(payload->>'region' AS VARCHAR)) FROM orders",
+    )
+    .await
+    .unwrap();
+    assert_eq!(res.rows, vec![vec![json!(1000.0), json!(25.5), json!("us")]]);
+}

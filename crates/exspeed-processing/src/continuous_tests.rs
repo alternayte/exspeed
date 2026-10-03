@@ -682,3 +682,114 @@ async fn legacy_query_files_are_imported_once() {
     assert_eq!(ids, vec!["old_0000cafe".to_string()]);
     node.stop().await;
 }
+
+#[tokio::test]
+async fn filter_coalesce_and_counts_in_continuous_aggregates() {
+    let w = World::new().await;
+    w.stream("ev").await;
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::start(&w, dir.path(), test_config()).await;
+    let win = qid(&node
+        .sql(
+            "CREATE STREAM wagg AS SELECT window_start, COUNT(*) AS n, COUNT(payload->>'v') AS nv, \
+             COUNT(DISTINCT payload->>'u') AS du, COUNT(*) FILTER (WHERE payload->>'w' > 150) AS big \
+             FROM ev TIMESTAMP BY payload->>'ts' WINDOW TUMBLING (SIZE 10 SECONDS) EMIT FINAL",
+        )
+        .await);
+    let tbl = qid(&node
+        .sql(
+            "CREATE TABLE byu AS SELECT payload->>'u' AS u, COALESCE(SUM(payload->>'missing'), 0) AS z, \
+             COUNT(*) FILTER (WHERE payload->>'w' > 150) AS big FROM ev GROUP BY payload->>'u'",
+        )
+        .await);
+    let co = qid(&node
+        .sql("CREATE STREAM c1 AS SELECT COALESCE(payload->>'v', 'none') AS v, NVL(payload->>'u', 'x') AS u FROM ev")
+        .await);
+    // Several micro-batches (one record each) exercise the FILTER path both
+    // with and without nulls in the mask.
+    for (u, v, wv, dt) in [
+        ("a", Some(1), 100, 1_000),
+        ("a", None, 200, 2_000),
+        ("b", Some(5), 300, 3_000),
+        ("b", Some(3), 400, 4_000),
+        ("c", Some(9), 1, 25_000),
+    ] {
+        let mut p = json!({"u": u, "w": wv, "ts": T0 + dt});
+        if let Some(v) = v {
+            p["v"] = json!(v);
+        }
+        w.publish("ev", None, "e", p).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    for id in [&win, &tbl, &co] {
+        node.wait_input(id, 5).await;
+        let q = node.engine.get_query(id).unwrap();
+        assert!(q.error.is_none(), "{id}: {:?}", q.error);
+    }
+    let out = w.payloads("wagg").await;
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert_eq!(out[0]["n"], json!(4));
+    assert_eq!(out[0]["nv"], json!(3));
+    assert_eq!(out[0]["du"], json!(2));
+    assert_eq!(out[0]["big"], json!(3));
+    let crate::engine::StatementResult::Rows(res) = node
+        .engine
+        .execute("SELECT u, z, big FROM byu ORDER BY u")
+        .await
+        .unwrap()
+    else {
+        panic!("expected rows")
+    };
+    assert_eq!(
+        res.rows,
+        vec![
+            vec![json!("a"), json!(0.0), json!(1)],
+            vec![json!("b"), json!(0.0), json!(2)],
+            vec![json!("c"), json!(0.0), json!(0)],
+        ]
+    );
+    let vs: Vec<Json> = w.payloads("c1").await.iter().map(|p| p["v"].clone()).collect();
+    assert_eq!(vs, vec![json!("1"), json!("none"), json!("5"), json!("3"), json!("9")]);
+    node.stop().await;
+}
+
+#[tokio::test]
+async fn extreme_event_times_neither_fail_nor_poison_the_watermark() {
+    let w = World::new().await;
+    w.stream("ev").await;
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::start(&w, dir.path(), test_config()).await;
+    let id = qid(&node
+        .sql(
+            "CREATE STREAM wx AS SELECT window_start, COUNT(*) AS n FROM ev TIMESTAMP BY payload->>'ts' \
+             WINDOW TUMBLING (SIZE 10 SECONDS) EMIT FINAL",
+        )
+        .await);
+    // Out-of-range event times fall back to the record timestamp (about
+    // now); the valid ones are in the near future, inside the allowed skew,
+    // so nothing is late.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let base = now - now.rem_euclid(10_000) + 20_000;
+    w.publish("ev", None, "e", json!({"ts": "9223372036854775807"})).await;
+    w.publish("ev", None, "e", json!({"ts": 4_102_444_800_000i64})).await; // year 2100
+    w.publish("ev", None, "e", json!({"ts": -5})).await;
+    w.publish("ev", None, "e", json!({"ts": base})).await;
+    w.publish("ev", None, "e", json!({"ts": base + 1_000})).await;
+    w.publish("ev", None, "e", json!({"ts": base + 20_000})).await;
+    node.wait_input(&id, 6).await;
+    let q = node.engine.get_query(&id).unwrap();
+    assert!(q.error.is_none(), "{:?}", q.error);
+    assert_eq!(q.stats["invalid_event_times"], json!(3), "{}", q.stats);
+    assert_eq!(q.stats["late_records_dropped"], json!(0), "{}", q.stats);
+    // The window at `base` closed with both of its records; the clamped
+    // ones landed in the window around now.
+    eventually("windows emitted", || async {
+        let out = w.payloads("wx").await;
+        out.iter().any(|p| p["n"] == json!(2)) && out.iter().any(|p| p["n"] == json!(3))
+    })
+    .await;
+    node.stop().await;
+}

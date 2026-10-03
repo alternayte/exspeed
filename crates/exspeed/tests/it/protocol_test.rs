@@ -125,7 +125,11 @@ async fn publish_then_read_with_filter() {
     assert_eq!(first.key.as_deref(), Some(&b"k1"[..]));
     assert_eq!(first.value.as_ref(), b"a");
     assert!(first.headers.contains(&("h".to_string(), "1".to_string())));
-    assert!(first.timestamp_ms > 1_600_000_000_000, "timestamp is in ms");
+    assert!(
+        first.timestamp_ns > 1_600_000_000_000_000_000,
+        "timestamp is in ns"
+    );
+    assert_eq!(first.timestamp_ms(), first.timestamp_ns / 1_000_000);
 
     let placed = c
         .read("orders", 0, 100, Duration::ZERO, "orders.placed")

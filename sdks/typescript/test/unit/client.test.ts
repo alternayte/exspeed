@@ -5,7 +5,7 @@ import { FakeServer } from "./fake-server.js";
 
 const rec = (offset: number, value = `v${offset}`): WireRecord => ({
   offset,
-  timestampMs: 1_700_000_000_000 + offset,
+  timestampNs: 1_700_000_000_000_000_000n + BigInt(offset),
   deliveryCount: 1,
   subject: "orders.placed",
   key: null,
