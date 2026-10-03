@@ -162,3 +162,57 @@ async fn resign_releases_lease_before_ttl() {
     let b = ClusterLeadership::start(lease.clone(), metrics(), ob, None);
     wait_for(|| b.is_currently_leader(), "b takes over before the TTL").await;
 }
+
+#[tokio::test]
+async fn step_down_releases_the_lease_and_holds_off() {
+    let lease = MemoryLeaseBackend::new();
+    let rec = Arc::new(Recorder::default());
+    // a's lease TTL is long: b can only take over within the test's wait if
+    // a released the lease instead of letting it expire.
+    let mut oa = opts("a");
+    oa.ttl = Duration::from_secs(60);
+    let a = ClusterLeadership::start(
+        lease.clone(),
+        metrics(),
+        oa,
+        Some(rec.clone() as Arc<dyn RoleHooks>),
+    );
+    wait_for(|| a.is_currently_leader(), "a leads").await;
+    let b = ClusterLeadership::start(lease.clone(), metrics(), opts("b"), None);
+    let token = a.current_child_token().await;
+    let ea = a.epoch();
+
+    a.step_down(Duration::from_secs(2)).await;
+    assert!(!a.is_currently_leader(), "writes close at once");
+    assert!(token.is_cancelled(), "leader work is cancelled");
+    assert_eq!(a.epoch(), 0);
+    wait_for(|| b.is_currently_leader(), "b takes over").await;
+    assert!(b.epoch() > ea);
+    let events = rec.0.lock().clone();
+    assert!(
+        events.ends_with(&["demoted".to_string(), "follow".to_string()]),
+        "a goes back to following: {events:?}"
+    );
+
+    // Once b goes away, a competes again (after its hold-off).
+    b.resign().await;
+    wait_for(|| a.is_currently_leader(), "a leads again").await;
+}
+
+#[tokio::test]
+async fn single_node_step_down_retries_after_the_hold_off() {
+    let lease = MemoryLeaseBackend::new();
+    let a = ClusterLeadership::start(lease.clone(), metrics(), opts("a"), None);
+    wait_for(|| a.is_currently_leader(), "a leads").await;
+    let start = tokio::time::Instant::now();
+    a.step_down(Duration::from_millis(500)).await;
+    assert!(!a.is_currently_leader());
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(!a.is_currently_leader(), "holds off before competing again");
+    wait_for(|| a.is_currently_leader(), "a re-acquires").await;
+    assert!(start.elapsed() >= Duration::from_millis(500));
+    // A no-op when not leading.
+    a.resign().await;
+    a.step_down(Duration::from_secs(1)).await;
+    assert!(!a.is_currently_leader());
+}

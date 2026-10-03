@@ -73,6 +73,14 @@ pub struct ServerArgs {
     pub log_level: Option<String>,
     /// The config file these settings came from, if any.
     pub config_file: Option<PathBuf>,
+    /// An already-bound client-protocol listener, used instead of binding
+    /// `bind`. Embedders and tests bind `127.0.0.1:0` themselves and pass
+    /// the listener, so there is no window between picking a free port and
+    /// binding it.
+    pub tcp_listener: Option<Arc<std::net::TcpListener>>,
+    /// An already-bound HTTP API listener, used instead of binding
+    /// `api_bind` (see `tcp_listener`).
+    pub api_listener: Option<Arc<std::net::TcpListener>>,
 }
 
 /// Multi-pod settings (`[cluster]`).
@@ -207,8 +215,32 @@ impl ServerArgs {
             log_format: None,
             log_level: None,
             config_file: None,
+            tcp_listener: None,
+            api_listener: None,
         }
     }
+}
+
+/// Use a pre-bound listener (a duplicate of its socket) or bind `addr`.
+fn std_listener(
+    prebound: Option<&Arc<std::net::TcpListener>>,
+    addr: &str,
+    what: &str,
+) -> Result<std::net::TcpListener> {
+    let l = match prebound {
+        Some(l) => l
+            .try_clone()
+            .with_context(|| format!("failed to use the pre-bound {what} listener"))?,
+        None => {
+            let a: SocketAddr = addr
+                .parse()
+                .with_context(|| format!("{what} address `{addr}` is not host:port"))?;
+            std::net::TcpListener::bind(a)
+                .with_context(|| format!("failed to bind the {what} listener on {a}"))?
+        }
+    };
+    l.set_nonblocking(true)?;
+    Ok(l)
 }
 
 pub async fn run(args: ServerArgs) -> Result<()> {
@@ -329,6 +361,19 @@ where
     // process exits) so an embedded server can be restarted in-process.
     let _data_dir_lock = crate::cli::server_lock::acquire_data_dir_lock(&args.data_dir)?;
 
+    // Bind both listeners before anything else starts, so a port conflict
+    // fails startup with an error instead of leaving a server without an
+    // API (or without its client port). Connections queue in the backlog
+    // until the server is ready to accept them.
+    let listener = TcpListener::from_std(std_listener(
+        args.tcp_listener.as_ref(),
+        &args.bind,
+        "client (TCP)",
+    )?)?;
+    let api_listener = std_listener(args.api_listener.as_ref(), &args.api_bind, "HTTP API")?;
+    let tcp_addr = listener.local_addr()?;
+    let api_addr = api_listener.local_addr()?;
+
     // Build storage sync mode from CLI args.
     let storage_sync_mode = match args.storage_sync {
         StorageSyncArg::Sync => exspeed_storage::file::StorageSyncMode::Sync,
@@ -444,9 +489,7 @@ where
         None => None,
     };
     let client_advertise: Option<String> = args.cluster.client_advertise.clone().or_else(|| {
-        args.bind
-            .parse::<SocketAddr>()
-            .ok()
+        Some(tcp_addr)
             .filter(|a| !a.ip().is_unspecified() && a.port() != 0)
             .map(|a| a.to_string())
     });
@@ -551,8 +594,8 @@ where
         lease = %args.cluster.lease,
         node_id = %node_id,
         role = role,
-        bind = %args.bind,
-        api_bind = %args.api_bind,
+        bind = %tcp_addr,
+        api_bind = %api_addr,
         replication_endpoint = ?replication_advertise,
         client_endpoint = ?client_advertise,
         acks = %args.cluster.acks,
@@ -616,9 +659,12 @@ where
     // Ensure connectors.d directory exists
     let _ = std::fs::create_dir_all(args.data_dir.join("connectors.d"));
 
-    // Load persisted + TOML connector configs on startup
+    // Load persisted + TOML connector configs on startup. Failing to read
+    // the catalog is fatal: running without the configured connectors would
+    // silently stop their data flow.
     if let Err(e) = connector_manager.load_all().await {
-        warn!("failed to load connector configs: {}", e);
+        abort_startup(&cancel_token, &leadership, cluster.as_ref(), &file_storage).await;
+        anyhow::bail!("failed to load connector configs: {e}");
     }
 
     // Spawn TOML file watcher for hot-reload of connectors.d/
@@ -640,9 +686,10 @@ where
         .map_err(|e| anyhow::anyhow!("ExQL engine: {e}"))?,
     );
     if let Err(e) = exql.load().await {
-        warn!("ExQL load: {e}");
+        abort_startup(&cancel_token, &leadership, cluster.as_ref(), &file_storage).await;
+        anyhow::bail!("failed to load the ExQL catalog: {e}");
     }
-    // resume_all_and_run(token) is called by the leader supervisor (Task 9).
+    // resume_all_and_run(token) is called by the leader supervisor.
 
     // Clone before moving into AppState so the leader supervisor can capture them.
     let connector_manager_for_supervisor = connector_manager.clone();
@@ -651,8 +698,9 @@ where
     let exql_for_tcp = exql.clone();
     let exql_for_shutdown = exql.clone();
 
-    // Readiness flag, flipped to true after the HTTP API server is spawned.
-    // Until then, /readyz returns 503 with {"status":"starting"}.
+    // Readiness flag, flipped to true once both listeners are bound and the
+    // HTTP API is serving. Until then, /readyz returns 503 with
+    // {"status":"starting"}.
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Create shared AppState. `cluster` lights up `GET /api/v1/cluster`.
@@ -692,6 +740,9 @@ where
         // so leader work stops in order and persists its state.
         supervisor_handle = tokio::spawn(async move {
             let mut is_leader_rx = leadership_sup.is_leader.clone();
+            // Consecutive tenures whose leader work failed to start; grows
+            // the hold-off before this node competes for the lease again.
+            let mut failed_tenures: u32 = 0;
             loop {
                 tokio::select! {
                     biased;
@@ -712,20 +763,38 @@ where
                 // `__exql_connections`, `__connectors`); reload them for
                 // this tenure, since a promoted follower's copy changed
                 // after startup.
-                if let Err(e) = exql_sup.load().await {
-                    error!(error = %e, "failed to reload the ExQL catalog; resigning tenure");
-                    token.cancel();
-                }
-                if let Err(e) = connector_manager_sup.reload_api_configs().await {
-                    error!(error = %e, "failed to reload the connector catalog; resigning tenure");
-                    token.cancel();
-                }
                 // Consumers run only on the leader; they restore their state
                 // from `__consumers` and stop when the token is cancelled.
-                if let Err(e) = consumers_sup.start(token.clone()).await {
-                    error!(error = %e, "failed to start consumers; resigning tenure");
-                    token.cancel();
+                let started: Result<(), String> = async {
+                    exql_sup
+                        .load()
+                        .await
+                        .map_err(|e| format!("failed to reload the ExQL catalog: {e}"))?;
+                    connector_manager_sup
+                        .reload_api_configs()
+                        .await
+                        .map_err(|e| format!("failed to reload the connector catalog: {e}"))?;
+                    consumers_sup
+                        .start(token.clone())
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| format!("failed to start consumers: {e}"))
                 }
+                .await;
+                if let Err(e) = started {
+                    // Leading without the leader's work (consumers,
+                    // connectors, queries) would keep writes open with
+                    // nothing delivering. Give up the tenure for real:
+                    // release the lease so a healthy peer can lead, and
+                    // compete again after a growing hold-off.
+                    failed_tenures = failed_tenures.saturating_add(1);
+                    let hold_off = std::time::Duration::from_secs(1u64 << failed_tenures.min(5));
+                    error!(error = %e, ?hold_off, "leader work did not start; stepping down");
+                    token.cancel();
+                    leadership_sup.step_down(hold_off).await;
+                    continue;
+                }
+                failed_tenures = 0;
 
                 tokio::select! {
                     _ = connector_manager_sup.run_all(token.clone()) => {}
@@ -767,39 +836,40 @@ where
         });
     }
 
-    // Spawn HTTP API server
-    let api_addr: SocketAddr = args.api_bind.parse()?;
-    let http_tls = tls_paths.clone();
-
-    // Mark ready: all eager startup work (storage open, broker.load_consumers,
-    // connector load, ExQL load) completed above; the API task is about to
-    // run. /readyz now performs the per-request data_dir writability check
-    // on top of this gate.
-    ready.store(true, std::sync::atomic::Ordering::Release);
-
+    // Load the TLS configs (TCP and HTTP) before reporting ready, so bad
+    // certificate files fail startup.
+    let drain_deadline = std::time::Duration::from_secs(args.drain_timeout_secs);
+    let tls_config = match &tls_paths {
+        Some(paths) => match crate::cli::server_tls::load_tls_config(&paths.cert, &paths.key) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                abort_startup(&cancel_token, &leadership, cluster.as_ref(), &file_storage).await;
+                return Err(e);
+            }
+        },
+        None => None,
+    };
+    let http = match exspeed_api::HttpServer::new(state, api_listener, tls_paths.clone()).await {
+        Ok(h) => h,
+        Err(e) => {
+            abort_startup(&cancel_token, &leadership, cluster.as_ref(), &file_storage).await;
+            return Err(anyhow::Error::new(e).context("failed to start the HTTP API"));
+        }
+    };
     let api_cancel = cancel_token.clone();
-    tokio::spawn(async move {
+    let http_handle = tokio::spawn(async move {
         let shutdown = async move { api_cancel.cancelled().await };
-        if let Err(e) = exspeed_api::serve_with_shutdown(state, api_addr, http_tls, shutdown).await
-        {
+        if let Err(e) = http.serve_with_shutdown(shutdown, drain_deadline).await {
             error!("HTTP API exited: {}", e);
         }
     });
-
-    // Load TLS config if enabled.
-    let tls_config = match &tls_paths {
-        Some(paths) => Some(crate::cli::server_tls::load_tls_config(
-            &paths.cert,
-            &paths.key,
-        )?),
-        None => None,
-    };
-
-    // TCP server
-    let tcp_addr: SocketAddr = args.bind.parse()?;
-    let listener = TcpListener::bind(tcp_addr).await?;
     info!("exspeed TCP listening on {}", tcp_addr);
     info!("exspeed HTTP API listening on {}", api_addr);
+
+    // Mark ready: storage is open, the catalogs are loaded and both
+    // listeners are bound and served. /readyz adds its per-request checks
+    // (dedup rebuild, data_dir writability, failed partitions) on top.
+    ready.store(true, std::sync::atomic::Ordering::Release);
 
     // Bound concurrent connections. Each accepted connection holds one permit
     // for its lifetime; the OS-level accept queue absorbs short bursts.
@@ -888,10 +958,11 @@ where
         }
     }
 
-    // Drain: wait for active connections to finish, up to 10 seconds. Each
-    // connection holds one semaphore permit for its lifetime; when permits
-    // return to `max_conns` available, all connection tasks have exited.
-    let drain_deadline = std::time::Duration::from_secs(args.drain_timeout_secs);
+    // Drain: wait for active connections to finish, up to
+    // `drain_timeout_secs`. Each connection holds one semaphore permit for
+    // its lifetime; when permits return to `max_conns` available, all
+    // connection tasks have exited. The HTTP API drains in parallel with the
+    // same budget (it watches the same cancel token).
     let drain_start = std::time::Instant::now();
     let active_at_start = max_conns - conn_sem.available_permits();
     info!(
@@ -950,6 +1021,19 @@ where
     }
     let _ = tokio::time::timeout(std::time::Duration::from_secs(10), supervisor_handle).await;
 
+    // The HTTP API stopped accepting at the cancel and has had the drain
+    // budget for in-flight requests; wait for it (bounded) so no handler
+    // runs against storage after it is closed.
+    if tokio::time::timeout(
+        drain_deadline + std::time::Duration::from_secs(1),
+        http_handle,
+    )
+    .await
+    .is_err()
+    {
+        warn!("HTTP API did not stop within the drain timeout");
+    }
+
     // Final dedup snapshot (taken by the snapshot task on cancel).
     if let Some(h) = snapshot_handle {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(10), h).await;
@@ -963,4 +1047,22 @@ where
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     info!("server stopped");
     Ok(())
+}
+
+/// Undo the parts of startup that already run when a later step fails, so
+/// `run_with_shutdown` can return the error with the lease released and
+/// storage closed (and an embedder can retry on the same data dir).
+async fn abort_startup(
+    cancel: &CancellationToken,
+    leadership: &exspeed_broker::leadership::ClusterLeadership,
+    cluster: Option<&Arc<exspeed_broker::cluster::Cluster>>,
+    storage: &Arc<FileStorage>,
+) {
+    cancel.cancel();
+    leadership.resign().await;
+    if let Some(c) = cluster {
+        c.shutdown().await;
+    }
+    let s = storage.clone();
+    let _ = tokio::task::spawn_blocking(move || s.close()).await;
 }
