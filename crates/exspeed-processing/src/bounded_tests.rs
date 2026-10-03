@@ -370,6 +370,9 @@ async fn external_postgres_join() {
         .execute(&pool)
         .await
         .unwrap();
+    // Column lists are cached with the snapshot TTL; a schema change is
+    // seen after it expires or when the connection is re-registered.
+    r.external.invalidate("wh");
     let res = run(
         &r,
         "SELECT name, rate FROM wh.exql_regions WHERE code = 'eu' AND \"we\"\"ird\" >= 1",

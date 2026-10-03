@@ -19,8 +19,6 @@ use exspeed_streams::StorageEngine;
 
 use crate::session::{self, SessionContext};
 
-/// A TLS handshake must finish within this time or the socket is dropped.
-
 /// Default cluster-replication bind address. Matches the advertised default
 /// in the replication design doc and the Plan G Wave 5 contract.
 const DEFAULT_CLUSTER_BIND: &str = "0.0.0.0:5934";
