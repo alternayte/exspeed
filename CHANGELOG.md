@@ -5,6 +5,73 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+The rebuild from [docs/REVIEW.md](docs/REVIEW.md). Breaking changes
+throughout. Nothing is compatible with 0.5.x: wire protocol, on-disk format,
+connector config and SDK API all change.
+
+### Storage (Phase 1)
+
+- New file engine: a writer thread per partition with group commit, readers
+  that take no locks, a high watermark (readers only see durable data),
+  sparse offset/time indexes, and fencing on write/fsync errors. Sidecars and
+  truncation are crash-safe.
+- Compaction (`compaction = true` per stream): keeps the latest record per
+  key; tombstones delete keys.
+- Removed: bloom filters, secondary indexes (`.sidx`), S3 tiering and its
+  `EXSPEED_STORAGE_S3_*` variables. The segment format is now version 2, and
+  old data dirs are refused.
+
+### Consumers and client protocol v2 (Phase 2)
+
+- New binary protocol ([docs/protocol.md](docs/protocol.md)), version byte 2.
+  It adds out-of-order replies, fire-and-forget acks and credits,
+  `SubscriptionEnded` pushes, JSON admin replies, structured errors with
+  details, and handshake and idle timeouts.
+- JetStream-style consumers:
+  - push (credit-based) and pull delivery
+  - `ack`, `nack(delay)`, `term`, `in_progress`
+  - `ack_wait`, `max_deliver`, `backoff`, `max_ack_pending`, DLQ with
+    provenance headers
+  - work sharing between any number of subscribers on one consumer, across
+    connections and app instances
+  - immediate redelivery when a subscriber goes away
+  - ephemeral consumers
+- Consumer state lives in the compacted internal stream `__consumers`.
+  Streams named `__*` are internal.
+- Removed: consumer groups, the file/Postgres/Redis/S3 consumer stores, the
+  work coordinators, `Fetch`/`Seek`/`Record` opcodes, `--delivery-buffer`.
+- HTTP: `POST /api/v1/consumers`, `POST /api/v1/consumers/{name}/seek`,
+  `GET /api/v1/streams/{name}/records`, and `compaction` on stream creation.
+- `EXSPEED_LEASE_BACKEND=postgres|redis` selects multi-pod mode.
+  `EXSPEED_CONSUMER_STORE` is a deprecated alias.
+- New Rust client crate `exspeed-client`, with a coalescing publisher.
+  `exspeed tail` no longer goes through SQL.
+
+### Connectors v2 (Phase 5)
+
+- A supervisor per connector (starting/running/backoff/failed/stopped):
+  restarts with backoff, catches panics, and reports status, last error,
+  restart count, lag and last success over HTTP and in metrics.
+- Uniform checkpoint protocol: source checkpoints are saved only after the
+  append is durable; sink offsets are committed only after `flush()`.
+- Typed per-plugin settings that reject unknown keys and accept native TOML
+  types. Errors are classified as transient, poison or fatal.
+- Connector offsets are stored in the internal `__connector_offsets` stream
+  by default (`EXSPEED_CONNECTOR_OFFSET_STORE=log|file`). The Postgres, Redis
+  and S3 offset stores are removed.
+- Config changes:
+  - `postgres` is split into `postgres_cdc` and `postgres_poll`.
+  - `dlq_stream` moves to `[connector]`.
+  - `http_webhook` needs an explicit `auth_type` (adds `hmac_sha256`).
+  - See [docs/connectors.md](docs/connectors.md).
+- Plugin fixes:
+  - CDC keys and envelope, TOAST columns, LSN feedback on idle
+  - poll ties, outbox id types, `mssql_cdc` cursor
+  - batched JDBC inserts, HTTP status taxonomy
+  - S3 sink idempotent object keys, RabbitMQ confirms
+
 ## [0.5.0] — 2026-04-24
 
 Indexing release. Queries on timestamp, key, and payload fields are now
