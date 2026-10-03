@@ -293,7 +293,7 @@ traffic and less tolerance for slow backends.
 | `GET /api/v1/cluster` (any node, admin) | node id, role, epoch, the leader's endpoints. On the leader: the ISR and each follower's lag and last fetch. On a follower: whether it is connected, its lag, and the last error |
 | `GET /api/v1/leases` (any node, admin) | the raw lease record |
 | `GET /healthz` | 200 on the leader only (with `leader_hint` otherwise) |
-| metrics | `exspeed_is_leader`, `exspeed_replication_role`, `exspeed_replication_lag_records`, `exspeed_replication_records_applied_total`, `exspeed_replication_truncated_records_total`, `exspeed_replication_bytes_total`, `exspeed_lease_*` |
+| metrics | `exspeed_is_leader`, `exspeed_replication_role`, `exspeed_replication_lag_records`, `exspeed_replication_records_applied_total`, `exspeed_replication_truncated_records_total`, `exspeed_replication_reseed_total`, `exspeed_replication_bytes_total`, `exspeed_replication_apply_errors_total`, `exspeed_replication_connect_attempts_total{result}`, `exspeed_lease_*` |
 
 ## How it is tested
 
