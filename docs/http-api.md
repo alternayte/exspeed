@@ -133,7 +133,7 @@ been removed.
 |--------|------|------|-------------|
 | `GET` | `/api/v1/connections` | | List connections |
 | `POST` | `/api/v1/connections` | `{"name", "driver", "url"}` | Register a connection (driver `postgres`). Bounded queries read its tables as `<name>.<table>` or `<name>.<schema>.<table>` |
-| `DELETE` | `/api/v1/connections/{name}` | | Remove a connection |
+| `DELETE` | `/api/v1/connections/{name}` | | Remove an API-created connection. `409` for connections defined in `connections.d/` or the environment |
 
 ### Identity and cluster
 

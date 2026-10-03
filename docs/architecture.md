@@ -98,13 +98,30 @@ Frames are capped at 16 MB.
       truncate.json                  only while a truncation is in progress
   streams/__consumers/               consumer state (internal compacted stream)
   streams/__connector_offsets/       connector offsets (internal compacted stream)
-  connectors.d/*.toml                connector configs (hot-reloaded)
-  connectors/                        API-created connector configs (JSON)
+  streams/__connectors/              API-created connector configs (internal compacted stream)
+  streams/__exql_queries/            continuous query definitions + desired state
+                                     (internal compacted stream; checkpoints live in
+                                     the stream __exql_ckpt_<id>)
+  streams/__exql_connections/        API-created ExQL connections (internal compacted stream)
+  connectors.d/*.toml                connector configs (hot-reloaded, operator-managed)
+  connections.d/*.toml               ExQL connections (operator-managed)
   connector-offsets/                 connector offsets (EXSPEED_CONNECTOR_OFFSET_STORE=file only;
                                      the default stores them in the __connector_offsets stream)
-  exql/queries/<id>.json             continuous query definitions + desired state
-                                     (checkpoints live in the stream __exql_ckpt_<id>)
+  connectors.migrated/               legacy files, kept after their one-time import
+  connections.migrated/                (older versions kept API definitions under
+  exql/queries.migrated/               connectors/, connections/ and exql/queries/)
 ```
+
+**Cluster metadata lives in the log.** Everything created through the API
+(consumers, connector configs and offsets, ExQL queries and connections) is
+stored as records in a compacted internal stream: the key is the object's
+id, the value its JSON definition, and a delete is a tombstone. These
+streams take the single write path, so only the leader can change them and
+they replicate like any other stream. Each leader tenure starts by reloading
+the catalogs from those streams, so a promoted follower runs exactly what
+the old leader had. Files under `connectors.d/` and `connections.d/` stay
+node-local on purpose: operators ship the same files to every pod. Dedup
+snapshots are node-local caches that can be rebuilt from the log.
 
 Segment files are named after their base offset and start with a 16-byte
 header (magic `EXSG`, format version 2). Older segment files are refused;

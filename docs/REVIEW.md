@@ -17,7 +17,7 @@
 | 3. Ops | 🚧 Done: `exspeed.toml` (defaults < file < env < flags, `exspeed config print-default/validate/show`, one `[cluster]` section), ordered shutdown (drain → connectors → queries → resign + lease release → consumer state → dedup snapshot → fsync), TLS/handshake/idle timeouts, Helm chart (config map, probes, ServiceMonitor), cargo-chef Docker build, `exspeed healthcheck`. Still to do: online backup/restore, OpenAPI, Linux benchmark refresh vs Kafka/NATS. |
 | 4. ExQL v2 | ✅ DataFusion bounded engine, continuous dataflow (event-time windows, joins, durable tables, checkpoints, effectively-once output), indexes removed, differential tests — see [exql.md](exql.md) |
 | 5. Connectors v2 | ✅ checkpoint protocol, supervisor, typed settings, error taxonomy, log-backed offsets, plugin fixes; PG CDC/outbox/poll tested against Postgres in CI. RabbitMQ/S3/MySQL/MSSQL service tests still to do |
-| 6. HA | — |
+| 6. HA | 🚧 Groundwork: all API-created cluster metadata (consumers, connector configs and offsets, ExQL queries and connections) lives in compacted internal streams (`__consumers`, `__connector_offsets`, `__connectors`, `__exql_queries`, `__exql_connections`) written through `Log`, reloaded at the start of every leader tenure; legacy files are imported once. Still to do: epoch-fenced log replication, `acks=quorum`, partition tests. |
 
 ## Contents
 

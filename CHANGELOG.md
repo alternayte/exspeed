@@ -72,6 +72,22 @@ connector config and SDK API all change.
   - batched JDBC inserts, HTTP status taxonomy
   - S3 sink idempotent object keys, RabbitMQ confirms
 
+### Cluster metadata in the log (Phase 6 groundwork)
+
+- ExQL query definitions, ExQL connections and API-created connector configs
+  move from node-local files into compacted internal streams written through
+  the single write path: `__exql_queries`, `__exql_connections` and
+  `__connectors` (key = id, value = JSON definition, delete = tombstone).
+  They replicate with the log, and writes are leader-only.
+- The catalogs are reloaded at the start of every leader tenure, so a
+  promoted follower runs the queries and connectors the old leader had.
+- Migration: on first start, the leader imports `exql/queries/*.json`,
+  `connections/*.json` and `connectors/*.json` into the streams and renames
+  those directories to `<dir>.migrated`.
+- Connections defined in `connections.d/` or the environment can no longer
+  be deleted through the API (`409`); unparseable `connections.d/` files are
+  logged instead of silently skipped.
+
 ## [0.5.0] — 2026-04-24
 
 Indexing release. Queries on timestamp, key, and payload fields are now
