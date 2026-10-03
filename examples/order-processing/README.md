@@ -27,7 +27,8 @@ flowchart LR
 ## Prerequisites
 
 - **Docker** and **Docker Compose**
-- **Bun** (https://bun.sh)
+- **Bun** (https://bun.sh), or Node.js 18 or later
+- The SDK built, since the example uses it from this repository: `npm ci && npm run build` in `sdks/typescript`
 
 ## Running
 
@@ -49,6 +50,12 @@ is registered as the ExQL connection `app-db`, which bounded queries can read
 ```bash
 bun install
 ```
+
+With Node.js, run `npm install` here, and below replace `bun run start`,
+`bun run consumer` and `bun run dashboard` with `npx tsx src/app.ts`,
+`npx tsx src/consumer.ts` and `npx tsx src/dashboard.ts`. The scripts connect to
+`localhost:5933` and `http://localhost:8080`; set `EXSPEED_HOST`, `EXSPEED_PORT`
+and `EXSPEED_URL` to change that, and `PORT` to move the API off port 3000.
 
 ### 3. Start the API server
 
@@ -104,9 +111,9 @@ bun run dashboard
 ```
 
 This creates the materialized table `order_stats` (order count and revenue
-per region) through `POST /api/v1/views`, reads it back with
-`GET /api/v1/views/order_stats`, and runs an ad-hoc ExQL query that counts
-orders by region.
+per region) through `POST /api/v1/views` unless it already exists, reads it
+back with `GET /api/v1/views/order_stats`, and runs an ad-hoc ExQL query that
+counts orders by region through the SDK's `query()`.
 
 ## Connectors
 

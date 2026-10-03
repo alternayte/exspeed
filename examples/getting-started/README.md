@@ -1,11 +1,12 @@
 # Getting Started: Crypto Price Tracker
 
-A minimal example showing Exspeed in action. It reads and subscribes to a stream of cryptocurrency prices.
+A minimal example showing Exspeed in action. It publishes to, reads and subscribes to a stream of cryptocurrency prices.
 
 ## Prerequisites
 
 - **Exspeed server** running on `localhost:5933`, for example with `docker compose up -d` in this directory (it builds the server image from the repository root)
-- **Bun** installed (https://bun.sh)
+- **Bun** installed (https://bun.sh), or Node.js 18 or later
+- The SDK built, since the example uses it from this repository: `npm ci && npm run build` in `sdks/typescript`
 
 ## Quick Start
 
@@ -14,15 +15,18 @@ bun install
 bun run start
 ```
 
+With Node.js: `npm install && npx tsx index.ts`. Set `EXSPEED_HOST` / `EXSPEED_PORT` to use a server elsewhere.
+
 ## What It Does
 
 `index.ts`:
 
 1. Connects to the Exspeed server on `localhost:5933`
 2. Creates the `crypto-prices` stream
-3. Reads up to 10 records from the start of the stream and prints them (a manual sample publish is included, commented out)
-4. Creates the durable consumer `price-watcher` on the stream
-5. Subscribes and prints each record as it arrives, acknowledging it
+3. Publishes a sample price record
+4. Reads up to 10 records from the start of the stream and prints them
+5. Creates the durable consumer `price-watcher` on the stream
+6. Subscribes and prints each record as it arrives, acknowledging it
 
 ## Live Data with the HTTP Poller Connector
 

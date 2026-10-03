@@ -1,21 +1,25 @@
 import { ExspeedClient } from "@exspeed/sdk";
 
-const client = new ExspeedClient({
+// Override the address with EXSPEED_HOST / EXSPEED_PORT
+const client = await ExspeedClient.connect({
   clientId: "order-processor",
-  host: "localhost",
-  port: 5933,
+  host: process.env.EXSPEED_HOST ?? "localhost",
+  port: Number(process.env.EXSPEED_PORT ?? 5933),
 });
-await client.connect();
 console.log("Connected to Exspeed");
 
-// Create a consumer that reads all order events from the beginning
+// The API server creates the stream too; this lets the worker start first (idempotent)
+await client.createStream("order-events");
+
+// A durable consumer that reads all order events from the beginning
+// (idempotent: a restarted worker resumes where it left off)
 await client.createConsumer({
   name: "order-processor",
   stream: "order-events",
-  subjectFilter: "order.>",
-  startFrom: "earliest",
+  filterSubjects: ["order.>"],
+  deliver: "all",
 });
-console.log("Consumer 'order-processor' created");
+console.log("Consumer 'order-processor' ready");
 
 // Subscribe to receive messages
 const sub = await client.subscribe("order-processor");
@@ -32,9 +36,9 @@ for await (const msg of sub) {
   }>();
 
   console.log(
-    `[${msg.subject}] Order ${order.order_id} | customer=${order.customer_id} | $${order.total} | ${order.region}`
+    `[${msg.subject}] Order ${order.order_id} | customer=${order.customer_id} | $${order.total} | ${order.region}`,
   );
 
   // In a real app you would update the database, send notifications, etc.
-  await msg.ack();
+  msg.ack();
 }

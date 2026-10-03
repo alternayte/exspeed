@@ -152,6 +152,11 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+      - name: Typecheck the examples against the SDK
+        run: |
+          for ex in getting-started order-processing; do
+            (cd "../../examples/$ex" && npm install --no-audit --no-fund && npx tsc --noEmit)
+          done
 
   helm:
     name: Helm chart
