@@ -17,7 +17,7 @@ use crate::state::AppState;
 ///   authenticated router.
 /// - Multi-pod mode gated here: if this pod has no attached
 ///   `ReplicationCoordinator` (the Wave 5 startup wiring only builds
-///   one when `EXSPEED_CONSUMER_STORE=postgres|redis`), we return 503
+///   one when `EXSPEED_LEASE_BACKEND=postgres|redis`), we return 503
 ///   with a hint pointing at the env var. A single-pod pod has nothing
 ///   meaningful to return; 503 makes the "you probably wanted to turn
 ///   replication on" signal explicit.
@@ -28,13 +28,13 @@ use crate::state::AppState;
 pub async fn list_followers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let Some(coord) = state.replication_coordinator.as_ref() else {
         // Deliberately verbose: the 503 here almost always means "the
-        // operator started the pod without setting EXSPEED_CONSUMER_STORE"
+        // operator started the pod without setting EXSPEED_LEASE_BACKEND"
         // and pointing at the fix inline saves one round-trip to docs.
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({
                 "error": "not a multi-pod deployment",
-                "hint": "set EXSPEED_CONSUMER_STORE=postgres|redis to enable replication",
+                "hint": "set EXSPEED_LEASE_BACKEND=postgres|redis to enable replication",
             })),
         )
             .into_response();

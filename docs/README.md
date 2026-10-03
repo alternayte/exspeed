@@ -5,7 +5,7 @@
 | Page | What it covers |
 |------|----------------|
 | [Getting started](getting-started.md) | Install, run, and publish, tail and query your first stream |
-| [Concepts](concepts.md) | Streams, records, subjects, consumers, groups, retention |
+| [Concepts](concepts.md) | Streams, records, subjects, consumers, work sharing, retention |
 
 ## Using Exspeed
 
@@ -17,6 +17,8 @@
 | [Connectors](connectors.md) | Source and sink plugins, config format, retry and DLQ |
 | [Idempotent publish](idempotent-publish.md) | `msg_id` dedup semantics, sizing, alerts |
 | [TypeScript SDK](../sdks/typescript/README.md) | `@exspeed/sdk` |
+| [Rust client](../crates/exspeed-client) | `exspeed-client` crate |
+| [Client protocol](protocol.md) | Binary protocol v2 reference for SDK authors |
 
 ## Running Exspeed
 

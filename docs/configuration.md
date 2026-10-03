@@ -35,7 +35,6 @@ Every flag that has an env var can be set either way.
 | `--storage-flush-threshold-bytes` | `EXSPEED_FLUSH_THRESHOLD_BYTES` | `1048576` | Flush early at this many bytes |
 | `--storage-sync-interval-ms` | `EXSPEED_SYNC_INTERVAL_MS` | `10` | Fsync interval in `async` mode |
 | `--storage-sync-bytes` | `EXSPEED_SYNC_BYTES` | `4194304` | In `async` mode, fsync early once this many bytes are unsynced (`0` = timer only) |
-| `--delivery-buffer` | `EXSPEED_DELIVERY_BUFFER` | `8192` | *No effect yet* |
 
 With `--storage-sync=async`, a crash can lose up to
 `--storage-sync-interval-ms` (or `--storage-sync-bytes`) of acknowledged
@@ -57,19 +56,21 @@ marks the stream failed (read-only until restart).
 
 Single-node defaults are file-based. See [high-availability.md](high-availability.md).
 
-**Backend selection** (each takes `file`, `postgres` or `redis`; offsets also accept `s3` and `stream`):
+**Backend selection:**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `EXSPEED_CONSUMER_STORE` | `file` | Where consumer configs and offsets are stored. Also accepts `s3`. Falls back to `EXSPEED_OFFSET_STORE`. |
-| `EXSPEED_OFFSET_STORE` | `file` | Where connector offsets are stored |
-| — | — | The lease and the group work-coordinator backends follow the consumer store |
+| `EXSPEED_LEASE_BACKEND` | none | `postgres` or `redis` turns on multi-pod mode: one pod holds the cluster lease and serves writes, the others follow. Unset = single node. (`EXSPEED_CONSUMER_STORE` is accepted as a deprecated alias.) |
+| `EXSPEED_OFFSET_STORE` | `file` | Where connector offsets are stored (`file`, `postgres`, `redis`, `s3`, `stream`) |
+
+Consumer state needs no backend: it lives in the internal `__consumers`
+stream.
 
 **Postgres:**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `EXSPEED_OFFSET_STORE_POSTGRES_URL` | — | Postgres URL. Every Postgres-backed component uses it. |
+| `EXSPEED_OFFSET_STORE_POSTGRES_URL` | — | Postgres URL, used by the Postgres lease and offset store |
 | `EXSPEED_OFFSET_STORE_POSTGRES_SCHEMA` | `public` | |
 | `EXSPEED_OFFSET_STORE_POSTGRES_TABLE` | `exspeed_offsets` | Connector offset table |
 
@@ -77,13 +78,11 @@ Single-node defaults are file-based. See [high-availability.md](high-availabilit
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `EXSPEED_OFFSET_STORE_REDIS_URL` | — | Redis URL. Every Redis-backed component uses it. |
-| `EXSPEED_CONSUMER_STORE_REDIS_KEY_PREFIX` | `exspeed:consumers:` | |
+| `EXSPEED_OFFSET_STORE_REDIS_URL` | — | Redis URL, used by the Redis lease and offset store |
 | `EXSPEED_OFFSET_STORE_REDIS_KEY_PREFIX` | `exspeed:offsets:` | |
 | `EXSPEED_LEASE_REDIS_KEY_PREFIX` | `exspeed:lease:` | |
-| `EXSPEED_WORK_COORDINATOR_REDIS_KEY_PREFIX` | `exspeed:coord:` | |
 
-**S3:**
+**S3 (connector offsets):**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -93,7 +92,6 @@ Single-node defaults are file-based. See [high-availability.md](high-availabilit
 | `EXSPEED_OFFSET_STORE_S3_ACCESS_KEY` | — | |
 | `EXSPEED_OFFSET_STORE_S3_SECRET_KEY` | — | |
 | `EXSPEED_OFFSET_STORE_S3_PREFIX` | `exspeed/offsets/` | |
-| `EXSPEED_CONSUMER_STORE_S3_PREFIX` | `exspeed/consumers/` | |
 
 **Lease and replication:**
 

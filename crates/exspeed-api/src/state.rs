@@ -45,7 +45,7 @@ pub struct AppState {
     pub data_dir: PathBuf,
     /// Leader-side replication fan-out coordinator. `Some(_)` only when
     /// this pod was started in multi-pod mode
-    /// (`EXSPEED_CONSUMER_STORE=postgres|redis`); `None` on single-pod
+    /// (`EXSPEED_LEASE_BACKEND=postgres|redis`); `None` on single-pod
     /// deployments. `GET /api/v1/cluster/followers` gates on presence
     /// and returns 503 when absent.
     pub replication_coordinator: Option<Arc<ReplicationCoordinator>>,

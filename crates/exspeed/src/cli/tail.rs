@@ -2,6 +2,7 @@ use crate::cli::client::CliClient;
 use crate::cli::format;
 use anyhow::Result;
 
+/// Follow a stream through `GET /api/v1/streams/{name}/records`.
 pub async fn run(
     client: &CliClient,
     stream: &str,
@@ -11,80 +12,66 @@ pub async fn run(
     from_beginning: bool,
     json_output: bool,
 ) -> Result<()> {
-    // Get current head offset
     let info = client.get(&format!("/api/v1/streams/{stream}")).await?;
     let head = info
         .get("head_offset")
-        .and_then(|v| v.as_i64())
+        .and_then(|v| v.as_u64())
         .unwrap_or(0);
-
-    let mut current_offset: i64 = if from_beginning {
+    let mut from: u64 = if from_beginning {
         0
     } else if let Some(n) = last {
-        (head - n as i64).max(0)
+        head.saturating_sub(n as u64)
     } else {
-        head // start from latest
+        head
     };
-
-    // Subject filter for SQL WHERE clause
-    let subject_clause = subject
-        .map(|s| format!(" AND subject_matches(subject, '{}')", s))
-        .unwrap_or_default();
+    let filter = subject.unwrap_or("");
 
     loop {
-        let sql = format!(
-            "SELECT offset, timestamp, subject, key, payload FROM \"{}\" WHERE offset >= {}{} ORDER BY offset LIMIT 100",
-            stream, current_offset, subject_clause
+        let path = format!(
+            "/api/v1/streams/{stream}/records?from={from}&limit=500&filter={}",
+            encode_query(filter)
         );
-
-        let body = serde_json::json!({"sql": sql});
-        let (status, result) = client.post("/api/v1/queries", &body).await?;
-
-        if status != 200 {
-            let msg = result
-                .get("error")
-                .and_then(|e| e.as_str())
-                .unwrap_or("query failed");
-            anyhow::bail!("Tail error: {}", msg);
-        }
-
-        let columns = result.get("columns").and_then(|c| c.as_array());
-        let rows = result.get("rows").and_then(|r| r.as_array());
-
-        if let (Some(cols), Some(rows)) = (columns, rows) {
-            for row_arr in rows {
-                if let Some(cells) = row_arr.as_array() {
-                    // Build a record object from columns + cells
-                    let mut record = serde_json::Map::new();
-                    for (i, col) in cols.iter().enumerate() {
-                        if let (Some(col_name), Some(val)) = (col.as_str(), cells.get(i)) {
-                            record.insert(col_name.to_string(), val.clone());
-                        }
-                    }
-                    let record_json = serde_json::Value::Object(record);
-
-                    if json_output {
-                        println!("{}", serde_json::to_string(&record_json)?);
-                    } else {
-                        println!("{}", format::format_tail_line(&record_json));
-                    }
-
-                    // Advance offset
-                    if let Some(offset) = cells.first().and_then(|v| v.as_i64()) {
-                        current_offset = offset + 1;
-                    }
-                }
+        let page = client.get(&path).await?;
+        let records = page["records"].as_array().cloned().unwrap_or_default();
+        for r in &records {
+            if json_output {
+                println!("{}", serde_json::to_string(r)?);
+            } else {
+                println!("{}", format::format_tail_line(r));
             }
         }
-
-        // Exit conditions
-        if no_follow {
-            break;
+        let next = page["next_offset"].as_u64().unwrap_or(from);
+        let caught_up = next >= page["high_watermark"].as_u64().unwrap_or(next);
+        from = next;
+        if caught_up {
+            if no_follow {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
-
-        // Sleep before next poll
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
-
     Ok(())
+}
+
+/// Percent-encode a query-string value (subject filters contain `>`/`*`).
+fn encode_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn encodes_wildcards() {
+        assert_eq!(super::encode_query("orders.>"), "orders.%3E");
+        assert_eq!(super::encode_query("a.*"), "a.%2A");
+    }
 }

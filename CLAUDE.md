@@ -98,22 +98,21 @@ exspeed                 Binary: CLI + server orchestration (TCP accept loop + HT
 ### Key Architectural Patterns
 
 - **StorageEngine trait** (`exspeed-streams`): async trait with `append`, `read`, `seek_by_time`, `create_stream`, etc. FileStorage is the real impl; MemoryStorage exists for tests.
-- **Wire protocol**: 10-byte frame header `[Version(1)][OpCode(1)][CorrelID(4)][PayloadLen(4)]`. Correlation IDs match request/response; push-delivered records use CorrelID 0. CRC32C framing on stored records.
+- **Single write path**: every writer (TCP, HTTP, webhooks, connectors, ExQL, consumer state, DLQ) appends through `exspeed_broker::log::Log` (leader gate → validation → dedup → storage → replication feed → metrics). Never call `StorageEngine::append` directly.
+- **Wire protocol v2** (`docs/protocol.md`, `exspeed-protocol/src/client.rs`): 10-byte frame header `[Version=2][OpCode][CorrelID u32 LE][PayloadLen u32 LE]`. Responses may arrive out of order; pushes and fire-and-forget requests use CorrelID 0. Server side is `crates/exspeed/src/session.rs`; the Rust client is `crates/exspeed-client`.
 - **Segment-based storage**: Log-structured append-only. Directory layout: `{data_dir}/streams/{stream}/partitions/0/`. Segments roll at 256MB. Offset and time indexes for random access.
 - **Single partition per stream**: Simplifies broker logic. Single-writer semantics.
-- **Delivery pipeline**: One `tokio::spawn`'d task per active subscription. Polls storage in batches, applies NATS-style subject filtering (`*` = one token, `>` = one or more), sends records via `mpsc` channel to connection handler.
-- **Consumer groups**: work sharing only happens with a Postgres/Redis `WorkCoordinator` (`EXSPEED_CONSUMER_STORE`); with the default noop coordinator every member receives every record. See `docs/REVIEW.md` §3.3.
+- **Consumers** (`exspeed-broker/src/consumer/`): JetStream-style. One actor per consumer, leader only; pure state machine in `core.rs` (ack floor, in-flight with deadlines, scheduled redeliveries, DLQ). Push (credits) and pull delivery; many subscribers on one consumer share its records (work queue across app instances). State persisted to the compacted internal stream `__consumers`. Streams starting with `__` are internal.
 - **ExQL execution**: Two paths — bounded (one-shot SELECT, reads entire stream) and continuous (long-lived task, outputs to target stream or materialized view). Supports EMIT CHANGES/FINAL, tumbling windows, stream-stream joins with WITHIN.
 - **Connector lifecycle**: `SourceConnector`/`SinkConnector` traits with start/poll/commit/stop. ConnectorManager loads from TOML configs in `{data_dir}/connectors.d/`, supports hot-reload via filesystem watcher.
 
 ### Server Startup Sequence
-1. Open FileStorage (CRC-validating tail-scan recovery of the active segment)
-2. Create Broker, load persisted consumers from `{data_dir}/consumers/*.json`
-3. Create ConnectorManager, load all connector configs
-4. Create ExqlEngine, load query registry, resume continuous queries
-5. Spawn retention enforcement background task
-6. Spawn HTTP API server (Axum)
-7. TCP accept loop — each connection gets a `tokio::spawn`'d handler
+1. Open FileStorage (tail-scan recovery of each active segment; one writer thread per partition)
+2. Build BrokerAppend (dedup maps rebuild in the background), lease, `ClusterLeadership`, `Broker` (Log + ConsumerManager)
+3. Create ConnectorManager and ExqlEngine, load configs/queries
+4. Leader supervisor: on promotion starts consumers (restored from `__consumers`), connectors, continuous queries, retention
+5. Spawn HTTP API server (Axum)
+6. TCP accept loop — each connection runs `session::run`
 
 ### TypeScript SDK
 The SDK (`@exspeed/sdk`) implements the binary wire protocol over TCP. Key classes:
@@ -129,8 +128,9 @@ User docs live in `docs/` (index: `docs/README.md`); the root README is a short 
 
 ## Integration Tests
 
-Integration tests live in `crates/exspeed/tests/`. They spin up a real server (FileStorage + Broker + API) on a random port using `portpicker` and `tempfile` for isolation. Test files:
-- `connect_test` / `broker_test` / `consumer_test` / `seek_test` — TCP protocol tests
+Integration tests live in `crates/exspeed/tests/`. They spin up a real server (FileStorage + Broker + API) on random ports (`exspeed_testkit::pick_unused_port`) with a temp data dir; most files are modules of the single `it` binary (`tests/it/main.rs`). Test files:
+- `common/mod.rs` — `TestServer` harness (in-process server, `client()`, `restart()`)
+- `protocol_test` / `consumer_test` / `dedup_test` — client protocol and consumer semantics via `exspeed-client`
 - `exql_test` / `exql_windows_test` — query engine tests
 - `connector_test` — connector lifecycle tests
 - `api_test` — HTTP API endpoint tests

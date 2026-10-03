@@ -116,7 +116,7 @@ async fn start_leader(schema: &str) -> LeaderHarness {
     let (cred_path, pub_token, rep_token) = write_credentials_toml(&tmp);
 
     // Postgres + leader wiring env. Short lease TTL keeps the test fast.
-    std::env::set_var("EXSPEED_CONSUMER_STORE", "postgres");
+    std::env::set_var("EXSPEED_LEASE_BACKEND", "postgres");
     std::env::set_var("EXSPEED_OFFSET_STORE_POSTGRES_SCHEMA", schema);
     std::env::set_var("EXSPEED_LEASE_TTL_SECS", "5");
     std::env::set_var("EXSPEED_LEASE_HEARTBEAT_SECS", "1");
@@ -202,7 +202,7 @@ async fn dial_and_handshake(
 }
 
 fn clear_env() {
-    std::env::remove_var("EXSPEED_CONSUMER_STORE");
+    std::env::remove_var("EXSPEED_LEASE_BACKEND");
     std::env::remove_var("EXSPEED_OFFSET_STORE_POSTGRES_SCHEMA");
     std::env::remove_var("EXSPEED_LEASE_TTL_SECS");
     std::env::remove_var("EXSPEED_LEASE_HEARTBEAT_SECS");

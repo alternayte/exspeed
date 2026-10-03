@@ -37,11 +37,12 @@ In multi-pod mode, standbys answer `503` on `/api/v1/*`. The exceptions are
 | Method | Path | Body / query | Description |
 |--------|------|--------------|-------------|
 | `GET` | `/api/v1/streams` | | List streams |
-| `POST` | `/api/v1/streams` | `{"name", "max_age_secs"?, "max_bytes"?, "dedup_window_secs"?, "dedup_max_entries"?}` | Create a stream |
+| `POST` | `/api/v1/streams` | `{"name", "max_age_secs"?, "max_bytes"?, "dedup_window_secs"?, "dedup_max_entries"?, "compaction"?}` | Create a stream. `compaction: true` keeps only the latest record per key. |
 | `GET` | `/api/v1/streams/{name}` | | Offsets, size, retention and dedup settings |
 | `PATCH` | `/api/v1/streams/{name}` | `{"max_age_secs"?, "max_bytes"?, "dedup_window_secs"?, "dedup_max_entries"?}` | Update settings |
 | `DELETE` | `/api/v1/streams/{name}` | `?force=true` | Delete. Without `force`, fails if connectors, queries or consumers still reference the stream. |
 | `POST` | `/api/v1/streams/{name}/publish` | `{"subject", "data", "key"?, "msg_id"?}` | Publish one record. The `x-idempotency-key` header can be used instead of `msg_id`. |
+| `GET` | `/api/v1/streams/{name}/records?from=&limit=&filter=` | | Browse records without a consumer: `{records, next_offset, high_watermark}`. `limit` ≤ 1000; each record has `offset`, `timestamp_ms`, `subject`, `key`, `value` (JSON when it parses, else a UTF-8 string, else base64; see `encoding`), `headers`. |
 
 ```bash
 curl -X POST localhost:8080/api/v1/streams -H 'Content-Type: application/json' \
@@ -54,14 +55,16 @@ curl -X POST localhost:8080/api/v1/streams/orders/publish -H 'Content-Type: appl
 
 ### Consumers
 
-There is no HTTP endpoint for creating consumers. Clients create them over
-TCP (see [concepts.md](concepts.md#consumers)).
+Delivery (push subscriptions, pulls, acks) is TCP-only; HTTP manages
+consumers. See [concepts.md](concepts.md#consumers) for the model.
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/v1/consumers` | List consumers |
-| `GET` | `/api/v1/consumers/{name}` | Offset, lag, group and filter |
-| `DELETE` | `/api/v1/consumers/{name}` | Delete a consumer |
+| Method | Path | Body | Description |
+|--------|------|------|-------------|
+| `GET` | `/api/v1/consumers[?stream=]` | | List consumers (with state) |
+| `POST` | `/api/v1/consumers` | consumer spec, e.g. `{"name": "billing", "stream": "orders", "filter_subjects": ["orders.placed"], "dlq_stream": "orders-dlq"}` | Create a durable consumer. Idempotent for an identical spec, `409` if it differs. Returns `201` with consumer info. |
+| `GET` | `/api/v1/consumers/{name}` | | Spec, `next_offset`, `ack_floor`, `num_unacked`, `num_waiting`, `lag`, `subscribers`, `stats` |
+| `POST` | `/api/v1/consumers/{name}/seek` | one of `"earliest"`, `"latest"`, `{"offset": n}`, `{"timestamp_ms": t}` | Reposition; drops unacked state |
+| `DELETE` | `/api/v1/consumers/{name}` | | Delete; active subscriptions end with code 404 |
 
 ### Queries (ExQL)
 
@@ -135,9 +138,7 @@ Errors are returned in this form:
 
 ## TCP protocol
 
-Applications publish and consume over the binary protocol on port 5933.
-Each frame has a 10-byte header: `[version u8][opcode u8][correlation_id u32][payload_len u32]`.
-The TypeScript SDK in [`sdks/typescript`](../sdks/typescript) is the
-reference client. Protocol v2 (byte-bounded fetch, high-watermark, error
-frames, version negotiation) is proposed in
-[REVIEW.md §5](REVIEW.md#5-proposed-target-architecture).
+Applications publish and consume over the binary protocol on port 5933 (TLS
+optional). The full specification is [protocol.md](protocol.md). Clients:
+the Rust crate [`exspeed-client`](../crates/exspeed-client) and the
+[TypeScript SDK](../sdks/typescript).

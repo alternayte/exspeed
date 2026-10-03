@@ -1,11 +1,10 @@
-//! Distributed leader-lease primitive. Used to ensure exactly one pod in a
-//! multi-pod deployment runs each source connector, continuous query, and
-//! ungrouped sink consumer.
+//! Distributed leader-lease primitive. Exactly one pod in a multi-pod
+//! deployment holds the cluster lease; only it accepts writes and runs
+//! consumers, connectors and continuous queries.
 //!
-//! Backend dispatched from `EXSPEED_CONSUMER_STORE` (same env var as
-//! [`crate::work_coordinator`]). File-backed deployments fall through to
-//! [`NoopLeaderLease`] which always succeeds — preserving current single-pod
-//! behavior.
+//! Backend chosen by `EXSPEED_LEASE_BACKEND` (`postgres` | `redis` |
+//! `none`, default `none`; see [`backend_from_env`]). Without one, every pod
+//! uses [`NoopLeaderLease`], which always succeeds: single-node mode.
 
 pub mod noop;
 pub mod postgres;
@@ -121,13 +120,32 @@ pub fn heartbeat_interval_from_env() -> Duration {
     Duration::from_secs(secs)
 }
 
-/// Build a `LeaderLease` from `EXSPEED_CONSUMER_STORE`. Mirrors
-/// [`crate::work_coordinator::from_env`]. Defaults to Noop when unset or file.
-pub async fn from_env() -> Result<Arc<dyn LeaderLease>, LeaseError> {
-    let backend = std::env::var("EXSPEED_CONSUMER_STORE")
-        .or_else(|_| std::env::var("EXSPEED_OFFSET_STORE"))
-        .unwrap_or_else(|_| "file".to_string());
+/// The configured lease backend: `EXSPEED_LEASE_BACKEND`, falling back to
+/// the deprecated `EXSPEED_CONSUMER_STORE`. Returns `"postgres"`, `"redis"`
+/// or `"none"`.
+pub fn backend_from_env() -> String {
+    let raw = match std::env::var("EXSPEED_LEASE_BACKEND") {
+        Ok(v) => v,
+        Err(_) => match std::env::var("EXSPEED_CONSUMER_STORE") {
+            Ok(v) => {
+                tracing::warn!(
+                    "EXSPEED_CONSUMER_STORE is deprecated for selecting the lease backend; \
+                     use EXSPEED_LEASE_BACKEND"
+                );
+                v
+            }
+            Err(_) => String::new(),
+        },
+    };
+    match raw.as_str() {
+        "postgres" | "redis" => raw,
+        _ => "none".to_string(),
+    }
+}
 
+/// Build a `LeaderLease` from [`backend_from_env`]. Noop when none is set.
+pub async fn from_env() -> Result<Arc<dyn LeaderLease>, LeaseError> {
+    let backend = backend_from_env();
     match backend.as_str() {
         "postgres" => {
             let b = postgres::PostgresLeaseBackend::from_env().await?;

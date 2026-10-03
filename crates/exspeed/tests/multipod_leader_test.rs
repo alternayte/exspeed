@@ -66,7 +66,7 @@ async fn spawn_broker(schema: &str) -> BrokerHandle {
     let api_port = exspeed_testkit::pick_unused_port().unwrap();
     let tmp = tempfile::tempdir().unwrap();
 
-    std::env::set_var("EXSPEED_CONSUMER_STORE", "postgres");
+    std::env::set_var("EXSPEED_LEASE_BACKEND", "postgres");
     std::env::set_var("EXSPEED_OFFSET_STORE_POSTGRES_SCHEMA", schema);
     // Short TTL for test speed. 5s TTL + 1s heartbeat means failover
     // completes well within the 30s test budget.
@@ -183,7 +183,7 @@ async fn failover_shifts_healthz_between_brokers() {
     }
 
     // Cleanup env vars (best-effort; test isolation is per-process anyway).
-    std::env::remove_var("EXSPEED_CONSUMER_STORE");
+    std::env::remove_var("EXSPEED_LEASE_BACKEND");
     std::env::remove_var("EXSPEED_OFFSET_STORE_POSTGRES_SCHEMA");
     std::env::remove_var("EXSPEED_LEASE_TTL_SECS");
     std::env::remove_var("EXSPEED_LEASE_HEARTBEAT_SECS");

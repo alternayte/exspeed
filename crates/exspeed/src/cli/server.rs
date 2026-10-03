@@ -58,15 +58,11 @@ fn replicator_credential() -> Option<String> {
     std::env::var("EXSPEED_REPLICATOR_CREDENTIAL").ok()
 }
 
-/// True when the operator asked for a coordinated backend. That's the
-/// single source of truth for "this pod is part of a multi-pod deployment"
-/// — every downstream multi-pod decision (build coord, bind cluster
-/// listener, run the supervisor) branches on this one check.
+/// True when a lease backend is configured (`EXSPEED_LEASE_BACKEND`): the
+/// single switch for "this pod is part of a multi-pod deployment" (lease,
+/// cluster listener, replication role supervisor).
 fn multi_pod_mode() -> bool {
-    matches!(
-        std::env::var("EXSPEED_CONSUMER_STORE").as_deref(),
-        Ok("postgres") | Ok("redis")
-    )
+    exspeed_broker::lease::backend_from_env() != "none"
 }
 
 /// Per-follower mpsc capacity. 100k records is ~100MB at 1KB records —
@@ -384,9 +380,9 @@ where
     // Warn if file-backed — multi-pod deployments need postgres/redis.
     if !lease.supports_coordination() {
         warn!(
-            "lease backend is file — multi-pod deployment not supported; \
+            "no lease backend — multi-pod deployment not supported; \
              all connectors and continuous queries will run on this pod. \
-             Set EXSPEED_CONSUMER_STORE=postgres|redis for multi-pod coordination."
+             Set EXSPEED_LEASE_BACKEND=postgres|redis for multi-pod coordination."
         );
     }
 
@@ -464,14 +460,7 @@ where
 
     // Posture log (always). Emitted after lease is built so the backend name
     // appears alongside auth/tls state.
-    let lease_backend_name = if lease.supports_coordination() {
-        // Read the env var so we show postgres/redis rather than "coordinated"
-        std::env::var("EXSPEED_CONSUMER_STORE")
-            .or_else(|_| std::env::var("EXSPEED_OFFSET_STORE"))
-            .unwrap_or_else(|_| "file".to_string())
-    } else {
-        "file".to_string()
-    };
+    let lease_backend_name = exspeed_broker::lease::backend_from_env();
     let (cred_file_count, cred_legacy) = credential_store
         .as_ref()
         .map(|s| s.source_breakdown())
@@ -603,7 +592,7 @@ where
     // Create shared AppState. `replication_coordinator` lights up
     // `GET /api/v1/cluster/followers` in multi-pod mode and stays `None`
     // elsewhere (the endpoint returns 503 in that case, with a hint
-    // pointing at EXSPEED_CONSUMER_STORE).
+    // pointing at EXSPEED_LEASE_BACKEND).
     let state = Arc::new(exspeed_api::AppState {
         broker: broker.clone(),
         storage: file_storage.clone(),
@@ -729,7 +718,7 @@ where
             // no peer can actually dial this pod. Prefer a hard error so
             // the operator doesn't silently run a crippled cluster.
             anyhow::bail!(
-                "EXSPEED_CONSUMER_STORE is multi-pod but EXSPEED_CLUSTER_BIND is unparseable — \
+                "EXSPEED_LEASE_BACKEND is set but EXSPEED_CLUSTER_BIND is unparseable — \
                  refusing to start so the misconfiguration is caught at deploy time"
             );
         } else {
@@ -775,7 +764,7 @@ where
         // resulting identity. A misconfiguration here would manifest as
         // every follower session failing with 401; fail fast instead.
         let replicator_bearer = replicator_credential().context(
-            "EXSPEED_REPLICATOR_CREDENTIAL must be set when EXSPEED_CONSUMER_STORE=postgres|redis \
+            "EXSPEED_REPLICATOR_CREDENTIAL must be set when EXSPEED_LEASE_BACKEND=postgres|redis \
              (the bearer a follower uses to authenticate its replication session)",
         )?;
 

@@ -13,7 +13,7 @@
 |-------|--------|
 | 0. Guard rails | ✅ CI, single test binary per crate, clippy clean, blockers 1, 2, 7, 10, 14, 15 fixed, JDBC Postgres sink fixed |
 | 1. Core log | 🚧 Storage engine rewritten: per-partition writer thread with group commit, lock-free readers with a high watermark, sparse indexes, fence-on-error, crash-safe sidecars and truncation, compaction, `append_at`. Bloom, secondary-index and S3 tiering code removed. Torn-write and fault-injection tests in place. Still to do: wire-format records, kill -9 loop tests, real-disk ENOSPC tests. |
-| 2. Consumers + protocol v2 | — |
+| 2. Consumers + protocol v2 | 🚧 Done: protocol v2 ([protocol.md](protocol.md)) with a new session layer (handshake/idle timeouts, out-of-order replies, bounded waits, cleanup on every exit path); JetStream-style consumers in the broker (push with credits + pull, ack/nack/term/in-progress, ack timeout, backoff, max_deliver, DLQ, `max_ack_pending`, work sharing across connections and instances, immediate redelivery when a subscriber leaves), state in the compacted `__consumers` stream; old consumer stores and work coordinators removed; HTTP consumer CRUD + seek and `/records` browsing; `exspeed-client` Rust crate with a coalescing publisher; integration tests and the bench rewritten on it. In progress: TypeScript SDK v2. |
 | 3. Ops | — |
 | 4. ExQL v2 | — |
 | 5. Connectors v2 | — |
@@ -165,6 +165,12 @@ Severity: **C** critical · **H** high · **M** medium · **L** low.
 | L | Subject matching allocates two `Vec`s per record per subscription. `>` in a non-final position is silently treated as final (`a.>.c` matches `a.x`). Published subjects aren't validated (empty tokens and wildcards are accepted). | `exspeed-common/src/subject.rs` |
 
 ### 3.3 Broker: delivery, consumers, dedup
+
+> **Status (Phase 2):** the consumer and delivery findings below are
+> resolved by the rewrite: the old consumer state, delivery tasks, consumer
+> stores and work coordinators were deleted and replaced (see
+> [concepts.md](concepts.md#consumers)). Dedup findings are addressed by the
+> `Log` write path (Phase 0) except where noted.
 
 | Sev | Finding | Where |
 |-----|---------|-------|

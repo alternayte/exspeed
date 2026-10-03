@@ -102,26 +102,23 @@ pub fn format_table(columns: &[String], rows: &[Vec<String>], execution_time_ms:
 /// - `timestamp`: converted from unix nanoseconds to `seconds.millis`
 /// - `payload`: truncated to 200 characters
 pub fn format_tail_line(record: &Value) -> String {
-    let timestamp_nanos = record["timestamp"].as_u64().unwrap_or(0);
-    let secs = timestamp_nanos / 1_000_000_000;
-    let millis = (timestamp_nanos % 1_000_000_000) / 1_000_000;
-
+    let ts_ms = record["timestamp_ms"].as_u64().unwrap_or(0);
+    let (secs, millis) = (ts_ms / 1000, ts_ms % 1000);
+    let offset = record["offset"].as_u64().unwrap_or(0);
     let subject = record["subject"].as_str().unwrap_or("");
     let key = record["key"].as_str().unwrap_or("");
 
-    let payload = match &record["payload"] {
+    let payload = match &record["value"] {
         Value::String(s) => s.clone(),
         Value::Null => String::new(),
         other => other.to_string(),
     };
-
-    let truncated_payload = if payload.len() > 200 {
-        format!("{}...", &payload[..200])
-    } else {
-        payload
+    let truncated = match payload.char_indices().nth(200) {
+        Some((i, _)) => format!("{}...", &payload[..i]),
+        None => payload,
     };
 
-    format!("[{secs}.{millis:03}] {subject} key={key} {truncated_payload}")
+    format!("#{offset} [{secs}.{millis:03}] {subject} key={key} {truncated}")
 }
 
 /// Extract columns and rows from a query result JSON value.
@@ -200,16 +197,21 @@ mod tests {
     #[test]
     fn test_format_tail_line() {
         let record = json!({
-            "timestamp": 1_700_000_000_123_000_000u64,
+            "offset": 7,
+            "timestamp_ms": 1_700_000_000_123u64,
             "subject": "orders.created",
             "key": "order-42",
-            "payload": "hello world"
+            "value": "hello world"
         });
 
         let line = format_tail_line(&record);
         assert_eq!(
             line,
-            "[1700000000.123] orders.created key=order-42 hello world"
+            "#7 [1700000000.123] orders.created key=order-42 hello world"
         );
+
+        // Long multi-byte payloads are truncated on a char boundary.
+        let long = json!({ "value": "é".repeat(300) });
+        assert!(format_tail_line(&long).ends_with("..."));
     }
 }

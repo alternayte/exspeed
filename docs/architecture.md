@@ -5,54 +5,81 @@ architecture is in [REVIEW.md §5](REVIEW.md#5-proposed-target-architecture).
 
 ## Crates
 
-The workspace has ten crates. Each one depends only on crates listed above
-it.
+Each crate depends only on crates listed above it.
 
 ```
-exspeed-common       shared types (StreamName, Offset), subject matching, auth store, metrics
-exspeed-streams      StorageEngine trait (async), Record / StoredRecord
-exspeed-protocol     wire protocol: Frame codec, OpCodes, Client/Server messages, replication messages
+exspeed-common       shared types (StreamName, Offset), subject filters, auth store, metrics
+exspeed-streams      StorageEngine trait (async), Record / StoredRecord, StreamConfig
+exspeed-protocol     wire protocol: Frame codec, opcodes, client protocol v2 (client.rs), replication messages
 exspeed-storage      FileStorage (segments, sparse indexes, retention, compaction), MemoryStorage
-exspeed-broker       BrokerAppend (dedup), consumers, delivery, ack/nack, DLQ, leases, replication
+exspeed-broker       Log (the single write path), BrokerAppend (dedup), consumers, leases, replication
 exspeed-connectors   connector manager, retry/DLQ, offset stores, built-in plugins
-exspeed-processing   ExQL: parser → logical plan → physical operators → bounded / continuous runtime
+exspeed-processing   ExQL: parser → plan → bounded / continuous runtime
 exspeed-api          Axum HTTP API, auth and leader-gate middleware, webhooks
-exspeed              binary: CLI + server bootstrap (cli/server.rs)
+exspeed              binary: CLI, server bootstrap (cli/server.rs), TCP sessions (session.rs)
+exspeed-client       async Rust client for protocol v2 (also used by the benchmarks and tests)
 exspeed-bench        benchmark harness (not shipped in the image)
+exspeed-testkit      test helpers
 ```
 
 ## Data flow
 
 ```
- Producers ──TCP──► server.rs handle_connection ──► broker handlers ──► BrokerAppend ──► FileStorage
-           ──HTTP─► exspeed-api ───────────────────────────────────────► BrokerAppend ──► FileStorage
- Webhooks  ──HTTP─► exspeed-api/webhooks ───────────────────────────────────────────────► FileStorage
- Sources   ───────► connector manager ─────────────────────────────────► BrokerAppend ──► FileStorage
- ExQL out  ───────► continuous runtime ───────────────────────────────────────────────► FileStorage
+ Producers ──TCP──► session.rs ─────────┐
+           ──HTTP─► exspeed-api ────────┤
+ Webhooks  ──HTTP─► exspeed-api ────────┼──► Log ──► (leader gate, validation, dedup) ──► FileStorage
+ Sources   ───────► connector manager ──┤            └──► replication feed, metrics
+ ExQL out  ───────► continuous runtime ─┘
+ Consumers ───────► __consumers stream ─┘
 
- FileStorage ──► delivery task (one per subscription) ──mpsc──► connection ──TCP──► consumers
+ FileStorage ──► consumer actors (one per consumer, leader only) ──► subscriptions / pulls ──TCP──► apps
+            ──► stateless reads (TCP Read, HTTP /records)
             ──► sink connectors ──► external systems
             ──► continuous queries / materialized views
             ──► replication server (leader) ──TCP 5934──► followers
 ```
 
-Writes reach storage along several different paths. Each path applies a
-different subset of dedup, metrics, replication and leader checks; see
-[REVIEW.md §1](REVIEW.md#1-verdict). This is the main structural problem
-that the rebuild addresses.
+Every write, whatever its origin, goes through `exspeed_broker::log::Log`.
+It enforces the leader gate, validates records, applies `msg_id` dedup,
+appends to storage, feeds replication, and records metrics.
+
+## Consumers
+
+`exspeed_broker::consumer::ConsumerManager` runs one actor task per
+consumer, only on the leader, under the leadership token. An actor owns a
+pure state machine (`consumer/core.rs`), which holds:
+
+- the next offset to read;
+- the ack floor;
+- the in-flight records, with deadlines and delivery counts;
+- the records scheduled for redelivery.
+
+The actor feeds push subscriptions (credit-based) and pull waiters from the
+log, reacting to `watch_appends` notifications. It redelivers on timeout,
+nack, or subscriber loss; dead-letters through `Log` with idempotency keys;
+and persists a snapshot to the compacted `__consumers` stream at most every
+100 ms. On promotion, a new leader restores every consumer from
+`__consumers`. Delivery is at-least-once.
 
 ## Wire protocol
 
-Every frame starts with a 10-byte header:
+Clients use protocol v2 ([protocol.md](protocol.md)). Every frame has a
+10-byte header:
 
 ```
-[version u8][opcode u8][correlation_id u32][payload_len u32][payload …]
+[version u8 = 2][opcode u8][correlation_id u32 LE][payload_len u32 LE][payload …]
 ```
 
-- Each response carries the correlation ID of the request it answers.
-- Push-delivered records use correlation ID `0`, with opcode `Record`
-  (0x82) or `RecordsBatch` (0x83).
-- Frames are capped at 16 MB.
+Each TCP connection is served by `crates/exspeed/src/session.rs`:
+
+- a reader loop decodes and dispatches requests;
+- one writer task owns the socket;
+- requests that wait (pull, long-poll read, query) run concurrently, so
+  replies can arrive out of order;
+- each subscription has a forwarder task that turns consumer events into
+  `Deliver` pushes (correlation id 0).
+
+Frames are capped at 16 MB.
 
 ## Storage layout
 
@@ -155,26 +182,26 @@ replication code yet.
    tail scan and starts one writer thread per stream and the compactor.
 4. Build `BrokerAppend`, then rebuild the dedup maps in the background.
    These come from the snapshot when one exists, otherwise from a scan.
-5. Build the consumer store, lease backend, work coordinator, and
-   `ClusterLeadership`.
-6. Build the `Broker` and load the persisted consumers.
-7. Build the `ConnectorManager` and `ExqlEngine`, and load their configs,
-   queries and index definitions.
-8. Spawn the background tasks: retention, dedup snapshot, queue depth, and
-   the leader supervisor. When this pod becomes leader, the supervisor
-   starts the connectors and continuous queries, then starts the
-   replication server or client.
+5. Build the lease backend and `ClusterLeadership`.
+6. Build the `Broker`, which contains the `Log` and the `ConsumerManager`,
+   and gate writes on leadership.
+7. Build the `ConnectorManager` and `ExqlEngine`, and load their configs and
+   queries.
+8. Spawn the background tasks: the dedup snapshot task and the leader
+   supervisor. When this pod becomes leader, the supervisor starts the
+   consumers (restored from `__consumers`), connectors, continuous queries
+   and retention, and the replication server or client.
 9. Spawn the HTTP API.
 10. Enter the TCP accept loop, which spawns one task per connection.
 
 ## Concurrency model
 
 - **One tokio runtime.**
-- **Appends:** each partition has an appender task that does group commit.
-  Fsync runs on the runtime threads.
-- **Subscriptions:** each one gets a delivery task that polls storage in
-  batches of 100 every 50 ms. It filters by subject and sends batches over
-  an mpsc channel to the connection task.
+- **Storage:** one writer OS thread per partition does group commit and all
+  file IO, off the tokio runtime. Readers take no lock.
+- **Consumers:** one actor task per consumer (leader only), woken by
+  `watch_appends`, timers and client commands.
+- **Connections:** a reader, a writer and one forwarder per subscription.
 - **Connectors:** one task each, under the leader's cancellation token.
 - **Continuous queries:** one task each, under the leader's cancellation
   token.

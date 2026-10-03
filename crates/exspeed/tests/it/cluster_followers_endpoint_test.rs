@@ -2,7 +2,7 @@
 //!
 //! Wave 5 ships the single-pod behavior: the handler returns 503 with a
 //! machine-readable error body when the pod was started without a
-//! replication coordinator (i.e. `EXSPEED_CONSUMER_STORE` is unset or
+//! replication coordinator (i.e. `EXSPEED_LEASE_BACKEND` is unset or
 //! `file`). The happy-path — a live leader with connected followers —
 //! belongs to Wave 6's end-to-end multi-pod tests.
 
@@ -123,7 +123,7 @@ async fn cluster_followers_endpoint_returns_503_in_single_pod_mode() {
         body["hint"]
             .as_str()
             .unwrap_or_default()
-            .contains("EXSPEED_CONSUMER_STORE"),
+            .contains("EXSPEED_LEASE_BACKEND"),
         "hint should mention the env var the operator needs to set; got {body:?}"
     );
 }

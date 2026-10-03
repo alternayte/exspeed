@@ -58,18 +58,20 @@ exspeed tail <stream> --from-beginning
 exspeed tail <stream> --subject 'order.eu.*'
 ```
 
-`tail` polls the SQL endpoint every 200 ms. Each poll scans the whole
-stream, so it is slow on large streams.
+`tail` reads through `GET /api/v1/streams/{name}/records`, page by page,
+and polls every 200 ms once caught up. It doesn't create a consumer. Output
+lines are `#offset [unix.ms] subject key=… value`; `--json` prints each
+record as JSON.
 
 ## Consumers
 
 ```bash
-exspeed consumers                  # list
-exspeed consumer-info <name>       # offset, lag, group, subject filter
+exspeed consumers                  # list: ack floor, unacked, lag, subscribers
+exspeed consumer-info <name>       # spec and live state
 ```
 
-Consumers are created by clients over TCP, for example with the SDK's
-`createConsumer`. The CLI cannot create them.
+Consumers are created by applications (SDK `createConsumer`) or with
+`POST /api/v1/consumers`.
 
 ## Queries
 

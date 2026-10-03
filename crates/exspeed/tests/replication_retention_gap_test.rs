@@ -93,7 +93,7 @@ struct PodHandle {
 }
 
 fn set_shared_env(schema: &str) {
-    std::env::set_var("EXSPEED_CONSUMER_STORE", "postgres");
+    std::env::set_var("EXSPEED_LEASE_BACKEND", "postgres");
     std::env::set_var("EXSPEED_OFFSET_STORE_POSTGRES_SCHEMA", schema);
     std::env::set_var("EXSPEED_LEASE_TTL_SECS", "5");
     std::env::set_var("EXSPEED_LEASE_HEARTBEAT_SECS", "1");
@@ -103,7 +103,7 @@ fn set_shared_env(schema: &str) {
 
 fn clear_shared_env() {
     for k in [
-        "EXSPEED_CONSUMER_STORE",
+        "EXSPEED_LEASE_BACKEND",
         "EXSPEED_OFFSET_STORE_POSTGRES_SCHEMA",
         "EXSPEED_LEASE_TTL_SECS",
         "EXSPEED_LEASE_HEARTBEAT_SECS",

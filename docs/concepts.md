@@ -36,46 +36,60 @@ filter on them using NATS-style wildcards:
 | `orders.>` | `orders.placed`, `orders.us.placed` | `orders` |
 | (empty) | everything | — |
 
-`>` must be the last token. Today a non-final `>` is silently treated as
-final.
+`>` must be the last token; a filter with a non-final `>` or an empty token
+is rejected.
 
 ## Consumers
 
-A **consumer** is a named, durable cursor over one stream. It has:
+A **consumer** is a named, durable cursor over one stream that tracks which
+records have been processed. Create one over TCP (SDK `createConsumer`) or
+HTTP (`POST /api/v1/consumers`):
 
-- `stream` and an optional `subject_filter`
-- `start_from`: `earliest`, `latest`, or a specific `offset`
-- an optional `group` name
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `stream` | — | The stream to consume |
+| `filter_subjects` | all | Subject filters; a record is delivered if any filter matches |
+| `deliver` | `all` | Where to start: `all`, `new`, `{from_offset}`, `{from_time}` (ms) |
+| `ack` | `explicit` | `explicit`, or `none` (delivery counts as processed) |
+| `ack_wait_ms` | 30000 | Redeliver if not acked within this time |
+| `max_deliver` | 5 | Attempts before dead-lettering |
+| `backoff_ms` | — | Redelivery delays per attempt (after a nack or timeout) |
+| `max_ack_pending` | 1000 | Unacked records allowed before delivery pauses |
+| `dlq_stream` | — | Where records go after `max_deliver` attempts or a `term` |
+| `ephemeral` | false | Deleted when the creating connection closes |
 
-Consumers are created over the TCP protocol (SDK `createConsumer`). The
-HTTP API can list, inspect, and delete them, but not create them. A client
-**subscribes** to a consumer and receives records pushed over its TCP
-connection. It then **acks** or **nacks** each record.
+**Delivery.** Clients either **subscribe** (push, with a credit window the
+SDK tops up automatically) or **pull** batches with a long-poll. Each
+delivered record is then settled:
 
-**Fetch** is a separate, stateless read of `N` records from an offset. It
-does not move any consumer cursor.
+- `ack`: processed; never delivered again.
+- `nack(delay)`: redeliver after `delay`, or after the consumer's backoff.
+- `term(reason)`: give up now and dead-letter it.
+- `in_progress`: still working; reset the ack timer.
 
-### Current delivery semantics
+A record that is not acked in time, or whose subscriber disconnects, is
+redelivered (to any subscriber) with a higher `delivery_count`.
 
-Several features are not implemented yet. See [REVIEW.md §3.3](REVIEW.md#33-broker-delivery-consumers-dedup)
-for details.
+**Scaling out: work sharing.** Any number of subscribers and pullers can
+attach to the same consumer, from any connection or any instance of your
+application. Each record goes to one of them at a time. This is how you run N
+replicas of a worker: give them all the same consumer name. For fan-out
+(every service sees every record), give each service its own consumer.
 
-- **Ungrouped consumers** behave as a read cursor. Acks are cumulative: acking
-  offset `N` moves the cursor to `N` and skips any unacked records before it.
-  There is no ack timeout and no automatic redelivery. The committed record is
-  redelivered once on resume.
-- **Groups.** With a Postgres or Redis coordinator configured, records are
-  shared across group members, with an ack timeout of 30 s. With the default
-  single-node setup, every member currently receives every record.
-- **DLQ.** A record is copied to `<stream>-dlq` after 5 nacks of the same
-  offset. Ungrouped consumers never redeliver a nacked record, so in practice
-  the client has to re-seek before it can nack again.
-- **Retention.** If a consumer falls behind retention, the subscription
-  ends. The client must re-seek.
+**Durability.** Consumer state (ack floor, unacked records, delivery counts)
+is stored in the internal, compacted stream `__consumers`. It survives
+restarts and replicates with the log. Delivery is **at-least-once**: an
+application can see a record more than once (after a crash, timeout or nack).
+Make handlers idempotent, or dedup on `offset`.
 
-The target model is a JetStream-style consumer with an ack floor, a pending
-list, `ack_wait`, `max_deliver`, and push and pull delivery. Its design is in
-[REVIEW.md §5.3](REVIEW.md#53-one-consumer-model-jetstream-style-in-the-broker).
+**Retention.** If retention deletes records a consumer has not reached yet,
+the consumer skips ahead to the earliest record still retained.
+
+**Stateless reads** (`read` over TCP, `GET /api/v1/streams/{name}/records`
+over HTTP) return records from any offset without a consumer, and can
+long-poll for new data.
+
+The wire-level details are in [protocol.md](protocol.md#consumers).
 
 ## Idempotent publish
 

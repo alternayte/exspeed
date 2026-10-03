@@ -2,7 +2,7 @@
 //! Single-pod regression tests for Plan G replication.
 //!
 //! The whole point of Wave 5's "bind the cluster listener ONLY when
-//! `EXSPEED_CONSUMER_STORE` is set" guard is that single-pod deployments
+//! `EXSPEED_LEASE_BACKEND` is set" guard is that single-pod deployments
 //! keep behaving EXACTLY as they did before Plan G. These tests pin that
 //! contract:
 //!   * The cluster port (5934 by default) is NOT bound — nothing listens there.
@@ -11,7 +11,7 @@
 //!   * Normal publish/fetch over port 5933 still works end-to-end.
 //!
 //! Every test here uses the file-backed consumer store (the default when
-//! `EXSPEED_CONSUMER_STORE` is unset), so they run in the default
+//! `EXSPEED_LEASE_BACKEND` is unset), so they run in the default
 //! `cargo test` pass without needing Postgres.
 
 use std::time::Duration;
@@ -28,9 +28,9 @@ struct SinglePodHarness {
 }
 
 async fn start_single_pod_server() -> SinglePodHarness {
-    // Intentionally do NOT set EXSPEED_CONSUMER_STORE. Guard against a
+    // Intentionally do NOT set EXSPEED_LEASE_BACKEND. Guard against a
     // stray leak from another test in the same binary by clearing it.
-    std::env::remove_var("EXSPEED_CONSUMER_STORE");
+    std::env::remove_var("EXSPEED_LEASE_BACKEND");
     std::env::remove_var("EXSPEED_OFFSET_STORE");
 
     let api_port = exspeed_testkit::pick_unused_port().unwrap();
@@ -110,7 +110,7 @@ async fn cluster_followers_endpoint_returns_503_body_in_single_pod_mode() {
         body["hint"]
             .as_str()
             .unwrap_or_default()
-            .contains("EXSPEED_CONSUMER_STORE"),
+            .contains("EXSPEED_LEASE_BACKEND"),
         "hint should mention the env var; got {body:?}"
     );
 }

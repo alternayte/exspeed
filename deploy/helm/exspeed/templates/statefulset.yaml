@@ -71,7 +71,7 @@ spec:
               value: /etc/exspeed/tls/tls.key
             {{- end }}
             {{- if $multi }}
-            - name: EXSPEED_CONSUMER_STORE
+            - name: EXSPEED_LEASE_BACKEND
               value: postgres
             - name: EXSPEED_OFFSET_STORE_POSTGRES_URL
               valueFrom: { secretKeyRef: { name: {{ .Values.cluster.postgresUrlSecret }}, key: url } }

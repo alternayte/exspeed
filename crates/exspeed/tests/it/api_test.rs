@@ -463,3 +463,115 @@ async fn http_publish_msg_id_collision_returns_conflict() {
         "same msg_id with different body should return 409 Conflict"
     );
 }
+
+#[tokio::test]
+async fn http_records_and_consumers() {
+    let server = crate::common::TestServer::start().await;
+    let http = reqwest::Client::new();
+    let url = |p: &str| server.api_url(p);
+
+    let r = http
+        .post(url("/api/v1/streams"))
+        .json(&serde_json::json!({"name": "web"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    for (subject, n) in [("web.click", 1), ("web.view", 2), ("web.click", 3)] {
+        let r = http
+            .post(url("/api/v1/streams/web/publish"))
+            .json(&serde_json::json!({"subject": subject, "key": "u1", "data": {"n": n}}))
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success());
+    }
+
+    // Browse with a subject filter and paging.
+    let page: Value = http
+        .get(url("/api/v1/streams/web/records?filter=web.click&limit=1"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(page["records"].as_array().unwrap().len(), 1);
+    assert_eq!(page["records"][0]["value"]["n"], 1);
+    assert_eq!(page["records"][0]["encoding"], "json");
+    assert_eq!(page["records"][0]["key"], "u1");
+    let next = page["next_offset"].as_u64().unwrap();
+    let page2: Value = http
+        .get(url(&format!(
+            "/api/v1/streams/web/records?filter=web.click&from={next}"
+        )))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(page2["records"].as_array().unwrap().len(), 1);
+    assert_eq!(page2["records"][0]["value"]["n"], 3);
+    assert_eq!(page2["high_watermark"], 3);
+
+    // Consumers over HTTP.
+    let r = http
+        .post(url("/api/v1/consumers"))
+        .json(
+            &serde_json::json!({"name": "web-c", "stream": "web", "filter_subjects": ["web.view"]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let info: Value = http
+        .get(url("/api/v1/consumers/web-c"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(info["spec"]["stream"], "web");
+    let list: Value = http
+        .get(url("/api/v1/consumers?stream=web"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 1);
+
+    let r = http
+        .post(url("/api/v1/consumers/web-c/seek"))
+        .json(&serde_json::json!({"offset": 2}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let seeked: Value = r.json().await.unwrap();
+    assert_eq!(seeked["next_offset"], 2);
+
+    let r = http
+        .post(url("/api/v1/consumers"))
+        .json(&serde_json::json!({"name": "eph", "stream": "web", "ephemeral": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400, "ephemeral consumers are TCP-only");
+
+    let r = http
+        .delete(url("/api/v1/consumers/web-c"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let r = http
+        .get(url("/api/v1/consumers/web-c"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+}
