@@ -125,7 +125,7 @@ The SDK (`@exspeed/sdk`, `sdks/typescript/`) implements protocol v2 over TCP; se
 
 ## Documentation
 
-User docs live in `docs/` (index: `docs/README.md`); the root README is a short landing page. `docs/REVIEW.md` holds the October 2026 deep review, the target architecture and the phased plan — read it before making structural changes, and keep the per-feature status notes in `docs/` honest when fixing or adding features.
+User docs live in `docs/` (index: `docs/README.md`); the root README is a short landing page. Diagrams in any Markdown doc must be Mermaid (` ```mermaid ` blocks, rendered by GitHub), never ASCII art. Check them with `npx -y @mermaid-js/mermaid-cli -i x.mmd -o x.svg` (a `;` inside a sequence-diagram message ends the statement). `docs/REVIEW.md` holds the October 2026 deep review, the target architecture and the phased plan — read it before making structural changes, and keep the per-feature status notes in `docs/` honest when fixing or adding features.
 
 ## Integration Tests
 
