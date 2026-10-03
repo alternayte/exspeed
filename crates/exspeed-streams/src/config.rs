@@ -6,8 +6,9 @@ pub const DEFAULT_MAX_AGE_SECS: u64 = 604_800; // 7 days
 pub const DEFAULT_MAX_BYTES: u64 = 10_737_418_240; // 10 GB
 pub const DEFAULT_DEDUP_WINDOW_SECS: u64 = 300;
 pub const DEFAULT_DEDUP_MAX_ENTRIES: u64 = 500_000;
+pub const DEFAULT_TOMBSTONE_RETENTION_SECS: u64 = 86_400; // 24 h
 
-/// Retention and dedup settings for one stream.
+/// Retention, dedup and compaction settings for one stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamConfig {
     pub max_age_secs: u64,
@@ -16,6 +17,15 @@ pub struct StreamConfig {
     pub dedup_window_secs: u64,
     #[serde(default = "default_dedup_max_entries")]
     pub dedup_max_entries: u64,
+    /// Keep only the latest record per key in sealed segments (log
+    /// compaction). Records without a key are never removed; a record with a
+    /// key and an empty value is a tombstone that deletes the key. Offsets
+    /// are preserved, so a compacted stream has offset gaps.
+    #[serde(default)]
+    pub compaction: bool,
+    /// How long a tombstone survives compaction before it is removed too.
+    #[serde(default = "default_tombstone_retention_secs")]
+    pub tombstone_retention_secs: u64,
 }
 
 fn default_dedup_window_secs() -> u64 {
@@ -23,6 +33,9 @@ fn default_dedup_window_secs() -> u64 {
 }
 fn default_dedup_max_entries() -> u64 {
     DEFAULT_DEDUP_MAX_ENTRIES
+}
+fn default_tombstone_retention_secs() -> u64 {
+    DEFAULT_TOMBSTONE_RETENTION_SECS
 }
 
 impl Default for StreamConfig {
@@ -32,6 +45,8 @@ impl Default for StreamConfig {
             max_bytes: DEFAULT_MAX_BYTES,
             dedup_window_secs: DEFAULT_DEDUP_WINDOW_SECS,
             dedup_max_entries: DEFAULT_DEDUP_MAX_ENTRIES,
+            compaction: false,
+            tombstone_retention_secs: DEFAULT_TOMBSTONE_RETENTION_SECS,
         }
     }
 }
@@ -64,6 +79,7 @@ impl StreamConfig {
             max_bytes: or(max_bytes, DEFAULT_MAX_BYTES),
             dedup_window_secs,
             dedup_max_entries: or(dedup_max_entries, DEFAULT_DEDUP_MAX_ENTRIES),
+            ..Self::default()
         }
     }
 
@@ -94,5 +110,21 @@ impl StreamConfig {
             self.dedup_window_secs,
             self.dedup_max_entries,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_json_defaults_compaction_off() {
+        let cfg: StreamConfig =
+            serde_json::from_str(r#"{"max_age_secs":3600,"max_bytes":1000}"#).unwrap();
+        assert!(!cfg.compaction);
+        assert_eq!(
+            cfg.tombstone_retention_secs,
+            DEFAULT_TOMBSTONE_RETENTION_SECS
+        );
     }
 }

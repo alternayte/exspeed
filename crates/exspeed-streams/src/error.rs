@@ -28,6 +28,28 @@ pub enum StorageError {
 
     #[error("internal channel closed (writer task exited unexpectedly)")]
     ChannelClosed,
+
+    /// The record can't be represented in the storage format (a field is
+    /// longer than its length prefix allows). Never retryable.
+    #[error("invalid record: {0}")]
+    InvalidRecord(String),
+
+    /// An explicit-offset append (`append_at`) would overlap existing data or
+    /// isn't strictly increasing.
+    #[error(
+        "offset {offset} conflicts with the log: the lowest acceptable offset is {min_allowed}"
+    )]
+    OffsetConflict { offset: u64, min_allowed: u64 },
+
+    /// The partition hit an IO error it could not roll back from and is now
+    /// read-only. Reads still work; writes fail until the process restarts
+    /// and recovery runs.
+    #[error("stream {stream} is read-only after an unrecoverable storage error: {reason}")]
+    PartitionFailed { stream: String, reason: String },
+
+    /// The engine doesn't implement this operation.
+    #[error("unsupported: {0}")]
+    Unsupported(String),
 }
 
 #[cfg(test)]
