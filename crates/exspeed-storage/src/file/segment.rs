@@ -388,8 +388,10 @@ impl Segment {
                 let n = read_at(file, &mut buf, 0)?;
                 buf.truncate(n - n % INDEX_ENTRY_LEN);
                 Ok(buf
-                    .chunks_exact(INDEX_ENTRY_LEN)
-                    .map(IndexEntry::decode)
+                    .as_chunks::<INDEX_ENTRY_LEN>()
+                    .0
+                    .iter()
+                    .map(|c| IndexEntry::decode(c))
                     .collect())
             }
         }

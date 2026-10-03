@@ -235,11 +235,22 @@ impl OffsetStore for CrashingOffsets {
         self.inner.load(c).await
     }
     async fn save(&self, c: &str, o: &StoredOffset) -> Result<(), OffsetStoreError> {
-        if self
-            .crash_saves
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok()
-        {
+        // Decrement-if-positive (a CAS loop; `fetch_update` is deprecated on
+        // newer toolchains and its replacement is not on older ones).
+        let crash = loop {
+            let n = self.crash_saves.load(Ordering::SeqCst);
+            if n == 0 {
+                break false;
+            }
+            if self
+                .crash_saves
+                .compare_exchange(n, n - 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                break true;
+            }
+        };
+        if crash {
             panic!("simulated crash before the checkpoint is persisted");
         }
         self.inner.save(c, o).await

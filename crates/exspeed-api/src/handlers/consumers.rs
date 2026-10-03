@@ -48,25 +48,22 @@ pub async fn list_consumers(
     }
 }
 
-/// Resolve the consumer's stream and require admin on it. `Err` carries
-/// the response to return (404 for unknown consumers, 403 on deny).
+/// Resolve the consumer's stream and require admin on it. Returns the
+/// response to send instead (404 for unknown consumers, 403 on deny), or
+/// `None` when allowed.
 async fn authorize(
     state: &AppState,
     name: &str,
     identity: &Option<Extension<Arc<Identity>>>,
-) -> Result<(), Response> {
+) -> Option<Response> {
     let Some(stream) = state.broker.consumers.stream_of(name).await else {
-        return Err(consumer_error(ConsumerError::NotFound(name.to_string())));
+        return Some(consumer_error(ConsumerError::NotFound(name.to_string())));
     };
-    if let Some(Extension(id)) = identity.as_ref() {
-        let Ok(s) = StreamName::try_from(stream.as_str()) else {
-            return Err(super::forbid());
-        };
-        if let Some(resp) = super::require_scoped_admin(id, &s) {
-            return Err(resp);
-        }
+    let Extension(id) = identity.as_ref()?;
+    match StreamName::try_from(stream.as_str()) {
+        Ok(s) => super::require_scoped_admin(id, &s),
+        Err(_) => Some(super::forbid()),
     }
-    Ok(())
 }
 
 pub async fn create_consumer(
@@ -110,7 +107,7 @@ pub async fn get_consumer(
     Path(name): Path<String>,
     identity: Option<Extension<Arc<Identity>>>,
 ) -> Response {
-    if let Err(r) = authorize(&state, &name, &identity).await {
+    if let Some(r) = authorize(&state, &name, &identity).await {
         return r;
     }
     match state.broker.consumers.info(&name).await {
@@ -124,7 +121,7 @@ pub async fn delete_consumer(
     Path(name): Path<String>,
     identity: Option<Extension<Arc<Identity>>>,
 ) -> Response {
-    if let Err(r) = authorize(&state, &name, &identity).await {
+    if let Some(r) = authorize(&state, &name, &identity).await {
         return r;
     }
     match state.broker.consumers.delete(&name).await {
@@ -150,7 +147,7 @@ pub async fn seek_consumer(
     identity: Option<Extension<Arc<Identity>>>,
     Json(body): Json<SeekBody>,
 ) -> Response {
-    if let Err(r) = authorize(&state, &name, &identity).await {
+    if let Some(r) = authorize(&state, &name, &identity).await {
         return r;
     }
     let to = match body {
