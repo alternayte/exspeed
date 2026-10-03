@@ -172,11 +172,9 @@ async fn run_case(seed: u64) {
                 storage = open(dir.path());
             }
             // Retention: keep from a random offset.
-            75..=84 => {
-                if m.next > 0 {
-                    let keep_from = m.earliest + rng.below(m.next - m.earliest + 1);
-                    storage.trim_up_to(&s, Offset(keep_from)).await.unwrap();
-                }
+            75..=84 if m.next > 0 => {
+                let keep_from = m.earliest + rng.below(m.next - m.earliest + 1);
+                storage.trim_up_to(&s, Offset(keep_from)).await.unwrap();
             }
             // Read only.
             _ => {}
