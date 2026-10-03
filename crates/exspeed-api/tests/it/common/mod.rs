@@ -1,34 +1,23 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
-
 use exspeed_broker::leadership::ClusterLeadership;
-use exspeed_broker::lease::{LeaderLease, LeaseError, LeaseGuard, LeaseInfo};
+use exspeed_broker::lease::{AcquireRequest, LeaderLease, MemoryLeaseBackend, CLUSTER_LEASE};
 use exspeed_common::Metrics;
 
-/// Lease backend that always rejects. Used to put a `ClusterLeadership`
-/// into a permanent standby state for tests.
-pub struct AlwaysRejectLease;
-
-#[async_trait]
-impl LeaderLease for AlwaysRejectLease {
-    fn supports_coordination(&self) -> bool {
-        true
-    }
-
-    async fn try_acquire(
-        &self,
-        _name: &str,
-        _ttl: Duration,
-        _replication_endpoint: Option<&str>,
-    ) -> Result<Option<LeaseGuard>, LeaseError> {
-        Ok(None)
-    }
-
-    async fn list_all(&self) -> Result<Vec<LeaseInfo>, LeaseError> {
-        Ok(vec![])
-    }
+/// A lease backend whose cluster lease is held by another node for an
+/// hour: a `ClusterLeadership` on it stays a follower.
+pub async fn held_elsewhere() -> Arc<dyn LeaderLease> {
+    let b = MemoryLeaseBackend::new();
+    b.try_acquire(&AcquireRequest::new(
+        CLUSTER_LEASE,
+        "someone-else",
+        Duration::from_secs(3600),
+    ))
+    .await
+    .unwrap()
+    .unwrap();
+    b
 }
 
 /// Build an AppState with the desired leadership state.
@@ -49,7 +38,7 @@ pub async fn make_state_with_leader(leader: bool) -> Arc<exspeed_api::AppState> 
     let lease: Arc<dyn LeaderLease> = if leader {
         Arc::new(exspeed_broker::lease::NoopLeaderLease::new())
     } else {
-        Arc::new(AlwaysRejectLease)
+        held_elsewhere().await
     };
 
     let leadership = Arc::new(ClusterLeadership::spawn(lease.clone(), metrics.clone(), None).await);
@@ -130,6 +119,6 @@ pub async fn make_state_with_leader(leader: bool) -> Arc<exspeed_api::AppState> 
         // /readyz directly should set this themselves.
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         data_dir,
-        replication_coordinator: None,
+        cluster: None,
     })
 }

@@ -5,9 +5,9 @@ image:
   tag: ""            # defaults to .Chart.AppVersion
   pullPolicy: IfNotPresent
 
-# Number of broker pods. 1 = single node. >1 enables multi-pod mode
-# (leader lease + replication), which also requires `cluster` below.
-# ⚠️ Multi-pod HA is experimental until Phase 6 of docs/REVIEW.md lands.
+# Number of broker pods. 1 = single node. >1 runs a cluster (leader lease +
+# log replication, see docs/high-availability.md), which also requires
+# `cluster` below. Use 3 for HA.
 replicas: 1
 
 ports:
@@ -58,8 +58,14 @@ cluster:
   # Secret with the replicator bearer token under key `token`
   # (must map to a credential with the `replicate` action).
   replicatorTokenSecret: ""
-  leaseTtlSecs: 30
-  leaseHeartbeatSecs: 10
+  leaseTtlSecs: 15
+  leaseHeartbeatSecs: 3
+  # "all": acknowledge writes once every in-sync replica has them;
+  # "leader": after the leader's local write.
+  acks: all
+  # acks=all writes fail while fewer replicas (leader included) are in sync.
+  # 2 on a 3-node cluster never acknowledges a write held by one node only.
+  minInsyncReplicas: 1
 
 resources:
   requests:

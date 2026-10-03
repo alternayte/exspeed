@@ -8,5 +8,8 @@ Try it:
   curl -X POST localhost:{{ .Values.ports.http }}/api/v1/streams -H 'Content-Type: application/json' -d '{"name":"orders"}'
 {{- if gt (int .Values.replicas) 1 }}
 
-⚠️ Multi-pod mode is experimental (see docs/high-availability.md).
+Cluster of {{ .Values.replicas }} nodes (acks={{ .Values.cluster.acks }}). The Services route to every pod;
+one is the leader. Cluster-aware SDK clients (Rust connect_cluster, TypeScript
+`servers`) follow the leader automatically; followers answer writes with 503
+and the leader's address. Status: GET /api/v1/cluster on any pod.
 {{- end }}

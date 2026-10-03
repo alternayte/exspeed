@@ -17,7 +17,7 @@
 | 3. Ops | 🚧 Done: `exspeed.toml` (defaults < file < env < flags, `exspeed config print-default/validate/show`, one `[cluster]` section), ordered shutdown (drain → connectors → queries → resign + lease release → consumer state → dedup snapshot → fsync), TLS/handshake/idle timeouts, Helm chart (config map, probes, ServiceMonitor), cargo-chef Docker build, `exspeed healthcheck`. Still to do: online backup/restore, OpenAPI, Linux benchmark refresh vs Kafka/NATS. |
 | 4. ExQL v2 | ✅ DataFusion bounded engine, continuous dataflow (event-time windows, joins, durable tables, checkpoints, effectively-once output), indexes removed, differential tests — see [exql.md](exql.md) |
 | 5. Connectors v2 | ✅ checkpoint protocol, supervisor, typed settings, error taxonomy, log-backed offsets, plugin fixes; PG CDC/outbox/poll tested against Postgres in CI. RabbitMQ/S3/MySQL/MSSQL service tests still to do |
-| 6. HA | — |
+| 6. HA | ✅ Epoch-fenced lease (stable node ids, ISR in the lease, bounded heartbeat with local deadline; Postgres, Redis, in-memory backends sharing one conformance suite), pull replication of every stream with KIP-101 divergence truncation, metadata and retention mirroring, `acks = all` + `min_insync_replicas` + ISR-gated election, promotion that rebuilds dedup state, leader hints in the protocol/HTTP/SDKs, `GET /api/v1/cluster`, in-process multi-node failover tests — see [high-availability.md](high-availability.md). Not done: TLS on the cluster port, per-stream replication factor. |
 
 ## Contents
 
@@ -397,34 +397,18 @@ ergonomics. Keep the single binary, the log, subjects, SQL and connectors.
 Rebuild the internals around a few primitives that everything else composes
 on.
 
-```
-                         ┌────────────────────────────────────────────┐
-  TCP (v2 protocol) ───► │  Session layer  (auth, authz policy, flow  │
-  HTTP / webhooks  ───►  │  control, one dispatch table)              │
-                         └──────────────┬─────────────────────────────┘
-                                        │ every write
-                                        ▼
-                         ┌────────────────────────────────────────────┐
-                         │  Log::append / append_batch                │
-                         │  leader+epoch check → validate → dedup →   │
-                         │  storage → replicate → notify → metrics    │
-                         └──────────────┬─────────────────────────────┘
-                                        ▼
-   ┌───────────────┐   ┌────────────────────────────┐   ┌────────────────────┐
-   │ Consumers     │   │ Segment store              │   │ Replication        │
-   │ (ack floor +  │◄──│ writer thread / partition  │──►│ follower pull by   │
-   │ PEL, push &   │   │ lock-free readers, sparse  │   │ (stream, offset,   │
-   │ pull, groups) │   │ index, wire-format records │   │ epoch); append_at  │
-   └──────┬────────┘   └────────────────────────────┘   └────────────────────┘
-          │                         ▲
-          ▼                         │ internal compacted streams
-   ┌───────────────┐   ┌────────────┴──────────────────────────────────────┐
-   │ ExQL          │   │ __meta (streams, consumers, connectors, queries,   │
-   │ DataFusion    │   │ indexes, ACLs) · __consumer_state · __connector_   │
-   │ bounded +     │   │ offsets · __exql.<qid>.<op> changelogs · __dedup   │
-   │ dataflow      │   └───────────────────────────────────────────────────┘
-   │ continuous    │
-   └───────────────┘   Connectors: supervisor + checkpoint protocol
+```mermaid
+flowchart TB
+  tcp["TCP (protocol v2)"] --> session
+  http["HTTP / webhooks"] --> session
+  session["Session layer<br/>auth, authz policy, flow control, one dispatch table"]
+  session -->|every write| log["Log::append / append_batch<br/>leader and epoch check, validate, dedup,<br/>storage, replicate, notify, metrics"]
+  log --> store["Segment store<br/>writer thread per partition, lock-free readers,<br/>sparse index, wire-format records"]
+  store --> consumers["Consumers<br/>ack floor + PEL, push and pull, groups"]
+  store --> repl["Replication<br/>follower pull by (stream, offset, epoch); append_at"]
+  consumers --> exql["ExQL<br/>DataFusion bounded + continuous dataflow"]
+  meta["Internal compacted streams<br/>__meta (streams, consumers, connectors, queries, indexes, ACLs),<br/>__consumer_state, __connector_offsets, __exql changelogs, __dedup"] --> store
+  connectors["Connectors<br/>supervisor + checkpoint protocol"] --> log
 ```
 
 ### 5.1 One write path

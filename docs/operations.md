@@ -76,7 +76,8 @@ These values cover the common cases:
 | `tls.secretName` | `kubernetes.io/tls` Secret; serves TLS on both listeners |
 | `env` | Any server env var from [configuration.md](configuration.md) |
 | `serviceMonitor.enabled` | Prometheus Operator scraping of `/metrics` |
-| `replicas` | `>1` enables multi-pod mode (experimental — needs `cluster.*` secrets) |
+| `replicas` | `>1` runs a cluster (needs `cluster.postgresUrlSecret` and `cluster.replicatorTokenSecret`; see [high-availability.md](high-availability.md)) |
+| `cluster.acks`, `cluster.minInsyncReplicas` | Write durability in a cluster |
 
 ## Structured logging
 
@@ -110,8 +111,8 @@ On `SIGTERM` or `SIGINT` the server shuts down in this order:
 2. Stop connectors. Sinks flush and commit, and sources finish their
    batch, within 30 s.
 3. Resign leadership. This stops consumers, continuous queries and
-   retention, and in multi-pod mode it deletes the lease row so a standby
-   takes over at once.
+   retention. In a cluster it releases the lease so a follower takes over
+   within one heartbeat interval.
 4. Wait for consumers to persist their final state: ack floors, unacked
    records and delivery counts.
 5. Write the final dedup snapshot.
@@ -131,8 +132,7 @@ Size your retention with your slowest expected consumer in mind. Metrics of inte
 
 Consumer state is stored in the internal, compacted stream `__consumers`,
 with one snapshot record per consumer. It therefore gets the same
-durability as your data, and in multi-pod mode it replicates with the
-log.
+durability as your data, and in a cluster it replicates with the log.
 
 Snapshots are written at most every 100 ms while state changes, and once
 more on graceful shutdown. A crash (not a clean shutdown) can lose up to

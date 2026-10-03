@@ -1,268 +1,284 @@
-//! `ClusterLeadership` — thin wrapper over the `LeaderLease` trait that
-//! owns a single cluster-wide `cluster:leader` lease and exposes:
-//!   - `is_leader: watch::Receiver<bool>` — subscribe to promotions /
-//!     demotions.
-//!   - `current_child_token()` — returns a fresh child of the current
-//!     leader token. Pre-cancelled when we are not leader, so tasks
-//!     awaiting it exit cleanly.
+//! `ClusterLeadership` competes for the `cluster:leader` lease and drives
+//! this node's role:
 //!
-//! The internal retry loop ticks every `TTL/3`. While holding the lease,
-//! the underlying `LeaseGuard`'s own heartbeat task keeps the lease
-//! alive; we observe its `on_lost` watcher to flip state on loss.
+//! * **follower** — not the holder. The [`RoleHooks`] keep a replica of the
+//!   leader's log (see `crate::cluster`).
+//! * **promoting** — the lease was just acquired. [`RoleHooks::promote`]
+//!   stops the follower, stamps the new epoch on every stream and rebuilds
+//!   the dedup state. Writes are still closed.
+//! * **leader** — `is_leader` is `true`: the write path is open and leader
+//!   work (consumers, connectors, continuous queries, retention) runs under
+//!   [`ClusterLeadership::current_child_token`].
+//!
+//! Losing the lease (the heartbeat found another holder or missed its local
+//! deadline) cancels the leader token, closes writes and hands the node back
+//! to the follower.
+//!
+//! Standbys poll the lease record every heartbeat interval, so they know the
+//! current leader's endpoints (for client redirects) and take over as soon
+//! as the lease expires.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use tokio::sync::{watch, Mutex};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
-use uuid::Uuid;
+use tracing::{debug, error, info, warn};
 
-use crate::lease::{LeaderLease, LeaseGuard};
+use crate::lease::{self, AcquireRequest, Heartbeat, LeaderLease, LeaseGuard, LeaseRecord};
 use exspeed_common::Metrics;
 
-const LEASE_NAME: &str = "cluster:leader";
+pub use crate::lease::CLUSTER_LEASE as LEASE_NAME;
 
-/// Handle to the cluster-leader-lease state machine. Clone freely — all
-/// internal state is `Arc`'d.
+/// Called on role changes. Implemented by the replication layer.
+#[async_trait]
+pub trait RoleHooks: Send + Sync {
+    /// This node is (or became) a follower of whoever holds the lease.
+    async fn follow(&self);
+    /// The lease was acquired. Prepare to lead: stop following, fence the
+    /// log with the new epoch, rebuild dedup state. An error releases the
+    /// lease again.
+    async fn promote(&self, lease: &LeaseRecord) -> Result<(), String>;
+    /// Leadership ended (the leader token is already cancelled and writes
+    /// are closed).
+    async fn demoted(&self);
+}
+
+/// Settings for [`ClusterLeadership::start`].
+#[derive(Debug, Clone)]
+pub struct LeadershipOptions {
+    /// This node's stable id (persisted in the data dir by the server).
+    pub node_id: String,
+    pub ttl: Duration,
+    pub heartbeat: Duration,
+    /// Where followers replicate from this node.
+    pub replication_endpoint: Option<String>,
+    /// Where clients reach this node (sent to clients as a leader hint).
+    pub client_endpoint: Option<String>,
+    /// Only take the lease when this node is in the published ISR (or the
+    /// ISR is empty). Disabling it allows unclean elections.
+    pub require_isr: bool,
+}
+
+impl LeadershipOptions {
+    pub fn new(node_id: impl Into<String>) -> Self {
+        Self {
+            node_id: node_id.into(),
+            ttl: Duration::from_secs(15),
+            heartbeat: Duration::from_secs(3),
+            replication_endpoint: None,
+            client_endpoint: None,
+            require_isr: true,
+        }
+    }
+}
+
+/// Handle to the leadership state machine. Clone freely.
 #[derive(Clone)]
 pub struct ClusterLeadership {
-    /// Subscribes to `false → true` on promotion and `true → false` on
-    /// demotion. Callers should use `wait_for(|&v| v)` rather than busy
-    /// looping.
+    /// `true` while this node is the leader and accepts writes.
     pub is_leader: watch::Receiver<bool>,
-    /// This pod's stable identity for lease ownership. Emitted via
-    /// `/healthz` and `/api/v1/leases` — not a secret.
-    pub holder_id: Uuid,
-    // Internal shared state.
+    /// This node's stable id.
+    pub node_id: String,
     inner: Arc<Inner>,
 }
 
 struct Inner {
     lease: Arc<dyn LeaderLease>,
     metrics: Arc<Metrics>,
+    opts: LeadershipOptions,
+    hooks: Option<Arc<dyn RoleHooks>>,
     is_leader_tx: watch::Sender<bool>,
-    // Stores the currently-held guard while we are leader (`None` otherwise).
-    // Held behind a `Mutex` because the background retry task and `demote`
-    // both touch it.
+    /// The latest lease record seen: ours while leading, the leader's
+    /// while following.
+    known_tx: watch::Sender<Option<LeaseRecord>>,
     guard: Mutex<Option<LeaseGuard>>,
-    // The live leader token. Rotated on each promotion so that callers
-    // who used `current_child_token()` during a previous tenure don't
-    // inherit the new one. Callers should always read via
-    // `ClusterLeadership::current_child_token()`.
+    /// Rotated on each promotion; pre-cancelled while not leader.
     current_token: Mutex<CancellationToken>,
-    /// Set by `resign`: the retry loop stops competing for the lease.
-    resigned: std::sync::atomic::AtomicBool,
-    holder_id: Uuid,
-    /// The `host:port` followers dial to replicate from this pod. Written
-    /// into the `cluster:leader` lease row on each acquire so a standby can
-    /// discover it via `list_all()` without a separate registry. `None`
-    /// when the server was started without a cluster-bind endpoint (single-pod
-    /// deployments, or Wave-5 not-yet-wired paths).
-    replication_endpoint: Option<String>,
+    /// Our epoch while leader; 0 otherwise.
+    epoch: AtomicU64,
+    resigned: AtomicBool,
+    /// Serializes promotion, demotion and resignation.
+    transition: Mutex<()>,
 }
 
 impl ClusterLeadership {
-    /// Spawn the leadership state machine and return a handle. The retry
-    /// task runs in the background for the lifetime of the returned value
-    /// (kept alive via `Arc`).
-    ///
-    /// `replication_endpoint` is the `host:port` advertised to followers
-    /// via the `cluster:leader` lease row. Pass `None` when this pod has
-    /// no cluster-bind listener (single-pod deployments, or tests that
-    /// don't exercise replication). Only the cluster-leader lease carries
-    /// this value; other leases (connector groups, etc.) always pass
-    /// `None` through the underlying `LeaderLease::try_acquire`.
+    /// Convenience for tests and single-node setups: random node id, default
+    /// timing, no role hooks.
     pub async fn spawn(
         lease: Arc<dyn LeaderLease>,
         metrics: Arc<Metrics>,
         replication_endpoint: Option<String>,
     ) -> Self {
-        Self::spawn_with_ttl(
-            lease,
-            metrics,
-            replication_endpoint,
-            crate::lease::ttl_from_env(),
-        )
-        .await
+        let mut opts = LeadershipOptions::new(uuid::Uuid::new_v4().to_string());
+        opts.replication_endpoint = replication_endpoint;
+        Self::start(lease, metrics, opts, None)
     }
 
-    /// Like [`spawn`](Self::spawn) with an explicit lease TTL.
-    pub async fn spawn_with_ttl(
+    /// Start competing for the lease.
+    pub fn start(
         lease: Arc<dyn LeaderLease>,
         metrics: Arc<Metrics>,
-        replication_endpoint: Option<String>,
-        ttl: Duration,
+        opts: LeadershipOptions,
+        hooks: Option<Arc<dyn RoleHooks>>,
     ) -> Self {
-        let holder_id = Uuid::new_v4();
         let (is_leader_tx, is_leader_rx) = watch::channel(false);
-
+        let (known_tx, _) = watch::channel(None);
+        let node_id = opts.node_id.clone();
         let inner = Arc::new(Inner {
             lease,
             metrics,
+            opts,
+            hooks,
             is_leader_tx,
+            known_tx,
             guard: Mutex::new(None),
-            // Pre-cancelled token so standbys that call
-            // current_child_token() immediately receive a cancelled child.
             current_token: Mutex::new({
                 let t = CancellationToken::new();
                 t.cancel();
                 t
             }),
-            resigned: std::sync::atomic::AtomicBool::new(false),
-            holder_id,
-            replication_endpoint,
+            epoch: AtomicU64::new(0),
+            resigned: AtomicBool::new(false),
+            transition: Mutex::new(()),
         });
-
-        // Spawn the retry loop.
-        let inner_for_task = Arc::clone(&inner);
-        tokio::spawn(async move {
-            run_retry_loop(inner_for_task, ttl).await;
-        });
-
+        tokio::spawn(run_loop(inner.clone()));
         Self {
             is_leader: is_leader_rx,
-            holder_id,
+            node_id,
             inner,
         }
     }
 
-    /// Step down for good (graceful shutdown): stop competing for the
-    /// lease, cancel the leader token so leader-only work stops, and drop
-    /// the lease guard, which deletes the lease row so a peer can take over
-    /// immediately instead of waiting out the TTL.
+    /// Step down for good (graceful shutdown): stop competing, cancel the
+    /// leader token, close writes and release the lease so a peer can take
+    /// over at once instead of waiting out the TTL.
     pub async fn resign(&self) {
-        self.inner
-            .resigned
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.inner.resigned.store(true, Ordering::SeqCst);
+        let _t = self.inner.transition.lock().await;
         self.inner.current_token.lock().await.cancel();
-        let guard = self.inner.guard.lock().await.take();
-        if let Some(g) = guard {
-            drop(g);
+        let had = self.inner.guard.lock().await.take().is_some();
+        let _ = self.inner.is_leader_tx.send(false);
+        self.inner.epoch.store(0, Ordering::SeqCst);
+        if had {
             self.inner.metrics.set_is_leader(false);
             self.inner.metrics.set_lease_held(LEASE_NAME, false);
             self.inner.metrics.record_leader_transition("resigned");
-            let _ = self.inner.is_leader_tx.send(false);
-            info!(holder = %self.inner.holder_id, "cluster:leader released (shutdown)");
+            info!(node = %self.node_id, "cluster:leader released (shutdown)");
         }
     }
 
-    /// Non-blocking snapshot of whether this pod is currently leader.
+    /// Whether this node is currently the leader (writes open).
     pub fn is_currently_leader(&self) -> bool {
         *self.is_leader.borrow()
     }
 
-    /// Return a fresh child of the *current* leader token. If this pod
-    /// is not currently leader, the returned token is already cancelled,
-    /// so tasks awaiting it will exit immediately — a safe default.
-    /// Always prefer this over trying to hold a long-lived token
-    /// reference across a demote/re-promote cycle.
-    pub async fn current_child_token(&self) -> CancellationToken {
-        let tok = self.inner.current_token.lock().await;
-        tok.child_token()
+    /// Our leader epoch, or 0 when not leading.
+    pub fn epoch(&self) -> u64 {
+        self.inner.epoch.load(Ordering::SeqCst)
     }
 
-    /// Returns the replication endpoint the current `cluster:leader` holder
-    /// advertised on acquire, as read from the lease backend. `None` when:
-    ///   - the backend has no active `cluster:leader` row (standby period),
-    ///   - the leader was started without a cluster-bind endpoint, or
-    ///   - the backend is Noop (which never returns rows).
-    ///
-    /// Backend errors are logged at WARN and collapsed to `None` so the
-    /// follower's discovery path degrades to "retry later" rather than
-    /// surfacing a transient failure up the stack.
-    pub async fn leader_replication_endpoint(&self) -> Option<String> {
-        match self.inner.lease.list_all().await {
-            Ok(entries) => entries
-                .into_iter()
-                .find(|e| e.name == LEASE_NAME)
-                .and_then(|e| e.replication_endpoint),
-            Err(e) => {
-                warn!(error = %e, "leader_replication_endpoint: lease backend list_all failed");
-                None
-            }
+    /// A fresh child of the current leader token; already cancelled when
+    /// this node isn't the leader.
+    pub async fn current_child_token(&self) -> CancellationToken {
+        self.inner.current_token.lock().await.child_token()
+    }
+
+    /// The latest lease record seen (ours while leading).
+    pub fn lease_record(&self) -> Option<LeaseRecord> {
+        self.inner.known_tx.borrow().clone()
+    }
+
+    /// Subscribe to lease record updates.
+    pub fn watch_lease(&self) -> watch::Receiver<Option<LeaseRecord>> {
+        self.inner.known_tx.subscribe()
+    }
+
+    /// Client endpoint of the current leader when that is another live node
+    /// — the hint sent to clients that reach a follower.
+    pub fn leader_hint(&self) -> Option<String> {
+        if self.is_currently_leader() {
+            return None;
         }
+        let rec = self.lease_record()?;
+        if rec.holder == self.node_id || !rec.is_live() {
+            return None;
+        }
+        rec.client_endpoint
+    }
+
+    /// The lease backend.
+    pub fn lease(&self) -> &Arc<dyn LeaderLease> {
+        &self.inner.lease
+    }
+
+    pub fn options(&self) -> &LeadershipOptions {
+        &self.inner.opts
     }
 }
 
-/// Periodic acquire + heartbeat-observation loop. Ticks every `TTL/3`.
-/// Only spawned once per `ClusterLeadership`.
-async fn run_retry_loop(inner: Arc<Inner>, ttl: Duration) {
-    let tick = std::cmp::max(ttl / 3, Duration::from_secs(1));
-    let mut ticker = tokio::time::interval(tick);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+fn heartbeat(opts: &LeadershipOptions) -> Heartbeat {
+    Heartbeat::new(opts.ttl, opts.heartbeat)
+}
 
+async fn run_loop(inner: Arc<Inner>) {
+    let coordinated = inner.lease.supports_coordination();
+    if coordinated {
+        if let Some(h) = &inner.hooks {
+            h.follow().await;
+        }
+    }
+    let hb = heartbeat(&inner.opts);
+    let mut tick = tokio::time::interval(hb.interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        ticker.tick().await;
-        if inner.resigned.load(std::sync::atomic::Ordering::SeqCst) {
+        tick.tick().await;
+        if inner.resigned.load(Ordering::SeqCst) {
             return;
         }
-
-        // If we already hold leadership, skip re-acquire; the LeaseGuard's
-        // own heartbeat task keeps the lease alive and fires on_lost on
-        // failure. Demotion is handled via the watcher task below.
-        {
-            let guard = inner.guard.lock().await;
-            if guard.is_some() {
-                continue;
+        if inner.guard.lock().await.is_some() {
+            continue; // leading; the guard's heartbeat keeps the lease
+        }
+        // Standby: look at the record first so we know the leader, and only
+        // try to acquire when it looks free (or is ours from before a
+        // restart).
+        if coordinated {
+            match inner.lease.get(LEASE_NAME).await {
+                Ok(rec) => {
+                    let free = rec
+                        .as_ref()
+                        .is_none_or(|r| !r.is_live() || r.holder == inner.opts.node_id);
+                    inner.known_tx.send_replace(rec);
+                    if !free {
+                        inner
+                            .metrics
+                            .record_lease_acquire_attempt(LEASE_NAME, "rejected");
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    debug!(error = %e, "lease backend unavailable");
+                    continue;
+                }
             }
         }
-
-        // Not currently leader — attempt to acquire. Pass the advertised
-        // endpoint (may be None) so followers can discover it via
-        // `list_all()` without a separate registry.
-        match inner
-            .lease
-            .try_acquire(LEASE_NAME, ttl, inner.replication_endpoint.as_deref())
-            .await
-        {
-            Ok(Some(lg)) => {
-                // Install fresh token BEFORE signalling is_leader, so
-                // subscribers that wake up on is_leader=true and call
-                // current_child_token() see the new token, not the
-                // pre-cancelled one.
-                let new_token = CancellationToken::new();
-                {
-                    let mut tok = inner.current_token.lock().await;
-                    *tok = new_token.clone();
-                }
-
-                // Clone on_lost before we move lg into the guard slot.
-                let mut on_lost = lg.on_lost.clone();
-
-                // Stash the guard. The LeaseGuard's own heartbeat task
-                // keeps the lease alive while it's held here.
-                {
-                    let mut g = inner.guard.lock().await;
-                    *g = Some(lg);
-                }
-
-                inner.metrics.set_is_leader(true);
-                inner.metrics.set_lease_held(LEASE_NAME, true);
-                inner.metrics.record_leader_transition("acquired");
-                inner
-                    .metrics
-                    .record_lease_acquire_attempt(LEASE_NAME, "acquired");
-                info!(
-                    holder = %inner.holder_id,
-                    role = "leader",
-                    "cluster:leader acquired — this pod is now the leader"
-                );
-                let _ = inner.is_leader_tx.send(true);
-
-                // Hook up on_lost watcher: when the guard's heartbeat
-                // fails, run demote() to cancel the token + clear state.
-                let inner_for_watch = Arc::clone(&inner);
-                tokio::spawn(async move {
-                    let _ = on_lost.wait_for(|&v| v).await;
-                    demote(inner_for_watch).await;
-                });
-            }
+        let req = AcquireRequest {
+            name: LEASE_NAME.to_string(),
+            holder: inner.opts.node_id.clone(),
+            ttl: inner.opts.ttl,
+            replication_endpoint: inner.opts.replication_endpoint.clone(),
+            client_endpoint: inner.opts.client_endpoint.clone(),
+            require_isr: inner.opts.require_isr,
+        };
+        match lease::acquire(inner.lease.clone(), &req, hb).await {
+            Ok(Some(guard)) => promote(&inner, guard).await,
             Ok(None) => {
                 inner
                     .metrics
                     .record_lease_acquire_attempt(LEASE_NAME, "rejected");
-                debug!("cluster:leader held by another pod; staying standby");
+                debug!("cluster:leader held by another node (or not in the ISR)");
             }
             Err(e) => {
                 inner
@@ -274,33 +290,65 @@ async fn run_retry_loop(inner: Arc<Inner>, ttl: Duration) {
     }
 }
 
-async fn demote(inner: Arc<Inner>) {
-    // A deliberate `resign` already did the cleanup; dropping its guard
-    // fires `on_lost`, which is not a lost lease.
-    if inner.resigned.load(std::sync::atomic::Ordering::SeqCst) {
+async fn promote(inner: &Arc<Inner>, guard: LeaseGuard) {
+    let _t = inner.transition.lock().await;
+    if inner.resigned.load(Ordering::SeqCst) {
+        return; // dropping the guard releases the lease
+    }
+    let record = guard.record.clone();
+    let mut on_lost = guard.on_lost.clone();
+    inner
+        .metrics
+        .record_lease_acquire_attempt(LEASE_NAME, "acquired");
+    info!(node = %inner.opts.node_id, epoch = record.epoch, "cluster:leader acquired; promoting");
+    inner.known_tx.send_replace(Some(record.clone()));
+
+    if let Some(h) = &inner.hooks {
+        let res = tokio::select! {
+            r = h.promote(&record) => r,
+            _ = on_lost.wait_for(|&l| l) => Err("lease lost during promotion".into()),
+        };
+        if let Err(e) = res {
+            error!(error = %e, "promotion failed; releasing the lease");
+            drop(guard);
+            h.follow().await;
+            return;
+        }
+    }
+
+    let token = CancellationToken::new();
+    *inner.current_token.lock().await = token.clone();
+    inner.epoch.store(record.epoch, Ordering::SeqCst);
+    *inner.guard.lock().await = Some(guard);
+    inner.metrics.set_is_leader(true);
+    inner.metrics.set_lease_held(LEASE_NAME, true);
+    inner.metrics.record_leader_transition("acquired");
+    let _ = inner.is_leader_tx.send(true);
+    info!(node = %inner.opts.node_id, epoch = record.epoch, role = "leader", "this node is now the leader");
+
+    let inner2 = inner.clone();
+    tokio::spawn(async move {
+        let _ = on_lost.wait_for(|&l| l).await;
+        demote(inner2, record.epoch).await;
+    });
+}
+
+async fn demote(inner: Arc<Inner>, epoch: u64) {
+    let _t = inner.transition.lock().await;
+    if inner.resigned.load(Ordering::SeqCst) || inner.epoch.load(Ordering::SeqCst) != epoch {
         return;
     }
-    // Cancel the current token (so background tasks exit), drop the
-    // guard (so peers can acquire), flip metrics + watcher.
-    let token = {
-        let tok = inner.current_token.lock().await;
-        tok.clone()
-    };
-    token.cancel();
-
-    {
-        let mut g = inner.guard.lock().await;
-        *g = None;
-    }
-
+    inner.current_token.lock().await.cancel();
+    let _ = inner.is_leader_tx.send(false);
+    inner.epoch.store(0, Ordering::SeqCst);
+    *inner.guard.lock().await = None;
     inner.metrics.set_is_leader(false);
     inner.metrics.set_lease_held(LEASE_NAME, false);
     inner.metrics.record_leader_transition("lost");
     inner.metrics.record_lease_lost(LEASE_NAME);
-    let _ = inner.is_leader_tx.send(false);
-    warn!(
-        holder = %inner.holder_id,
-        role = "standby",
-        "cluster:leader lost — this pod is now a standby"
-    );
+    warn!(node = %inner.opts.node_id, epoch, role = "follower", "cluster:leader lost; this node is now a follower");
+    if let Some(h) = &inner.hooks {
+        h.demoted().await;
+        h.follow().await;
+    }
 }

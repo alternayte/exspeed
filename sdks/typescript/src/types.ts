@@ -21,6 +21,13 @@ export interface ClientOptions {
   host?: string;
   /** Default `5933`. */
   port?: number;
+  /**
+   * Cluster seed addresses (`"host:port"`). When set, the client connects to
+   * whichever node is the leader, following the leader hints followers
+   * return, and finds the new leader again after a failover. Overrides
+   * `host`/`port`.
+   */
+  servers?: string[];
   /** Bearer token, when the server runs with auth. */
   token?: string;
   /**

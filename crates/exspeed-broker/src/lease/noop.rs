@@ -1,14 +1,11 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::{oneshot, watch};
-use uuid::Uuid;
 
-use super::{LeaderLease, LeaseError, LeaseGuard, LeaseInfo};
+use super::{AcquireRequest, LeaderLease, LeaseError, LeaseRecord, Refresh};
 
-/// Always-succeed lease backend used when no shared coordination backend
-/// is configured (`EXSPEED_LEASE_BACKEND` unset). Each pod acts as
-/// its own leader — preserving current single-pod behavior exactly.
+/// Always-grant lease backend used when no coordination backend is
+/// configured: every node is its own leader (single-node mode).
 pub struct NoopLeaderLease;
 
 impl NoopLeaderLease {
@@ -29,31 +26,35 @@ impl LeaderLease for NoopLeaderLease {
         false
     }
 
-    async fn try_acquire(
-        &self,
-        name: &str,
-        _ttl: Duration,
-        // Noop is stateless — `list_all` always returns `[]`, so whatever
-        // endpoint the caller passes is thrown away. Spec only requires
-        // observability via `list_all`, which Noop intentionally skips.
-        _replication_endpoint: Option<&str>,
-    ) -> Result<Option<LeaseGuard>, LeaseError> {
-        let (cancel_tx, _cancel_rx) = oneshot::channel::<()>();
-        let (lost_tx, lost_rx) = watch::channel(false);
-        Ok(Some(LeaseGuard {
-            name: name.to_string(),
-            holder_id: Uuid::new_v4(),
-            on_lost: lost_rx,
-            // Keep the sender alive so `on_lost.changed()` stays pending.
-            // Without this, owner tasks that select on `on_lost.changed()`
-            // would stop immediately because the dropped sender causes
-            // `changed()` to resolve with `Err(_)`.
-            _lost_tx: Some(lost_tx),
-            _cancel_heartbeat: cancel_tx,
+    async fn try_acquire(&self, req: &AcquireRequest) -> Result<Option<LeaseRecord>, LeaseError> {
+        Ok(Some(LeaseRecord {
+            name: req.name.clone(),
+            holder: req.holder.clone(),
+            epoch: 0,
+            expires_at: chrono::DateTime::<chrono::Utc>::MAX_UTC,
+            replication_endpoint: None,
+            client_endpoint: req.client_endpoint.clone(),
+            isr: Vec::new(),
         }))
     }
 
-    async fn list_all(&self) -> Result<Vec<LeaseInfo>, LeaseError> {
+    async fn refresh(&self, _: &str, _: &str, _: u64, _: Duration) -> Result<Refresh, LeaseError> {
+        Ok(Refresh::Held)
+    }
+
+    async fn release(&self, _: &str, _: &str, _: u64) -> Result<(), LeaseError> {
+        Ok(())
+    }
+
+    async fn set_isr(&self, _: &str, _: &str, _: u64, _: &[String]) -> Result<bool, LeaseError> {
+        Ok(true)
+    }
+
+    async fn get(&self, _: &str) -> Result<Option<LeaseRecord>, LeaseError> {
+        Ok(None)
+    }
+
+    async fn list_all(&self) -> Result<Vec<LeaseRecord>, LeaseError> {
         Ok(Vec::new())
     }
 }
@@ -61,48 +62,22 @@ impl LeaderLease for NoopLeaderLease {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::sync::Arc;
 
     #[tokio::test]
-    async fn noop_always_acquires() {
-        let b = NoopLeaderLease::new();
-        let guard = b
-            .try_acquire("foo", Duration::from_secs(30), None)
-            .await
-            .unwrap();
-        assert!(guard.is_some());
-        let g2 = b
-            .try_acquire("foo", Duration::from_secs(30), None)
-            .await
-            .unwrap();
-        assert!(g2.is_some(), "noop never rejects");
-    }
-
-    #[tokio::test]
-    async fn noop_list_is_empty() {
-        let b = NoopLeaderLease::new();
-        let _g = b
-            .try_acquire("x", Duration::from_secs(30), None)
-            .await
-            .unwrap();
-        assert!(b.list_all().await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn noop_on_lost_never_fires() {
-        let b = NoopLeaderLease::new();
-        let guard = b
-            .try_acquire("x", Duration::from_secs(30), None)
+    async fn noop_always_grants_and_never_loses() {
+        let b: Arc<dyn LeaderLease> = Arc::new(NoopLeaderLease::new());
+        let hb = super::super::Heartbeat::new(Duration::from_millis(60), Duration::from_millis(10));
+        let req = AcquireRequest::new("x", "n", hb.ttl);
+        let g = super::super::acquire(b.clone(), &req, hb)
             .await
             .unwrap()
             .unwrap();
-        // Spin briefly — on_lost should remain false.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!(*guard.on_lost.borrow()));
-    }
-
-    #[tokio::test]
-    async fn noop_reports_no_coordination() {
-        assert!(!NoopLeaderLease::new().supports_coordination());
+        let g2 = super::super::acquire(b.clone(), &req, hb).await.unwrap();
+        assert!(g2.is_some(), "noop never rejects");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!g.is_lost());
+        assert!(b.list_all().await.unwrap().is_empty());
+        assert!(!b.supports_coordination());
     }
 }

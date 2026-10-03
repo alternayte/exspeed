@@ -5,43 +5,72 @@ architecture is in [REVIEW.md §5](REVIEW.md#5-proposed-target-architecture).
 
 ## Crates
 
-Each crate depends only on crates listed above it.
+Arrows point from a crate to the crates it depends on.
 
+```mermaid
+graph BT
+  streams[exspeed-streams] --> common[exspeed-common]
+  protocol[exspeed-protocol] --> streams
+  storage[exspeed-storage] --> streams
+  broker[exspeed-broker] --> protocol
+  broker --> storage
+  connectors[exspeed-connectors] --> broker
+  processing[exspeed-processing] --> broker
+  api[exspeed-api] --> connectors
+  api --> processing
+  bin[exspeed] --> api
+  client[exspeed-client] --> protocol
+  bench[exspeed-bench] --> client
 ```
-exspeed-common       shared types (StreamName, Offset), subject filters, auth store, metrics
-exspeed-streams      StorageEngine trait (async), Record / StoredRecord, StreamConfig
-exspeed-protocol     wire protocol: Frame codec, opcodes, client protocol v2 (client.rs), replication messages
-exspeed-storage      FileStorage (segments, sparse indexes, retention, compaction), MemoryStorage
-exspeed-broker       Log (the single write path), BrokerAppend (dedup), consumers, leases, replication
-exspeed-connectors   connector manager, per-connector supervisor, retry/DLQ, offset stores, built-in plugins
-exspeed-processing   ExQL: parser → plan → bounded / continuous runtime
-exspeed-api          Axum HTTP API, auth and leader-gate middleware, webhooks
-exspeed              binary: CLI, server bootstrap (cli/server.rs), TCP sessions (session.rs)
-exspeed-client       async Rust client for protocol v2 (also used by the benchmarks and tests)
-exspeed-bench        benchmark harness (not shipped in the image)
-exspeed-testkit      test helpers
-```
+
+| Crate | Contents |
+|-------|----------|
+| `exspeed-common` | Shared types (`StreamName`, `Offset`), subject filters, auth store, metrics |
+| `exspeed-streams` | `StorageEngine` trait (async), `Record` / `StoredRecord`, `StreamConfig` |
+| `exspeed-protocol` | Wire protocol: frame codec, opcodes, client protocol v2 (`client.rs`) |
+| `exspeed-storage` | `FileStorage` (segments, sparse indexes, retention, compaction), `MemoryStorage` |
+| `exspeed-broker` | `Log` (the single write path), `BrokerAppend` (dedup), consumers, leases and leadership, cluster replication (`cluster/`) |
+| `exspeed-connectors` | Connector manager, per-connector supervisor, retry/DLQ, offset stores, built-in plugins |
+| `exspeed-processing` | ExQL: parser, planner, bounded and continuous runtimes |
+| `exspeed-api` | Axum HTTP API, auth and leader-gate middleware, webhooks |
+| `exspeed` | Binary: CLI, server bootstrap (`cli/server.rs`), TCP sessions (`session.rs`) |
+| `exspeed-client` | Async Rust client for protocol v2 (also used by the benchmarks and tests) |
+| `exspeed-bench` | Benchmark harness (not shipped in the image) |
+| `exspeed-testkit` | Test helpers |
 
 ## Data flow
 
-```
- Producers ──TCP──► session.rs ─────────┐
-           ──HTTP─► exspeed-api ────────┤
- Webhooks  ──HTTP─► exspeed-api ────────┼──► Log ──► (leader gate, validation, dedup) ──► FileStorage
- Sources   ───────► connector manager ──┤            └──► replication feed, metrics
- ExQL out  ───────► continuous runtime ─┘
- Consumers ───────► __consumers stream ─┘
-
- FileStorage ──► consumer actors (one per consumer, leader only) ──► subscriptions / pulls ──TCP──► apps
-            ──► stateless reads (TCP Read, HTTP /records)
-            ──► sink connectors ──► external systems
-            ──► continuous queries / materialized tables
-            ──► replication server (leader) ──TCP 5934──► followers
+```mermaid
+flowchart LR
+  subgraph writers[Writers]
+    tcp["Producers (TCP, session.rs)"]
+    http["Producers and webhooks (HTTP, exspeed-api)"]
+    src["Source connectors"]
+    exqlout["ExQL continuous output"]
+    cstate["Consumer state (__consumers)"]
+  end
+  log["Log<br/>leader gate, validation, dedup,<br/>acks=all wait, metrics"]
+  fs[("FileStorage")]
+  tcp --> log
+  http --> log
+  src --> log
+  exqlout --> log
+  cstate --> log
+  log --> fs
+  fs --> actors["Consumer actors<br/>(leader only)"] -->|"push / pull over TCP"| apps["Applications"]
+  fs --> reads["Stateless reads<br/>(TCP Read, HTTP /records)"]
+  fs --> sinks["Sink connectors"] --> ext["External systems"]
+  fs --> cq["Continuous queries and tables"]
+  fs --> fetch["Fetch server (leader)"]
+  followers["Followers<br/>(cluster::follower)"] -->|"pull over TCP 5934"| fetch
 ```
 
 Every write, whatever its origin, goes through `exspeed_broker::log::Log`.
 It enforces the leader gate, validates records, applies `msg_id` dedup,
-appends to storage, feeds replication, and records metrics.
+appends to storage, waits for the in-sync replicas in a cluster with
+`acks = all`, and records metrics. The one other writer is the replication
+follower, which applies the leader's records with `StorageEngine::append_at`
+while the node is not the leader (see [high-availability.md](high-availability.md)).
 
 ## Consumers
 
@@ -172,8 +201,8 @@ not expose it yet.
 **Replication.** `StorageEngine::append_at` appends records that already
 carry their offsets, timestamps and keys. Offsets must be strictly
 increasing and at or above the next offset; gaps are allowed. It is
-implemented by `FileStorage` and `MemoryStorage` and is not used by the
-replication code yet.
+implemented by `FileStorage` and `MemoryStorage` and is how followers apply
+replicated records (`exspeed_broker::cluster::follower`).
 
 ## Server startup sequence
 
@@ -185,15 +214,19 @@ replication code yet.
    tail scan and starts one writer thread per stream and the compactor.
 4. Build `BrokerAppend`, then rebuild the dedup maps in the background.
    These come from the snapshot when one exists, otherwise from a scan.
-5. Build the lease backend and `ClusterLeadership`.
-6. Build the `Broker`, which contains the `Log` and the `ConsumerManager`,
-   and gate writes on leadership.
+5. Build the lease backend, bind the cluster port (cluster mode), and build
+   the `Broker`, which contains the `Log` and the `ConsumerManager`.
+6. In cluster mode build `cluster::Cluster` (epoch store, write-path hooks,
+   follower, fetch server). Start `ClusterLeadership` with it as the role
+   hooks, and gate writes on leadership. A node starts as a follower;
+   on acquiring the lease it stops following, stamps the new epoch on every
+   stream and rebuilds dedup state before writes open.
 7. Build the `ConnectorManager` and `ExqlEngine`, and load their configs and
    queries.
 8. Spawn the background tasks: the dedup snapshot task and the leader
    supervisor. When this pod becomes leader, the supervisor starts the
    consumers (restored from `__consumers`), connectors, continuous queries
-   and retention, and the replication server or client.
+   and retention.
 9. Spawn the HTTP API.
 10. Enter the TCP accept loop, which spawns one task per connection.
 

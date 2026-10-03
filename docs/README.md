@@ -27,7 +27,7 @@
 | [Configuration](configuration.md) | Server flags and every environment variable |
 | [Operations](operations.md) | Docker, logging, probes, shutdown, backups, metrics |
 | [Security](security.md) | Tokens, scoped credentials, TLS |
-| [High availability](high-availability.md) | Multi-pod leader lease and replication (not production-safe yet) |
+| [High availability](high-availability.md) | Clusters: leader election, replication, failover, `acks` |
 
 ## Internals and project
 

@@ -8,37 +8,20 @@ use serde_json::json;
 
 use crate::state::AppState;
 
-/// `GET /api/v1/cluster/followers` — snapshot of currently-connected
-/// replication followers on this leader.
-///
-/// Gating:
-/// - Admin-bearer gated via the `require_admin` middleware.
-/// - Leader-only via the `leader_gate` middleware applied to the same
-///   authenticated router.
-/// - Multi-pod mode gated here: if this pod has no attached
-///   `ReplicationCoordinator` (the Wave 5 startup wiring only builds
-///   one when `EXSPEED_LEASE_BACKEND=postgres|redis`), we return 503
-///   with a hint pointing at the env var. A single-pod pod has nothing
-///   meaningful to return; 503 makes the "you probably wanted to turn
-///   replication on" signal explicit.
-///
-/// Success body: `Vec<FollowerSnapshot>` — `follower_id` + UTC
-/// `registered_at` per connected follower. Richer data (lag seconds,
-/// cursor summary, records applied) lands in a later wave.
-pub async fn list_followers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let Some(coord) = state.replication_coordinator.as_ref() else {
-        // Deliberately verbose: the 503 here almost always means "the
-        // operator started the pod without setting EXSPEED_LEASE_BACKEND"
-        // and pointing at the fix inline saves one round-trip to docs.
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
+/// `GET /api/v1/cluster` — this node's view of the cluster: node id, role,
+/// leader epoch, the leader's endpoints, and either the ISR plus follower
+/// progress (on the leader) or the replication session (on a follower).
+/// Answered by every node, leader or not.
+pub async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.cluster.as_ref() {
+        Some(c) => (StatusCode::OK, Json(c.status().await)).into_response(),
+        None => (
+            StatusCode::OK,
             Json(json!({
-                "error": "not a multi-pod deployment",
-                "hint": "set EXSPEED_LEASE_BACKEND=postgres|redis to enable replication",
+                "node_id": state.leadership.node_id,
+                "role": "standalone",
             })),
         )
-            .into_response();
-    };
-
-    (StatusCode::OK, Json(coord.snapshot())).into_response()
+            .into_response(),
+    }
 }

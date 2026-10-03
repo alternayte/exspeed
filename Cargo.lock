@@ -2365,6 +2365,7 @@ dependencies = [
  "opentelemetry",
  "parking_lot",
  "prometheus",
+ "rand 0.8.5",
  "redis",
  "rust-s3",
  "serde",

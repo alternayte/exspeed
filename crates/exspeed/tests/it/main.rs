@@ -2,7 +2,7 @@
 //! one per file). Each submodule is one former `tests/*.rs` file.
 
 mod api_test;
-mod cluster_followers_endpoint_test;
+mod cluster_test;
 mod common;
 mod connector_dlq_test;
 mod connector_test;

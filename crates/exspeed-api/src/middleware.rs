@@ -130,7 +130,8 @@ pub async fn leader_gate(
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({
             "error": "not leader",
-            "hint": "this pod is a standby. GET /api/v1/leases on any pod to discover the current leader.",
+            "leader": state.leadership.leader_hint(),
+            "hint": "this node is a follower; send requests to the leader (GET /api/v1/cluster on any node shows it)",
         })),
     )
         .into_response()

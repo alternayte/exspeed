@@ -1,123 +1,191 @@
-//! Redis lease backend. Uses `SET key value NX PX ttl_ms` for acquire and
-//! Lua scripts for compare-and-swap on refresh and release. Keys namespaced
-//! under `EXSPEED_LEASE_REDIS_KEY_PREFIX` (default `exspeed:lease:`).
-//!
-//! This is the canonical Redlock single-instance pattern: SET-NX wins the
-//! lease atomically; the stored value is checked on refresh/release so a
-//! process whose lease has been stolen cannot clobber the new holder's entry.
-//!
-//! Value format (Plan G+): JSON blob
-//! `{"holder":"<uuid>","replication_endpoint":"<addr>"}`.
-//! `replication_endpoint` is optional (serialized only when `Some`). The
-//! heartbeat task refreshes TTL only — it never rewrites the value — so the
-//! blob is byte-stable for the tenure, which is what the Lua CAS compares.
-//!
-//! NOT backward-compatible with pre-Plan-G deployments that stored a bare
-//! UUID. A rolling upgrade will see CAS failures on old keys; those keys
-//! expire via TTL and the new scheme takes over on the first post-upgrade
-//! acquire. No operator action required — just expect a brief leadership
-//! re-election at the upgrade boundary.
+//! Redis lease backend. Each lease is a hash at `{prefix}{name}` (fields
+//! `name`, `holder`, `epoch`, `exp` in ms, `repl`, `client`, `isr`), and
+//! `{prefix}__names` indexes them. Every transition is a Lua script that reads
+//! the Redis server clock (`TIME`), so node clocks don't matter. The hash
+//! never expires on its own: an expired lease keeps its epoch and ISR.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use redis::AsyncCommands;
-use serde::{Deserialize, Serialize};
-use tokio::sync::{oneshot, watch, Mutex};
-use tracing::{debug, trace, warn};
-use uuid::Uuid;
+use tokio::sync::Mutex;
 
-use super::{LeaderLease, LeaseError, LeaseGuard, LeaseInfo};
+use super::{AcquireRequest, LeaderLease, LeaseError, LeaseRecord, Refresh};
 
-/// Value stored under each lease key. `serde(skip_serializing_if = "Option::is_none")`
-/// keeps the key absent from the JSON when `None`, so the on-the-wire bytes
-/// are identical across two acquires with the same UUID and no endpoint —
-/// this is what lets the heartbeat CAS remain exact-match on the stored value.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct StoredValue {
-    holder: String,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    replication_endpoint: Option<String>,
-}
-
-impl StoredValue {
-    fn encode(&self) -> String {
-        // serde_json is deterministic for a fixed struct + field order, so the
-        // output is byte-stable and safe to pass to the CAS.
-        serde_json::to_string(self).expect("StoredValue serialization is infallible")
-    }
-
-    fn decode(raw: &str) -> Option<Self> {
-        serde_json::from_str(raw).ok()
-    }
-}
-
-/// Lua script: refresh TTL only if the stored value still matches our
-/// holder UUID. Returns 1 if refreshed, 0 if not (lost or deleted).
-const REFRESH_LUA: &str = r#"
-if redis.call('GET', KEYS[1]) == ARGV[1] then
-    return redis.call('PEXPIRE', KEYS[1], ARGV[2])
-else
-    return 0
-end
+const NOW_LUA: &str = r#"
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 "#;
 
-/// Lua script: delete key only if its value matches our holder UUID.
-const RELEASE_LUA: &str = r#"
-if redis.call('GET', KEYS[1]) == ARGV[1] then
-    return redis.call('DEL', KEYS[1])
-else
-    return 0
+const ACQUIRE_LUA: &str = r#"
+local cur = redis.call('HMGET', KEYS[1], 'holder', 'epoch', 'exp', 'isr')
+local epoch = 0
+local isr = ''
+if cur[1] then
+  if tonumber(cur[3]) > now and cur[1] ~= ARGV[1] then return false end
+  isr = cur[4] or ''
+  if ARGV[5] == '1' and isr ~= '' and
+     not string.find(',' .. isr .. ',', ',' .. ARGV[1] .. ',', 1, true) then
+    return false
+  end
+  epoch = tonumber(cur[2])
 end
+epoch = epoch + 1
+local exp = now + tonumber(ARGV[2])
+redis.call('HSET', KEYS[1], 'name', ARGV[6], 'holder', ARGV[1], 'epoch', epoch, 'exp', exp,
+           'repl', ARGV[3], 'client', ARGV[4], 'isr', isr)
+redis.call('SADD', KEYS[2], ARGV[6])
+return {epoch, exp}
+"#;
+
+const REFRESH_LUA: &str = r#"
+local cur = redis.call('HMGET', KEYS[1], 'holder', 'epoch', 'exp')
+if cur[1] == ARGV[1] and cur[2] == ARGV[2] and tonumber(cur[3]) > now then
+  redis.call('HSET', KEYS[1], 'exp', now + tonumber(ARGV[3]))
+  return 1
+end
+return 0
+"#;
+
+const RELEASE_LUA: &str = r#"
+local cur = redis.call('HMGET', KEYS[1], 'holder', 'epoch')
+if cur[1] == ARGV[1] and cur[2] == ARGV[2] then
+  redis.call('HSET', KEYS[1], 'exp', now - 1)
+  return 1
+end
+return 0
+"#;
+
+const SET_ISR_LUA: &str = r#"
+local cur = redis.call('HMGET', KEYS[1], 'holder', 'epoch', 'exp')
+if cur[1] == ARGV[1] and cur[2] == ARGV[2] and tonumber(cur[3]) > now then
+  redis.call('HSET', KEYS[1], 'isr', ARGV[3])
+  return 1
+end
+return 0
 "#;
 
 pub struct RedisLeaseBackend {
-    inner: Arc<Inner>,
-}
-
-struct Inner {
-    conn: Mutex<redis::aio::MultiplexedConnection>,
+    client: redis::Client,
+    conn: Mutex<Option<redis::aio::MultiplexedConnection>>,
     prefix: String,
-    heartbeat_interval: Duration,
+    call_timeout: Duration,
 }
 
 impl RedisLeaseBackend {
-    /// Connect using `EXSPEED_LEASE_REDIS_URL` (or the legacy
-    /// `EXSPEED_OFFSET_STORE_REDIS_URL`) and friends.
-    pub async fn from_env() -> Result<Self, LeaseError> {
-        let cfg = super::LeaseConfig::from_env();
-        let url = cfg.redis_url.ok_or_else(|| {
-            LeaseError::Connection("EXSPEED_LEASE_REDIS_URL is required".to_string())
-        })?;
-        Self::connect(&url, &cfg.redis_key_prefix, cfg.heartbeat).await
-    }
-
     pub async fn connect(
         url: &str,
         prefix: &str,
-        heartbeat_interval: Duration,
+        call_timeout: Duration,
     ) -> Result<Self, LeaseError> {
-        let prefix = prefix.to_string();
         let client = redis::Client::open(url)
             .map_err(|e| LeaseError::Connection(format!("redis client: {e}")))?;
-        let conn = client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| LeaseError::Connection(format!("redis connect: {e}")))?;
-
-        Ok(Self {
-            inner: Arc::new(Inner {
-                conn: Mutex::new(conn),
-                prefix,
-                heartbeat_interval,
-            }),
-        })
+        let b = Self {
+            client,
+            conn: Mutex::new(None),
+            prefix: prefix.to_string(),
+            call_timeout,
+        };
+        b.connection().await?;
+        Ok(b)
     }
-}
 
-fn key(prefix: &str, name: &str) -> String {
-    format!("{prefix}{name}")
+    async fn connection(&self) -> Result<redis::aio::MultiplexedConnection, LeaseError> {
+        let mut guard = self.conn.lock().await;
+        if let Some(c) = guard.as_ref() {
+            return Ok(c.clone());
+        }
+        let c = tokio::time::timeout(
+            self.call_timeout,
+            self.client.get_multiplexed_async_connection(),
+        )
+        .await
+        .map_err(|_| LeaseError::Timeout)?
+        .map_err(|e| LeaseError::Connection(format!("redis connect: {e}")))?;
+        *guard = Some(c.clone());
+        Ok(c)
+    }
+
+    fn key(&self, name: &str) -> String {
+        format!("{}{name}", self.prefix)
+    }
+
+    fn index(&self) -> String {
+        format!("{}__names", self.prefix)
+    }
+
+    async fn script<T: redis::FromRedisValue>(
+        &self,
+        body: &str,
+        keys: &[String],
+        args: &[String],
+    ) -> Result<T, LeaseError> {
+        let mut conn = self.connection().await?;
+        let script = redis::Script::new(&format!("{NOW_LUA}{body}"));
+        let mut inv = script.prepare_invoke();
+        for k in keys {
+            inv.key(k);
+        }
+        for a in args {
+            inv.arg(a);
+        }
+        match tokio::time::timeout(self.call_timeout, inv.invoke_async(&mut conn)).await {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => {
+                *self.conn.lock().await = None;
+                Err(LeaseError::Backend(e.to_string()))
+            }
+            Err(_) => {
+                *self.conn.lock().await = None;
+                Err(LeaseError::Timeout)
+            }
+        }
+    }
+
+    async fn cmd<T: redis::FromRedisValue>(&self, cmd: redis::Cmd) -> Result<T, LeaseError> {
+        let mut conn = self.connection().await?;
+        match tokio::time::timeout(self.call_timeout, cmd.query_async(&mut conn)).await {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => {
+                *self.conn.lock().await = None;
+                Err(LeaseError::Backend(e.to_string()))
+            }
+            Err(_) => {
+                *self.conn.lock().await = None;
+                Err(LeaseError::Timeout)
+            }
+        }
+    }
+
+    async fn read(&self, name: &str) -> Result<Option<LeaseRecord>, LeaseError> {
+        let mut c = redis::cmd("HMGET");
+        c.arg(self.key(name))
+            .arg("holder")
+            .arg("epoch")
+            .arg("exp")
+            .arg("repl")
+            .arg("client")
+            .arg("isr");
+        let v: Vec<Option<String>> = self.cmd(c).await?;
+        let Some(holder) = v.first().cloned().flatten() else {
+            return Ok(None);
+        };
+        let field = |i: usize| v.get(i).cloned().flatten().unwrap_or_default();
+        let opt = |s: String| if s.is_empty() { None } else { Some(s) };
+        let exp_ms: i64 = field(2).parse().unwrap_or(0);
+        Ok(Some(LeaseRecord {
+            name: name.to_string(),
+            holder,
+            epoch: field(1).parse().unwrap_or(0),
+            expires_at: chrono::DateTime::from_timestamp_millis(exp_ms).unwrap_or_default(),
+            replication_endpoint: opt(field(3)),
+            client_endpoint: opt(field(4)),
+            isr: field(5)
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect(),
+        }))
+    }
 }
 
 #[async_trait]
@@ -126,207 +194,97 @@ impl LeaderLease for RedisLeaseBackend {
         true
     }
 
-    async fn try_acquire(
+    async fn try_acquire(&self, req: &AcquireRequest) -> Result<Option<LeaseRecord>, LeaseError> {
+        let won: Option<(i64, i64)> = self
+            .script(
+                ACQUIRE_LUA,
+                &[self.key(&req.name), self.index()],
+                &[
+                    req.holder.clone(),
+                    req.ttl.as_millis().to_string(),
+                    req.replication_endpoint.clone().unwrap_or_default(),
+                    req.client_endpoint.clone().unwrap_or_default(),
+                    if req.require_isr { "1" } else { "0" }.to_string(),
+                    req.name.clone(),
+                ],
+            )
+            .await?;
+        if won.is_none() {
+            return Ok(None);
+        }
+        self.read(&req.name).await
+    }
+
+    async fn refresh(
         &self,
         name: &str,
+        holder: &str,
+        epoch: u64,
         ttl: Duration,
-        replication_endpoint: Option<&str>,
-    ) -> Result<Option<LeaseGuard>, LeaseError> {
-        let holder_id = Uuid::new_v4();
-        let k = key(&self.inner.prefix, name);
-        let stored = StoredValue {
-            holder: holder_id.to_string(),
-            replication_endpoint: replication_endpoint.map(|s| s.to_string()),
-        };
-        let value = stored.encode();
-        let ttl_ms = ttl.as_millis() as u64;
-
-        let mut conn = self.inner.conn.lock().await;
-        // SET NX PX — returns Some("OK") on win, None if key already exists.
-        let res: Option<String> = redis::cmd("SET")
-            .arg(&k)
-            .arg(&value)
-            .arg("NX")
-            .arg("PX")
-            .arg(ttl_ms)
-            .query_async(&mut *conn)
-            .await
-            .map_err(|e| LeaseError::Backend(format!("redis SET NX: {e}")))?;
-        drop(conn);
-
-        if res.as_deref() == Some("OK") {
-            Ok(Some(spawn_heartbeat(
-                self.inner.clone(),
-                name.to_string(),
-                holder_id,
-                value,
-                ttl,
-            )))
+    ) -> Result<Refresh, LeaseError> {
+        let ok: i64 = self
+            .script(
+                REFRESH_LUA,
+                &[self.key(name)],
+                &[
+                    holder.to_string(),
+                    epoch.to_string(),
+                    ttl.as_millis().to_string(),
+                ],
+            )
+            .await?;
+        Ok(if ok == 1 {
+            Refresh::Held
         } else {
-            Ok(None)
-        }
+            Refresh::Lost
+        })
     }
 
-    async fn list_all(&self) -> Result<Vec<LeaseInfo>, LeaseError> {
-        let pattern = format!("{}*", self.inner.prefix);
-        let mut conn = self.inner.conn.lock().await;
+    async fn release(&self, name: &str, holder: &str, epoch: u64) -> Result<(), LeaseError> {
+        let _: i64 = self
+            .script(
+                RELEASE_LUA,
+                &[self.key(name)],
+                &[holder.to_string(), epoch.to_string()],
+            )
+            .await?;
+        Ok(())
+    }
 
-        // SCAN-based iteration; collect all matching keys before issuing
-        // GET/PTTL commands (the iter holds a borrow on `conn`).
-        let mut iter: redis::AsyncIter<String> = conn
-            .scan_match(&pattern)
-            .await
-            .map_err(|e| LeaseError::Backend(format!("scan: {e}")))?;
+    async fn set_isr(
+        &self,
+        name: &str,
+        holder: &str,
+        epoch: u64,
+        isr: &[String],
+    ) -> Result<bool, LeaseError> {
+        let ok: i64 = self
+            .script(
+                SET_ISR_LUA,
+                &[self.key(name)],
+                &[holder.to_string(), epoch.to_string(), isr.join(",")],
+            )
+            .await?;
+        Ok(ok == 1)
+    }
 
-        let mut keys: Vec<String> = Vec::new();
-        while let Some(k) = iter.next_item().await {
-            keys.push(k);
-        }
-        drop(iter);
+    async fn get(&self, name: &str) -> Result<Option<LeaseRecord>, LeaseError> {
+        self.read(name).await
+    }
 
-        let mut out = Vec::with_capacity(keys.len());
-        for k in keys {
-            let raw: Option<String> = conn
-                .get(&k)
-                .await
-                .map_err(|e| LeaseError::Backend(format!("get: {e}")))?;
-            let pttl_ms: i64 = conn
-                .pttl(&k)
-                .await
-                .map_err(|e| LeaseError::Backend(format!("pttl: {e}")))?;
-            if let Some(raw) = raw {
-                if pttl_ms <= 0 {
-                    continue; // expired or no-TTL key
+    async fn list_all(&self) -> Result<Vec<LeaseRecord>, LeaseError> {
+        let mut c = redis::cmd("SMEMBERS");
+        c.arg(self.index());
+        let mut names: Vec<String> = self.cmd(c).await?;
+        names.sort();
+        let mut out = Vec::new();
+        for n in names {
+            if let Some(r) = self.read(&n).await? {
+                if r.is_live() {
+                    out.push(r);
                 }
-                let name = k.strip_prefix(&self.inner.prefix).unwrap_or(&k).to_string();
-                // Tolerate pre-Plan-G bare-UUID values by falling back to
-                // parsing the raw string as a UUID. This is observability
-                // only — the refresh/release CAS still fails against the
-                // old value, which is how the rolling-upgrade failover
-                // actually happens.
-                let (holder, endpoint) = match StoredValue::decode(&raw) {
-                    Some(v) => (Uuid::parse_str(&v.holder), v.replication_endpoint),
-                    None => (Uuid::parse_str(&raw), None),
-                };
-                let holder = match holder {
-                    Ok(u) => u,
-                    Err(_) => continue,
-                };
-                let expires_at = chrono::Utc::now() + chrono::Duration::milliseconds(pttl_ms);
-                out.push(LeaseInfo {
-                    name,
-                    holder,
-                    expires_at,
-                    replication_endpoint: endpoint,
-                });
             }
         }
-
         Ok(out)
-    }
-}
-
-/// Spawn a heartbeat task that refreshes the lease every
-/// `heartbeat_interval` and CAS-releases on drop. Returns the LeaseGuard.
-///
-/// `stored_value` is the exact JSON blob written by `try_acquire` — we pass
-/// it here so the CAS can be an exact string match. The value never changes
-/// during a tenure (heartbeat only refreshes TTL), so stashing it once is
-/// sound and keeps the CAS one Redis round-trip instead of two.
-fn spawn_heartbeat(
-    inner: Arc<Inner>,
-    name: String,
-    holder_id: Uuid,
-    stored_value: String,
-    ttl: Duration,
-) -> LeaseGuard {
-    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-    let (lost_tx, lost_rx) = watch::channel(false);
-
-    let inner_hb = inner.clone();
-    let name_hb = name.clone();
-    let cas_value = stored_value;
-    tokio::spawn(async move {
-        let mut consecutive_failures = 0u32;
-        let mut interval = tokio::time::interval(inner_hb.heartbeat_interval);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Skip the immediate tick — don't heartbeat at t=0, only after the
-        // interval has elapsed once.
-        interval.tick().await;
-
-        tokio::pin!(cancel_rx);
-        loop {
-            tokio::select! {
-                _ = &mut cancel_rx => {
-                    // Graceful release: CAS-delete via Lua so we never
-                    // delete a key that has already been re-acquired by
-                    // another holder.
-                    let k = key(&inner_hb.prefix, &name_hb);
-                    let mut conn = inner_hb.conn.lock().await;
-                    let r: redis::RedisResult<i32> = redis::Script::new(RELEASE_LUA)
-                        .key(&k)
-                        .arg(&cas_value)
-                        .invoke_async(&mut *conn)
-                        .await;
-                    if let Err(e) = r {
-                        warn!(error = %e, lease = %name_hb, "redis lease release failed");
-                    }
-                    trace!(lease = %name_hb, "lease released");
-                    break;
-                }
-                _ = interval.tick() => {
-                    let k = key(&inner_hb.prefix, &name_hb);
-                    let mut conn = inner_hb.conn.lock().await;
-                    let r: redis::RedisResult<i32> = redis::Script::new(REFRESH_LUA)
-                        .key(&k)
-                        .arg(&cas_value)
-                        .arg(ttl.as_millis() as u64)
-                        .invoke_async(&mut *conn)
-                        .await;
-                    drop(conn);
-                    match r {
-                        Ok(1) => {
-                            consecutive_failures = 0;
-                            trace!(lease = %name_hb, "heartbeat ok");
-                        }
-                        Ok(_) => {
-                            consecutive_failures += 1;
-                            debug!(
-                                lease = %name_hb,
-                                consecutive_failures,
-                                "heartbeat found lease stolen or missing"
-                            );
-                        }
-                        Err(e) => {
-                            consecutive_failures += 1;
-                            warn!(
-                                lease = %name_hb,
-                                consecutive_failures,
-                                error = %e,
-                                "heartbeat backend error"
-                            );
-                        }
-                    }
-                    if consecutive_failures >= 2 {
-                        warn!(
-                            lease = %name_hb,
-                            "lease lost after 2 consecutive heartbeat failures"
-                        );
-                        let _ = lost_tx.send(true);
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    LeaseGuard {
-        name,
-        holder_id,
-        on_lost: lost_rx,
-        // Sender is owned by the heartbeat task (moved into `tokio::spawn`
-        // above); the guard keeps nothing here.
-        _lost_tx: None,
-        _cancel_heartbeat: cancel_tx,
     }
 }

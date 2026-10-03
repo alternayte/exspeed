@@ -68,8 +68,16 @@ export class ExspeedClient extends EventEmitter {
   private pendingAcks = new Map<string, number[]>();
   private ackFlushScheduled = false;
 
-  private constructor(conn: Connection, connOpts: ConnectionOptions, reconnect: Required<ReconnectOptions> | null) {
+  private readonly servers: string[];
+
+  private constructor(
+    conn: Connection,
+    connOpts: ConnectionOptions,
+    reconnect: Required<ReconnectOptions> | null,
+    servers: string[],
+  ) {
     super();
+    this.servers = servers;
     this.conn = conn;
     this.connOpts = connOpts;
     this.reconnectOpts = reconnect;
@@ -103,12 +111,15 @@ export class ExspeedClient extends EventEmitter {
             maxDelayMs: 5_000,
             ...(typeof r === "object" ? r : {}),
           };
+    const servers = options.servers ?? [];
     let client: ExspeedClient | null = null;
-    const conn = await Connection.open(connOpts, {
-      onClose: (err) => client?.onConnectionLost(err),
+    const conn = await openLeader(connOpts, servers, null, {
+      onClose: (c, err) => {
+        if (client && client.conn === c) client.onConnectionLost(err);
+      },
       onAsyncError: (err) => client?.onAsyncError(err),
     });
-    client = new ExspeedClient(conn, connOpts, reconnect);
+    client = new ExspeedClient(conn, connOpts, reconnect, servers);
     return client;
   }
 
@@ -425,9 +436,9 @@ export class ExspeedClient extends EventEmitter {
       if (this.state !== "reconnecting") return; // closed meanwhile
       let conn: Connection;
       try {
-        conn = await Connection.open(this.connOpts, {
-          onClose: (e) => {
-            if (this.conn === conn) this.onConnectionLost(e);
+        conn = await openLeader(this.connOpts, this.servers, this.conn.info.leader, {
+          onClose: (c, e) => {
+            if (this.conn === c) this.onConnectionLost(e);
           },
           onAsyncError: (e) => this.onAsyncError(e),
         });
@@ -478,4 +489,89 @@ export class ExspeedClient extends EventEmitter {
       }),
     );
   }
+}
+
+interface LeaderHandlers {
+  onClose(conn: Connection, err: Error): void;
+  onAsyncError(err: ServerError | ProtocolError): void;
+}
+
+function parseAddr(addr: string, fallbackPort: number): { host: string; port: number } {
+  const i = addr.lastIndexOf(":");
+  if (i <= 0) return { host: addr, port: fallbackPort };
+  const port = Number(addr.slice(i + 1));
+  return { host: addr.slice(0, i).replace(/^\[|\]$/g, ""), port: Number.isFinite(port) ? port : fallbackPort };
+}
+
+/**
+ * Open a connection to the cluster leader. Without seed `servers` this is a
+ * plain connect to `opts.host:opts.port`, except that a node naming another
+ * node as leader in its handshake is followed. With seeds, each candidate
+ * (the last known leader first) is asked whether it leads; leader hints are
+ * followed, and a follower is accepted only when no node claims to lead.
+ */
+async function openLeader(
+  opts: ConnectionOptions,
+  servers: string[],
+  hint: string | null,
+  handlers: LeaderHandlers,
+): Promise<Connection> {
+  const queue: string[] = [];
+  if (hint) queue.push(hint);
+  if (servers.length > 0) queue.push(...servers);
+  else queue.push(`${opts.host}:${opts.port}`);
+  const tried = new Set<string>();
+  let fallback: Connection | null = null;
+  let lastErr: Error | null = null;
+  while (queue.length > 0) {
+    const addr = queue.shift()!;
+    if (tried.has(addr)) continue;
+    tried.add(addr);
+    const { host, port } = parseAddr(addr, opts.port);
+    let conn: Connection;
+    // `onClose` can fire while the handshake is still failing, before
+    // `open` resolves; such a connection was never handed out, so ignore it.
+    let opened: Connection | undefined;
+    try {
+      opened = await Connection.open(
+        { ...opts, host, port },
+        {
+          onClose: (err) => {
+            if (opened) handlers.onClose(opened, err);
+          },
+          onAsyncError: (err) => handlers.onAsyncError(err),
+        },
+      );
+      conn = opened;
+    } catch (err) {
+      if (err instanceof ServerError && (err.code === ErrorCode.Unauthorized || err.code === ErrorCode.Forbidden)) {
+        throw err;
+      }
+      lastErr = err as Error;
+      continue;
+    }
+    let isLeader = conn.info.leader === null;
+    let leader = conn.info.leader;
+    if (servers.length > 0) {
+      try {
+        const resp = await conn.request({ type: "Metadata" });
+        if (resp.type === "Json") {
+          const m = JSON.parse(resp.json.toString("utf8")) as { is_leader?: boolean; leader?: string | null };
+          isLeader = m.is_leader === true;
+          leader = m.leader ?? null;
+        }
+      } catch {
+        // An old server without Metadata: trust the handshake.
+      }
+    }
+    if (isLeader) {
+      if (fallback) void fallback.close();
+      return conn;
+    }
+    if (leader && !tried.has(leader)) queue.unshift(leader);
+    if (!fallback) fallback = conn;
+    else void conn.close();
+  }
+  if (fallback) return fallback;
+  throw lastErr ?? new ConnectionError("no server reachable");
 }

@@ -1,349 +1,283 @@
-# High availability (multi-pod)
+# High availability
 
-> ❌ **Not production-safe in v0.5.** A failover can lose writes and leave
-> data inconsistent:
->
-> - **Writes that never replicate.** Only single-record TCP publishes are
->   replicated live. Batch publishes, HTTP publishes, webhooks, connector
->   output, ExQL output and DLQ writes reach followers only when a follower
->   reconnects and catches up, and catch-up can wedge.
-> - **Keys are lost.** Record keys are not replicated, so they are gone
->   after a failover.
-> - **No write fencing.** A demoted leader keeps accepting writes on open
->   TCP connections. Followers accept TCP and webhook writes directly.
-> - **Consumer state isn't refreshed on promotion.**
->
-> Treat this mode as a warm standby you would fail over to by hand, and
-> expect data loss. The analysis is in [REVIEW.md §3.4](REVIEW.md#34-ha-leadership--replication)
-> and the redesign (epoch-fenced log replication) in [§5.4](REVIEW.md#54-ha-kafka-style-log-replication-with-epochs).
+An Exspeed cluster is a set of nodes (typically three), each with its own
+data directory, sharing a **lease backend** (Postgres or Redis). One node
+holds the lease and is the **leader**: it alone accepts writes and runs
+consumers, connectors, continuous queries and retention. The others are
+**followers**: they replicate the leader's log and take over when it fails.
 
-Exspeed supports **hot-standby multi-pod** via a single cluster-leader
-lease. Running N broker pods means N identical pods; exactly one is the
-**leader** at any moment and serves all traffic. Standbys are silent
-until failover. If the leader crashes, a survivor takes over within the
-lease TTL.
+- **Everything replicates.** Every stream, internal ones included
+  (`__consumers`, `__connector_offsets`, ExQL checkpoints and catalogs), with
+  the same offsets, timestamps, keys and headers. A new leader resumes
+  consumers, connectors and continuous queries from the replicated state.
+- **Acknowledged writes survive failover.** With `acks = "all"` (the
+  default) a write is acknowledged once every in-sync replica has it, and
+  only an in-sync replica can be elected.
+- **No split brain.** Each leadership has an epoch (a fencing token). A
+  leader that loses the lease stops before anyone else can take it, and any
+  writes it accepted but never replicated are truncated when it rejoins.
+- **Clients follow the leader.** Followers reject writes with `503` and
+  name the leader. The SDKs find the leader from a list of seed addresses
+  and find the new one after a failover.
 
-## A health-check-aware load balancer is REQUIRED
-
-Standby pods return `503` on every `/api/v1/*` endpoint except
-`/api/v1/leases` and `/api/v1/whoami`. The TCP port (5933) and `/webhooks/*`
-are **not** gated on standbys: writes sent there land on the standby and
-are later discarded. Without a probe-aware LB, consumers connecting to a
-standby will see 503s on ~(N−1)/N of their requests. **This is a
-deployment misconfiguration, not a bug.**
-
-## Requirements
-
-1. **A shared lease backend.** `EXSPEED_LEASE_BACKEND=postgres` or `=redis`
-   (the old name `EXSPEED_CONSUMER_STORE` still works, with a warning).
-   Without one the server runs single-node and says so on every boot.
-   Consumer state needs no shared store: it lives in the internal
-   `__consumers` stream and replicates with the log.
-
-2. **One `data_dir` per pod.** The data-dir `flock` guarantees exclusive
-   access. Multi-pod does NOT mean shared storage — each pod owns its own
-   streams. Typical deployment: N identical pods, each with its own PV /
-   local disk.
-
-3. **A probe-aware LB in front of both HTTP (8080) and TCP (5933).** k8s
-   `Service` + `readinessProbe` handles this natively — only pods passing
-   the probe receive traffic on any port.
-
-## k8s deployment (recommended)
-
-```yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: exspeed
-spec:
-  selector: { app: exspeed }
-  ports:
-    - name: api
-      port: 8080
-      targetPort: 8080
-    - name: tcp
-      port: 5933
-      targetPort: 5933
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: exspeed
-spec:
-  replicas: 2
-  selector:
-    matchLabels: { app: exspeed }
-  serviceName: exspeed
-  template:
-    metadata:
-      labels: { app: exspeed }
-    spec:
-      containers:
-        - name: exspeed
-          image: exspeed:latest
-          ports:
-            - containerPort: 8080
-            - containerPort: 5933
-          env:
-            - name: EXSPEED_LEASE_BACKEND
-              value: postgres
-            - name: EXSPEED_OFFSET_STORE_POSTGRES_URL
-              valueFrom: { secretKeyRef: { name: pg, key: url } }
-          readinessProbe:
-            httpGet: { path: /healthz, port: 8080 }
-            periodSeconds: 5
-            failureThreshold: 2
-            successThreshold: 1
-          volumeMounts:
-            - name: data
-              mountPath: /var/lib/exspeed
-  volumeClaimTemplates:
-    - metadata: { name: data }
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        resources: { requests: { storage: 10Gi } }
+```mermaid
+flowchart LR
+  clients["Clients / SDKs"] -->|"writes, consumers (5933)"| L
+  clients -.->|"reads; 503 + leader hint for writes"| F1
+  subgraph cluster[Cluster]
+    L["Leader<br/>node A, epoch 7"]
+    F1["Follower<br/>node B"]
+    F2["Follower<br/>node C"]
+  end
+  F1 -->|"fetch (5934)"| L
+  F2 -->|"fetch (5934)"| L
+  lease[("Lease backend<br/>Postgres or Redis<br/>holder, epoch, ISR")]
+  L -->|"heartbeat, publish ISR"| lease
+  F1 -.->|"poll"| lease
+  F2 -.->|"poll"| lease
 ```
 
-## nginx (active health check; nginx Plus or a compatible module)
+## How it works
 
-```nginx
-upstream exspeed {
-    server exspeed-0:8080;
-    server exspeed-1:8080;
-    health_check uri=/healthz interval=5s fails=2 passes=1;
-}
+### Leader election
+
+The lease is one record in the backend:
+
+| Field | Meaning |
+|-------|---------|
+| `holder` | node id of the current (or last) holder |
+| `epoch` | incremented on every acquisition |
+| `expires_at` | the backend's clock; the lease is free once it passes |
+| `replication_endpoint` / `client_endpoint` | where followers and clients reach the holder |
+| `isr` | the in-sync replicas the holder last published |
+
+The holder refreshes the lease every `lease_heartbeat_secs`. It considers the
+lease lost on the first refresh that finds another holder, or when two
+thirds of `lease_ttl_secs` pass without a successful refresh. So it stops
+acting as leader well before the backend lets anyone else in. Followers poll
+the record every heartbeat interval and try to take the lease once it has
+expired. All timing uses the backend's clock (`now()` in Postgres, `TIME` in
+Redis), so node clocks don't matter.
+
+Node ids are generated once and kept in `{data_dir}/node_id` (override with
+`cluster.node_id`). A restarted node can take its own unexpired lease back.
+
+### Promotion
+
+A node that acquires the lease, before it opens writes:
+
+1. stops its follower;
+2. stamps the new epoch on every stream's epoch history;
+3. starts rebuilding the dedup maps from the log. Until that finishes,
+   writes carrying a `msg_id` get a retryable `503`; other writes are
+   accepted at once.
+
+Then `/healthz` turns 200, the write path opens, and the leader supervisor
+starts consumers, connectors, continuous queries and retention.
+
+### Replication
+
+Followers pull. Each follower connects to the leader's cluster port (5934)
+and repeatedly sends a fetch with its position in every stream: the next
+offset, the epoch of its last record and its earliest offset. The leader
+answers with the missing records, up to 8 MiB per fetch. When there is
+nothing new, it holds the fetch for up to a second until something is
+appended (a long poll), so replication latency is about one round trip.
+
+Each response carries:
+
+- **Metadata** when the follower's view is out of date: every stream with
+  its config and a uid. The follower creates missing streams, applies config
+  changes, deletes streams the leader no longer has, and recreates a stream
+  whose uid changed (it was deleted and recreated on the leader).
+- **Per stream:** records, a truncation point, or only the leader's earliest
+  offset. The follower trims up to the leader's earliest offset, which is how
+  retention reaches followers.
+
+```mermaid
+sequenceDiagram
+  participant F as Follower
+  participant L as Leader
+  loop continuously
+    F->>L: Fetch(epoch, metadata version, per stream: next, last epoch, earliest)
+    alt nothing new
+      Note over L: hold up to 1 s until an append or metadata change
+    end
+    L-->>F: FetchOk(metadata?, per stream: records / truncate / trim, epoch history)
+    F->>F: apply metadata, truncate or append_at, trim, adopt epochs
+    Note over L: next fetch positions = follower progress,<br/>used for the ISR and acks=all
+  end
 ```
 
-## HAProxy
+**Divergence.** Each stream has an epoch history: the offset where each
+leader epoch started. A follower whose last record has epoch `e` asks, in
+effect, "where does epoch `e` end in your log?" If the follower has records
+beyond that point, a deposed leader wrote them and they were never
+replicated, so the follower truncates them and continues from there. This
+is the KIP-101 scheme Kafka uses.
 
-```
-backend exspeed
-    option httpchk GET /healthz
-    http-check expect status 200
-    default-server check inter 5s fall 2 rise 1
-    server pod0 exspeed-0:8080
-    server pod1 exspeed-1:8080
-```
+### Durability: `acks`, the ISR and `min_insync_replicas`
 
-## Failover timing
+A follower is **in sync** while it has caught up with the leader within the
+last `replica_lag_max_ms`. Caught up means its fetch reached the high
+watermarks of the previous response. The leader publishes the in-sync set,
+itself included, in the lease record.
 
-| Scenario | Time to failover |
-|---|---|
-| Leader crashes (SIGKILL / OOM) | ≤ TTL + TTL/3 + probe_interval ≈ **30–40s** |
-| Leader SIGTERM (graceful) | ≤ TTL/3 + probe_interval ≈ **5–15s** |
-| Backend partition (heartbeat fails) | ~20s to detect, then failover per above |
+| `acks` | A write is acknowledged when | On leader failure |
+|--------|------------------------------|-------------------|
+| `all` (default) | every in-sync replica has it | no acknowledged write is lost (unless every in-sync replica fails) |
+| `leader` | the leader has written it locally | writes not yet replicated are lost |
 
-## Tuning
+- **Election:** with `unclean_leader_election = false` (the default), only
+  a node in the published ISR can take the lease. A node that is missing
+  acknowledged writes never becomes leader. If every ISR member is gone,
+  the cluster waits for one to return. Set `unclean_leader_election = true`
+  to prefer availability.
+- **Shrinking the ISR:** a follower that falls behind leaves the ISR after
+  `replica_lag_max_ms`. The leader publishes the smaller set before it stops
+  waiting for that follower, so an acknowledged write is always on every
+  published ISR member.
+- **`min_insync_replicas`:** with `acks = "all"`, writes fail with `503`
+  ("not enough in-sync replicas") while fewer replicas than this (leader
+  included) are in sync. Use `2` on a three-node cluster to never
+  acknowledge a write that only one node has. The default `1` keeps
+  accepting writes on a lone leader.
+- **Timeouts:** a write that isn't replicated within `ack_timeout_ms` fails
+  with a retryable `503`. It is in the leader's log and may still survive,
+  so retry it with the same `msg_id`.
 
-```bash
-EXSPEED_LEASE_TTL_SECS=30         # default 30
-EXSPEED_LEASE_HEARTBEAT_SECS=10   # default 10 (~TTL/3)
-```
+After a failover, members of the previous ISR get `replica_lag_max_ms` to
+reconnect before the new leader drops them from the ISR. Writes during that
+window wait for them.
 
-Shorter TTL = faster failover + more chatty backend traffic. Longer TTL
-= slower failover + less traffic.
+Stream create, update and delete are metadata. They replicate on the next
+fetch, but writes don't wait for them.
 
-## Operator visibility
+## Running a cluster
 
-- `GET /healthz` — 200 if this pod is the leader, 503 otherwise. Public.
-- `GET /metrics` — Prometheus. Public. Includes `exspeed_is_leader`,
-  `exspeed_leader_transitions_total{direction}`, and the existing
-  `exspeed_lease_*` series (`name="cluster:leader"`).
-- `GET /api/v1/leases` — bearer-authed; returns the single
-  `cluster:leader` row. Available on any pod (leader and standby) so
-  operators can discover who's in charge from anywhere.
-- Postgres backend: `SELECT * FROM exspeed_leases WHERE name = 'cluster:leader';`
+### Requirements
 
-## Replication
+1. **A lease backend:** Postgres or Redis, reachable from every node.
+2. **One data directory per node.** Nodes never share storage.
+3. **Addresses:** `cluster.advertise` (where peers reach this node's
+   replication port) and `cluster.client_advertise` (where clients reach
+   its client port). Both are needed when the bind addresses are wildcards,
+   as they are in containers.
+4. **With auth on:** a credential with the `replicate` action for the
+   followers (`cluster.replicator_credential`):
 
-In multi-pod mode Exspeed runs **asynchronous follower-pull replication**:
-every non-leader pod mirrors the leader's `data_dir` over a persistent
-TCP session on port 5934. When the leader dies, the surviving pod that
-wins the lease already has an up-to-date copy of every stream, so
-failover is data-preserving (subject to the RPO below). There is no
-manual operator work between failover and serving traffic — the new
-leader starts accepting writes as soon as `/healthz` returns 200.
+   ```toml
+   [[credentials]]
+   name = "replicator"
+   token_sha256 = "<sha256 of the token>"
+   permissions = [{ streams = "*", actions = ["replicate"] }]
+   ```
 
-### RPO (data loss on crash)
+Start followers with **empty** data directories (or with a copy of the
+leader's). A node whose directory holds unrelated data from a standalone
+server is not detected as different. Its streams are reconciled by name,
+and records at offsets the leader also has are kept.
 
-Writes are acknowledged when they hit the leader's local disk — the
-leader does not wait for a follower to apply the record before
-responding. The window between "leader acks" and "follower applies" is
-reported as `exspeed_replication_lag_seconds` + `exspeed_replication_lag_records`
-(the latter is best-effort; `lag_seconds` is the primary signal).
-If the leader crashes with `lag > 0` at the moment of death, those
-records can be lost on promotion. Mitigations:
-
-- **Keep lag low.** Alert on `exspeed_replication_lag_seconds{stream=~".*"} > 10`.
-- **Idempotent publishes do *not* help across failover yet.** Dedup state
-  is not replicated or rebuilt on promotion, so a retry that lands on the
-  new leader is written again.
-
-### RTO (time-to-serve)
-
-~30-40s for an unclean leader death (lease
-TTL + retry slack + probe flip) and ~5-15s for a graceful SIGTERM. The
-new leader's storage is already warm, so there's no data-reload step.
-
-### Required replicator credential
-
-The follower side of the handshake authenticates with a bearer token
-carrying `Action::Replicate`. Declare it in your `credentials.toml`:
+### Configuration
 
 ```toml
-[[credentials]]
-name = "replicator"
-token_sha256 = "<sha256 of the bearer>"
-permissions = [
-  { streams = "*", actions = ["replicate"] },
-]
+[cluster]
+lease = "postgres"
+postgres_url = "postgres://exspeed:...@pg/exspeed"
+advertise = "exspeed-0.exspeed:5934"
+client_advertise = "exspeed-0.exspeed:5933"
+replicator_credential = "..."
+acks = "all"
+min_insync_replicas = 2
 ```
 
-Then point every pod at the bearer via `EXSPEED_REPLICATOR_CREDENTIAL`.
-Startup hard-fails in multi-pod mode if this env var is unset — the
-follower cannot authenticate without it.
+Every setting, with environment variables, is in
+[configuration.md](configuration.md#cluster-cluster).
 
-### Tuning
+### Kubernetes
 
-| Env var | Default | Purpose |
-|---|---|---|
-| `EXSPEED_CLUSTER_BIND` | `0.0.0.0:5934` | Leader-side listener for follower sessions. |
-| `EXSPEED_CLUSTER_ADVERTISE` | same as bind | What the leader writes into the `cluster:leader` lease row as its replication endpoint. Set when the listen address differs from what peers should dial (NAT / k8s pod-IP vs service-IP). |
-| `EXSPEED_REPLICATION_BATCH_RECORDS` | 1000 | Max records per `RecordsAppended` frame. Smaller = lower latency, larger = better throughput. |
-| `EXSPEED_REPLICATION_HEARTBEAT_SECS` | 5 | Leader-side keepalive cadence when no records are flowing. Paired with the 30s follower idle timeout (6× ratio) — a single dropped heartbeat does not tear a session down. |
-| `EXSPEED_REPLICATION_IDLE_TIMEOUT_SECS` | 30 | Follower tears the session down if it receives nothing for this long. |
-| `EXSPEED_REPLICATION_FOLLOWER_QUEUE_RECORDS` | 100000 | Leader's per-follower mpsc queue capacity. Bigger = more memory per stuck follower, smaller = earlier drops under backpressure. |
+The Helm chart (`deploy/helm/exspeed`) sets this up with `replicas: 3`:
 
-### Seeding a large initial replica
-
-The wire protocol streams every historical record from offset 0 on
-first connect, which is fine for tens of millions of small records but
-slow for TB-scale datasets. For those, rsync or snapshot the leader's
-`data_dir` to the new pod offline, start the new pod pointed at the
-seeded dir, and let the replication session pick up from the tail.
-There's no manifest-fingerprint verification — the follower's cursor
-is authoritative about where it left off.
-
-### Metrics
-
-- `exspeed_replication_role{role="leader|follower|standalone"}` — gauge set to 1 for the current role, 0 otherwise.
-- `exspeed_replication_connected_followers` — gauge; count of active follower sessions on the leader.
-- `exspeed_replication_lag_seconds{stream}` — gauge; seconds between leader's latest write and follower's last-applied record. **Primary indicator** — alert on `exspeed_replication_lag_seconds{stream=~".*"} > 10`.
-- `exspeed_replication_lag_records{stream}` — gauge; same idea, in records. Best-effort — reflects offset-lag at the moment of the last applied batch, not the live tail; `lag_seconds` is the more reliable signal.
-- `exspeed_replication_records_applied_total{stream}` — counter; records applied on the follower.
-- `exspeed_replication_bytes_total{direction="in|out"}` — counter; bytes over the replication socket.
-- `exspeed_replication_truncated_records_total{stream}` — counter; records truncated from the follower's local storage during divergent-history reconciliation.
-- `exspeed_replication_reseed_total{stream}` — counter; streams wiped + rebuilt because the follower fell behind the leader's retention window.
-- `exspeed_replication_follower_queue_drops_total` — counter; records dropped by the leader when a follower's queue was full.
-- `exspeed_auth_denied_total{action="replicate"}` — counter; replication handshakes rejected for missing `Action::Replicate`.
-
-> **Prometheus suffix quirk.** Scrapers observe counters here with a doubled `_total` suffix (e.g. `exspeed_replication_truncated_records_total_total`, `exspeed_replication_records_applied_total_total`). This is a known OTel-to-Prometheus exporter behaviour — it appends `_total` to counter names, including ones that already end in `_total`. Write PromQL and alert rules against the doubled name.
-
-### Running the ignored replication integration tests
-
-The five Postgres-backed replication tests are `#[ignore]`d by default because they require a live Postgres. To run them locally:
+- a StatefulSet with a volume per pod;
+- a headless Service, so each pod has a stable DNS name for `advertise` and
+  `client_advertise`;
+- a client Service over all pods. Cluster-aware clients connect through it
+  and follow the leader hint to the leader pod's DNS name. HTTP callers
+  either use `/healthz` to pick the leader, or retry against the `leader`
+  named in a follower's `503`.
 
 ```bash
-docker compose up -d postgres
-EXSPEED_OFFSET_STORE_POSTGRES_URL=postgres://testuser:testpass@localhost:5432/testdb \
-  cargo test -p exspeed -- --ignored --nocapture
+helm install exspeed deploy/helm/exspeed \
+  --set replicas=3 \
+  --set cluster.postgresUrlSecret=pg \
+  --set cluster.replicatorTokenSecret=replicator
 ```
 
-### Operator endpoints
+### Clients
 
-- `GET /api/v1/leases` — existing endpoint; now includes a
-  `replication_endpoint` field on the `cluster:leader` row so operators
-  (and followers) can see where to dial.
-- `GET /api/v1/cluster/followers` — leader-only, admin-bearer-gated.
-  Returns a list of currently-connected followers with `follower_id` +
-  `registered_at`. Returns 503 on single-pod pods with an explicit
-  `hint` string pointing at `EXSPEED_LEASE_BACKEND`.
+- **Rust:** `Client::connect_cluster(&["exspeed-0:5933", "exspeed-1:5933"], opts, wait)`
+  connects to the leader, following hints. After a failover, reconnect the
+  same way.
+- **TypeScript:** `ExspeedClient.connect({ servers: ["exspeed-0:5933", "exspeed-1:5933"] })`.
+  The client finds the leader, and finds the new one when it reconnects
+  after a failover. Subscriptions are re-established.
+- **Other clients:** connect anywhere and follow the `leader` field of
+  `ConnectOk`, of `Metadata`, or of the `503` error detail
+  ([protocol.md](protocol.md)). Behind a load balancer, route to the node
+  whose `/healthz` returns 200.
 
-### Known limitation: TCP publish leader-gate
+Client-protocol reads (`Read`, `StreamInfo`, `ListStreams`, `Query`) work on
+followers and return replicated data. Writes and consumers need the leader.
+The HTTP API answers only on the leader (503 with the leader's address
+elsewhere), except the probes, `/metrics`, `/api/v1/cluster`,
+`/api/v1/leases` and `/api/v1/whoami`.
 
-Clients should connect only to the leader's port 5933 via the probe-aware
-Service — the readiness probe only routes to the pod whose `/healthz`
-returns 200. A TCP client that bypasses the Service and connects
-directly to a follower's port 5933 to publish will succeed: the write
-lands on the follower's local storage and is overwritten by the
-divergent-history truncation on the next replication handshake cycle.
-Tracked for a future release.
+### Failover timing
 
-### k8s deployment with replication
-
-Extend the Service + StatefulSet example above to expose 5934:
-
-```yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: exspeed
-spec:
-  selector: { app: exspeed }
-  ports:
-    - name: api
-      port: 8080
-      targetPort: 8080
-    - name: tcp
-      port: 5933
-      targetPort: 5933
-    - name: cluster
-      port: 5934
-      targetPort: 5934
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: exspeed
-spec:
-  replicas: 2
-  selector:
-    matchLabels: { app: exspeed }
-  serviceName: exspeed
-  template:
-    metadata:
-      labels: { app: exspeed }
-    spec:
-      containers:
-        - name: exspeed
-          image: exspeed:latest
-          ports:
-            - containerPort: 8080
-            - containerPort: 5933
-            - containerPort: 5934
-          env:
-            - name: EXSPEED_LEASE_BACKEND
-              value: postgres
-            - name: EXSPEED_OFFSET_STORE_POSTGRES_URL
-              valueFrom: { secretKeyRef: { name: pg, key: url } }
-            - name: EXSPEED_REPLICATOR_CREDENTIAL
-              valueFrom: { secretKeyRef: { name: replicator, key: token } }
-            - name: EXSPEED_CLUSTER_BIND
-              value: "0.0.0.0:5934"
-            - name: EXSPEED_CLUSTER_ADVERTISE
-              value: "$(POD_NAME).exspeed.$(POD_NAMESPACE).svc.cluster.local:5934"
-          readinessProbe:
-            httpGet: { path: /healthz, port: 8080 }
-            periodSeconds: 5
-            failureThreshold: 2
-            successThreshold: 1
+```mermaid
+sequenceDiagram
+  participant A as Leader A
+  participant LB as Lease backend
+  participant B as Follower B (in ISR)
+  A->>LB: refresh (every heartbeat)
+  Note over A: A crashes or is cut off
+  Note over A: if alive: no refresh for 2/3 TTL, so it stops leading
+  B->>LB: poll: lease still held
+  Note over LB: TTL passes, lease expires
+  B->>LB: acquire (B in ISR): epoch 8
+  B->>B: stop following, stamp epoch 8, rebuild dedup
+  Note over B: writes open, /healthz = 200
+  A->>LB: (on return) lease held by B
+  A->>B: fetch as follower, truncate unreplicated writes
 ```
 
-## What's still not in v1
+| Event | Writes unavailable for about |
+|-------|------------------------------|
+| Leader shuts down (SIGTERM) | one heartbeat interval: the lease is released and a follower takes it at its next poll |
+| Leader crashes or is cut off from the lease backend | `lease_ttl_secs` + one heartbeat interval (default about 18 s) |
 
-- **Synchronous replication.** Every ack is local-disk; the RPO window
-  is non-zero on crash. There's no `wait_for_quorum` knob.
-- **Per-stream replication factor.** Every stream replicates to every
-  follower. You can't mark a stream as "leader-only" or "2/3 replicas".
-- **Raft / consensus writes.** Lease coordination is single-key; there
-  is no multi-stage write commit. A split-brain scenario with a
-  partitioned lease backend is recoverable via divergent-history
-  truncation, not prevented.
-- **Geo / WAN replication.** The replication protocol assumes a
-  low-RTT network between pods. Running followers across regions
-  works mechanically but lag alerts will fire continuously.
-- **Catastrophic S3-only restore.** There is no "restore from object
-  storage" path independent of a live follower. Sink connectors to S3
-  provide an archive, but restoring a stream from that archive into
-  a new cluster is a manual operator task.
+Lower `lease_ttl_secs` for faster failover, at the cost of more lease
+traffic and less tolerance for slow backends.
+
+### Observability
+
+| Where | What |
+|-------|------|
+| `GET /api/v1/cluster` (any node, admin) | node id, role, epoch, the leader's endpoints. On the leader: the ISR and each follower's lag and last fetch. On a follower: whether it is connected, its lag, and the last error |
+| `GET /api/v1/leases` (any node, admin) | the raw lease record |
+| `GET /healthz` | 200 on the leader only (with `leader_hint` otherwise) |
+| metrics | `exspeed_is_leader`, `exspeed_replication_role`, `exspeed_replication_lag_records`, `exspeed_replication_records_applied_total`, `exspeed_replication_truncated_records_total`, `exspeed_replication_bytes_total`, `exspeed_lease_*` |
+
+## Limits
+
+- **Every node has every stream.** There is no partitioning across nodes or
+  per-stream replication factor. A cluster scales reads and availability,
+  not write throughput.
+- **The cluster port has no TLS.** It authenticates followers with a token.
+  Keep it on a private network.
+- **Followers apply compaction themselves.** Compacted streams converge on
+  the same contents, but a follower may keep superseded records slightly
+  longer than the leader.
+- **One lease backend.** Its availability bounds the cluster's: if Postgres
+  or Redis is unreachable for longer than the lease TTL, the leader steps
+  down and no one can take over until the backend returns.

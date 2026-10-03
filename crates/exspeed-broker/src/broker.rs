@@ -11,7 +11,6 @@ use crate::broker_append::BrokerAppend;
 use crate::consumer::ConsumerManager;
 use crate::lease::LeaderLease;
 use crate::log::Log;
-use crate::replication::ReplicationCoordinator;
 
 pub struct Broker {
     pub storage: Arc<dyn StorageEngine>,
@@ -26,9 +25,6 @@ pub struct Broker {
     pub metrics: Arc<Metrics>,
     /// Set to `true` once all startup dedup rebuild tasks complete.
     pub dedup_ready: Arc<AtomicBool>,
-    /// Leader-side replication coordinator. `None` on single-pod
-    /// deployments; `Some(_)` when multi-pod mode is configured.
-    pub(crate) replication_coordinator: Option<Arc<ReplicationCoordinator>>,
 }
 
 impl Broker {
@@ -56,24 +52,7 @@ impl Broker {
             lease,
             metrics,
             dedup_ready,
-            replication_coordinator: None,
         }
-    }
-
-    /// Attach a `ReplicationCoordinator` so every write is fanned out to
-    /// connected followers.
-    pub fn with_replication_coordinator(
-        mut self,
-        coordinator: Arc<ReplicationCoordinator>,
-    ) -> Self {
-        self.log.set_replication(coordinator.clone());
-        self.replication_coordinator = Some(coordinator);
-        self
-    }
-
-    /// The attached replication coordinator, if any.
-    pub fn replication_coordinator(&self) -> Option<&Arc<ReplicationCoordinator>> {
-        self.replication_coordinator.as_ref()
     }
 
     /// Returns `true` once all startup dedup rebuild tasks have completed.

@@ -69,6 +69,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // answer "who's the leader?".
     let leases_router = Router::new()
         .route("/api/v1/leases", get(leases::list_leases))
+        .route("/api/v1/cluster", get(cluster::status))
         .layer(from_fn_with_state(
             state.clone(),
             crate::middleware::require_admin,
@@ -161,7 +162,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/v1/connections/{name}",
             delete(connections::delete_connection),
         )
-        .route("/api/v1/cluster/followers", get(cluster::list_followers))
         .layer(from_fn_with_state(
             state.clone(),
             crate::middleware::leader_gate,

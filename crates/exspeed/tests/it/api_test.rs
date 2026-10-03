@@ -56,8 +56,8 @@ async fn healthz_returns_ok() {
         body
     );
     assert!(
-        body.get("holder").is_some(),
-        "response should include holder id; body: {:?}",
+        body["node_id"].is_string(),
+        "response should include the node id; body: {:?}",
         body
     );
 }

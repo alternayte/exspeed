@@ -128,9 +128,19 @@ pub(crate) fn log_error_response(
 ) -> Response {
     use exspeed_broker::log::LogError;
     match e {
-        LogError::NotLeader | LogError::DedupNotReady => (
+        LogError::NotLeader => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": e.to_string(), "leader": state.leadership.leader_hint()})),
+        )
+            .into_response(),
+        LogError::DedupNotReady | LogError::ReplicationTimeout => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+        LogError::NotEnoughReplicas { in_sync, required } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": e.to_string(), "in_sync": in_sync, "required": required})),
         )
             .into_response(),
         LogError::InvalidRecord(_) | LogError::InvalidConfig(_) => (
