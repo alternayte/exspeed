@@ -51,6 +51,8 @@ struct Inner {
     // inherit the new one. Callers should always read via
     // `ClusterLeadership::current_child_token()`.
     current_token: Mutex<CancellationToken>,
+    /// Set by `resign`: the retry loop stops competing for the lease.
+    resigned: std::sync::atomic::AtomicBool,
     holder_id: Uuid,
     /// The `host:port` followers dial to replicate from this pod. Written
     /// into the `cluster:leader` lease row on each acquire so a standby can
@@ -91,6 +93,7 @@ impl ClusterLeadership {
                 t.cancel();
                 t
             }),
+            resigned: std::sync::atomic::AtomicBool::new(false),
             holder_id,
             replication_endpoint,
         });
@@ -105,6 +108,26 @@ impl ClusterLeadership {
             is_leader: is_leader_rx,
             holder_id,
             inner,
+        }
+    }
+
+    /// Step down for good (graceful shutdown): stop competing for the
+    /// lease, cancel the leader token so leader-only work stops, and drop
+    /// the lease guard, which deletes the lease row so a peer can take over
+    /// immediately instead of waiting out the TTL.
+    pub async fn resign(&self) {
+        self.inner
+            .resigned
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.inner.current_token.lock().await.cancel();
+        let guard = self.inner.guard.lock().await.take();
+        if let Some(g) = guard {
+            drop(g);
+            self.inner.metrics.set_is_leader(false);
+            self.inner.metrics.set_lease_held(LEASE_NAME, false);
+            self.inner.metrics.record_leader_transition("resigned");
+            let _ = self.inner.is_leader_tx.send(false);
+            info!(holder = %self.inner.holder_id, "cluster:leader released (shutdown)");
         }
     }
 
@@ -156,6 +179,9 @@ async fn run_retry_loop(inner: Arc<Inner>) {
 
     loop {
         ticker.tick().await;
+        if inner.resigned.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
 
         // If we already hold leadership, skip re-acquire; the LeaseGuard's
         // own heartbeat task keeps the lease alive and fires on_lost on

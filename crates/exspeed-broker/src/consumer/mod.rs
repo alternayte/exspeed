@@ -119,6 +119,8 @@ pub struct ConsumerManager {
     /// `Some` while this node is the leader and consumers are running.
     token: RwLock<Option<CancellationToken>>,
     next_sub_id: AtomicU32,
+    /// Every actor task, so shutdown can wait for final persists.
+    tasks: tokio_util::task::TaskTracker,
 }
 
 impl ConsumerManager {
@@ -130,7 +132,19 @@ impl ConsumerManager {
             consumers: RwLock::new(HashMap::new()),
             token: RwLock::new(None),
             next_sub_id: AtomicU32::new(1),
+            tasks: tokio_util::task::TaskTracker::new(),
         })
+    }
+
+    /// Wait (up to `timeout`) for every consumer actor to exit after its
+    /// token was cancelled; each persists its final state on the way out.
+    pub async fn wait_stopped(&self, timeout: std::time::Duration) -> bool {
+        self.tasks.close();
+        let done = tokio::time::timeout(timeout, self.tasks.wait())
+            .await
+            .is_ok();
+        self.tasks.reopen();
+        done
     }
 
     /// Load every persisted consumer and start it under `token` (cancelled
@@ -182,7 +196,7 @@ impl ConsumerManager {
             self.metrics.clone(),
         )?;
         let (tx, rx) = mpsc::channel(4096);
-        tokio::spawn(actor.run(rx, token));
+        self.tasks.spawn(actor.run(rx, token));
         Ok(Handle { spec, tx })
     }
 

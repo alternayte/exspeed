@@ -519,3 +519,26 @@ async fn retention_by_age() {
     let info = c.stream_info("short").await.unwrap();
     assert_eq!(info["config"]["max_age_secs"], 1);
 }
+
+/// Graceful shutdown persists consumer state, including delivery counts of
+/// records that were delivered but not acked.
+#[tokio::test]
+async fn delivery_counts_survive_graceful_restart() {
+    let server = TestServer::start().await;
+    {
+        let c = server.client().await;
+        create_stream(&c, "s").await;
+        publish_n(&c, "s", "x", 1).await;
+        c.create_consumer(ConsumerSpec::new("dc", "s"))
+            .await
+            .unwrap();
+        let got = c.pull("dc", 1, Duration::from_secs(2)).await.unwrap();
+        assert_eq!(got[0].delivery_count, 1);
+        // Not acked; shut down right away (no time for a periodic persist).
+    }
+    let server = server.restart().await;
+    let c = server.client().await;
+    let again = c.pull("dc", 1, Duration::from_secs(2)).await.unwrap();
+    assert_eq!(again[0].offset, 0);
+    assert_eq!(again[0].delivery_count, 2);
+}

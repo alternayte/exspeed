@@ -410,6 +410,22 @@ impl FileStorage {
     /// Enforce retention (age and size) on every stream. Blocking; call it
     /// from `spawn_blocking` or a plain thread. Errors are logged per stream
     /// so one bad stream never stops the others.
+    /// Flush and fsync every partition and stop the writer threads. Call
+    /// once at shutdown after all writers are done; appends afterwards fail
+    /// with `ChannelClosed`. Blocking: run it on a blocking thread.
+    pub fn close(&self) {
+        self.inner.compactor_stop.lock().unwrap().take();
+        let handles: Vec<Arc<PartitionHandle>> = self
+            .inner
+            .partitions
+            .iter()
+            .map(|e| e.value().clone())
+            .collect();
+        for h in handles {
+            h.shutdown_blocking();
+        }
+    }
+
     pub fn enforce_all_retention(&self) -> io::Result<()> {
         let handles: Vec<Arc<PartitionHandle>> = self
             .inner

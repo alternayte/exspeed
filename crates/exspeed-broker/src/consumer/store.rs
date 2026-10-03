@@ -36,7 +36,7 @@ impl ConsumerStore {
     /// per consumer, which bounds its size.
     fn stream_config() -> StreamConfig {
         StreamConfig {
-            max_age_secs: u64::MAX / 2,
+            max_age_secs: 100 * 365 * 24 * 3600,
             max_bytes: u64::MAX / 2,
             compaction: true,
             ..StreamConfig::default()

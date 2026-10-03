@@ -484,7 +484,7 @@ impl Request {
             },
             OpCode::PublishBatch => {
                 let stream = r.str()?;
-                let n = r.count(16)?;
+                let n = r.count(10)?;
                 let mut records = Vec::with_capacity(n);
                 for _ in 0..n {
                     records.push(r.publish_record()?);

@@ -525,7 +525,7 @@ where
     }
 
     // Spawn periodic dedup snapshot task (runs every 60s, final snapshot on shutdown).
-    let _snapshot_handle = exspeed_broker::snapshot_task::spawn_dedup_snapshot_task(
+    let snapshot_handle = exspeed_broker::snapshot_task::spawn_dedup_snapshot_task(
         broker.broker_append.clone(),
         args.data_dir.clone(),
         cancel_token.clone(),
@@ -610,6 +610,7 @@ where
         replication_coordinator: replication_coordinator.clone(),
     });
 
+    let supervisor_handle: tokio::task::JoinHandle<()>;
     // Spawn the leader supervisor: waits for is_leader=true, then runs
     // connectors + continuous queries + retention under the current
     // leader token. Loops so that if we get demoted and re-promoted,
@@ -626,11 +627,12 @@ where
         // multi-pod mode; `None` in single-pod short-circuits the emit
         // call inside the task.
         let replication_coordinator_for_retention = replication_coordinator.clone();
-        // Leader supervisor: three select-wraps observe `supervisor_cancel` because the
-        // supervisor has three idle states (awaiting promotion, active tenure, awaiting
-        // demotion). Without the third wrap, SIGTERM during the post-tenure idle window
-        // would block until the next promotion or watcher channel close.
-        tokio::spawn(async move {
+        // Leader supervisor. While idle (awaiting promotion or demotion) it
+        // exits on `supervisor_cancel`. An active tenure ends only when the
+        // leader token is cancelled: on demotion, or when shutdown calls
+        // `leadership.resign()` after draining connections and connectors,
+        // so leader work stops in order and persists its state.
+        supervisor_handle = tokio::spawn(async move {
             let mut is_leader_rx = leadership_sup.is_leader.clone();
             loop {
                 tokio::select! {
@@ -662,11 +664,10 @@ where
                             token.clone(),
                             replication_coordinator_for_retention.clone(),
                         ) => {}
+                    // Shutdown also ends a tenure: the server resigns
+                    // leadership (cancelling `token`) only after draining
+                    // connections and stopping connectors.
                     _ = token.cancelled() => {}
-                    _ = supervisor_cancel.cancelled() => {
-                        info!("leader supervisor: cancelled");
-                        return;
-                    }
                 }
 
                 info!("leader supervisor: tenure ended; awaiting re-promotion");
@@ -1054,6 +1055,29 @@ where
     {
         warn!("connectors did not stop within 30s");
     }
+
+    // Step down: cancels the leader token, stopping consumers, continuous
+    // queries and retention, and releases the lease so a peer can take
+    // over at once.
+    leadership.resign().await;
+    if !broker
+        .consumers
+        .wait_stopped(std::time::Duration::from_secs(10))
+        .await
+    {
+        warn!("consumers did not stop within 10s");
+    }
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), supervisor_handle).await;
+
+    // Final dedup snapshot (taken by the snapshot task on cancel).
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), snapshot_handle).await;
+
+    // Flush and fsync every partition, then release the data-dir lock
+    // (dropped when this function returns).
+    let storage_for_close = file_storage.clone();
+    let _ = tokio::task::spawn_blocking(move || storage_for_close.close()).await;
+    // Give the lease release (an async DELETE in the guard's task) a moment.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     info!("server stopped");
     Ok(())
 }
