@@ -173,17 +173,35 @@ fn is_marker(e: &Expr, name: &str) -> bool {
     }
 }
 
+/// Simplify, then compile one expression. The logical optimizer never runs
+/// on a continuous plan, and some functions (`coalesce`, `nvl`) only work
+/// after simplification rewrites them; without it they fail at runtime.
+/// No execution start time is set, so `now()` is not folded to a constant.
+fn physical_expr(
+    state: &SessionState,
+    e: &Expr,
+    schema: &DFSchema,
+) -> Result<Arc<dyn PhysicalExpr>, ExqlError> {
+    use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
+    let ctx = SimplifyContext::builder()
+        .with_schema(Arc::new(schema.clone()))
+        .with_config_options(Arc::new(state.config_options().as_ref().clone()))
+        .build();
+    let e = ExprSimplifier::new(ctx)
+        .simplify(e.clone())
+        .map_err(map_expr_err)?;
+    state
+        .create_physical_expr(e, schema)
+        .map_err(map_expr_err)
+}
+
 /// Compile `[Projection | Filter | SubqueryAlias]*` nodes (top-down order)
 /// into stateless steps (applied bottom-up).
 pub(crate) fn compile_chain(
     state: &SessionState,
     nodes: &[&LogicalPlan],
 ) -> Result<Chain, ExqlError> {
-    let phys = |e: &Expr, schema: &DFSchema| {
-        state
-            .create_physical_expr(e.clone(), schema)
-            .map_err(map_expr_err)
-    };
+    let phys = |e: &Expr, schema: &DFSchema| physical_expr(state, e, schema);
     let mut steps = vec![];
     for node in nodes.iter().rev() {
         match node {
@@ -221,9 +239,7 @@ enum ScanKind {
 
 impl Builder<'_> {
     fn phys(&self, e: &Expr, schema: &DFSchema) -> Result<Arc<dyn PhysicalExpr>, ExqlError> {
-        self.state
-            .create_physical_expr(e.clone(), schema)
-            .map_err(map_expr_err)
+        physical_expr(self.state, e, schema)
     }
 
     fn chain(&self, nodes: &[&LogicalPlan]) -> Result<Chain, ExqlError> {

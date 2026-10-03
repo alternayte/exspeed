@@ -48,6 +48,12 @@ pub struct ExqlConfig {
     /// Default allowed lateness (`GRACE PERIOD`) when a query names none
     /// (`EXSPEED_EXQL_DEFAULT_GRACE_MS`, default 0).
     pub default_grace_ms: i64,
+    /// A `TIMESTAMP BY` value more than this far ahead of the record's own
+    /// timestamp (or before 1970) is treated as invalid and replaced by the
+    /// record timestamp, so one bad record can't move the watermark years
+    /// ahead and make every later record late
+    /// (`EXSPEED_EXQL_MAX_EVENT_TIME_SKEW_MS`, default 1 day).
+    pub max_event_time_skew_ms: i64,
     pub external: ExternalConfig,
 }
 
@@ -64,6 +70,7 @@ impl Default for ExqlConfig {
             micro_batch_records: 1000,
             poll_interval: Duration::from_millis(200),
             default_grace_ms: 0,
+            max_event_time_skew_ms: 24 * 60 * 60 * 1000,
             external: ExternalConfig::default(),
         }
     }
@@ -93,6 +100,9 @@ impl ExqlConfig {
         }
         if let Some(v) = env_u64("EXSPEED_EXQL_DEFAULT_GRACE_MS") {
             c.default_grace_ms = v as i64;
+        }
+        if let Some(v) = env_u64("EXSPEED_EXQL_MAX_EVENT_TIME_SKEW_MS") {
+            c.max_event_time_skew_ms = v.min(i64::MAX as u64) as i64;
         }
         c
     }

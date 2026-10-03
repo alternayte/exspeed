@@ -12,7 +12,11 @@
 //!   the text, so they stay usable as join keys);
 //! - arithmetic (`+ - * / %`);
 //! - numeric aggregates (`SUM`, `AVG`, `MIN`, `MAX`, `STDDEV`, …, also as
-//!   window functions) and math functions (`ABS`, `ROUND`, …);
+//!   window functions) and math functions (`ABS`, `ROUND`, …). `MIN`/`MAX`
+//!   of non-numeric JSON text therefore give NULL: write
+//!   `MAX(CAST(payload->>'name' AS VARCHAR))` for the text maximum;
+//! - a comparison with an integer is exact (as BIGINT) when the JSON text
+//!   is an integer, so values above 2^53 don't collide;
 //! - `ORDER BY`: values sort numerically first, then as text, so numbers
 //!   order correctly and non-numbers still sort deterministically.
 //!
@@ -127,15 +131,28 @@ fn column_is_json(c: &datafusion::common::Column, plan: &LogicalPlan, depth: usi
     }
 }
 
+/// `payload->'k'` (`json_get`) is a JSON union; casting it to a number or
+/// text gives NULL for some members (integers), so numeric contexts and
+/// ORDER BY read it through `json_as_text` (`->>`) instead.
+fn json_text_form(e: Expr) -> Expr {
+    match e {
+        Expr::Alias(a) => json_text_form(*a.expr),
+        Expr::ScalarFunction(f) if f.func.name() == "json_get" => Expr::ScalarFunction(
+            ScalarFunction::new_udf(datafusion_functions_json::udfs::json_as_text_udf(), f.args),
+        ),
+        other => other,
+    }
+}
+
 fn to_double(e: Expr) -> Expr {
-    Expr::TryCast(TryCast::new(Box::new(e), DataType::Float64))
+    Expr::TryCast(TryCast::new(Box::new(json_text_form(e)), DataType::Float64))
 }
 
 /// Numeric ORDER BY key for JSON text.
 fn sort_key(e: Expr) -> Expr {
     let udf = Arc::new(crate::udfs::json_num());
     let arg = Expr::Cast(datafusion::logical_expr::Cast::new(
-        Box::new(e),
+        Box::new(json_text_form(e)),
         DataType::Utf8,
     ));
     Expr::ScalarFunction(ScalarFunction::new_udf(udf, vec![arg]))
@@ -204,6 +221,32 @@ fn rewrite_expr(
                         None,
                         vec![(Box::new(cond), Box::new(then))],
                         Some(Box::new(otherwise)),
+                    ),
+                )));
+            }
+            // JSON integer vs integer: compare exactly as BIGINT when the
+            // text is an integer (DOUBLE loses precision above 2^53), as
+            // DOUBLE otherwise.
+            let int = |t: &Option<DataType>| t.as_ref().is_some_and(|t| t.is_integer());
+            if is_cmp(&op) && (lj && !rj && int(&rt) || rj && !lj && int(&lt)) {
+                let (l, r) = (*left, *right);
+                let as_int = |e: Expr| {
+                    Expr::TryCast(TryCast::new(Box::new(json_text_form(e)), DataType::Int64))
+                };
+                let (li, ri, ld, rd, probe) = if lj {
+                    let p = as_int(l.clone());
+                    (p.clone(), r.clone(), to_double(l), r, p)
+                } else {
+                    let p = as_int(r.clone());
+                    (l.clone(), p.clone(), l, to_double(r), p)
+                };
+                let exact = Expr::BinaryExpr(BinaryExpr::new(Box::new(li), op, Box::new(ri)));
+                let approx = Expr::BinaryExpr(BinaryExpr::new(Box::new(ld), op, Box::new(rd)));
+                return Ok(Transformed::yes(Expr::Case(
+                    datafusion::logical_expr::expr::Case::new(
+                        None,
+                        vec![(Box::new(probe.is_not_null()), Box::new(exact))],
+                        Some(Box::new(approx)),
                     ),
                 )));
             }
