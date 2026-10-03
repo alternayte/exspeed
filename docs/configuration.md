@@ -29,17 +29,18 @@ Every flag that has an env var can be set either way.
 
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
-| `--storage-sync` | `EXSPEED_STORAGE_SYNC` | `sync` | `sync`: group commit with an fsync per batch. `async`: fsync on a timer. |
+| `--storage-sync` | `EXSPEED_STORAGE_SYNC` | `sync` | `sync`: group commit with an fsync per batch; records become visible to readers after the fsync. `async`: records are visible once written and fsynced on a timer. |
 | `--storage-flush-window-us` | `EXSPEED_FLUSH_WINDOW_US` | `500` | Longest the appender waits to fill a batch |
 | `--storage-flush-threshold-records` | `EXSPEED_FLUSH_THRESHOLD_RECORDS` | `256` | Flush early at this many records |
 | `--storage-flush-threshold-bytes` | `EXSPEED_FLUSH_THRESHOLD_BYTES` | `1048576` | Flush early at this many bytes |
 | `--storage-sync-interval-ms` | `EXSPEED_SYNC_INTERVAL_MS` | `10` | Fsync interval in `async` mode |
-| `--storage-sync-bytes` | `EXSPEED_SYNC_BYTES` | `4194304` | *No effect yet* |
+| `--storage-sync-bytes` | `EXSPEED_SYNC_BYTES` | `4194304` | In `async` mode, fsync early once this many bytes are unsynced (`0` = timer only) |
 | `--delivery-buffer` | `EXSPEED_DELIVERY_BUFFER` | `8192` | *No effect yet* |
 
 With `--storage-sync=async`, a crash can lose up to
-`--storage-sync-interval-ms` of acknowledged writes. This matches NATS
-JetStream's default.
+`--storage-sync-interval-ms` (or `--storage-sync-bytes`) of acknowledged
+writes. This matches NATS JetStream's default. A failed background fsync
+marks the stream failed (read-only until restart).
 
 ## Environment variables
 
@@ -108,23 +109,6 @@ Single-node defaults are file-based. See [high-availability.md](high-availabilit
 | `EXSPEED_REPLICATION_IDLE_TIMEOUT_SECS` | `30` | |
 | `EXSPEED_REPLICATION_FOLLOWER_QUEUE_RECORDS` | `100000` | |
 
-### S3 tiered storage (experimental, broken)
-
-> ❌ Do not enable this. Evicting a segment makes every read of that stream
-> fail, and queries never fall back to S3. See
-> [REVIEW.md §3.1](REVIEW.md#31-storage-exspeed-storage).
-
-| Variable | Default |
-|----------|---------|
-| `EXSPEED_STORAGE_S3_ENABLED` | off |
-| `EXSPEED_STORAGE_S3_BUCKET` | — |
-| `EXSPEED_STORAGE_S3_PREFIX` | — |
-| `EXSPEED_STORAGE_S3_REGION` | — |
-| `EXSPEED_STORAGE_S3_ENDPOINT` | — |
-| `EXSPEED_STORAGE_S3_ACCESS_KEY` | — |
-| `EXSPEED_STORAGE_S3_SECRET_KEY` | — |
-| `EXSPEED_STORAGE_LOCAL_MAX_BYTES` | `10737418240` |
-
 ### External database connections (ExQL)
 
 | Variable | Description |
@@ -149,9 +133,20 @@ Single-node defaults are file-based. See [high-availability.md](high-availabilit
 | Dedup window | `5m` | `--dedup-window`, or `dedup_window_secs` |
 | Dedup max entries | `500000` | `--dedup-max-entries`, or `dedup_max_entries` |
 | Segment size | 256 MB | not configurable |
+| Compaction | off | `compaction` in `StreamConfig` only; not exposed over HTTP or the CLI yet |
+| Tombstone retention | `24h` | `tombstone_retention_secs` in `StreamConfig` |
 
 A background task enforces retention every 60 s by deleting whole sealed
-segments.
+segments from the front of the log. The active segment is never deleted. A
+stream whose `stream.json` is unreadable is skipped (with a warning); the
+others are still enforced.
+
+Compacted streams keep only the newest record per key in sealed segments,
+and a background compactor visits them every 60 s. A record with a key and
+an empty value is a tombstone that deletes the key; the tombstone itself is
+removed after the tombstone retention. Offsets are preserved, so compacted
+streams have offset gaps. See
+[architecture.md](architecture.md#storage-layout).
 
 ## Connector env substitution
 

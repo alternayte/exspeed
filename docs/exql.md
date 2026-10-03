@@ -220,7 +220,7 @@ and `EXSPEED_CONNECTION_<NAME>_URL` environment variables.
 
 ## Indexes
 
-Secondary indexes on a top-level JSON field speed up equality lookups:
+You can define an index on a top-level JSON field:
 
 ```sql
 CREATE INDEX orders_by_customer ON orders(payload->>'customer_id');
@@ -230,13 +230,10 @@ DROP INDEX orders_by_customer;
 You can run these through `exspeed query` or `/api/v1/indexes`
 (`GET`, `POST {"sql": "CREATE INDEX …"}`, `DELETE /{name}`).
 
-> ⚠️ **Known issues with indexes:**
->
-> - Creating an index forces a segment roll. With more than one index, or an
->   empty active segment, this can make records appear twice (REVIEW.md
->   blocker 2).
-> - `DROP INDEX` does not remove the index from storage.
-> - Avoid indexes until the storage fixes land.
+> ⚠️ **Indexes do nothing yet.** The storage engine no longer builds
+> secondary-index files, so a query planned as an index lookup runs as a
+> filtered scan of the whole stream. Results are correct; there is no
+> speed-up. The definitions are kept for the ExQL rewrite.
 
 ## Functions
 

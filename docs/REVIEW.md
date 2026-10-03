@@ -12,7 +12,7 @@
 | Phase | Status |
 |-------|--------|
 | 0. Guard rails | ✅ CI, single test binary per crate, clippy clean, blockers 1, 2, 7, 10, 14, 15 fixed, JDBC Postgres sink fixed |
-| 1. Core log | ⏳ next |
+| 1. Core log | 🚧 Storage engine rewritten: per-partition writer thread with group commit, lock-free readers with a high watermark, sparse indexes, fence-on-error, crash-safe sidecars and truncation, compaction, `append_at`. Bloom, secondary-index and S3 tiering code removed. Torn-write and fault-injection tests in place. Still to do: wire-format records, kill -9 loop tests, real-disk ENOSPC tests. |
 | 2. Consumers + protocol v2 | — |
 | 3. Ops | — |
 | 4. ExQL v2 | — |
@@ -122,6 +122,11 @@ a headline feature not work at all.
 Severity: **C** critical · **H** high · **M** medium · **L** low.
 
 ### 3.1 Storage (`exspeed-storage`)
+
+> **Status (Phase 1):** every finding in this table is addressed by the
+> storage engine rewrite (see [architecture.md](architecture.md#storage-layout)),
+> and the S3 tiering and secondary-index code is gone. The file and line
+> references below point at the old engine.
 
 | Sev | Finding | Where | Fix |
 |-----|---------|-------|-----|
