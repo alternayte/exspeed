@@ -218,10 +218,45 @@ impl PartitionShared {
         *self.config.lock().unwrap() = Some(cfg);
     }
 
+    /// Run a read and retry it if a truncation raced with it: the epoch
+    /// moved, or the high watermark dropped below the one the read used. A
+    /// raced read may have returned records that `truncate_from` was
+    /// removing, or new records appended at the same offsets afterwards.
+    fn read_consistent<T>(
+        &self,
+        mut read: impl FnMut() -> Result<T, StorageError>,
+        hwm_of: impl Fn(&T) -> u64,
+    ) -> Result<T, StorageError> {
+        for _ in 0..8 {
+            let epoch = self.truncation_epoch();
+            let r = read()?;
+            if self.truncation_epoch() == epoch && self.high_watermark() >= hwm_of(&r) {
+                return Ok(r);
+            }
+        }
+        Err(StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            format!("{}: read kept racing a truncation; retry", self.stream),
+        )))
+    }
+
     /// Read records at offsets `>= from`, below the high watermark. `strict`
     /// reports `from` below the earliest retained offset as
     /// [`StorageError::OffsetOutOfRange`]; otherwise `from` is clamped.
     pub fn read(
+        &self,
+        from: u64,
+        max_records: usize,
+        max_bytes: usize,
+        strict: bool,
+    ) -> Result<ReadBatch, StorageError> {
+        self.read_consistent(
+            || self.read_once(from, max_records, max_bytes, strict),
+            |b| b.high_watermark.0,
+        )
+    }
+
+    fn read_once(
         &self,
         from: u64,
         max_records: usize,
@@ -320,6 +355,18 @@ impl PartitionShared {
     /// never spans two segments once it holds a record, so the result is a
     /// view of one read buffer. CRCs are verified.
     pub fn read_raw(
+        &self,
+        from: u64,
+        max_records: usize,
+        max_bytes: usize,
+    ) -> Result<RawBatch, StorageError> {
+        self.read_consistent(
+            || self.read_raw_once(from, max_records, max_bytes),
+            |b| b.high_watermark.0,
+        )
+    }
+
+    fn read_raw_once(
         &self,
         from: u64,
         max_records: usize,
@@ -839,4 +886,79 @@ pub fn apply_truncation(dir: &Path, drop_from: u64) -> io::Result<()> {
         drop(create_segment_file(dir, drop_from)?);
     }
     fsync_dir(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn shared(next: u64) -> PartitionShared {
+        PartitionShared::new("t", Path::new("/nonexistent"), Vec::new(), next, None)
+    }
+
+    /// §3.1 #10: a read that raced a truncation (epoch moved) is retried
+    /// instead of returning records `truncate_from` was removing.
+    #[test]
+    fn read_racing_a_truncation_is_retried() {
+        let s = shared(100);
+        let calls = Cell::new(0);
+        let got = s
+            .read_consistent(
+                || {
+                    calls.set(calls.get() + 1);
+                    let hwm = s.high_watermark();
+                    if calls.get() == 1 {
+                        // A truncation starts while this read runs.
+                        s.begin_truncation();
+                        s.publish_committed(40);
+                    }
+                    Ok(hwm)
+                },
+                |hwm| *hwm,
+            )
+            .unwrap();
+        assert_eq!(calls.get(), 2, "the raced read is retried");
+        assert_eq!(got, 40, "the retry sees the truncated log");
+    }
+
+    /// A read that used a high watermark which then dropped (the window
+    /// between `begin_truncation` and hiding the records) is retried too.
+    #[test]
+    fn read_that_used_a_dropped_high_watermark_is_retried() {
+        let s = shared(100);
+        s.begin_truncation(); // the epoch moved before the read started
+        let calls = Cell::new(0);
+        let got = s
+            .read_consistent(
+                || {
+                    calls.set(calls.get() + 1);
+                    let hwm = s.high_watermark();
+                    if calls.get() == 1 {
+                        s.publish_committed(10);
+                    }
+                    Ok(hwm)
+                },
+                |hwm| *hwm,
+            )
+            .unwrap();
+        assert_eq!((calls.get(), got), (2, 10));
+    }
+
+    #[test]
+    fn read_that_keeps_racing_fails_retryably() {
+        let s = shared(100);
+        let err = s
+            .read_consistent(
+                || {
+                    s.begin_truncation();
+                    Ok(0u64)
+                },
+                |_| 0,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, StorageError::Io(ref e) if e.kind() == std::io::ErrorKind::Interrupted)
+        );
+    }
 }

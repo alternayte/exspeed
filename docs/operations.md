@@ -13,6 +13,7 @@ For every flag and environment variable, see [configuration.md](configuration.md
 - [Kubernetes (Helm)](#kubernetes-helm)
 - [Structured logging](#structured-logging)
 - [Connection cap](#connection-cap)
+- [Open file limit](#open-file-limit)
 - [Exclusive data-dir lock](#exclusive-data-dir-lock)
 - [Graceful shutdown](#graceful-shutdown)
 - [Consumers vs. retention](#consumers-vs-retention)
@@ -95,6 +96,20 @@ EXSPEED_MAX_CONNS=1024   # default
 ```
 
 Caps concurrent TCP connections to the broker port. When the cap is reached, new connections are accepted-then-immediately-closed; each rejection is logged and increments the `connections_rejected_total` counter (scraped as `connections_rejected_total_total`). Tune by watching that counter alongside `connections_active`.
+
+## Open file limit
+
+The storage engine keeps every segment open for the life of the process:
+two file descriptors per sealed segment (data + index) and about three per
+stream for its active segment (reader, writer, index), plus one per client connection, connector and
+replication link. Segments roll at 256 MiB by default, so a node holding
+1 TiB has about 4,096 sealed segments, which is ~8,200 descriptors for
+storage alone. There is no descriptor cache yet, so raise the limit
+(`ulimit -n`, systemd `LimitNOFILE=`, Docker `--ulimit nofile=`; on
+Kubernetes it comes from the container runtime) to at least
+`2 × sealed segments + 3 × streams + max connections + headroom`. Running out
+shows up as `Too many open files` errors on segment rolls and new
+connections.
 
 ## Exclusive data-dir lock
 
