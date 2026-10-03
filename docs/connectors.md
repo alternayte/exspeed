@@ -60,21 +60,55 @@ the stream's dedup window (see [idempotent publish](idempotent-publish.md)).
 | Plugin | Type | Guarantee | Tested against |
 |--------|------|-----------|----------------|
 | `postgres_cdc` | source | at-least-once; effectively-once for replays within the dedup window | real Postgres: envelope and keys, crash + restart without loss or duplicates, non-destructive dry run |
-| `postgres_outbox` | source | effectively-once within the dedup window (`x-idempotency-key` = outbox id); at-least-once beyond it | real Postgres: poll mode with delete cleanup, CDC mode |
+| `postgres_outbox` | source | effectively-once within the dedup window (`x-idempotency-key` = outbox id); at-least-once beyond it | real Postgres: poll mode with delete cleanup, CDC mode, two crashes before the delete leave each event exactly once |
 | `postgres_poll` | source | at-least-once (a crash replays the last batch); rows committed late with an older tracking value are missed | real Postgres: timestamp/numeric/uuid/json decoding, tied tracking values, resume |
-| `jdbc_poll` | source | at-least-once; integer cursor, so late commits below the cursor are missed | SQLite, SQL Server |
-| `mssql_cdc` | source | at-least-once; effectively-once for replays within the dedup window | unit tests only (no SQL Server in CI) |
-| `rabbitmq` | source | at-least-once (ack after the append); effectively-once with `dedup_on_message_id` | unit tests only |
+| `jdbc_poll` | source | at-least-once (a crash replays the last batch; no idempotency key); integer cursor, so late commits below the cursor are missed | SQLite; real MySQL and SQL Server: a crash between append and checkpoint replays exactly that batch, resume after a restart |
+| `mssql_cdc` | source | at-least-once; effectively-once for replays within the dedup window | real SQL Server: two crashes + restart without loss or duplicates, update/delete/insert while stopped |
+| `rabbitmq` | source | at-least-once (ack after the append); effectively-once with `dedup_on_message_id` | real RabbitMQ: a crash before the ack redelivers (duplicates, nothing lost, queue drained); exactly once with `dedup_on_message_id` across two crashes and a restart |
 | `http_poll` | source | at-least-once per response; effectively-once with `idempotent_items` | in-process HTTP server: no truncation, pagination |
 | `http_webhook` | source | `200` only after the record is stored: at-least-once from the sender's side; effectively-once with `Idempotency-Key` | HTTP API tests |
-| `jdbc` | sink | effectively-once in `upsert` mode; at-least-once in `insert` mode (a duplicate-key error on replay counts as written) | Postgres, MySQL, SQLite, SQL Server |
+| `jdbc` | sink | effectively-once in `upsert` mode; at-least-once in `insert` mode (a duplicate-key error on replay counts as written) | Postgres, MySQL, SQLite, SQL Server; real MySQL and SQL Server: two crashes before the commit leave every row exactly once in `upsert` mode and in `insert` mode with a key, nothing in the DLQ |
 | `http_sink` | sink | at-least-once; every request carries `Idempotency-Key` | in-process HTTP server: retries, 401, poison → DLQ |
-| `rabbitmq` | sink | at-least-once (publisher confirms, persistent messages); `message_id` = idempotency key | unit tests only |
-| `s3` | sink | effectively-once: one object per buffer, keyed by its first offset, so a retry overwrites the same object | unit tests only |
+| `rabbitmq` | sink | at-least-once (publisher confirms, persistent messages); `message_id` = idempotency key | real RabbitMQ: a crash before the commit republishes the batch with the same `message_id`s; a clean restart publishes only new records |
+| `s3` | sink | effectively-once: one object per buffer, keyed by its first offset, so a retry overwrites the same object | MinIO: two crashes before the commit overwrite the same objects (each record exactly once); a graceful stop flushes the partial buffer |
 
 The framework itself (checkpoint ordering, crash between append and
 checkpoint, crash before ack, sink flush failures, restarts, panics) is
 tested with fake plugins in `crates/exspeed-connectors/tests/it/`.
+
+### Testing against real services
+
+The service-backed tests in `crates/exspeed-connectors/tests/it/` run the
+real plugins under the supervisor and crash them mid-stream: a panic when
+the checkpoint or sink offset is saved (after the append or the write is
+durable), or just before a source's external ack. The supervisor restarts
+the plugin, and the test checks what reached the stream or the target:
+every upstream message at least once, and no duplicates where the plugin
+promises effectively-once.
+
+| Variable | Service | Tests |
+|----------|---------|-------|
+| `EXSPEED_POSTGRES_URL` | Postgres with `wal_level = logical` | `postgres_cdc`, `postgres_outbox`, `postgres_poll` |
+| `EXSPEED_MYSQL_URL` | MySQL or MariaDB | `jdbc` sink, `jdbc_poll` |
+| `EXSPEED_MSSQL_URL` | SQL Server with SQL Server Agent and a user database | `jdbc` sink, `jdbc_poll`, `mssql_cdc` |
+| `EXSPEED_RABBITMQ_URL` | RabbitMQ | `rabbitmq` source and sink |
+| `EXSPEED_S3_ENDPOINT` (with `EXSPEED_S3_ACCESS_KEY` and `EXSPEED_S3_SECRET_KEY`, default `minioadmin`) | MinIO or another S3-compatible store | `s3` sink |
+
+These tests are `#[ignore]`d. A test whose variable is unset skips, or
+fails under `CI=true`. The `test-services` CI job runs all of these
+services. To run them locally:
+
+```bash
+docker-compose up -d postgres mysql mssql rabbitmq minio
+docker exec exspeed-mssql /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa \
+  -P 'Exspeed_Test!1' -Q "CREATE DATABASE exspeed"
+export EXSPEED_POSTGRES_URL=postgres://testuser:testpass@127.0.0.1:5432/testdb
+export EXSPEED_MYSQL_URL=mysql://exspeed:exspeed@127.0.0.1:3306/exspeed
+export EXSPEED_MSSQL_URL='mssql://sa:Exspeed_Test!1@127.0.0.1:1433/exspeed?trust_server_certificate=true'
+export EXSPEED_RABBITMQ_URL=amqp://guest:guest@127.0.0.1:5672/%2f
+export EXSPEED_S3_ENDPOINT=http://127.0.0.1:9000
+cargo test -p exspeed-connectors --test it -- --include-ignored
+```
 
 ## Config file format
 
@@ -407,7 +441,10 @@ schema = "id:bigint, customer:text, total:double, paid:boolean"   # required
 ```
 
 The `schema` DSL is a list of `name:type` pairs. The supported types are
-`text`, `bigint`, `double`, `boolean`, `timestamptz` and `jsonb`. The
+`text`, `bigint`, `double`, `boolean`, `timestamptz` and `jsonb`. Each
+column is cast in SQL to its schema type, so native types such as
+`DECIMAL`, `DATETIME`, `JSON`, `TINYINT(1)` or `BIT` decode; `timestamptz`
+values are the database's text form (ISO 8601 on SQL Server). The
 checkpoint is the last tracking value. For Postgres, prefer `postgres_poll`.
 
 ### `mssql_cdc`
@@ -617,7 +654,9 @@ propagate_headers = true
 
 Publisher confirms are always on: a record counts as written only once the
 broker has confirmed it. Messages carry the record headers, `message_id` =
-idempotency key, `x-exspeed-offset` and `x-exspeed-subject`.
+idempotency key, `x-exspeed-offset` and `x-exspeed-subject`. With
+`mandatory`, a record the exchange can't route goes to the DLQ; the records
+after it in the same batch are not published again.
 
 ### `s3`
 

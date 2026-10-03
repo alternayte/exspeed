@@ -6,12 +6,14 @@
 //! - Messages are persistent (`delivery_mode = 2`) by default.
 //! - `mandatory = true` (default): a message no queue is bound for is
 //!   returned by the broker and treated as **poison** (DLQ, or dropped with
-//!   a metric), instead of vanishing silently.
+//!   a metric), instead of vanishing silently. The records published after
+//!   it in the same batch are not published again.
 //! - Record headers become AMQP headers; the record's idempotency key
 //!   (`x-idempotency-key`, or `<stream>:<offset>`) becomes `message_id`, so
 //!   consumers can drop the duplicates a retry may produce.
 //! - A lost connection is a `Connection` error: the supervisor reconnects.
 
+use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -67,6 +69,24 @@ pub struct RabbitmqSink {
     stream: String,
     connection: Option<Connection>,
     channel: Option<lapin::Channel>,
+    /// Broker outcomes of the records published after a returned
+    /// (unroutable) one in the same `write()`. The framework sends those
+    /// records again after handling the poison one; they are settled from
+    /// here instead of being published a second time.
+    settled: VecDeque<(u64, Settled)>,
+}
+
+enum Settled {
+    Confirmed,
+    Returned(String),
+}
+
+/// The broker's answer to one publish.
+enum Outcome {
+    Confirmed,
+    Returned(String),
+    Nacked,
+    Lost(lapin::Error),
 }
 
 impl RabbitmqSink {
@@ -82,6 +102,7 @@ impl RabbitmqSink {
             stream: init.config.stream.clone(),
             connection: None,
             channel: None,
+            settled: VecDeque::new(),
         })
     }
 
@@ -207,10 +228,35 @@ impl SinkConnector for RabbitmqSink {
         }
         self.connection = Some(conn);
         self.channel = Some(channel);
+        self.settled.clear();
         Ok(())
     }
 
     async fn write(&mut self, records: &[SinkRecord]) -> Result<WriteResult, ConnectorError> {
+        // Records already published by the previous call (after a returned
+        // one): settle them without publishing again.
+        let mut base = 0;
+        while let Some(r) = records.get(base) {
+            match self.settled.front() {
+                Some((offset, _)) if *offset == r.offset => {}
+                _ => break,
+            }
+            match self.settled.pop_front().map(|(_, s)| s) {
+                Some(Settled::Returned(detail)) => {
+                    return Ok(WriteResult::Poison {
+                        index: base,
+                        reason: PoisonReason::SinkRejected { detail },
+                    })
+                }
+                _ => base += 1,
+            }
+        }
+        self.settled.clear();
+        let records = &records[base..];
+        if records.is_empty() {
+            return Ok(WriteResult::Accepted);
+        }
+
         let channel = self
             .channel
             .clone()
@@ -239,37 +285,57 @@ impl SinkConnector for RabbitmqSink {
                     // Earlier publishes may still be confirmed; count them.
                     let accepted = await_confirms(confirms).await.unwrap_or(0);
                     return Ok(WriteResult::Failed {
-                        accepted,
+                        accepted: base + accepted,
                         error: conn_err("publish", e),
                     });
                 }
             }
         }
-        for (i, c) in confirms.into_iter().enumerate() {
-            match c.await {
-                Ok(Confirmation::Ack(None)) | Ok(Confirmation::NotRequested) => {}
-                Ok(Confirmation::Ack(Some(ret))) => {
+        // Await every confirm, also past a returned message: those records
+        // are already published, and re-sending them would duplicate them.
+        let mut outcomes = Vec::with_capacity(confirms.len());
+        for c in confirms {
+            outcomes.push(match c.await {
+                Ok(Confirmation::Ack(None)) | Ok(Confirmation::NotRequested) => Outcome::Confirmed,
+                Ok(Confirmation::Ack(Some(ret))) => Outcome::Returned(format!(
+                    "unroutable: exchange '{}' returned the message ({} {})",
+                    self.settings.exchange,
+                    ret.reply_code,
+                    ret.reply_text.as_str()
+                )),
+                Ok(Confirmation::Nack(_)) => Outcome::Nacked,
+                Err(e) => Outcome::Lost(e),
+            });
+        }
+        let mut outcomes = outcomes.into_iter().enumerate();
+        while let Some((i, o)) = outcomes.next() {
+            match o {
+                Outcome::Confirmed => {}
+                Outcome::Returned(detail) => {
+                    // Remember the outcomes after it, up to the first one
+                    // that isn't settled (that one and later are re-sent).
+                    for (j, o) in outcomes.by_ref() {
+                        let s = match o {
+                            Outcome::Confirmed => Settled::Confirmed,
+                            Outcome::Returned(d) => Settled::Returned(d),
+                            Outcome::Nacked | Outcome::Lost(_) => break,
+                        };
+                        self.settled.push_back((records[j].offset, s));
+                    }
                     return Ok(WriteResult::Poison {
-                        index: i,
-                        reason: PoisonReason::SinkRejected {
-                            detail: format!(
-                                "unroutable: exchange '{}' returned the message ({} {})",
-                                self.settings.exchange,
-                                ret.reply_code,
-                                ret.reply_text.as_str()
-                            ),
-                        },
-                    })
+                        index: base + i,
+                        reason: PoisonReason::SinkRejected { detail },
+                    });
                 }
-                Ok(Confirmation::Nack(_)) => {
+                Outcome::Nacked => {
                     return Ok(WriteResult::Failed {
-                        accepted: i,
+                        accepted: base + i,
                         error: ConnectorError::transient("rabbitmq: broker nacked the message"),
                     })
                 }
-                Err(e) => {
+                Outcome::Lost(e) => {
                     return Ok(WriteResult::Failed {
-                        accepted: i,
+                        accepted: base + i,
                         error: conn_err("publisher confirm", e),
                     })
                 }
