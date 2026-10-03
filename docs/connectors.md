@@ -70,7 +70,7 @@ the stream's dedup window (see [idempotent publish](idempotent-publish.md)).
 | `jdbc` | sink | effectively-once in `upsert` mode; at-least-once in `insert` mode (a duplicate-key error on replay counts as written) | Postgres, MySQL, SQLite, SQL Server; real MySQL and SQL Server: two crashes before the commit leave every row exactly once in `upsert` mode and in `insert` mode with a key, nothing in the DLQ |
 | `http_sink` | sink | at-least-once; every request carries `Idempotency-Key` | in-process HTTP server: retries, 401, poison → DLQ |
 | `rabbitmq` | sink | at-least-once (publisher confirms, persistent messages); `message_id` = idempotency key | real RabbitMQ: a crash before the commit republishes the batch with the same `message_id`s; a clean restart publishes only new records |
-| `s3` | sink | effectively-once: one object per buffer, keyed by its first offset, so a retry overwrites the same object | MinIO: two crashes before the commit overwrite the same objects (each record exactly once); a graceful stop flushes the partial buffer |
+| `s3` | sink | effectively-once: one object per buffer, keyed by its first offset, so a retry overwrites the same object | S3-compatible store (moto in CI): two crashes before the commit overwrite the same objects (each record exactly once); a graceful stop flushes the partial buffer |
 
 The framework itself (checkpoint ordering, crash between append and
 checkpoint, crash before ack, sink flush failures, restarts, panics) is
@@ -92,14 +92,14 @@ promises effectively-once.
 | `EXSPEED_MYSQL_URL` | MySQL or MariaDB | `jdbc` sink, `jdbc_poll` |
 | `EXSPEED_MSSQL_URL` | SQL Server with SQL Server Agent and a user database | `jdbc` sink, `jdbc_poll`, `mssql_cdc` |
 | `EXSPEED_RABBITMQ_URL` | RabbitMQ | `rabbitmq` source and sink |
-| `EXSPEED_S3_ENDPOINT` (with `EXSPEED_S3_ACCESS_KEY` and `EXSPEED_S3_SECRET_KEY`, default `minioadmin`) | MinIO or another S3-compatible store | `s3` sink |
+| `EXSPEED_S3_ENDPOINT` (with `EXSPEED_S3_ACCESS_KEY` and `EXSPEED_S3_SECRET_KEY`, default `minioadmin`) | An S3-compatible store (CI and docker-compose use moto; MinIO works too) | `s3` sink |
 
 These tests are `#[ignore]`d. A test whose variable is unset skips, or
 fails under `CI=true`. The `test-services` CI job runs all of these
 services. To run them locally:
 
 ```bash
-docker-compose up -d postgres mysql mssql rabbitmq minio
+docker-compose up -d postgres mysql mssql rabbitmq s3
 docker exec exspeed-mssql /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa \
   -P 'Exspeed_Test!1' -Q "CREATE DATABASE exspeed"
 export EXSPEED_POSTGRES_URL=postgres://testuser:testpass@127.0.0.1:5432/testdb

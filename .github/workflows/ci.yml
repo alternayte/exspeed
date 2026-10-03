@@ -48,7 +48,7 @@ jobs:
       - run: cargo test --workspace
 
   test-services:
-    name: cargo test (Postgres, Redis, MySQL, RabbitMQ, MinIO, SQL Server)
+    name: cargo test (Postgres, Redis, MySQL, RabbitMQ, S3, SQL Server)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -78,9 +78,8 @@ jobs:
             -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=exspeed \
             -e MYSQL_USER=exspeed -e MYSQL_PASSWORD=exspeed mysql:8
           docker run -d --name rabbitmq -p 5672:5672 rabbitmq:3-management
-          docker run -d --name minio -p 9000:9000 \
-            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio server /data
+          # S3-compatible store (MinIO no longer publishes images on Docker Hub).
+          docker run -d --name s3 -p 9000:5000 motoserver/moto:latest
           docker run -d --name mssql -p 1433:1433 \
             -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD -e MSSQL_PID=Developer \
             -e MSSQL_AGENT_ENABLED=true \
@@ -107,7 +106,7 @@ jobs:
           wait_for pg docker exec pg pg_isready -U testuser
           wait_for mysql docker exec mysql mysqladmin ping -uroot -proot --silent
           wait_for rabbitmq docker exec rabbitmq rabbitmq-diagnostics -q check_port_connectivity
-          wait_for minio curl -sf http://127.0.0.1:9000/minio/health/live
+          wait_for s3 curl -s -o /dev/null http://127.0.0.1:9000/
           wait_for mssql sqlcmd -Q "SELECT 1"
           # A user database: CDC can't be enabled on master.
           sqlcmd -Q "IF DB_ID('exspeed') IS NULL CREATE DATABASE exspeed"

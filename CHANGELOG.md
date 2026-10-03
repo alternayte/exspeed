@@ -105,12 +105,12 @@ connector config and SDK API all change.
   - batched JDBC inserts, HTTP status taxonomy
   - S3 sink idempotent object keys, RabbitMQ confirms
 - Crash/resume tests against real services for every remaining plugin: the
-  RabbitMQ source and sink, the S3 sink (MinIO), the JDBC sink and
+  RabbitMQ source and sink, the S3 sink (against moto, an S3-compatible server), the JDBC sink and
   `jdbc_poll` on MySQL, SQL Server and Postgres, `mssql_cdc`, and the
   Postgres outbox (crash before the delete). Each one crashes the connector
   mid-stream and checks at-least-once delivery, or no duplicates where the
   plugin promises effectively-once. The CI service
-  job now also runs RabbitMQ, MinIO and SQL Server (with Agent, for CDC).
+  job now also runs RabbitMQ, an S3-compatible store (moto) and SQL Server (with Agent, for CDC).
   See [docs/connectors.md](docs/connectors.md#testing-against-real-services).
 - Fixes found by these tests:
   - `jdbc_poll` failed every poll on columns that sqlx's `Any` driver can't

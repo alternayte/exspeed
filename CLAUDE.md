@@ -31,7 +31,7 @@ E2E tests start a real server from `EXSPEED_BIN` or `target/debug/exspeed` (buil
 
 ### Infrastructure (for connector integration tests)
 ```bash
-docker-compose up -d   # Postgres (5432), RabbitMQ (5672/15672), MinIO (9000/9001)
+docker-compose up -d   # Postgres (5432), MySQL, SQL Server, RabbitMQ (5672/15672), S3 via moto (9000)
 ```
 
 ### Releasing
