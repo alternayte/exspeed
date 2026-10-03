@@ -318,7 +318,10 @@ async fn poll_crash_replay(db: &Db, url: &str) {
         want,
         "at-least-once: the crashed batch is replayed"
     );
-    assert!(json_of(&first[0])["name"].as_str().unwrap().starts_with('r'));
+    assert!(json_of(&first[0])["name"]
+        .as_str()
+        .unwrap()
+        .starts_with('r'));
     assert_eq!(first[0].subject, format!("jdbc_poll.{table}"));
     assert_eq!(
         all.len(),

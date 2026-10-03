@@ -6,6 +6,7 @@
 //! under `CI=true`, where they fail so a misconfigured service job can't
 //! pass silently.
 
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -427,6 +428,63 @@ async fn outbox_cdc_streams_inserts() {
     assert_eq!(header(&recs[1], "x-idempotency-key"), Some("2"));
     assert_eq!(recs[1].key.as_deref(), Some(&b"u-2"[..]));
     assert_eq!(json_of(&recs[1]), json!({"plan": "free"}));
+}
+
+/// Two crashes after the append but before the outbox rows are deleted: the
+/// rows are polled again, and their ids (the idempotency keys) make the
+/// broker drop the replays. Each event is in the stream exactly once and the
+/// outbox ends up empty.
+#[tokio::test]
+#[ignore = "needs Postgres (EXSPEED_POSTGRES_URL)"]
+async fn outbox_crash_before_delete_is_exactly_once() {
+    let url = require_pg!();
+    let name = unique("obx");
+    let t = format!("{name}_outbox");
+    let c = client(&url).await;
+    c.batch_execute(&format!(
+        "CREATE TABLE {t} (id bigserial PRIMARY KEY, aggregate_type text, aggregate_id text, \
+         event_type text, payload jsonb);
+         INSERT INTO {t} (aggregate_type, aggregate_id, event_type, payload)
+         SELECT 'order', 'o-' || i, 'created', json_build_object('i', i)
+         FROM generate_series(1, 7) AS i;"
+    ))
+    .await
+    .unwrap();
+
+    let mut cfg = fast_config(&name, Source, "postgres_outbox", &name);
+    cfg.batch_size = 3;
+    cfg.settings = json!({"connection": url, "table": t})
+        .as_object()
+        .unwrap()
+        .clone();
+    let env = Env::new();
+    let reg = crash_before_ack_registry("postgres_outbox", Arc::new(AtomicU32::new(2)));
+    let (h, state) = env.run(&reg, cfg, Arc::new(MemOffsets::default()));
+    eventually(30, "outbox drained", || async {
+        let n: i64 = c
+            .query_one(&format!("SELECT count(*) FROM {t}"), &[])
+            .await
+            .unwrap()
+            .get(0);
+        n == 0
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let recs = env.read_all(&name).await;
+    let restarts = state.snapshot().restart_count;
+    h.stop(Duration::from_secs(15)).await;
+    cleanup(&url, None, None, &[&t]).await;
+
+    assert!(restarts >= 2, "both crashes restarted the connector");
+    let ids: Vec<&str> = recs
+        .iter()
+        .map(|r| header(r, "x-idempotency-key").unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["1", "2", "3", "4", "5", "6", "7"],
+        "exactly once, in order"
+    );
 }
 
 // ---------------------------------------------------------------------------
