@@ -480,6 +480,7 @@ pub async fn compile(
         _ => return Err(ExqlError::parse("expected a SELECT after AS")),
     }
     ast::rewrite_json_numeric_args(&mut stmt)?;
+    ast::alias_qualified_json(&mut stmt);
     if spec.window.is_some() {
         ast::rewrite_window_markers(&mut stmt)?;
     }

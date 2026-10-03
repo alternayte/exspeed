@@ -103,6 +103,36 @@ pub fn subject_matches() -> ScalarUDF {
     )
 }
 
+/// Name of the numeric sort key used for ORDER BY on JSON text.
+pub const JSON_NUM: &str = "__exql_json_num";
+
+/// `__exql_json_num(text)`: the text as a DOUBLE, or NULL if it isn't a
+/// number. Used as the primary ORDER BY key for JSON text (a plain
+/// `TRY_CAST` would be merged with the text key by the optimizer).
+pub fn json_num() -> ScalarUDF {
+    create_udf(
+        JSON_NUM,
+        vec![DataType::Utf8],
+        DataType::Float64,
+        Volatility::Immutable,
+        Arc::new(|args: &[ColumnarValue]| {
+            let n = rows(args);
+            let s = to_array(&args[0], n)?;
+            let s = s.as_string::<i32>();
+            let out: datafusion::arrow::array::Float64Array = (0..n)
+                .map(|r| {
+                    if s.is_null(r) {
+                        None
+                    } else {
+                        s.value(r).trim().parse::<f64>().ok().filter(|f| !f.is_nan())
+                    }
+                })
+                .collect();
+            finish(Arc::new(out), all_scalar(args))
+        }),
+    )
+}
+
 fn window_marker(name: &'static str) -> ScalarUDF {
     create_udf(
         name,
@@ -128,6 +158,7 @@ pub fn all() -> Vec<ScalarUDF> {
     vec![
         subject_part(),
         subject_matches(),
+        json_num(),
         window_start_marker(),
         window_end_marker(),
     ]

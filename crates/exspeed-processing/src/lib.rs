@@ -20,6 +20,8 @@ mod bounded_tests;
 #[cfg(test)]
 mod continuous_tests;
 #[cfg(test)]
+mod differential_tests;
+#[cfg(test)]
 mod test_util;
 
 pub use bounded::QueryResult;

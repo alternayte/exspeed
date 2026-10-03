@@ -6,7 +6,7 @@ use datafusion::execution::session_state::SessionState;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, SelectItem,
+    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, OrderByKind, SelectItem,
     SetExpr, Statement as SQLStatement,
 };
 use datafusion::sql::sqlparser::ast::{visit_expressions_mut, BinaryOperator};
@@ -56,11 +56,34 @@ fn sql_statements(stmt: &mut DFStatement) -> Vec<&mut SQLStatement> {
     }
 }
 
-/// `AVG(payload->>'x')` → `AVG(TRY_CAST(payload->>'x' AS DOUBLE))`.
+/// `AVG(payload->>'x')` → `AVG(TRY_CAST(payload->>'x' AS DOUBLE))`, and the
+/// same for operands of `+ - * / %`.
 pub fn rewrite_json_numeric_args(stmt: &mut DFStatement) -> Result<(), ExqlError> {
     let mut err: Option<ExqlError> = None;
     for s in sql_statements(stmt) {
         let _ = visit_expressions_mut(s, |e: &mut Expr| {
+            if let Expr::BinaryOp { left, op, right } = e {
+                // Arithmetic is type-checked while planning: cast JSON text
+                // operands to numbers up front.
+                if matches!(
+                    op,
+                    BinaryOperator::Plus
+                        | BinaryOperator::Minus
+                        | BinaryOperator::Multiply
+                        | BinaryOperator::Divide
+                        | BinaryOperator::Modulo
+                ) {
+                    for side in [left, right] {
+                        if is_arrow(side) {
+                            match parse_expr(&format!("TRY_CAST({side} AS DOUBLE)")) {
+                                Ok(new) => **side = new,
+                                Err(e) => err = Some(e),
+                            }
+                        }
+                    }
+                }
+                return ControlFlow::<()>::Continue(());
+            }
             let Expr::Function(f) = e else {
                 return ControlFlow::<()>::Continue(());
             };
@@ -90,6 +113,87 @@ pub fn rewrite_json_numeric_args(stmt: &mut DFStatement) -> Result<(), ExqlError
     match err {
         Some(e) => Err(e),
         None => Ok(()),
+    }
+}
+
+/// `SELECT DISTINCT e … ORDER BY e` → `ORDER BY <position of e>`.
+/// DataFusion can't match the (aliased) JSON operator expressions in ORDER
+/// BY back to a DISTINCT select list.
+pub fn rewrite_distinct_order_by(stmt: &mut DFStatement) -> Result<(), ExqlError> {
+    for s in sql_statements(stmt) {
+        let SQLStatement::Query(q) = s else {
+            continue;
+        };
+        let Some(ob) = q.order_by.as_mut() else {
+            continue;
+        };
+        let SetExpr::Select(sel) = q.body.as_ref() else {
+            continue;
+        };
+        if sel.distinct.is_none() {
+            continue;
+        }
+        let OrderByKind::Expressions(exprs) = &mut ob.kind else {
+            continue;
+        };
+        for o in exprs.iter_mut() {
+            let key = o.expr.to_string();
+            let pos = sel.projection.iter().position(|item| match item {
+                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e.to_string() == key,
+                _ => false,
+            });
+            if let Some(i) = pos {
+                o.expr = parse_expr(&(i + 1).to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn unnest(e: &Expr) -> &Expr {
+    match e {
+        Expr::Nested(inner) => unnest(inner),
+        other => other,
+    }
+}
+
+/// Whether a JSON-operator chain starts at a qualified column (`a.payload`).
+fn qualified_arrow(e: &Expr) -> bool {
+    match unnest(e) {
+        Expr::BinaryOp { left, op, .. }
+            if matches!(op, BinaryOperator::Arrow | BinaryOperator::LongArrow) =>
+        {
+            match unnest(left) {
+                Expr::CompoundIdentifier(_) => true,
+                other => qualified_arrow(other),
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Name unaliased `a.payload->>'x'` select items `a.payload ->> 'x'`, so
+/// `SELECT a.payload->>'id', b.payload->>'id'` doesn't produce two columns
+/// with the same name.
+pub fn alias_qualified_json(stmt: &mut DFStatement) {
+    for s in sql_statements(stmt) {
+        let SQLStatement::Query(q) = s else {
+            continue;
+        };
+        let SetExpr::Select(sel) = q.body.as_mut() else {
+            continue;
+        };
+        for item in sel.projection.iter_mut() {
+            if let SelectItem::UnnamedExpr(e) = item {
+                if qualified_arrow(e) {
+                    let alias = Ident::with_quote('"', unnest(e).to_string());
+                    *item = SelectItem::ExprWithAlias {
+                        expr: e.clone(),
+                        alias,
+                    };
+                }
+            }
+        }
     }
 }
 

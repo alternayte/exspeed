@@ -64,6 +64,8 @@ pub async fn execute(
     let fut = async {
         let mut stmt = crate::ast::parse_one(&normalized)?;
         crate::ast::rewrite_json_numeric_args(&mut stmt)?;
+        crate::ast::rewrite_distinct_order_by(&mut stmt)?;
+        crate::ast::alias_qualified_json(&mut stmt);
         let plan = state.statement_to_plan(stmt).await?;
         sql_options().verify_plan(&plan)?;
         let ctx = SessionContext::new_with_state(state);

@@ -7,6 +7,9 @@
 //! context is numeric:
 //!
 //! - comparisons, `BETWEEN` and `IN` against a numeric operand;
+//! - `<`, `<=`, `>`, `>=` between two JSON texts: numerically when both are
+//!   numbers, as text otherwise (`=` / `<>` between two JSON texts compare
+//!   the text, so they stay usable as join keys);
 //! - arithmetic (`+ - * / %`);
 //! - numeric aggregates (`SUM`, `AVG`, `MIN`, `MAX`, `STDDEV`, …, also as
 //!   window functions) and math functions (`ABS`, `ROUND`, …);
@@ -114,6 +117,13 @@ fn to_double(e: Expr) -> Expr {
     Expr::TryCast(TryCast::new(Box::new(e), DataType::Float64))
 }
 
+/// Numeric ORDER BY key for JSON text.
+fn sort_key(e: Expr) -> Expr {
+    let udf = Arc::new(crate::udfs::json_num());
+    let arg = Expr::Cast(datafusion::logical_expr::Cast::new(Box::new(e), DataType::Utf8));
+    Expr::ScalarFunction(ScalarFunction::new_udf(udf, vec![arg]))
+}
+
 fn numeric(t: &DataType) -> bool {
     t.is_numeric()
 }
@@ -150,6 +160,20 @@ fn rewrite_expr(e: Expr, schema: &DFSchema, inputs: &[&LogicalPlan]) -> DFResult
             }
             let lt = ty(&left);
             let rt = ty(&right);
+            if lj && rj && matches!(op, Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq) {
+                // Both sides JSON text: numbers compare as numbers, anything
+                // else as text.
+                let (l, r) = (*left, *right);
+                let (ln, rn) = (sort_key(l.clone()), sort_key(r.clone()));
+                let cond = ln.clone().is_not_null().and(rn.clone().is_not_null());
+                let then = Expr::BinaryExpr(BinaryExpr::new(Box::new(ln), op, Box::new(rn)));
+                let otherwise = Expr::BinaryExpr(BinaryExpr::new(Box::new(l), op, Box::new(r)));
+                return Ok(Transformed::yes(Expr::Case(datafusion::logical_expr::expr::Case::new(
+                    None,
+                    vec![(Box::new(cond), Box::new(then))],
+                    Some(Box::new(otherwise)),
+                ))));
+            }
             let (l, r) = if is_arith(&op) {
                 (
                     if lj { to_double(*left) } else { *left },
@@ -248,7 +272,7 @@ impl AnalyzerRule for JsonNumericRule {
                 for s in &sort.expr {
                     if is_json_text(&s.expr, &[input.as_ref()]) {
                         changed = true;
-                        exprs.push(SortExpr::new(to_double(s.expr.clone()), s.asc, s.nulls_first));
+                        exprs.push(SortExpr::new(sort_key(s.expr.clone()), s.asc, s.nulls_first));
                     }
                     exprs.push(s.clone());
                 }
