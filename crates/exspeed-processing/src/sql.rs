@@ -175,12 +175,25 @@ pub(crate) fn token_sql(t: &Token) -> String {
 }
 
 fn render(tokens: &[Token]) -> String {
-    tokens
-        .iter()
-        .map(token_sql)
-        .collect::<String>()
-        .trim()
-        .to_string()
+    let mut out = String::new();
+    let mut prev: Option<&Token> = None;
+    for t in tokens {
+        // `a, offset FROM s`: sqlparser takes `, OFFSET` for a trailing
+        // comma before an OFFSET clause. After a comma it can only be the
+        // stream column, so quote it.
+        let is_offset_col = matches!(prev, Some(Token::Comma))
+            && word(t)
+                .is_some_and(|w| w.quote_style.is_none() && w.value.eq_ignore_ascii_case("offset"));
+        if is_offset_col {
+            out.push_str("\"offset\"");
+        } else {
+            out.push_str(&token_sql(t));
+        }
+        if !is_ws(t) {
+            prev = Some(t);
+        }
+    }
+    out.trim().to_string()
 }
 
 fn is_arrow(t: &Token) -> bool {
@@ -1128,6 +1141,15 @@ mod tests {
         assert_eq!(
             normalize_sql("SELECT 'it''s', \"we\"\"ird\" FROM s").unwrap(),
             "SELECT 'it''s', \"we\"\"ird\" FROM s"
+        );
+    }
+
+    #[test]
+    fn offset_column_after_comma() {
+        assert_eq!(
+            normalize_sql("SELECT key, offset FROM s ORDER BY key, offset LIMIT 1 OFFSET 2")
+                .unwrap(),
+            "SELECT key, \"offset\" FROM s ORDER BY key, \"offset\" LIMIT 1 OFFSET 2"
         );
     }
 

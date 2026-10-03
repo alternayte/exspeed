@@ -593,6 +593,8 @@ impl ExecutionPlan for StreamScanExec {
                 }
                 let batch = records_to_batch_projected(&records, st.projection.as_deref())
                     .map_err(|e| e.into_df())?;
+                // Let timeouts and cancellation in between batches.
+                tokio::task::consume_budget().await;
                 return Ok(Some((batch, st)));
             }
         });

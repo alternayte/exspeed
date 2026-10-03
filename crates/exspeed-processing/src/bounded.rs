@@ -36,6 +36,26 @@ impl QueryResult {
     }
 }
 
+/// A spawned task that is aborted when this handle is dropped.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> std::future::Future for AbortOnDrop<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 fn sql_options() -> SQLOptions {
     SQLOptions::new()
         .with_allow_ddl(false)
@@ -61,7 +81,7 @@ pub async fn execute(
             ))
         }
     };
-    let fut = async {
+    let fut = async move {
         let mut stmt = crate::ast::parse_one(&normalized)?;
         crate::ast::rewrite_json_numeric_args(&mut stmt)?;
         crate::ast::rewrite_distinct_order_by(&mut stmt)?;
@@ -99,9 +119,18 @@ pub async fn execute(
         }
         Ok::<_, ExqlError>((columns, rows, truncated))
     };
-    let (columns, rows, truncated) = tokio::time::timeout(cfg.query_timeout, fut)
-        .await
-        .map_err(|_| ExqlError::Timeout(cfg.query_timeout.as_millis() as u64))??;
+    // Run on its own task so the timeout (and a dropped request) take effect
+    // even while DataFusion is busy on another worker; the guard aborts the
+    // task when this future completes or is dropped.
+    let task = AbortOnDrop(tokio::spawn(fut));
+    let (columns, rows, truncated) = match tokio::time::timeout(cfg.query_timeout, task).await {
+        Err(_) => return Err(ExqlError::Timeout(cfg.query_timeout.as_millis() as u64)),
+        Ok(Err(e)) if e.is_panic() => {
+            return Err(ExqlError::Internal(format!("query panicked: {e}")))
+        }
+        Ok(Err(_)) => return Err(ExqlError::Cancelled),
+        Ok(Ok(r)) => r?,
+    };
     Ok(QueryResult {
         row_count: rows.len(),
         columns,

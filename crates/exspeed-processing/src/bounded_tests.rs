@@ -354,3 +354,48 @@ async fn external_postgres_join() {
         .await
         .unwrap();
 }
+
+async fn many(n: usize) -> (Arc<dyn StorageEngine>, Resolver, tempfile::TempDir) {
+    let recs: Vec<(String, String)> = (0..n)
+        .map(|i| {
+            (
+                format!("s.{}", i % 7),
+                format!(r#"{{"i": {i}, "pad": "{}"}}"#, "x".repeat(64)),
+            )
+        })
+        .collect();
+    let refs: Vec<(&str, &str)> = recs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    setup(&refs).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timeout_and_memory_limit() {
+    let (_s, r, _d) = many(1000).await;
+    let cfg = ExqlConfig {
+        query_timeout: std::time::Duration::from_millis(1),
+        ..ExqlConfig::default()
+    };
+    let state = build_state(&cfg, runtime_env(&cfg).unwrap(), r.clone()).unwrap();
+    let e = execute(
+        state,
+        "SELECT COUNT(*) FROM orders a CROSS JOIN orders b CROSS JOIN orders c",
+        &cfg,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(e.code(), "TIMEOUT", "{e}");
+
+    let cfg = ExqlConfig {
+        memory_limit_bytes: 256 * 1024,
+        ..ExqlConfig::default()
+    };
+    let state = build_state(&cfg, runtime_env(&cfg).unwrap(), r.clone()).unwrap();
+    let e = execute(
+        state,
+        "SELECT payload, offset FROM orders ORDER BY payload->>'pad', offset DESC",
+        &cfg,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(e.code(), "RESOURCES_EXHAUSTED", "{e}");
+}
