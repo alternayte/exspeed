@@ -6,7 +6,6 @@
 //! under `CI=true`, where they fail so a misconfigured service job can't
 //! pass silently.
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,7 +13,6 @@ use serde_json::{json, Value};
 
 use exspeed_connectors::config::ConnectorConfig;
 use exspeed_connectors::offset_store::OffsetStore;
-use exspeed_connectors::status::Status;
 use exspeed_connectors::ConnectorType::Source;
 use exspeed_connectors::Registry;
 use exspeed_streams::StoredRecord;
@@ -22,17 +20,7 @@ use exspeed_streams::StoredRecord;
 use crate::common::*;
 
 fn pg_url() -> Option<String> {
-    match std::env::var("EXSPEED_POSTGRES_URL") {
-        Ok(u) if !u.is_empty() => Some(u),
-        _ => {
-            let ci = std::env::var("CI").unwrap_or_default();
-            if ci == "true" || ci == "1" {
-                panic!("EXSPEED_POSTGRES_URL must be set when CI=true (Postgres tests would silently pass)");
-            }
-            eprintln!("SKIP: EXSPEED_POSTGRES_URL not set");
-            None
-        }
-    }
+    service_env("EXSPEED_POSTGRES_URL")
 }
 
 macro_rules! require_pg {
@@ -42,17 +30,6 @@ macro_rules! require_pg {
             None => return,
         }
     };
-}
-
-static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-/// A unique lowercase identifier usable as a table, slot and connector name.
-fn unique(tag: &str) -> String {
-    format!(
-        "it_{tag}_{}_{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    )
 }
 
 async fn client(url: &str) -> tokio_postgres::Client {
@@ -103,28 +80,6 @@ fn header<'a>(r: &'a StoredRecord, k: &str) -> Option<&'a str> {
         .iter()
         .find(|(n, _)| n == k)
         .map(|(_, v)| v.as_str())
-}
-
-async fn wait_records(env: &Env, stream: &str, n: usize) -> Vec<StoredRecord> {
-    eventually(30, &format!("{n} records in {stream}"), || async {
-        env.read_all(stream).await.len() >= n
-    })
-    .await;
-    env.read_all(stream).await
-}
-
-async fn wait_running(state: &exspeed_connectors::status::ConnectorState) {
-    eventually(30, "connector running", || async {
-        let s = state.snapshot();
-        assert_ne!(
-            s.status,
-            Status::Failed,
-            "connector failed: {:?}",
-            s.last_error
-        );
-        s.status == Status::Running
-    })
-    .await;
 }
 
 fn cdc_config(

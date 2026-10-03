@@ -57,16 +57,22 @@ impl Env {
     }
 
     pub async fn publish(&self, stream: &str, values: &[&str]) {
+        let with: Vec<(&str, &str)> = values.iter().map(|v| ("t", *v)).collect();
+        self.publish_with_subjects(stream, &with).await;
+    }
+
+    /// Append `(subject, value)` records.
+    pub async fn publish_with_subjects(&self, stream: &str, records: &[(&str, &str)]) {
         let s = StreamName::try_from(stream).unwrap();
         self.log.ensure_stream(&s).await.unwrap();
-        for v in values {
+        for (subject, v) in records {
             self.log
                 .append(
                     &s,
                     Record {
                         key: None,
                         value: Bytes::from(v.to_string()),
-                        subject: "t".into(),
+                        subject: subject.to_string(),
                         headers: vec![],
                         timestamp_ns: None,
                     },
@@ -235,22 +241,7 @@ impl OffsetStore for CrashingOffsets {
         self.inner.load(c).await
     }
     async fn save(&self, c: &str, o: &StoredOffset) -> Result<(), OffsetStoreError> {
-        // Decrement-if-positive (a CAS loop; `fetch_update` is deprecated on
-        // newer toolchains and its replacement is not on older ones).
-        let crash = loop {
-            let n = self.crash_saves.load(Ordering::SeqCst);
-            if n == 0 {
-                break false;
-            }
-            if self
-                .crash_saves
-                .compare_exchange(n, n - 1, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                break true;
-            }
-        };
-        if crash {
+        if take_atomic(&self.crash_saves) {
             panic!("simulated crash before the checkpoint is persisted");
         }
         self.inner.save(c, o).await
@@ -477,4 +468,141 @@ pub fn sink_registry(ext: &Shared<SinkExt>) -> Registry {
 
 pub fn shared<T: Default>() -> Shared<T> {
     Arc::new(Mutex::new(T::default()))
+}
+
+// ---------------------------------------------------------------------------
+// Service-backed tests
+// ---------------------------------------------------------------------------
+
+/// The value of a service env var (`EXSPEED_RABBITMQ_URL`, …). Unset or
+/// empty: `None` (the test skips), except under `CI=true`, where it panics
+/// so a misconfigured service job can't pass silently.
+pub fn service_env(var: &str) -> Option<String> {
+    match std::env::var(var) {
+        Ok(v) if !v.is_empty() => Some(v),
+        _ => {
+            let ci = std::env::var("CI").unwrap_or_default();
+            if ci == "true" || ci == "1" {
+                panic!("{var} must be set when CI=true (the service tests would silently pass)");
+            }
+            eprintln!("SKIP: {var} not set");
+            None
+        }
+    }
+}
+
+static UNIQUE: AtomicU32 = AtomicU32::new(0);
+
+/// A unique lowercase identifier usable as a table, queue, bucket prefix and
+/// connector name.
+pub fn unique(tag: &str) -> String {
+    format!(
+        "it_{tag}_{}_{}",
+        std::process::id(),
+        UNIQUE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Wait for the connector to reach `running` (panics if it fails).
+pub async fn wait_running(state: &ConnectorState) {
+    eventually(60, "connector running", || async {
+        let s = state.snapshot();
+        assert_ne!(
+            s.status,
+            exspeed_connectors::status::Status::Failed,
+            "connector failed: {:?}",
+            s.last_error
+        );
+        s.status == exspeed_connectors::status::Status::Running
+    })
+    .await;
+}
+
+/// Wait until `stream` holds at least `n` records and return them all.
+pub async fn wait_records(env: &Env, stream: &str, n: usize) -> Vec<StoredRecord> {
+    eventually(60, &format!("{n} records in {stream}"), || async {
+        env.read_all(stream).await.len() >= n
+    })
+    .await;
+    env.read_all(stream).await
+}
+
+/// Wait until the sink has committed position `pos`.
+pub async fn wait_committed(offsets: &Arc<dyn OffsetStore>, name: &str, pos: u64) {
+    eventually(60, &format!("{name} committed {pos}"), || async {
+        offsets.load_sink(name).await.unwrap() == Some(pos)
+    })
+    .await;
+}
+
+/// Publish JSON values with `x-idempotency-key`-free records.
+pub async fn publish_json(env: &Env, stream: &str, values: &[serde_json::Value]) {
+    let v: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+    let refs: Vec<&str> = v.iter().map(String::as_str).collect();
+    env.publish(stream, &refs).await;
+}
+
+/// The settings map of a connector config.
+pub fn settings(v: serde_json::Value) -> exspeed_connectors::config::Settings {
+    v.as_object().unwrap().clone()
+}
+
+/// Wraps a built-in source: the first `crashes` calls to `ack()` panic
+/// before reaching the plugin. That is a crash after the batch is durable in
+/// the log (and its checkpoint saved) but before the external
+/// acknowledgement (AMQP ack, WAL confirm, outbox delete).
+pub struct CrashBeforeAck {
+    inner: Box<dyn SourceConnector>,
+    crashes: Arc<AtomicU32>,
+}
+
+/// Decrement-if-positive (a CAS loop; `fetch_update` is deprecated on
+/// newer toolchains and its replacement is not on older ones).
+pub fn take_atomic(n: &AtomicU32) -> bool {
+    loop {
+        let v = n.load(Ordering::SeqCst);
+        if v == 0 {
+            return false;
+        }
+        if n.compare_exchange(v, v - 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return true;
+        }
+    }
+}
+
+#[async_trait]
+impl SourceConnector for CrashBeforeAck {
+    async fn start(&mut self, checkpoint: Option<String>) -> Result<(), ConnectorError> {
+        self.inner.start(checkpoint).await
+    }
+    async fn poll(&mut self, max: usize) -> Result<SourceBatch, ConnectorError> {
+        self.inner.poll(max).await
+    }
+    async fn ack(&mut self, checkpoint: Option<&str>) -> Result<(), ConnectorError> {
+        if take_atomic(&self.crashes) {
+            panic!("simulated crash before the external ack");
+        }
+        self.inner.ack(checkpoint).await
+    }
+    async fn stop(&mut self) -> Result<(), ConnectorError> {
+        self.inner.stop().await
+    }
+    fn lag(&self) -> Option<exspeed_connectors::Lag> {
+        self.inner.lag()
+    }
+}
+
+/// The built-in registry with source `plugin` wrapped in [`CrashBeforeAck`].
+pub fn crash_before_ack_registry(plugin: &str, crashes: Arc<AtomicU32>) -> Registry {
+    let builtin = Registry::builtin();
+    let mut r = Registry::builtin();
+    r.register_source(plugin, move |init| {
+        Ok(Box::new(CrashBeforeAck {
+            inner: builtin.create_source(init)?,
+            crashes: crashes.clone(),
+        }))
+    });
+    r
 }
