@@ -104,6 +104,26 @@ connector config and SDK API all change.
   - poll ties, outbox id types, `mssql_cdc` cursor
   - batched JDBC inserts, HTTP status taxonomy
   - S3 sink idempotent object keys, RabbitMQ confirms
+- Crash/resume tests against real services for every remaining plugin: the
+  RabbitMQ source and sink, the S3 sink (MinIO), the JDBC sink and
+  `jdbc_poll` on MySQL, SQL Server and Postgres, `mssql_cdc`, and the
+  Postgres outbox (crash before the delete). Each one crashes the connector
+  mid-stream and checks at-least-once delivery, or no duplicates where the
+  plugin promises effectively-once. The CI service
+  job now also runs RabbitMQ, MinIO and SQL Server (with Agent, for CDC).
+  See [docs/connectors.md](docs/connectors.md#testing-against-real-services).
+- Fixes found by these tests:
+  - `jdbc_poll` failed every poll on columns that sqlx's `Any` driver can't
+    map: MySQL `TINYINT(1)`, `DECIMAL`, `DATETIME` and `JSON`, and Postgres
+    `numeric` and `timestamptz`. The error was classified as transient, so
+    the connector restarted forever. On SQL Server, `datetime2` columns came
+    out as `null`. Columns are now cast in SQL to their `schema` type. A
+    tracking value that can't be read now fails the connector instead of
+    re-reading the same rows forever.
+  - `rabbitmq` sink: when a message was returned as unroutable
+    (`mandatory`), every record after it in the batch was published again,
+    once for each returned message in the batch. The rest of the batch is
+    now settled from the publisher confirms that were already received.
 
 ### High availability (Phase 6)
 
