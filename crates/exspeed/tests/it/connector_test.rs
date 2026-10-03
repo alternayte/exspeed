@@ -262,10 +262,24 @@ async fn connector_status() {
         "connector should be running, got: {:?}",
         body["status"]
     );
-    assert!(
-        body.get("uptime_secs").is_some(),
-        "response should include uptime_secs"
-    );
+    for field in [
+        "last_error",
+        "restart_count",
+        "lag",
+        "last_success_ms",
+        "status_secs",
+        "checkpoint",
+        "origin",
+        "config",
+    ] {
+        assert!(
+            body.get(field).is_some(),
+            "response should include {field}: {body}"
+        );
+    }
+    assert_eq!(body["origin"], "api");
+    assert_eq!(body["restart_count"], 0);
+    assert_eq!(body["config"]["settings"]["auth_type"], "none");
 }
 
 async fn start_server_in(data_dir: std::path::PathBuf) -> String {
@@ -330,7 +344,7 @@ async fn file_watcher_leaves_api_created_connectors_alone() {
             "type": "source",
             "plugin": "http_webhook",
             "stream": "api-events",
-            "settings": {"path": "api-hook"}
+            "settings": {"path": "api-hook", "auth_type": "none"}
         }))
         .send()
         .await
@@ -341,7 +355,7 @@ async fn file_watcher_leaves_api_created_connectors_alone() {
     std::fs::write(
         dir.path().join("connectors.d").join("hooks.toml"),
         "[connector]\nname = \"file-hook\"\ntype = \"source\"\nplugin = \"http_webhook\"\n\
-         stream = \"file-events\"\n\n[settings]\npath = \"file-hook\"\n",
+         stream = \"file-events\"\n\n[settings]\npath = \"file-hook\"\nauth_type = \"none\"\n",
     )
     .unwrap();
 

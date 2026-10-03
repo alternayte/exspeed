@@ -118,7 +118,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/v1/connectors/{name}",
-            get(connectors::get_connector).delete(connectors::delete_connector),
+            get(connectors::get_connector)
+                .put(connectors::update_connector)
+                .delete(connectors::delete_connector),
         )
         .route(
             "/api/v1/connectors/{name}/restart",

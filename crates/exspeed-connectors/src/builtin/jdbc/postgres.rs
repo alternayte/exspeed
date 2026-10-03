@@ -9,6 +9,9 @@ impl Dialect for PostgresDialect {
     fn placeholder(&self, n: usize) -> String {
         format!("${}", n)
     }
+    fn max_params(&self) -> usize {
+        32767
+    }
     fn json_blob_type(&self) -> &'static str {
         "JSONB"
     }

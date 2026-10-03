@@ -665,15 +665,15 @@ where
         }
     }
 
-    // Create offset store (backend selected by EXSPEED_OFFSET_STORE env var)
-    let offset_backend =
-        std::env::var("EXSPEED_OFFSET_STORE").unwrap_or_else(|_| "file".to_string());
-    let offset_store = exspeed_connectors::offset_store::from_env(&args.data_dir, storage.clone())
-        .await
-        .expect("failed to initialize offset store");
+    // Connector offsets: the `__connector_offsets` stream (default, replicates
+    // with the log) or atomic files (`EXSPEED_CONNECTOR_OFFSET_STORE=file`).
+    let offset_backend = exspeed_connectors::offset_store::backend_from_env();
+    let offset_store =
+        exspeed_connectors::offset_store::from_env(&args.data_dir, broker.log.clone())
+            .map_err(|e| anyhow::anyhow!("connector offset store: {e}"))?;
     info!(
         backend = offset_backend.as_str(),
-        "offset store initialized"
+        "connector offset store initialized"
     );
 
     // Create connector manager
@@ -716,6 +716,7 @@ where
 
     // Clone before moving into AppState so the leader supervisor can capture them.
     let connector_manager_for_supervisor = connector_manager.clone();
+    let connector_manager_for_shutdown = connector_manager.clone();
     let exql_for_supervisor = exql.clone();
     let exql_for_tcp = exql.clone();
 
@@ -1179,6 +1180,16 @@ where
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    // Stop connectors: sinks flush and commit, sources finish their batch.
+    if tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        connector_manager_for_shutdown.shutdown(),
+    )
+    .await
+    .is_err()
+    {
+        warn!("connectors did not stop within 30s");
     }
     info!("server stopped");
     Ok(())

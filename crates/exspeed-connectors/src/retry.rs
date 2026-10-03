@@ -1,7 +1,11 @@
-//! Exponential-backoff retry policy with full jitter.
+//! Exponential-backoff policies with full jitter.
 //!
-//! Pure logic — no I/O. Consumed by the manager's sink and source loops to
-//! decide how long to sleep between retries, and when to give up.
+//! - [`RetryPolicy`] (`[retry]`): in-place retries of a transient error
+//!   before `on_transient_exhausted` applies.
+//! - [`RestartPolicy`] (`[restart]`): how the supervisor spaces restarts
+//!   after a connector run fails.
+//!
+//! Pure logic — no I/O.
 
 use std::time::Duration;
 
@@ -12,7 +16,8 @@ use serde::{Deserialize, Serialize};
 ///
 /// Deserialized from a `[retry]` section of a connector's TOML or JSON config.
 /// Missing section → `default_transient()`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetryPolicy {
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
@@ -89,6 +94,60 @@ impl RetryPolicy {
             computed_ms
         };
         Some(Duration::from_millis(ms))
+    }
+}
+
+/// Supervisor restart backoff. A restart is `stop()` then `start()`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestartPolicy {
+    #[serde(default = "default_restart_initial_ms")]
+    pub initial_backoff_ms: u64,
+    #[serde(default = "default_restart_max_ms")]
+    pub max_backoff_ms: u64,
+    #[serde(default = "default_multiplier")]
+    pub multiplier: f64,
+    #[serde(default = "default_jitter")]
+    pub jitter: bool,
+    /// Consecutive failed runs before the connector is marked `failed`.
+    /// 0 = never give up. A run that commits at least one batch resets the
+    /// count.
+    #[serde(default)]
+    pub max_restarts: u32,
+}
+
+fn default_restart_initial_ms() -> u64 {
+    1_000
+}
+fn default_restart_max_ms() -> u64 {
+    60_000
+}
+
+impl Default for RestartPolicy {
+    fn default() -> Self {
+        Self {
+            initial_backoff_ms: default_restart_initial_ms(),
+            max_backoff_ms: default_restart_max_ms(),
+            multiplier: default_multiplier(),
+            jitter: default_jitter(),
+            max_restarts: 0,
+        }
+    }
+}
+
+impl RestartPolicy {
+    /// Delay before restart number `attempt` (0-indexed). Always bounded by
+    /// `max_backoff_ms`; with jitter, uniform in `[computed/2, computed]`
+    /// so restarts never spin.
+    pub fn delay_for(&self, attempt: u32) -> Duration {
+        let base = (self.initial_backoff_ms as f64) * self.multiplier.powi(attempt.min(64) as i32);
+        let capped = base.min(self.max_backoff_ms as f64).max(0.0) as u64;
+        let ms = if self.jitter && capped > 1 {
+            rand::thread_rng().gen_range(capped / 2..=capped)
+        } else {
+            capped
+        };
+        Duration::from_millis(ms)
     }
 }
 
@@ -181,6 +240,33 @@ mod tests {
         assert_eq!(p.max_retries, 3);
         assert_eq!(p.initial_backoff_ms, 200);
         assert!(!p.jitter);
+    }
+
+    #[test]
+    fn restart_delay_is_bounded() {
+        let p = RestartPolicy {
+            initial_backoff_ms: 100,
+            max_backoff_ms: 1_000,
+            multiplier: 2.0,
+            jitter: false,
+            max_restarts: 0,
+        };
+        assert_eq!(p.delay_for(0), Duration::from_millis(100));
+        assert_eq!(p.delay_for(3), Duration::from_millis(800));
+        assert_eq!(p.delay_for(10_000), Duration::from_millis(1_000));
+        let j = RestartPolicy {
+            jitter: true,
+            ..p.clone()
+        };
+        for _ in 0..100 {
+            let d = j.delay_for(2);
+            assert!(d >= Duration::from_millis(200) && d <= Duration::from_millis(400));
+        }
+    }
+
+    #[test]
+    fn retry_rejects_unknown_keys() {
+        assert!(toml::from_str::<RetryPolicy>("max_retires = 3").is_err());
     }
 
     #[test]

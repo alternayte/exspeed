@@ -1,250 +1,427 @@
-use std::collections::HashMap;
+//! Connector configuration: the TOML file format, the JSON API format, name
+//! validation and `${VAR}` substitution.
+//!
+//! ```toml
+//! [connector]
+//! name = "orders-cdc"
+//! type = "source"
+//! plugin = "postgres_cdc"
+//! stream = "orders"
+//!
+//! [settings]            # plugin-specific, typed (numbers, bools, arrays, tables)
+//! connection = "${DATABASE_URL}"
+//! tables = ["public.orders"]
+//!
+//! [retry]               # in-place retries of transient errors
+//! [restart]             # supervisor restart backoff
+//! [transform]
+//! sql = "SELECT ..."
+//! ```
+//!
+//! The JSON accepted by `POST /api/v1/connectors` is the same document with
+//! the `[connector]` keys at the top level and `transform_sql` instead of a
+//! `[transform]` table. Unknown keys are rejected in both formats.
+
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::retry::RetryPolicy;
+use crate::retry::{RestartPolicy, RetryPolicy};
+use crate::traits::ConnectorError;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConnectorConfig {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub connector_type: String, // "source" or "sink"
-    pub plugin: String, // "http_webhook", "http_sink", "postgres_outbox"
-    pub stream: String, // target stream (source publishes to, sink reads from)
-    #[serde(default)]
-    pub subject_template: String, // sources: derive subject from record
-    #[serde(default)]
-    pub subject_filter: String, // sinks: filter records by subject
-    #[serde(default)]
-    pub settings: HashMap<String, String>,
-    #[serde(default = "default_batch_size")]
-    pub batch_size: u32,
-    #[serde(default = "default_poll_interval")]
-    pub poll_interval_ms: u64,
-    #[serde(default = "default_dedup_enabled")]
-    pub dedup_enabled: bool,
-    #[serde(default)]
-    pub dedup_key: String,
-    #[serde(default = "default_dedup_window")]
-    pub dedup_window_secs: u64,
-    #[serde(default)]
-    pub transform_sql: String,
-    #[serde(default)]
-    pub key_field: String,
-
-    // ---- DLQ + retry (all optional with backwards-compatible defaults) ----
-    /// Behavior when `RetryPolicy` exhausts on a `TransientFailure`. Default
-    /// `LoopForever` preserves today's behavior.
-    #[serde(default)]
-    pub on_transient_exhausted: OnTransientExhausted,
-
-    /// Retry policy for transient (whole-batch) failures. Missing = default.
-    #[serde(default)]
-    pub retry: RetryPolicy,
-}
+/// Plugin settings: a JSON object. TOML files are converted to JSON on load.
+pub type Settings = serde_json::Map<String, serde_json::Value>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[derive(Default)]
-pub enum OnTransientExhausted {
-    /// Put the connector into `Failed` status; offset does not advance.
-    /// Requires manual restart to resume.
-    Halt,
-    /// Route the current batch to the DLQ stream (if configured) and
-    /// advance past it. Falls back to `Halt` if `dlq_stream` is unset.
-    DlqBatch,
-    /// Keep retrying forever (today's behavior). Ignores `max_retries`
-    /// post-exhaustion — loops with `poll_interval_ms` between attempts.
-    #[default]
-    LoopForever,
+#[serde(rename_all = "lowercase")]
+pub enum ConnectorType {
+    Source,
+    Sink,
 }
 
-fn default_batch_size() -> u32 {
+impl ConnectorType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ConnectorType::Source => "source",
+            ConnectorType::Sink => "sink",
+        }
+    }
+}
+
+impl std::fmt::Display for ConnectorType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What happens when `[retry]` is exhausted on a transient error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OnTransientExhausted {
+    /// Hand the error to the supervisor, which restarts the connector with
+    /// bounded exponential backoff (status `backoff`), forever.
+    #[default]
+    LoopForever,
+    /// Move the connector to `failed`. It stays there until restarted
+    /// through the API or its config changes.
+    #[serde(alias = "halt")]
+    Fail,
+    /// Sinks only: write the batch to `dlq_stream` and move on. Falls back
+    /// to `fail` without a `dlq_stream`.
+    DlqBatch,
+}
+
+/// A connector definition (JSON form).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorConfig {
+    pub name: String,
+    #[serde(rename = "type", alias = "connector_type")]
+    pub connector_type: ConnectorType,
+    pub plugin: String,
+    /// Stream written by a source, read by a sink.
+    pub stream: String,
+    /// Sources: subject for produced records. `{var}` placeholders are
+    /// plugin variables, `{$.field}` reads the record's JSON value.
+    #[serde(default)]
+    pub subject_template: String,
+    /// Sinks: only deliver records whose subject matches (NATS wildcards).
+    #[serde(default)]
+    pub subject_filter: String,
+    /// Sources: JSON field of the value to use as the record key when the
+    /// plugin doesn't set one.
+    #[serde(default)]
+    pub key_field: String,
+    #[serde(default = "default_batch_size")]
+    pub batch_size: u32,
+    /// Sleep between polls when there is nothing to do.
+    #[serde(default = "default_poll_interval")]
+    pub poll_interval_ms: u64,
+    /// Sinks: flush + commit at most this often. Default: plugin-specific
+    /// (0 = after every batch for unbuffered sinks, 60 s for S3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush_interval_ms: Option<u64>,
+    /// Stream for poison records. Unset = drop them and count a metric.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dlq_stream: Option<String>,
+    #[serde(default)]
+    pub on_transient_exhausted: OnTransientExhausted,
+    #[serde(default)]
+    pub retry: RetryPolicy,
+    #[serde(default)]
+    pub restart: RestartPolicy,
+    /// Sources: ExQL projection/filter applied before append.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub transform_sql: String,
+    #[serde(default)]
+    pub settings: Settings,
+}
+
+pub(crate) fn default_batch_size() -> u32 {
     100
 }
-fn default_poll_interval() -> u64 {
+pub(crate) fn default_poll_interval() -> u64 {
     50
-}
-/// Off by default: with no `dedup_key`, dedup keys on the record key, which
-/// for most sources is an entity id (outbox aggregate_id, AMQP routing key),
-/// so enabling it silently drops every event after the first per entity.
-/// Broker-level idempotency (`x-idempotency-key`) still applies.
-fn default_dedup_enabled() -> bool {
-    false
-}
-fn default_dedup_window() -> u64 {
-    86400
 }
 
 impl ConnectorConfig {
-    /// Load from a JSON file.
-    pub fn load_json(path: &Path) -> io::Result<Self> {
-        let json = fs::read_to_string(path)?;
-        let config: Self = serde_json::from_str(&json)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        Ok(config)
-    }
-
-    /// Save as JSON.
-    pub fn save_json(&self, path: &Path) -> io::Result<()> {
-        let json = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
-        fs::write(path, json)?;
-        fs::File::open(path)?.sync_all()?;
-        Ok(())
-    }
-
-    /// Load from a TOML file.
-    ///
-    /// TOML format uses `[connector]` table for top-level fields and `[settings]` for plugin config.
-    pub fn load_toml(path: &Path) -> io::Result<Self> {
-        let text = fs::read_to_string(path)?;
-        let toml_val: TomlConnector =
-            toml::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        Ok(toml_val.into_config())
-    }
-
-    /// Resolve environment variable references in settings values.
-    /// `${VAR_NAME}` is replaced with the env var value.
-    pub fn resolve_env_vars(&mut self) {
-        for value in self.settings.values_mut() {
-            *value = resolve_env(value);
+    /// Minimal config, handy for tests and programmatic use.
+    pub fn new(
+        name: impl Into<String>,
+        connector_type: ConnectorType,
+        plugin: impl Into<String>,
+        stream: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            connector_type,
+            plugin: plugin.into(),
+            stream: stream.into(),
+            subject_template: String::new(),
+            subject_filter: String::new(),
+            key_field: String::new(),
+            batch_size: default_batch_size(),
+            poll_interval_ms: default_poll_interval(),
+            flush_interval_ms: None,
+            dlq_stream: None,
+            on_transient_exhausted: OnTransientExhausted::default(),
+            retry: RetryPolicy::default(),
+            restart: RestartPolicy::default(),
+            transform_sql: String::new(),
+            settings: Settings::new(),
         }
     }
 
-    /// Get a setting value, or return an error.
-    pub fn setting(&self, key: &str) -> Result<&str, String> {
-        self.settings
-            .get(key)
-            .map(|v| v.as_str())
-            .ok_or_else(|| format!("missing required setting: {key}"))
+    pub fn with_setting(mut self, key: &str, value: impl Into<serde_json::Value>) -> Self {
+        self.settings.insert(key.to_string(), value.into());
+        self
     }
 
-    /// Get a setting value with a default.
-    pub fn setting_or(&self, key: &str, default: &str) -> String {
-        self.settings
-            .get(key)
-            .cloned()
-            .unwrap_or_else(|| default.to_string())
+    /// Load from a JSON file (API-created connectors).
+    pub fn load_json(path: &Path) -> io::Result<Self> {
+        let json = fs::read_to_string(path)?;
+        serde_json::from_str(&json).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    /// Save as JSON atomically (tmp + fsync + rename + dir fsync).
+    pub fn save_json(&self, path: &Path) -> io::Result<()> {
+        let json = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
+        write_atomic(path, &json)
+    }
+
+    /// Load from a TOML file. Settings are kept unresolved (`${VAR}` stays
+    /// as written); see [`ConnectorConfig::resolved_settings`].
+    pub fn load_toml(path: &Path) -> io::Result<Self> {
+        let text = fs::read_to_string(path)?;
+        Self::from_toml_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    pub fn from_toml_str(text: &str) -> Result<Self, String> {
+        let file: TomlConnector = toml::from_str(text).map_err(|e| e.to_string())?;
+        file.into_config()
+    }
+
+    /// Settings with `${VAR}` / `${VAR:-default}` substituted from the
+    /// process environment. The result is used to build the plugin and is
+    /// never persisted.
+    pub fn resolved_settings(&self) -> Result<Settings, ConnectorError> {
+        let mut out = Settings::new();
+        for (k, v) in &self.settings {
+            out.insert(k.clone(), resolve_value(v).map_err(ConnectorError::Fatal)?);
+        }
+        Ok(out)
+    }
+
+    /// Check everything that doesn't depend on the plugin.
+    pub fn validate_common(&self) -> Result<(), String> {
+        validate_name(&self.name)?;
+        exspeed_common::StreamName::try_from(self.stream.as_str())
+            .map_err(|e| format!("invalid stream name '{}': {e}", self.stream))?;
+        if let Some(dlq) = &self.dlq_stream {
+            exspeed_common::StreamName::try_from(dlq.as_str())
+                .map_err(|e| format!("invalid dlq_stream '{dlq}': {e}"))?;
+            if dlq == &self.stream {
+                return Err("dlq_stream must differ from stream".into());
+            }
+        }
+        if self.batch_size == 0 {
+            return Err("batch_size must be at least 1".into());
+        }
+        if !self.transform_sql.is_empty() {
+            if self.connector_type == ConnectorType::Sink {
+                return Err("transforms are only supported on sources".into());
+            }
+            crate::transform::Transform::compile(&self.transform_sql)
+                .map_err(|e| format!("transform SQL error: {e}"))?;
+        }
+        Ok(())
     }
 }
 
-/// TOML file structure (different from JSON — uses [connector] and [settings] sections).
+/// Connector names become file names, Postgres identifiers and metric
+/// labels: 1–100 chars of `[A-Za-z0-9_-]`, starting with a letter or digit.
+pub fn validate_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("connector name cannot be empty".into());
+    }
+    if name.len() > 100 {
+        return Err("connector name is longer than 100 characters".into());
+    }
+    let first = name.chars().next().unwrap();
+    if !first.is_ascii_alphanumeric() {
+        return Err(format!(
+            "invalid connector name '{name}': must start with a letter or digit"
+        ));
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '_' || *c == '-'))
+    {
+        return Err(format!(
+            "invalid connector name '{name}': character '{bad}' is not allowed \
+             (use letters, digits, '_' and '-')"
+        ));
+    }
+    Ok(())
+}
+
+/// The form of a name used for external identifiers (replication slots,
+/// publications): lowercase, `-` → `_`. Two connectors whose sanitised
+/// names are equal are rejected.
+pub fn sanitized_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Write `bytes` to `path` atomically: tmp file, fsync, rename, fsync dir.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(dir)?;
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let tmp = dir.join(format!(".{file_name}.tmp-{}", std::process::id()));
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    if let Ok(d) = fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// TOML file structure
+// ---------------------------------------------------------------------------
+
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TomlConnector {
     connector: TomlConnectorSection,
     #[serde(default)]
-    settings: HashMap<String, String>,
+    settings: toml::Table,
     #[serde(default)]
     transform: Option<TomlTransform>,
     #[serde(default)]
     retry: RetryPolicy,
+    #[serde(default)]
+    restart: RestartPolicy,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TomlTransform {
     sql: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TomlConnectorSection {
     name: String,
     #[serde(rename = "type")]
-    connector_type: String,
+    connector_type: ConnectorType,
     plugin: String,
     stream: String,
     #[serde(default)]
     subject_template: String,
     #[serde(default)]
     subject_filter: String,
+    #[serde(default)]
+    key_field: String,
     #[serde(default = "default_batch_size")]
     batch_size: u32,
     #[serde(default = "default_poll_interval")]
     poll_interval_ms: u64,
-    #[serde(default = "default_dedup_enabled")]
-    dedup_enabled: bool,
     #[serde(default)]
-    dedup_key: String,
-    #[serde(default = "default_dedup_window")]
-    dedup_window_secs: u64,
+    flush_interval_ms: Option<u64>,
     #[serde(default)]
-    key_field: String,
+    dlq_stream: Option<String>,
     #[serde(default)]
     on_transient_exhausted: OnTransientExhausted,
 }
 
 impl TomlConnector {
-    fn into_config(self) -> ConnectorConfig {
-        ConnectorConfig {
-            name: self.connector.name,
-            connector_type: self.connector.connector_type,
-            plugin: self.connector.plugin,
-            stream: self.connector.stream,
-            subject_template: self.connector.subject_template,
-            subject_filter: self.connector.subject_filter,
-            settings: self.settings,
-            batch_size: self.connector.batch_size,
-            poll_interval_ms: self.connector.poll_interval_ms,
-            dedup_enabled: self.connector.dedup_enabled,
-            dedup_key: self.connector.dedup_key,
-            dedup_window_secs: self.connector.dedup_window_secs,
-            transform_sql: self.transform.map(|t| t.sql).unwrap_or_default(),
-            key_field: self.connector.key_field,
-            on_transient_exhausted: self.connector.on_transient_exhausted,
+    fn into_config(self) -> Result<ConnectorConfig, String> {
+        let mut settings = Settings::new();
+        for (k, v) in self.settings {
+            settings.insert(k, toml_to_json(v));
+        }
+        let c = self.connector;
+        Ok(ConnectorConfig {
+            name: c.name,
+            connector_type: c.connector_type,
+            plugin: c.plugin,
+            stream: c.stream,
+            subject_template: c.subject_template,
+            subject_filter: c.subject_filter,
+            key_field: c.key_field,
+            batch_size: c.batch_size,
+            poll_interval_ms: c.poll_interval_ms,
+            flush_interval_ms: c.flush_interval_ms,
+            dlq_stream: c.dlq_stream.filter(|s| !s.trim().is_empty()),
+            on_transient_exhausted: c.on_transient_exhausted,
             retry: self.retry,
+            restart: self.restart,
+            transform_sql: self.transform.map(|t| t.sql).unwrap_or_default(),
+            settings,
+        })
+    }
+}
+
+/// Convert TOML to JSON; datetimes become RFC 3339 strings.
+fn toml_to_json(v: toml::Value) -> serde_json::Value {
+    use serde_json::Value as J;
+    match v {
+        toml::Value::String(s) => J::String(s),
+        toml::Value::Integer(i) => J::from(i),
+        toml::Value::Float(f) => serde_json::Number::from_f64(f)
+            .map(J::Number)
+            .unwrap_or(J::Null),
+        toml::Value::Boolean(b) => J::Bool(b),
+        toml::Value::Datetime(d) => J::String(d.to_string()),
+        toml::Value::Array(a) => J::Array(a.into_iter().map(toml_to_json).collect()),
+        toml::Value::Table(t) => {
+            J::Object(t.into_iter().map(|(k, v)| (k, toml_to_json(v))).collect())
         }
     }
 }
 
-/// Replace `${VAR}` or `${VAR:-default}` with env var value.
-/// - `${VAR}`: replaced with env var; left as-is if unset.
-/// - `${VAR:-default}`: replaced with env var if set, otherwise with `default`.
-fn resolve_env(input: &str) -> String {
-    let mut result = input.to_string();
-    let mut search_from = 0;
-    while let Some(rel) = result[search_from..].find("${") {
-        let start = search_from + rel;
-        if let Some(end_rel) = result[start..].find('}') {
-            let inner = &result[start + 2..start + end_rel];
-            let (var_name, default_val) = if let Some(sep) = inner.find(":-") {
-                (&inner[..sep], Some(&inner[sep + 2..]))
-            } else {
-                (inner, None)
-            };
-            match std::env::var(var_name) {
-                Ok(val) => {
-                    result = format!(
-                        "{}{}{}",
-                        &result[..start],
-                        val,
-                        &result[start + end_rel + 1..]
-                    );
-                    search_from = start + val.len();
-                }
-                Err(_) => match default_val {
-                    Some(default) => {
-                        let default_owned = default.to_string();
-                        result = format!(
-                            "{}{}{}",
-                            &result[..start],
-                            default_owned,
-                            &result[start + end_rel + 1..]
-                        );
-                        search_from = start + default_owned.len();
-                    }
-                    None => {
-                        // Leave as-is, skip past this placeholder
-                        search_from = start + end_rel + 1;
-                    }
-                },
+// ---------------------------------------------------------------------------
+// ${VAR} substitution
+// ---------------------------------------------------------------------------
+
+fn resolve_value(v: &serde_json::Value) -> Result<serde_json::Value, String> {
+    use serde_json::Value as J;
+    Ok(match v {
+        J::String(s) => J::String(resolve_env(s)?),
+        J::Array(a) => J::Array(a.iter().map(resolve_value).collect::<Result<_, _>>()?),
+        J::Object(o) => J::Object(
+            o.iter()
+                .map(|(k, v)| Ok((k.clone(), resolve_value(v)?)))
+                .collect::<Result<_, String>>()?,
+        ),
+        other => other.clone(),
+    })
+}
+
+/// Replace `${VAR}` or `${VAR:-default}` with the env var's value.
+/// An unset variable without a default is an error.
+pub fn resolve_env(input: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            out.push_str(&rest[start..]);
+            return Ok(out);
+        };
+        let inner = &after[..end];
+        let (var, default) = match inner.find(":-") {
+            Some(sep) => (&inner[..sep], Some(&inner[sep + 2..])),
+            None => (inner, None),
+        };
+        match (std::env::var(var), default) {
+            (Ok(val), _) => out.push_str(&val),
+            (Err(_), Some(d)) => out.push_str(d),
+            (Err(_), None) => {
+                return Err(format!("environment variable '{var}' is not set"));
             }
-        } else {
-            break;
         }
+        rest = &after[end + 1..];
     }
-    result
+    out.push_str(rest);
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -256,299 +433,130 @@ mod tests {
     fn json_roundtrip() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.json");
-
-        let config = ConnectorConfig {
-            name: "my-connector".into(),
-            connector_type: "source".into(),
-            plugin: "http_webhook".into(),
-            stream: "events".into(),
-            subject_template: "webhook.{$.type}".into(),
-            subject_filter: "".into(),
-            settings: HashMap::from([("path".into(), "/webhooks/test".into())]),
-            batch_size: 100,
-            poll_interval_ms: 50,
-            dedup_enabled: true,
-            dedup_key: String::new(),
-            dedup_window_secs: 86400,
-            transform_sql: String::new(),
-            key_field: String::new(),
-            on_transient_exhausted: OnTransientExhausted::default(),
-            retry: RetryPolicy::default_transient(),
-        };
-
+        let config = ConnectorConfig::new(
+            "my-connector",
+            ConnectorType::Source,
+            "http_webhook",
+            "events",
+        )
+        .with_setting("path", "test");
         config.save_json(&path).unwrap();
         let loaded = ConnectorConfig::load_json(&path).unwrap();
-        assert_eq!(loaded.name, "my-connector");
-        assert_eq!(loaded.plugin, "http_webhook");
-        assert_eq!(loaded.settings.get("path").unwrap(), "/webhooks/test");
+        assert_eq!(loaded, config);
     }
 
     #[test]
-    fn toml_parsing() {
+    fn json_accepts_connector_type_alias_and_rejects_unknown() {
+        let ok: ConnectorConfig = serde_json::from_str(
+            r#"{"name":"a","connector_type":"sink","plugin":"jdbc","stream":"s"}"#,
+        )
+        .unwrap();
+        assert_eq!(ok.connector_type, ConnectorType::Sink);
+        let err = serde_json::from_str::<ConnectorConfig>(
+            r#"{"name":"a","type":"sink","plugin":"jdbc","stream":"s","bacth_size":1}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("bacth_size"), "{err}");
+    }
+
+    #[test]
+    fn toml_native_types() {
         let toml = r#"
 [connector]
-name = "pg-outbox"
+name = "poller"
 type = "source"
-plugin = "postgres_outbox"
-stream = "domain-events"
-subject_template = "{aggregate_type}.{event_type}"
+plugin = "http_poll"
+stream = "s"
+dlq_stream = "s-dlq"
+on_transient_exhausted = "halt"
 
 [settings]
-connection = "postgres://user:pass@host/db"
-slot_name = "exspeed_outbox"
-outbox_table = "outbox_events"
-"#;
-
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("test.toml");
-        std::fs::write(&path, toml).unwrap();
-
-        let config = ConnectorConfig::load_toml(&path).unwrap();
-        assert_eq!(config.name, "pg-outbox");
-        assert_eq!(config.connector_type, "source");
-        assert_eq!(config.plugin, "postgres_outbox");
-        assert_eq!(
-            config.settings.get("connection").unwrap(),
-            "postgres://user:pass@host/db"
-        );
-    }
-
-    #[test]
-    fn env_var_interpolation() {
-        std::env::set_var("TEST_SECRET_XYZ", "my-secret-value");
-        let mut config = ConnectorConfig {
-            name: "test".into(),
-            connector_type: "source".into(),
-            plugin: "http_webhook".into(),
-            stream: "s".into(),
-            subject_template: "".into(),
-            subject_filter: "".into(),
-            settings: HashMap::from([("secret".into(), "${TEST_SECRET_XYZ}".into())]),
-            batch_size: 100,
-            poll_interval_ms: 50,
-            dedup_enabled: true,
-            dedup_key: String::new(),
-            dedup_window_secs: 86400,
-            transform_sql: String::new(),
-            key_field: String::new(),
-            on_transient_exhausted: OnTransientExhausted::default(),
-            retry: RetryPolicy::default_transient(),
-        };
-        config.resolve_env_vars();
-        assert_eq!(config.settings.get("secret").unwrap(), "my-secret-value");
-        std::env::remove_var("TEST_SECRET_XYZ");
-    }
-
-    #[test]
-    fn env_var_missing_left_as_is() {
-        let mut config = ConnectorConfig {
-            name: "test".into(),
-            connector_type: "source".into(),
-            plugin: "test".into(),
-            stream: "s".into(),
-            subject_template: "".into(),
-            subject_filter: "".into(),
-            settings: HashMap::from([("val".into(), "${NONEXISTENT_VAR_ABC}".into())]),
-            batch_size: 100,
-            poll_interval_ms: 50,
-            dedup_enabled: true,
-            dedup_key: String::new(),
-            dedup_window_secs: 86400,
-            transform_sql: String::new(),
-            key_field: String::new(),
-            on_transient_exhausted: OnTransientExhausted::default(),
-            retry: RetryPolicy::default_transient(),
-        };
-        config.resolve_env_vars();
-        assert_eq!(
-            config.settings.get("val").unwrap(),
-            "${NONEXISTENT_VAR_ABC}"
-        );
-    }
-
-    #[test]
-    fn env_var_with_default_uses_default_when_unset() {
-        std::env::remove_var("EXSPEED_TEST_UNSET_VAR");
-        let mut config = ConnectorConfig {
-            name: "test".into(),
-            connector_type: "source".into(),
-            plugin: "test".into(),
-            stream: "s".into(),
-            subject_template: "".into(),
-            subject_filter: "".into(),
-            settings: HashMap::from([(
-                "val".into(),
-                "${EXSPEED_TEST_UNSET_VAR:-fallback_value}".into(),
-            )]),
-            batch_size: 100,
-            poll_interval_ms: 50,
-            dedup_enabled: true,
-            dedup_key: String::new(),
-            dedup_window_secs: 86400,
-            transform_sql: String::new(),
-            key_field: String::new(),
-            on_transient_exhausted: OnTransientExhausted::default(),
-            retry: RetryPolicy::default_transient(),
-        };
-        config.resolve_env_vars();
-        assert_eq!(config.settings.get("val").unwrap(), "fallback_value");
-    }
-
-    #[test]
-    fn env_var_with_default_uses_env_when_set() {
-        std::env::set_var("EXSPEED_TEST_SET_VAR", "from_env");
-        let mut config = ConnectorConfig {
-            name: "test".into(),
-            connector_type: "source".into(),
-            plugin: "test".into(),
-            stream: "s".into(),
-            subject_template: "".into(),
-            subject_filter: "".into(),
-            settings: HashMap::from([("val".into(), "${EXSPEED_TEST_SET_VAR:-ignored}".into())]),
-            batch_size: 100,
-            poll_interval_ms: 50,
-            dedup_enabled: true,
-            dedup_key: String::new(),
-            dedup_window_secs: 86400,
-            transform_sql: String::new(),
-            key_field: String::new(),
-            on_transient_exhausted: OnTransientExhausted::default(),
-            retry: RetryPolicy::default_transient(),
-        };
-        config.resolve_env_vars();
-        assert_eq!(config.settings.get("val").unwrap(), "from_env");
-        std::env::remove_var("EXSPEED_TEST_SET_VAR");
-    }
-
-    #[test]
-    fn env_var_with_empty_default() {
-        std::env::remove_var("EXSPEED_TEST_EMPTY_DEFAULT");
-        let mut config = ConnectorConfig {
-            name: "test".into(),
-            connector_type: "source".into(),
-            plugin: "test".into(),
-            stream: "s".into(),
-            subject_template: "".into(),
-            subject_filter: "".into(),
-            settings: HashMap::from([("val".into(), "${EXSPEED_TEST_EMPTY_DEFAULT:-}".into())]),
-            batch_size: 100,
-            poll_interval_ms: 50,
-            dedup_enabled: true,
-            dedup_key: String::new(),
-            dedup_window_secs: 86400,
-            transform_sql: String::new(),
-            key_field: String::new(),
-            on_transient_exhausted: OnTransientExhausted::default(),
-            retry: RetryPolicy::default_transient(),
-        };
-        config.resolve_env_vars();
-        assert_eq!(config.settings.get("val").unwrap(), "");
-    }
-
-    #[test]
-    fn setting_helpers() {
-        let config = ConnectorConfig {
-            name: "test".into(),
-            connector_type: "source".into(),
-            plugin: "test".into(),
-            stream: "s".into(),
-            subject_template: "".into(),
-            subject_filter: "".into(),
-            settings: HashMap::from([("url".into(), "http://example.com".into())]),
-            batch_size: 100,
-            poll_interval_ms: 50,
-            dedup_enabled: true,
-            dedup_key: String::new(),
-            dedup_window_secs: 86400,
-            transform_sql: String::new(),
-            key_field: String::new(),
-            on_transient_exhausted: OnTransientExhausted::default(),
-            retry: RetryPolicy::default_transient(),
-        };
-        assert_eq!(config.setting("url").unwrap(), "http://example.com");
-        assert!(config.setting("missing").is_err());
-        assert_eq!(config.setting_or("missing", "default"), "default");
-    }
-
-    #[test]
-    fn toml_parsing_with_retry_and_dlq() {
-        let toml = r#"
-[connector]
-name = "test"
-type = "sink"
-plugin = "http_sink"
-stream = "events"
-on_transient_exhausted = "dlq_batch"
-
-[settings]
-url = "https://example.com/hook"
-dlq_stream = "events-dlq"
+url = "http://x"
+interval_secs = 60
+enabled = true
+headers = { Authorization = "Bearer x" }
+tables = ["a", "b"]
 
 [retry]
 max_retries = 7
-initial_backoff_ms = 250
-max_backoff_ms = 60000
-multiplier = 1.5
-jitter = false
-"#;
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("test.toml");
-        std::fs::write(&path, toml).unwrap();
 
-        let config = ConnectorConfig::load_toml(&path).unwrap();
-        assert_eq!(
-            config.on_transient_exhausted,
-            OnTransientExhausted::DlqBatch
-        );
-        assert_eq!(config.retry.max_retries, 7);
-        assert_eq!(config.retry.initial_backoff_ms, 250);
-        assert!(!config.retry.jitter);
-        assert_eq!(config.settings.get("dlq_stream").unwrap(), "events-dlq");
+[restart]
+max_backoff_ms = 5000
+
+[transform]
+sql = "SELECT payload->>'a' AS a"
+"#;
+        let c = ConnectorConfig::from_toml_str(toml).unwrap();
+        assert_eq!(c.settings["interval_secs"], serde_json::json!(60));
+        assert_eq!(c.settings["enabled"], serde_json::json!(true));
+        assert_eq!(c.settings["headers"]["Authorization"], "Bearer x");
+        assert_eq!(c.settings["tables"], serde_json::json!(["a", "b"]));
+        assert_eq!(c.dlq_stream.as_deref(), Some("s-dlq"));
+        assert_eq!(c.on_transient_exhausted, OnTransientExhausted::Fail);
+        assert_eq!(c.retry.max_retries, 7);
+        assert_eq!(c.restart.max_backoff_ms, 5000);
+        assert!(c.transform_sql.contains("payload"));
     }
 
     #[test]
-    fn toml_parsing_without_retry_section_uses_defaults() {
+    fn toml_rejects_unknown_connector_keys() {
         let toml = r#"
 [connector]
-name = "test"
+name = "x"
 type = "sink"
-plugin = "http_sink"
-stream = "events"
-
-[settings]
-url = "https://example.com/hook"
+plugin = "jdbc"
+stream = "s"
+dedup_enabled = true
 "#;
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("test.toml");
-        std::fs::write(&path, toml).unwrap();
-
-        let config = ConnectorConfig::load_toml(&path).unwrap();
-        assert_eq!(
-            config.on_transient_exhausted,
-            OnTransientExhausted::LoopForever
-        );
-        assert_eq!(config.retry.max_retries, 5);
-        assert!(config.retry.jitter);
+        let err = ConnectorConfig::from_toml_str(toml).unwrap_err();
+        assert!(err.contains("dedup_enabled"), "{err}");
     }
 
     #[test]
-    fn key_field_parsed_from_toml() {
-        let toml = r#"
-[connector]
-name = "test"
-type = "source"
-plugin = "test"
-stream = "s"
-key_field = "order_id"
+    fn env_substitution() {
+        std::env::set_var("EXSPEED_CFG_TEST_A", "secret");
+        std::env::remove_var("EXSPEED_CFG_TEST_UNSET");
+        assert_eq!(
+            resolve_env("x-${EXSPEED_CFG_TEST_A}-y").unwrap(),
+            "x-secret-y"
+        );
+        assert_eq!(
+            resolve_env("${EXSPEED_CFG_TEST_UNSET:-fallback}").unwrap(),
+            "fallback"
+        );
+        assert_eq!(resolve_env("${EXSPEED_CFG_TEST_UNSET:-}").unwrap(), "");
+        assert!(resolve_env("${EXSPEED_CFG_TEST_UNSET}").is_err());
+        assert_eq!(resolve_env("no vars").unwrap(), "no vars");
 
-[settings]
-url = "http://example.com"
-"#;
+        let c = ConnectorConfig::new("a", ConnectorType::Sink, "x", "s")
+            .with_setting("nested", serde_json::json!({"h": "${EXSPEED_CFG_TEST_A}"}));
+        let r = c.resolved_settings().unwrap();
+        assert_eq!(r["nested"]["h"], "secret");
+        // The config itself keeps the reference.
+        assert_eq!(c.settings["nested"]["h"], "${EXSPEED_CFG_TEST_A}");
+        std::env::remove_var("EXSPEED_CFG_TEST_A");
+    }
+
+    #[test]
+    fn names() {
+        assert!(validate_name("orders-cdc_1").is_ok());
+        assert!(validate_name("").is_err());
+        assert!(validate_name("../x").is_err());
+        assert!(validate_name("a/b").is_err());
+        assert!(validate_name("a.b").is_err());
+        assert!(validate_name("-a").is_err());
+        assert!(validate_name(&"a".repeat(101)).is_err());
+        assert_eq!(sanitized_name("Orders-CDC"), "orders_cdc");
+    }
+
+    #[test]
+    fn atomic_write_replaces() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("test.toml");
-        std::fs::write(&path, toml).unwrap();
-
-        let config = ConnectorConfig::load_toml(&path).unwrap();
-        assert_eq!(config.key_field, "order_id");
+        let p = dir.path().join("x.json");
+        write_atomic(&p, b"one").unwrap();
+        write_atomic(&p, b"two").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"two");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(leftovers.len(), 1);
     }
 }

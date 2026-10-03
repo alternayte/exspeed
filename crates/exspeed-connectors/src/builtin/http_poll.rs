@@ -1,425 +1,378 @@
+//! `http_poll`: fetch a JSON endpoint every `interval_secs` and emit one
+//! record per item. Every item of every response is emitted (no
+//! truncation). With `next_page_path`, the connector follows pagination
+//! links/tokens across polls without waiting for the interval.
+//!
+//! Guarantee: at-least-once per fetched response. There is no durable
+//! cursor: after a restart the endpoint is polled from the first page. Set
+//! `idempotent_items = true` (with `item_key`) to let the broker drop items
+//! it already stored within the stream's dedup window.
+
+use std::time::Duration;
+
 use async_trait::async_trait;
 use bytes::Bytes;
+use serde::Deserialize;
 use tokio::time::Instant;
 
-use crate::config::ConnectorConfig;
-use crate::traits::{ConnectorError, HealthStatus, SourceBatch, SourceConnector, SourceRecord};
+use crate::builtin::http::{self, classify_reqwest_error, classify_status};
+use crate::registry::PluginInit;
+use crate::settings::{self, de};
+use crate::subject::lookup;
+use crate::traits::{ConnectorError, SourceBatch, SourceConnector, SourceRecord};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PollAuth {
+    None,
+    Bearer,
+    Basic,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpPollSettings {
+    pub url: String,
+    #[serde(default = "default_method")]
+    pub method: String,
+    #[serde(default = "default_interval", deserialize_with = "de::u64")]
+    pub interval_secs: u64,
+    #[serde(default, deserialize_with = "de::string_map")]
+    pub headers: Vec<(String, String)>,
+    #[serde(default = "default_auth")]
+    pub auth_type: PollAuth,
+    #[serde(default)]
+    pub auth_token: Option<String>,
+    /// JSON path of the item array (`$`, `$.data.items`). Unset = the whole
+    /// body is one item.
+    #[serde(default)]
+    pub items_path: Option<String>,
+    /// JSON path of each item's key.
+    #[serde(default)]
+    pub item_key: Option<String>,
+    /// Use `item_key` as the idempotency key (`x-idempotency-key`).
+    #[serde(default, deserialize_with = "de::bool")]
+    pub idempotent_items: bool,
+    /// JSON path of the next page: a URL (absolute or relative), or a token
+    /// put into `page_param`. Missing/null/empty = last page.
+    #[serde(default)]
+    pub next_page_path: Option<String>,
+    #[serde(default)]
+    pub page_param: Option<String>,
+    #[serde(default = "default_timeout", deserialize_with = "de::u64")]
+    pub timeout_secs: u64,
+}
+
+fn default_method() -> String {
+    "GET".into()
+}
+fn default_interval() -> u64 {
+    60
+}
+fn default_auth() -> PollAuth {
+    PollAuth::None
+}
+fn default_timeout() -> u64 {
+    http::DEFAULT_TIMEOUT_SECS
+}
+
 pub struct HttpPollSource {
-    url: String,
-    method: String,
-    interval_secs: u64,
-    headers: Vec<(String, String)>,
-    auth_type: String,
-    auth_token: Option<String>,
-    items_path: Option<String>,
-    item_key: Option<String>,
+    s: HttpPollSettings,
+    name: String,
+    method: reqwest::Method,
+    base: reqwest::Url,
     subject_template: String,
-    client: reqwest::Client,
+    client: Option<reqwest::Client>,
     last_poll: Option<Instant>,
+    next_url: Option<reqwest::Url>,
     last_etag: Option<String>,
     last_modified: Option<String>,
 }
 
 impl HttpPollSource {
-    pub fn new(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
-        let url = config
-            .setting("url")
-            .map_err(ConnectorError::Config)?
-            .to_string();
-
-        let method = config.setting_or("method", "GET");
-
-        let interval_secs: u64 = config
-            .setting_or("interval_secs", "60")
-            .parse()
-            .map_err(|e| ConnectorError::Config(format!("invalid interval_secs: {e}")))?;
-
-        let headers_str = config.setting_or("headers", "");
-        let headers = if headers_str.is_empty() {
-            Vec::new()
-        } else {
-            headers_str
-                .split(',')
-                .filter_map(|part| {
-                    let part = part.trim();
-                    if part.is_empty() {
-                        return None;
-                    }
-                    let colon = part.find(':')?;
-                    let key = part[..colon].trim().to_string();
-                    let val = part[colon + 1..].trim().to_string();
-                    Some((key, val))
-                })
-                .collect()
-        };
-
-        let auth_type = config.setting_or("auth_type", "none");
-        let auth_token = config.settings.get("auth_token").cloned();
-
-        let items_path = config
-            .settings
-            .get("items_path")
-            .cloned()
-            .filter(|s| !s.is_empty());
-
-        let item_key = config
-            .settings
-            .get("item_key")
-            .cloned()
-            .filter(|s| !s.is_empty());
-
-        let subject_template = config.subject_template.clone();
-
+    pub fn new(init: &PluginInit) -> Result<Self, ConnectorError> {
+        let s: HttpPollSettings = settings::parse("http_poll", &init.settings)?;
+        let method = reqwest::Method::from_bytes(s.method.to_ascii_uppercase().as_bytes())
+            .map_err(|e| ConnectorError::config(format!("http_poll: invalid method: {e}")))?;
+        let base = reqwest::Url::parse(&s.url).map_err(|e| {
+            ConnectorError::config(format!("http_poll: invalid url '{}': {e}", s.url))
+        })?;
+        if s.auth_type != PollAuth::None && s.auth_token.as_deref().unwrap_or("").is_empty() {
+            return Err(ConnectorError::config(
+                "http_poll: auth_token is required for bearer/basic auth",
+            ));
+        }
+        if s.idempotent_items && s.item_key.is_none() {
+            return Err(ConnectorError::config(
+                "http_poll: idempotent_items requires item_key",
+            ));
+        }
+        if s.timeout_secs == 0 {
+            return Err(ConnectorError::config(
+                "http_poll: timeout_secs must be > 0",
+            ));
+        }
         Ok(Self {
-            url,
+            name: init.config.name.clone(),
             method,
-            interval_secs,
-            headers,
-            auth_type,
-            auth_token,
-            items_path,
-            item_key,
-            subject_template,
-            client: reqwest::Client::builder()
-                .user_agent("exspeed-http-poll/0.1")
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            base,
+            subject_template: init.config.subject_template.clone(),
+            s,
+            client: None,
             last_poll: None,
+            next_url: None,
             last_etag: None,
             last_modified: None,
         })
     }
-}
 
-/// Navigate a simple JSON path like "$", "$.field", or "$.field.nested"
-/// and return the items found at that location.
-fn extract_items(body: &serde_json::Value, path: &str) -> Vec<serde_json::Value> {
-    if path == "$" {
-        // Root array
-        match body.as_array() {
-            Some(arr) => arr.clone(),
-            None => vec![body.clone()],
-        }
-    } else if let Some(dotted) = path.strip_prefix("$.") {
-        let segments: Vec<&str> = dotted.split('.').collect();
-        let mut current = body;
-        for seg in &segments {
-            match current.get(*seg) {
-                Some(val) => current = val,
-                None => return Vec::new(),
+    fn next_page(&self, body: &serde_json::Value) -> Option<reqwest::Url> {
+        let path = self.s.next_page_path.as_deref()?;
+        let v = lookup(body, path)?;
+        let token = match v {
+            serde_json::Value::String(s) if !s.is_empty() => s.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            _ => return None,
+        };
+        match &self.s.page_param {
+            Some(param) => {
+                let mut u = self.base.clone();
+                let pairs: Vec<(String, String)> = u
+                    .query_pairs()
+                    .filter(|(k, _)| k != param)
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect();
+                u.query_pairs_mut()
+                    .clear()
+                    .extend_pairs(pairs)
+                    .append_pair(param, &token);
+                Some(u)
             }
+            None => self.base.join(&token).ok(),
         }
-        match current.as_array() {
-            Some(arr) => arr.clone(),
-            None => vec![current.clone()],
-        }
-    } else {
-        // Unrecognized path format, treat body as single item
-        vec![body.clone()]
     }
 }
 
-/// Extract a field value from a JSON object for use as a record key.
-fn extract_key(item: &serde_json::Value, key_path: &str) -> Option<String> {
-    let path = key_path.strip_prefix("$.").unwrap_or(key_path);
-    let segments: Vec<&str> = path.split('.').collect();
-    let mut current = item;
-    for seg in &segments {
-        current = current.get(*seg)?;
+/// Items at `path` (`$` = root). A non-array is one item.
+pub fn extract_items(body: &serde_json::Value, path: &str) -> Vec<serde_json::Value> {
+    match lookup(body, path) {
+        Some(serde_json::Value::Array(a)) => a.clone(),
+        Some(serde_json::Value::Null) | None => Vec::new(),
+        Some(other) => vec![other.clone()],
     }
-    match current {
-        serde_json::Value::String(s) => Some(s.clone()),
-        serde_json::Value::Number(n) => Some(n.to_string()),
-        serde_json::Value::Bool(b) => Some(b.to_string()),
-        _ => Some(current.to_string()),
+}
+
+fn key_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
     }
 }
 
 #[async_trait]
 impl SourceConnector for HttpPollSource {
-    async fn start(&mut self, _last_position: Option<String>) -> Result<(), ConnectorError> {
-        self.client = reqwest::Client::builder()
-            .user_agent("exspeed-http-poll/0.1")
-            .build()
-            .map_err(|e| ConnectorError::Connection(format!("failed to build HTTP client: {e}")))?;
+    async fn start(&mut self, _checkpoint: Option<String>) -> Result<(), ConnectorError> {
+        self.client = Some(http::client(
+            Duration::from_secs(self.s.timeout_secs),
+            "exspeed-http-poll",
+        )?);
+        self.next_url = None;
+        self.last_poll = None;
         Ok(())
     }
 
-    async fn poll(&mut self, max_batch: usize) -> Result<SourceBatch, ConnectorError> {
-        // Check if enough time has elapsed since last poll
-        if let Some(last) = self.last_poll {
-            let elapsed = last.elapsed();
-            if elapsed.as_secs() < self.interval_secs {
-                return Ok(SourceBatch {
-                    records: Vec::new(),
-                    position: None,
-                });
+    async fn poll(&mut self, _max_batch: usize) -> Result<SourceBatch, ConnectorError> {
+        if self.next_url.is_none() {
+            if let Some(last) = self.last_poll {
+                if last.elapsed() < Duration::from_secs(self.s.interval_secs) {
+                    return Ok(SourceBatch::empty());
+                }
             }
         }
+        let client = self
+            .client
+            .clone()
+            .ok_or_else(|| ConnectorError::connection("http_poll: not started"))?;
+        let first_page = self.next_url.is_none();
+        let url = self.next_url.clone().unwrap_or_else(|| self.base.clone());
 
-        // Build request
-        let method = reqwest::Method::from_bytes(self.method.as_bytes()).map_err(|e| {
-            ConnectorError::Config(format!("invalid HTTP method '{}': {e}", self.method))
-        })?;
-
-        let mut req = self.client.request(method, &self.url);
-
-        // Add custom headers
-        for (k, v) in &self.headers {
+        let mut req = client.request(self.method.clone(), url);
+        for (k, v) in &self.s.headers {
             req = req.header(k, v);
         }
-
-        // Add auth
-        match self.auth_type.as_str() {
-            "bearer" => {
-                if let Some(ref token) = self.auth_token {
-                    req = req.header("Authorization", format!("Bearer {token}"));
-                }
+        if let Some(token) = &self.s.auth_token {
+            match self.s.auth_type {
+                PollAuth::Bearer => req = req.header("Authorization", format!("Bearer {token}")),
+                PollAuth::Basic => req = req.header("Authorization", format!("Basic {token}")),
+                PollAuth::None => {}
             }
-            "basic" => {
-                if let Some(ref token) = self.auth_token {
-                    req = req.header("Authorization", format!("Basic {token}"));
-                }
+        }
+        if first_page {
+            if let Some(etag) = &self.last_etag {
+                req = req.header("If-None-Match", etag);
             }
-            _ => {} // "none" or unrecognized
+            if let Some(lm) = &self.last_modified {
+                req = req.header("If-Modified-Since", lm);
+            }
         }
 
-        // Add conditional headers for change detection
-        if let Some(ref etag) = self.last_etag {
-            req = req.header("If-None-Match", etag.as_str());
-        }
-        if let Some(ref lm) = self.last_modified {
-            req = req.header("If-Modified-Since", lm.as_str());
-        }
-
-        // Send request
-        let response = req
-            .send()
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("HTTP poll request failed: {e}")))?;
-
+        let response = req.send().await.map_err(|e| classify_reqwest_error(&e))?;
         let status = response.status().as_u16();
-
-        // 304 Not Modified — no changes
         if status == 304 {
             self.last_poll = Some(Instant::now());
-            return Ok(SourceBatch {
-                records: Vec::new(),
-                position: None,
-            });
+            return Ok(SourceBatch::empty());
         }
-
         if !(200..300).contains(&status) {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| String::from("<unreadable body>"));
-            return Err(ConnectorError::Connection(format!(
-                "HTTP poll returned status {status}: {body}"
-            )));
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+            let body = response.text().await.unwrap_or_default();
+            return Err(
+                match classify_status(status, retry_after.as_deref(), &body) {
+                    // A request that can never succeed is a configuration
+                    // problem for a poller.
+                    Some(ConnectorError::Poison(_)) => {
+                        ConnectorError::fatal(format!("http_poll: HTTP {status}: {body}"))
+                    }
+                    Some(e) => e,
+                    None => {
+                        ConnectorError::transient(format!("http_poll: unexpected status {status}"))
+                    }
+                },
+            );
         }
-
-        // Store ETag / Last-Modified from response headers
-        self.last_etag = response
-            .headers()
-            .get("etag")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        self.last_modified = response
-            .headers()
-            .get("last-modified")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        // Parse response body as JSON
-        let body_text = response
+        if first_page {
+            let h = response.headers();
+            self.last_etag = h
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+            self.last_modified = h
+                .get("last-modified")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+        }
+        let text = response
             .text()
             .await
-            .map_err(|e| ConnectorError::Data(format!("failed to read response body: {e}")))?;
+            .map_err(|e| ConnectorError::transient(format!("http_poll: reading body: {e}")))?;
+        let body: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+            ConnectorError::transient(format!("http_poll: response is not JSON: {e}"))
+        })?;
 
-        let body: serde_json::Value = serde_json::from_str(&body_text)
-            .map_err(|e| ConnectorError::Data(format!("failed to parse JSON: {e}")))?;
-
-        // Extract items
-        let items = match &self.items_path {
-            None => vec![body],
+        let items = match &self.s.items_path {
+            None => vec![body.clone()],
             Some(path) => extract_items(&body, path),
         };
-
-        // Build records, respecting max_batch
-        let mut records = Vec::new();
-        for item in items.into_iter().take(max_batch) {
+        let mut records = Vec::with_capacity(items.len());
+        for item in items {
             let key = self
+                .s
                 .item_key
-                .as_ref()
-                .and_then(|kp| extract_key(&item, kp))
-                .map(|k| Bytes::from(k.into_bytes()));
-
-            let value = Bytes::from(
-                serde_json::to_vec(&item)
-                    .map_err(|e| ConnectorError::Data(format!("failed to serialize item: {e}")))?,
-            );
-
-            let subject = self.subject_template.clone();
-
+                .as_deref()
+                .and_then(|p| lookup(&item, p))
+                .map(key_string);
+            let mut headers = vec![("x-exspeed-source".to_string(), "http_poll".to_string())];
+            if self.s.idempotent_items {
+                if let Some(k) = &key {
+                    headers.push((
+                        "x-idempotency-key".to_string(),
+                        format!("http_poll:{}:{k}", self.name),
+                    ));
+                }
+            }
+            let value = serde_json::to_vec(&item)
+                .map_err(|e| ConnectorError::transient(format!("http_poll: {e}")))?;
             records.push(SourceRecord {
-                key,
-                value,
-                subject,
-                headers: Vec::new(),
+                key: key.map(|k| Bytes::from(k.into_bytes())),
+                subject: crate::subject::render(&self.subject_template, &[], Some(&item)),
+                value: Bytes::from(value),
+                headers,
             });
         }
 
-        self.last_poll = Some(Instant::now());
-
+        self.next_url = self.next_page(&body);
+        if self.next_url.is_none() {
+            self.last_poll = Some(Instant::now());
+        }
         Ok(SourceBatch {
             records,
-            position: None,
+            checkpoint: None,
         })
     }
 
-    async fn commit(&mut self, _position: String) -> Result<(), ConnectorError> {
+    async fn ack(&mut self, _checkpoint: Option<&str>) -> Result<(), ConnectorError> {
         Ok(())
     }
 
     async fn stop(&mut self) -> Result<(), ConnectorError> {
+        self.client = None;
         Ok(())
     }
-
-    async fn health(&self) -> HealthStatus {
-        HealthStatus::Healthy
-    }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ConnectorConfig;
-    use std::collections::HashMap;
+    use crate::config::{ConnectorConfig, ConnectorType};
+    use serde_json::json;
 
-    fn make_config(settings: Vec<(&str, &str)>) -> ConnectorConfig {
-        ConnectorConfig {
-            name: "test-http-poll".to_string(),
-            connector_type: "source".to_string(),
-            plugin: "http_poll".to_string(),
-            stream: "events".to_string(),
-            subject_template: "poll.events".to_string(),
-            subject_filter: String::new(),
-            settings: settings
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect::<HashMap<_, _>>(),
-            batch_size: 100,
-            poll_interval_ms: 50,
-            dedup_enabled: true,
-            dedup_key: String::new(),
-            dedup_window_secs: 86400,
-            transform_sql: String::new(),
-            key_field: String::new(),
-            on_transient_exhausted: crate::config::OnTransientExhausted::default(),
-            retry: crate::retry::RetryPolicy::default_transient(),
-        }
+    fn source(settings: serde_json::Value) -> Result<HttpPollSource, ConnectorError> {
+        let (m, _) = exspeed_common::Metrics::new();
+        HttpPollSource::new(&PluginInit {
+            config: ConnectorConfig::new("p", ConnectorType::Source, "http_poll", "s"),
+            settings: settings.as_object().unwrap().clone(),
+            metrics: std::sync::Arc::new(m),
+        })
     }
 
     #[test]
-    fn extract_items_single_object_no_path() {
-        let body = serde_json::json!({"id": 1, "name": "alice"});
-        // When items_path is None, the poll method uses vec![body] directly.
-        // The extract_items function with "$" on a non-array returns the item.
-        let items = extract_items(&body, "$");
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0]["id"], 1);
+    fn extract() {
+        let body = json!({"data": {"items": [{"id": 1}, {"id": 2}, {"id": 3}]}});
+        assert_eq!(extract_items(&body, "$.data.items").len(), 3);
+        assert_eq!(extract_items(&json!([1, 2]), "$").len(), 2);
+        assert_eq!(extract_items(&json!({"a": 1}), "$").len(), 1);
+        assert!(extract_items(&body, "$.missing").is_empty());
     }
 
     #[test]
-    fn extract_items_root_array() {
-        let body = serde_json::json!([
-            {"id": 1, "name": "alice"},
-            {"id": 2, "name": "bob"}
-        ]);
-        let items = extract_items(&body, "$");
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0]["name"], "alice");
-        assert_eq!(items[1]["name"], "bob");
+    fn settings() {
+        let s = source(json!({
+            "url": "https://api.example.com/v1/items?limit=10",
+            "interval_secs": 30,
+            "headers": {"X-Api-Key": "k"},
+            "auth_type": "bearer", "auth_token": "t",
+            "items_path": "$.results", "item_key": "id"
+        }))
+        .unwrap();
+        assert_eq!(s.s.interval_secs, 30);
+        assert!(source(json!({"url": "https://x", "auth_type": "bearer"})).is_err());
+        assert!(source(json!({"url": "https://x", "intervl_secs": 3})).is_err());
+        assert!(source(json!({"method": "GET"})).is_err());
     }
 
     #[test]
-    fn extract_items_nested_path() {
-        let body = serde_json::json!({
-            "status": "ok",
-            "results": [
-                {"id": 10, "title": "post-a"},
-                {"id": 20, "title": "post-b"},
-                {"id": 30, "title": "post-c"}
-            ]
-        });
-        let items = extract_items(&body, "$.results");
-        assert_eq!(items.len(), 3);
-        assert_eq!(items[0]["id"], 10);
-        assert_eq!(items[2]["title"], "post-c");
-    }
+    fn pagination_links_and_tokens() {
+        let s = source(
+            json!({"url": "https://api.example.com/v1/items?limit=10", "next_page_path": "$.next"}),
+        )
+        .unwrap();
+        let next = s.next_page(&json!({"next": "/v1/items?page=2"})).unwrap();
+        assert_eq!(next.as_str(), "https://api.example.com/v1/items?page=2");
+        assert!(s.next_page(&json!({"next": null})).is_none());
+        assert!(s.next_page(&json!({})).is_none());
 
-    #[test]
-    fn extract_key_from_json_object() {
-        let item = serde_json::json!({"id": 42, "name": "test"});
-        assert_eq!(extract_key(&item, "id"), Some("42".to_string()));
-        assert_eq!(extract_key(&item, "name"), Some("test".to_string()));
-        assert_eq!(extract_key(&item, "$.name"), Some("test".to_string()));
-        assert_eq!(extract_key(&item, "missing"), None);
-    }
-
-    #[test]
-    fn config_parsing() {
-        let config = make_config(vec![
-            ("url", "https://api.example.com/data"),
-            ("method", "POST"),
-            ("interval_secs", "30"),
-            ("headers", "Accept: application/json, X-Api-Key: secret123"),
-            ("auth_type", "bearer"),
-            ("auth_token", "my-token"),
-            ("items_path", "$.results"),
-            ("item_key", "id"),
-        ]);
-        let source = HttpPollSource::new(&config).expect("should parse");
-        assert_eq!(source.url, "https://api.example.com/data");
-        assert_eq!(source.method, "POST");
-        assert_eq!(source.interval_secs, 30);
-        assert_eq!(source.headers.len(), 2);
-        assert_eq!(source.headers[0].0, "Accept");
-        assert_eq!(source.headers[0].1, "application/json");
-        assert_eq!(source.headers[1].0, "X-Api-Key");
-        assert_eq!(source.headers[1].1, "secret123");
-        assert_eq!(source.auth_type, "bearer");
-        assert_eq!(source.auth_token, Some("my-token".to_string()));
-        assert_eq!(source.items_path, Some("$.results".to_string()));
-        assert_eq!(source.item_key, Some("id".to_string()));
-        assert_eq!(source.subject_template, "poll.events");
-    }
-
-    #[test]
-    fn config_defaults() {
-        let config = make_config(vec![("url", "https://api.example.com/data")]);
-        let source = HttpPollSource::new(&config).expect("should parse");
-        assert_eq!(source.method, "GET");
-        assert_eq!(source.interval_secs, 60);
-        assert!(source.headers.is_empty());
-        assert_eq!(source.auth_type, "none");
-        assert_eq!(source.auth_token, None);
-        assert_eq!(source.items_path, None);
-        assert_eq!(source.item_key, None);
-    }
-
-    #[test]
-    fn config_missing_url_returns_error() {
-        let config = make_config(vec![("method", "GET")]);
-        let err = HttpPollSource::new(&config).unwrap_err();
-        assert!(err.to_string().contains("url"));
+        let t = source(json!({
+            "url": "https://api.example.com/v1/items?limit=10",
+            "next_page_path": "$.meta.cursor", "page_param": "cursor"
+        }))
+        .unwrap();
+        let next = t.next_page(&json!({"meta": {"cursor": "abc"}})).unwrap();
+        assert_eq!(
+            next.as_str(),
+            "https://api.example.com/v1/items?limit=10&cursor=abc"
+        );
     }
 }

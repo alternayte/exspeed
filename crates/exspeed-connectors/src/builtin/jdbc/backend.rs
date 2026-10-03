@@ -26,12 +26,22 @@ pub enum Param {
 
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
-    #[error("pool error: {0}")]
-    Pool(String),
-    #[error("I/O error: {0}")]
-    Io(String),
-    #[error("sql error ({sqlstate}): {message}")]
-    Sql { sqlstate: String, message: String },
+    /// Connecting failed or the connection dropped.
+    #[error("connection error: {0}")]
+    Connection(String),
+    /// A parameter could not be encoded (a bad value in this record).
+    #[error("encode error: {0}")]
+    Encode(String),
+    /// A configuration problem in the driver (bad URL, TLS setup, ...).
+    #[error("configuration error: {0}")]
+    Config(String),
+    /// The database rejected the statement. `code` is the dialect's error
+    /// code: SQLSTATE for Postgres, the vendor error number for MySQL and
+    /// SQL Server, the extended result code for SQLite.
+    #[error("sql error ({code}): {message}")]
+    Sql { code: String, message: String },
+    #[error("{0}")]
+    Other(String),
 }
 
 #[async_trait]
@@ -39,8 +49,8 @@ pub trait SinkBackend: Send + Sync {
     /// Execute a DDL statement (CREATE TABLE, etc.). No parameters.
     async fn execute_ddl(&self, sql: &str) -> Result<(), BackendError>;
 
-    /// Execute a single-row DML statement with the given bound parameters.
-    /// Parameters are applied in positional order.
+    /// Execute a DML statement (single- or multi-row) with the given bound
+    /// parameters, in positional order.
     async fn execute_row(&self, sql: &str, params: &[Param]) -> Result<(), BackendError>;
 
     /// Close the underlying pool. Idempotent.

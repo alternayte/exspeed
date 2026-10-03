@@ -9,6 +9,9 @@ impl Dialect for MssqlDialect {
     fn placeholder(&self, n: usize) -> String {
         format!("@P{}", n)
     }
+    fn max_params(&self) -> usize {
+        2000
+    }
     fn json_blob_type(&self) -> &'static str {
         "NVARCHAR(MAX)"
     }

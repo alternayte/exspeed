@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::config::ConnectorConfig;
-use crate::manager::{ConnectorManager, TomlFile};
+use crate::manager::{ConnectorManager, ManagerError, Origin, TomlFile};
 
 /// Scan `connectors_dir` for `.toml` files and reconcile the connectors that
 /// came from that directory.
@@ -56,21 +56,26 @@ pub(crate) async fn sync_connectors(manager: &Arc<ConnectorManager>, connectors_
         if previous.map(|p| p.hash) == Some(hash) {
             continue; // unchanged
         }
-        let mut config = match ConnectorConfig::load_toml(path) {
+        let config = match ConnectorConfig::load_toml(path) {
             Ok(c) => c,
             Err(e) => {
-                warn!(file = ?path, error = %e, "file_watcher: failed to parse TOML connector config");
+                warn!(file = ?path, error = %e, "file_watcher: failed to parse TOML connector config; keeping the previous config");
+                if let Some(prev) = previous {
+                    manager
+                        .note_config_error(&prev.connector_name, &e.to_string())
+                        .await;
+                }
                 continue;
             }
         };
-        config.resolve_env_vars();
         let name = config.name.clone();
+        let origin = Origin::File(filename.clone());
 
-        let result = match previous {
+        let result: Result<(), ManagerError> = match previous {
             Some(prev) if prev.connector_name == name => {
                 info!(connector = name.as_str(), file = ?path,
                       "file_watcher: connector config changed, restarting (offsets kept)");
-                manager.update_config(config).await
+                manager.update_config(config, origin).await
             }
             Some(prev) => {
                 info!(old = prev.connector_name.as_str(), new = name.as_str(), file = ?path,
@@ -79,7 +84,7 @@ pub(crate) async fn sync_connectors(manager: &Arc<ConnectorManager>, connectors_
                     warn!(connector = prev.connector_name.as_str(), error = %e,
                           "file_watcher: failed to delete replaced connector");
                 }
-                manager.create_from_file(config).await
+                manager.create_from_file(config, filename).await
             }
             None => {
                 if manager.get_status(&name).await.is_some() {
@@ -87,16 +92,16 @@ pub(crate) async fn sync_connectors(manager: &Arc<ConnectorManager>, connectors_
                     // as the definition, keeping offsets.
                     info!(connector = name.as_str(), file = ?path,
                           "file_watcher: file redefines an existing connector");
-                    manager.update_config(config).await
+                    manager.update_config(config, origin).await
                 } else {
                     info!(connector = name.as_str(), file = ?path,
                           "file_watcher: new connector config detected");
-                    manager.create_from_file(config).await
+                    manager.create_from_file(config, filename).await
                 }
             }
         };
         if let Err(e) = result {
-            warn!(file = ?path, error = %e, "file_watcher: failed to apply connector config");
+            warn!(file = ?path, error = %e, "file_watcher: connector config not applied cleanly");
         }
         manager.toml_files.write().await.insert(
             filename.clone(),
