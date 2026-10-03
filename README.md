@@ -54,10 +54,10 @@ or the Rust [`exspeed-client`](crates/exspeed-client) on TCP port 5933
 | Durable streams, subjects, retention, compaction, publish, read | ✅ rewritten storage engine (crash-safe, lock-free reads) |
 | Consumers: push + pull, ack/nack/term, ack timeout, redelivery, backoff, DLQ | ✅ JetStream-style, state in the log |
 | Work sharing across app instances (one consumer, many subscribers) | ✅ |
-| Idempotent publish (`msg_id`) | ✅ single node · ⚠️ gaps in batches and on failover |
+| Idempotent publish (`msg_id`) | ✅ on every write path, within batches, enforced from startup, rebuilt on failover ([idempotent-publish.md](docs/idempotent-publish.md)) |
 | Auth (scoped tokens) and TLS | ✅ |
 | ExQL bounded queries | ✅ full SQL on DataFusion (joins, HAVING, window functions, subqueries), JSON numerics, pushdown, timeouts/limits ([exql.md](docs/exql.md)) |
-| ExQL continuous queries, windows, joins, tables | ✅ event-time windows, stream-stream/stream-table joins, durable tables, checkpointed state, effectively-once output · ⚠️ query registry not replicated ([exql.md](docs/exql.md#state-recovery-and-delivery-guarantees)) |
+| ExQL continuous queries, windows, joins, tables | ✅ event-time windows, stream-stream/stream-table joins, durable tables, checkpointed state, effectively-once output; query and connection definitions live in the replicated `__exql_queries` / `__exql_connections` streams ([exql.md](docs/exql.md#state-recovery-and-delivery-guarantees)) |
 | Connectors: framework (checkpoint protocol, supervisor, typed settings, DLQ, replicated offsets) | ✅ tested with fault injection |
 | Connectors: Postgres CDC, outbox, poll; JDBC sink; HTTP poll/sink/webhook | ✅ at-least-once or effectively-once, tested against real services ([guarantees](docs/connectors.md#delivery-guarantees)) |
 | Connectors: RabbitMQ, S3, SQL Server CDC | ⚠️ implemented to the same protocol; unit-tested only, no service tests in CI yet |

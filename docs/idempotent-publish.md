@@ -8,19 +8,27 @@ publish in one of these ways:
 - the `--msg-id` CLI flag
 - the `x-idempotency-key` header, kept for compatibility with existing connectors
 
-> ⚠️ **Known gaps (v0.5).** These are tracked in [REVIEW.md §3.3](REVIEW.md#33-broker-delivery-consumers-dedup).
->
-> - **During startup.** Dedup is not enforced until the startup rebuild of
->   the dedup map finishes. Only `/readyz` waits for the rebuild; TCP
->   publishes are accepted before it completes.
-> - **Batch publish.** `PublishBatch` writes duplicates that occur within
->   the same batch, and it ignores `dedup_max_entries`.
-> - **Deleted streams.** Deleting a stream doesn't clear its dedup map, so a
->   re-created stream can answer `duplicate: true` for a record that
->   doesn't exist.
-> - **Failover.** Dedup state is not carried across failover, so retries
->   after a leader change are not deduplicated.
-> - **Webhooks.** Webhook writes bypass dedup.
+Where dedup applies:
+
+- **Every write path.** TCP, HTTP, webhooks, connectors and ExQL output all
+  append through the broker's single write path, so a `msg_id` (or
+  `x-idempotency-key` header) is deduplicated wherever the record comes
+  from.
+- **During startup.** Until the startup rebuild of the dedup maps finishes,
+  publishes that carry a `msg_id` are refused with a retryable error
+  (`503` over HTTP, `UNAVAILABLE` over TCP) instead of being written
+  unchecked; publishes without one are accepted. `/readyz` reports
+  `dedup_rebuild_in_progress` meanwhile.
+- **Batches.** `PublishBatch` deduplicates within the batch as well as
+  against earlier records (a repeated `msg_id` in one batch is written once,
+  or rejected as a collision when the bodies differ), and it honours
+  `dedup_max_entries`.
+- **Deleted streams.** Deleting a stream clears its dedup map, so a
+  re-created stream starts empty.
+- **Failover.** A promoted follower rebuilds every stream's dedup map from
+  the replicated log (local snapshots are ignored) before it opens writes,
+  so a retry after a leader change is still answered `duplicate: true`
+  for records within the window.
 
 ## Semantics
 
@@ -56,8 +64,9 @@ exspeed-data/
       stream.json           Stream config (retention, dedup_window, dedup_max_entries)
       dedup_snapshot.bin    Periodic dedup-map snapshot — restored on restart
       partitions/0/
-        00000000000000000000.seg
-        00000000000000000000.idx
+        00000000000000000000.seg    Records
+        00000000000000000000.idx    Sparse offset index
+        00000000000000000000.meta   Sealed-segment metadata (offset and time range, record count)
 ```
 
 ## Prometheus alerts
