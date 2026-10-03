@@ -178,12 +178,13 @@ cargo build --release -p exspeed -p exspeed-bench
 
 ## Releasing
 
-Pushing a `vX.Y.Z` tag runs the Release workflow (cargo-dist): it builds
-the binaries and installers, creates the GitHub Release with the matching
-`CHANGELOG.md` section as its notes, and publishes the multi-arch image
-`ghcr.io/alternayte/exspeed` from those binaries. The checklist (version
-bump, changelog, tag, npm publish) is in the "Releasing" section of
-[CLAUDE.md](../CLAUDE.md).
+A release is cut by running the Release workflow (cargo-dist) from the
+Actions tab with the tag `vX.Y.Z` (`dry-run` builds without publishing).
+It creates the tag on `main`, builds the binaries and installers, creates
+the GitHub Release with the matching `CHANGELOG.md` section as its notes,
+and publishes the multi-arch image `ghcr.io/alternayte/exspeed` from those
+binaries. The checklist (version bump, changelog, tag, npm publish) is in
+the "Releasing" section of [CLAUDE.md](../CLAUDE.md).
 
 ## Repository layout
 
