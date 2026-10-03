@@ -233,12 +233,16 @@ Prometheus metrics (label `connector`):
 
 ## Errors, retries and the DLQ
 
-Every plugin maps its errors into four classes:
+Every plugin maps its errors into four classes. A source only returns
+**Transient** from `poll` when retrying the call returns the same records
+(nothing upstream was consumed); a replication stream that already moved
+past part of a batch returns **Connection**, so it restarts from the saved
+checkpoint instead of skipping those changes.
 
 | Class | Examples | What happens |
 |-------|----------|--------------|
 | **Transient** | timeout, HTTP 408/425/429/5xx, deadlock, serialization failure | retried in place with `[retry]` (honouring `Retry-After`); when exhausted, `on_transient_exhausted` applies |
-| **Connection** | socket closed, server restart, RabbitMQ channel closed | supervisor restart with backoff (reconnect) |
+| **Connection** | socket closed, server restart, RabbitMQ channel closed, malformed replication message (CDC) | supervisor restart with backoff (reconnect from the last saved checkpoint) |
 | **Poison** | bad JSON, type mismatch, constraint violation, HTTP 4xx, unroutable AMQP message | the record goes to `dlq_stream`, or is dropped and counted; the connector continues |
 | **Fatal** | bad config, HTTP 401/403, missing table, auth failure | connector → `failed` with a clear `last_error` |
 

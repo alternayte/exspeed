@@ -175,6 +175,14 @@ pub trait SourceConnector: Send {
     async fn start(&mut self, checkpoint: Option<String>) -> Result<(), ConnectorError>;
 
     /// Return the next records. Must not acknowledge anything externally.
+    ///
+    /// A `Transient` error makes the runtime call `poll` again on the same
+    /// instance, so it must leave the source able to return the same records
+    /// again: it must not have consumed upstream state (advanced a stream,
+    /// popped a queue, moved a cursor) that the failed call's records came
+    /// from. When it has — e.g. a replication stream that already delivered
+    /// part of the batch — return a `Connection` error instead; the runtime
+    /// then restarts the connector from the last saved checkpoint.
     async fn poll(&mut self, max_batch: usize) -> Result<SourceBatch, ConnectorError>;
 
     /// Called after the last polled batch is durable and `checkpoint` (the

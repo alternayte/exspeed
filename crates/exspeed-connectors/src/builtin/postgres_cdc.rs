@@ -116,6 +116,18 @@ pub(crate) enum Step {
     Timeout,
 }
 
+/// Turn a `Transient` error from the middle of a replication stream into a
+/// `Connection` error. The stream cannot be retried in place: the events
+/// already consumed (and the records built from them) would be lost.
+fn restart_from_checkpoint(e: ConnectorError) -> ConnectorError {
+    match e {
+        ConnectorError::Transient { message, .. } => {
+            ConnectorError::connection(format!("{message}; restarting from the saved LSN"))
+        }
+        other => other,
+    }
+}
+
 /// Shared pgoutput streaming used by `postgres_cdc` and `postgres_outbox`.
 pub(crate) struct CdcStream {
     pub conn: String,
@@ -171,6 +183,12 @@ impl CdcStream {
     }
 
     /// Next step, waiting at most until `deadline`.
+    ///
+    /// Every error is a `Connection` error (or `Fatal`), never `Transient`:
+    /// the replication stream has already moved past whatever the caller
+    /// collected in this poll, so retrying `poll` in place would silently
+    /// lose those changes. A `Connection` error makes the supervisor restart
+    /// the stream from the last saved LSN instead.
     pub async fn next(&mut self, deadline: Instant) -> Result<Step, ConnectorError> {
         loop {
             let repl = self
@@ -189,80 +207,87 @@ impl CdcStream {
                     )));
                 }
             };
-            match ev {
-                ReplicationEvent::Begin {
-                    final_lsn,
-                    xid,
-                    commit_time_micros,
-                } => {
-                    self.txn = Some(Txn {
-                        final_lsn: final_lsn.as_u64(),
-                        xid,
-                        commit_time_micros,
-                        ordinal: 0,
-                    });
-                }
-                ReplicationEvent::Commit { end_lsn, .. } => {
-                    self.txn = None;
-                    self.server_end = self.server_end.max(end_lsn.as_u64());
-                    return Ok(Step::Commit(end_lsn));
-                }
-                ReplicationEvent::KeepAlive { wal_end, .. } => {
-                    self.server_end = self.server_end.max(wal_end.as_u64());
-                    if self.txn.is_none() && wal_end > self.acked {
-                        return Ok(Step::Idle(wal_end));
-                    }
-                }
-                ReplicationEvent::XLogData { data, wal_end, .. } => {
-                    self.server_end = self.server_end.max(wal_end.as_u64());
-                    match pgoutput::parse_pgoutput_message(&data)? {
-                        WalEvent::Relation(rel) => {
-                            debug!(relation = rel.id, table = %rel.table, "relation");
-                            self.relations.insert(rel.id, Arc::new(rel));
-                        }
-                        WalEvent::Insert {
-                            relation_id,
-                            new_tuple,
-                        } => {
-                            if let Some(c) =
-                                self.change(relation_id, ChangeKind::Insert { new: new_tuple })?
-                            {
-                                return Ok(Step::Change(c));
-                            }
-                        }
-                        WalEvent::Update {
-                            relation_id,
-                            old,
-                            new_tuple,
-                        } => {
-                            if let Some(c) = self.change(
-                                relation_id,
-                                ChangeKind::Update {
-                                    old,
-                                    new: new_tuple,
-                                },
-                            )? {
-                                return Ok(Step::Change(c));
-                            }
-                        }
-                        WalEvent::Delete { relation_id, old } => {
-                            if let Some(c) = self.change(relation_id, ChangeKind::Delete { old })? {
-                                return Ok(Step::Change(c));
-                            }
-                        }
-                        WalEvent::Truncate { relation_ids } => {
-                            warn!(?relation_ids, "TRUNCATE is not emitted by CDC");
-                        }
-                        WalEvent::Begin { .. } | WalEvent::Commit { .. } | WalEvent::Unknown(_) => {
-                        }
-                    }
-                }
-                ReplicationEvent::Message { .. } => {}
-                ReplicationEvent::StoppedAt { .. } => {
-                    return Err(ConnectorError::connection("replication stopped"));
-                }
+            if let Some(step) = self.handle(ev).map_err(restart_from_checkpoint)? {
+                return Ok(step);
             }
         }
+    }
+
+    /// Apply one replication event; `Some` when it completes a step.
+    fn handle(&mut self, ev: ReplicationEvent) -> Result<Option<Step>, ConnectorError> {
+        match ev {
+            ReplicationEvent::Begin {
+                final_lsn,
+                xid,
+                commit_time_micros,
+            } => {
+                self.txn = Some(Txn {
+                    final_lsn: final_lsn.as_u64(),
+                    xid,
+                    commit_time_micros,
+                    ordinal: 0,
+                });
+            }
+            ReplicationEvent::Commit { end_lsn, .. } => {
+                self.txn = None;
+                self.server_end = self.server_end.max(end_lsn.as_u64());
+                return Ok(Some(Step::Commit(end_lsn)));
+            }
+            ReplicationEvent::KeepAlive { wal_end, .. } => {
+                self.server_end = self.server_end.max(wal_end.as_u64());
+                if self.txn.is_none() && wal_end > self.acked {
+                    return Ok(Some(Step::Idle(wal_end)));
+                }
+            }
+            ReplicationEvent::XLogData { data, wal_end, .. } => {
+                self.server_end = self.server_end.max(wal_end.as_u64());
+                match pgoutput::parse_pgoutput_message(&data)? {
+                    WalEvent::Relation(rel) => {
+                        debug!(relation = rel.id, table = %rel.table, "relation");
+                        self.relations.insert(rel.id, Arc::new(rel));
+                    }
+                    WalEvent::Insert {
+                        relation_id,
+                        new_tuple,
+                    } => {
+                        if let Some(c) =
+                            self.change(relation_id, ChangeKind::Insert { new: new_tuple })?
+                        {
+                            return Ok(Some(Step::Change(c)));
+                        }
+                    }
+                    WalEvent::Update {
+                        relation_id,
+                        old,
+                        new_tuple,
+                    } => {
+                        if let Some(c) = self.change(
+                            relation_id,
+                            ChangeKind::Update {
+                                old,
+                                new: new_tuple,
+                            },
+                        )? {
+                            return Ok(Some(Step::Change(c)));
+                        }
+                    }
+                    WalEvent::Delete { relation_id, old } => {
+                        if let Some(c) = self.change(relation_id, ChangeKind::Delete { old })? {
+                            return Ok(Some(Step::Change(c)));
+                        }
+                    }
+                    WalEvent::Truncate { relation_ids } => {
+                        warn!(?relation_ids, "TRUNCATE is not emitted by CDC");
+                    }
+                    WalEvent::Begin { .. } | WalEvent::Commit { .. } | WalEvent::Unknown(_) => {}
+                }
+            }
+            ReplicationEvent::Message { .. } => {}
+            ReplicationEvent::StoppedAt { .. } => {
+                return Err(ConnectorError::connection("replication stopped"));
+            }
+        }
+        Ok(None)
     }
 
     fn change(
@@ -750,6 +775,51 @@ mod tests {
             commit_time_micros: 0,
             ordinal: 2,
         }
+    }
+
+    /// A malformed pgoutput message in the middle of a poll must restart the
+    /// stream from the saved LSN (`Connection`), never be retried in place
+    /// (`Transient`): the runtime would re-poll a stream that has already
+    /// moved past the changes collected so far, losing them.
+    #[test]
+    fn stream_errors_restart_instead_of_retrying_in_place() {
+        use crate::traits::ErrorKind;
+        let mut st = CdcStream::new("postgres://h/db".into(), "s".into(), "p".into(), vec![]);
+        st.handle(ReplicationEvent::Begin {
+            final_lsn: Lsn::from(100u64),
+            xid: 1,
+            commit_time_micros: 0,
+        })
+        .unwrap();
+        for bad in [&b""[..], b"I", b"I\x00\x00\x00\x01N", b"R\x00\x00"] {
+            let Err(err) = st.handle(ReplicationEvent::XLogData {
+                wal_start: Lsn::from(100u64),
+                wal_end: Lsn::from(100u64),
+                server_time_micros: 0,
+                data: Bytes::copy_from_slice(bad),
+            }) else {
+                panic!("{bad:?} must fail");
+            };
+            assert_eq!(err.kind(), ErrorKind::Connection, "{bad:?}: {err}");
+        }
+        // A change for a relation never announced also restarts.
+        let mut ins = vec![b'I'];
+        ins.extend_from_slice(&42u32.to_be_bytes());
+        ins.extend_from_slice(b"N\x00\x00");
+        let Err(err) = st.handle(ReplicationEvent::XLogData {
+            wal_start: Lsn::from(100u64),
+            wal_end: Lsn::from(100u64),
+            server_time_micros: 0,
+            data: Bytes::from(ins),
+        }) else {
+            panic!("unknown relation must fail");
+        };
+        assert_eq!(err.kind(), ErrorKind::Connection, "{err}");
+        // Any transient error surfacing from the stream is converted.
+        let e = restart_from_checkpoint(ConnectorError::transient("x"));
+        assert_eq!(e.kind(), ErrorKind::Connection);
+        let e = restart_from_checkpoint(ConnectorError::fatal("x"));
+        assert_eq!(e.kind(), ErrorKind::Fatal);
     }
 
     #[test]

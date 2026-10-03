@@ -2,7 +2,10 @@
 //! `postgres_outbox` in CDC mode.
 //!
 //! The parser never panics: every read is bounds-checked and a short or
-//! malformed buffer is an error.
+//! malformed buffer is an error. Errors are `Connection` errors: a bad
+//! message means the stream position is unreliable, so the connector is
+//! restarted from its saved LSN rather than retried in place (which would
+//! drop the changes already consumed in the current poll).
 
 use crate::traits::ConnectorError;
 
@@ -102,7 +105,7 @@ impl<'a> Reader<'a> {
     }
 
     fn short(&self) -> ConnectorError {
-        ConnectorError::transient(format!("pgoutput: truncated {} message", self.what))
+        ConnectorError::connection(format!("pgoutput: truncated {} message", self.what))
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], ConnectorError> {
@@ -163,7 +166,7 @@ impl<'a> Reader<'a> {
                     values.push(ColValue::Null);
                 }
                 other => {
-                    return Err(ConnectorError::transient(format!(
+                    return Err(ConnectorError::connection(format!(
                         "pgoutput: unknown tuple column kind {other:#x}"
                     )))
                 }
@@ -176,7 +179,7 @@ impl<'a> Reader<'a> {
 /// Parse one pgoutput message (an XLogData payload).
 pub fn parse_pgoutput_message(data: &[u8]) -> Result<WalEvent, ConnectorError> {
     let Some((&tag, rest)) = data.split_first() else {
-        return Err(ConnectorError::transient("pgoutput: empty message"));
+        return Err(ConnectorError::connection("pgoutput: empty message"));
     };
     match tag {
         b'B' => {
@@ -227,7 +230,7 @@ pub fn parse_pgoutput_message(data: &[u8]) -> Result<WalEvent, ConnectorError> {
             match r.u8()? {
                 b'N' => {}
                 other => {
-                    return Err(ConnectorError::transient(format!(
+                    return Err(ConnectorError::connection(format!(
                         "pgoutput: unexpected Insert tuple tag {other:#x}"
                     )))
                 }
@@ -255,7 +258,7 @@ pub fn parse_pgoutput_message(data: &[u8]) -> Result<WalEvent, ConnectorError> {
                 _ => None,
             };
             if tag != b'N' {
-                return Err(ConnectorError::transient(format!(
+                return Err(ConnectorError::connection(format!(
                     "pgoutput: unexpected Update tuple tag {tag:#x}"
                 )));
             }
@@ -272,7 +275,7 @@ pub fn parse_pgoutput_message(data: &[u8]) -> Result<WalEvent, ConnectorError> {
                 b'K' => OldKind::Key,
                 b'O' => OldKind::Full,
                 other => {
-                    return Err(ConnectorError::transient(format!(
+                    return Err(ConnectorError::connection(format!(
                         "pgoutput: unexpected Delete tuple tag {other:#x}"
                     )))
                 }
