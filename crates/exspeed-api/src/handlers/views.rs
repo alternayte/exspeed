@@ -14,13 +14,16 @@ use serde_json::json;
 use super::queries::exql_error;
 use crate::state::AppState;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreateViewRequest {
+    /// `CREATE TABLE … AS SELECT … GROUP BY …`
     pub sql: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct GetViewParams {
+    /// Group key; a JSON array for several GROUP BY columns.
     pub key: Option<String>,
 }
 
@@ -29,6 +32,15 @@ fn deny(identity: Option<Extension<Arc<Identity>>>) -> Option<Response> {
 }
 
 /// GET /api/v1/views
+#[utoipa::path(
+    get,
+    path = "/api/v1/views",
+    tag = "views",
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "Tables", body = Vec<crate::openapi::TableInfoDoc>),
+    )
+)]
 pub async fn list_views(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<Arc<Identity>>>,
@@ -45,6 +57,17 @@ pub async fn list_views(
 /// group (`{columns, row}`). The key is the group value; for several
 /// GROUP BY columns it is a JSON array (`["eu",3]`), and empty for a
 /// global aggregate.
+#[utoipa::path(
+    get,
+    path = "/api/v1/views/{name}",
+    tag = "views",
+    security(("bearer" = [])),
+    params(("name" = String, Path, description = "Table name"), GetViewParams),
+    responses(
+        (status = 200, description = "`{columns, rows, row_count}`, or `{columns, row}` with `key`", body = Object),
+        (status = 404, description = "No such table, or no row for the key", body = crate::openapi::ExqlErrorBody),
+    )
+)]
 pub async fn get_view(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -68,6 +91,18 @@ pub async fn get_view(
 ///
 /// Create a materialized table (`CREATE TABLE … AS SELECT … GROUP BY …`;
 /// `CREATE MATERIALIZED VIEW` is an alias).
+#[utoipa::path(
+    post,
+    path = "/api/v1/views",
+    tag = "views",
+    security(("bearer" = [])),
+    request_body = CreateViewRequest,
+    responses(
+        (status = 201, description = "The table's query", body = crate::openapi::QueryInfoDoc),
+        (status = 400, description = "Invalid statement", body = crate::openapi::ExqlErrorBody),
+        (status = 503, description = "Not the leader", body = crate::openapi::ExqlErrorBody),
+    )
+)]
 pub async fn create_view(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<Arc<Identity>>>,

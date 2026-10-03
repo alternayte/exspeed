@@ -12,7 +12,7 @@ use exspeed_processing::external::ConnectionConfig;
 
 use crate::state::AppState;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreateConnectionRequest {
     pub name: String,
     pub driver: String,
@@ -22,6 +22,18 @@ pub struct CreateConnectionRequest {
 /// POST /api/v1/connections
 ///
 /// Add a new external database connection.
+#[utoipa::path(
+    post,
+    path = "/api/v1/connections",
+    tag = "connections",
+    security(("bearer" = [])),
+    request_body = CreateConnectionRequest,
+    responses(
+        (status = 201, description = "`{name, driver, status: \"created\"}`", body = Object),
+        (status = 400, description = "Invalid connection", body = crate::openapi::ExqlErrorBody),
+        (status = 409, description = "Exists", body = crate::openapi::ExqlErrorBody),
+    )
+)]
 pub async fn create_connection(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<Arc<Identity>>>,
@@ -51,6 +63,15 @@ pub async fn create_connection(
 /// GET /api/v1/connections
 ///
 /// List all registered connections (URLs are masked for security).
+#[utoipa::path(
+    get,
+    path = "/api/v1/connections",
+    tag = "connections",
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "`[{name, driver}]`", body = Vec<Object>),
+    )
+)]
 pub async fn list_connections(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<Arc<Identity>>>,
@@ -73,6 +94,17 @@ pub async fn list_connections(
 /// DELETE /api/v1/connections/{name}
 ///
 /// Remove an external database connection.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/connections/{name}",
+    tag = "connections",
+    security(("bearer" = [])),
+    params(("name" = String, Path, description = "Connection name")),
+    responses(
+        (status = 200, description = "`{status: \"removed\", name}`", body = Object),
+        (status = 404, description = "No such connection", body = crate::openapi::ExqlErrorBody),
+    )
+)]
 pub async fn delete_connection(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,

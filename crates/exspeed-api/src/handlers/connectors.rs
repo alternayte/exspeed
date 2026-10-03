@@ -27,6 +27,19 @@ fn admin_only(identity: Option<Extension<Arc<Identity>>>) -> Option<Response> {
 }
 
 /// `POST /api/v1/connectors`
+#[utoipa::path(
+    post,
+    path = "/api/v1/connectors",
+    tag = "connectors",
+    security(("bearer" = [])),
+    request_body(content = Object, description = "Connector config: the JSON form of a connectors.d TOML file (docs/connectors.md)"),
+    responses(
+        (status = 201, description = "Created: `{\"created\": name}`", body = Object),
+        (status = 400, description = "Invalid config", body = crate::openapi::ErrorBody),
+        (status = 409, description = "Exists, or collides with a file connector", body = crate::openapi::ErrorBody),
+        (status = 503, description = "Not the leader", body = crate::openapi::ErrorBody),
+    )
+)]
 pub async fn create_connector(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<Arc<Identity>>>,
@@ -44,6 +57,20 @@ pub async fn create_connector(
 
 /// `PUT /api/v1/connectors/{name}`: replace an API-created connector's
 /// config and restart it. Offsets are kept.
+#[utoipa::path(
+    put,
+    path = "/api/v1/connectors/{name}",
+    tag = "connectors",
+    security(("bearer" = [])),
+    params(("name" = String, Path, description = "Connector name")),
+    request_body(content = Object, description = "Connector config: the JSON form of a connectors.d TOML file (docs/connectors.md)"),
+    responses(
+        (status = 200, description = "Updated: `{\"updated\": name}`", body = Object),
+        (status = 400, description = "Invalid config, or body name differs from the path", body = crate::openapi::ErrorBody),
+        (status = 404, description = "No such connector", body = crate::openapi::ErrorBody),
+        (status = 409, description = "Defined by a connectors.d file", body = crate::openapi::ErrorBody),
+    )
+)]
 pub async fn update_connector(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -67,6 +94,15 @@ pub async fn update_connector(
 }
 
 /// `GET /api/v1/connectors`: every connector with its live status.
+#[utoipa::path(
+    get,
+    path = "/api/v1/connectors",
+    tag = "connectors",
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "Connectors", body = Vec<crate::openapi::ConnectorInfoDoc>),
+    )
+)]
 pub async fn list_connectors(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<Arc<Identity>>>,
@@ -79,6 +115,17 @@ pub async fn list_connectors(
 }
 
 /// `GET /api/v1/connectors/{name}`: status plus the (unresolved) config.
+#[utoipa::path(
+    get,
+    path = "/api/v1/connectors/{name}",
+    tag = "connectors",
+    security(("bearer" = [])),
+    params(("name" = String, Path, description = "Connector name")),
+    responses(
+        (status = 200, description = "The connector with its `config`", body = crate::openapi::ConnectorInfoDoc),
+        (status = 404, description = "No such connector", body = crate::openapi::ErrorBody),
+    )
+)]
 pub async fn get_connector(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -98,7 +145,18 @@ pub async fn get_connector(
     }
 }
 
-/// `DELETE /api/v1/connectors/{name}`
+/// `DELETE /api/v1/connectors/{name}`: stop it and delete it with its offsets.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/connectors/{name}",
+    tag = "connectors",
+    security(("bearer" = [])),
+    params(("name" = String, Path, description = "Connector name")),
+    responses(
+        (status = 200, description = "Deleted: `{\"deleted\": name}`", body = Object),
+        (status = 404, description = "No such connector", body = crate::openapi::ErrorBody),
+    )
+)]
 pub async fn delete_connector(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -115,6 +173,18 @@ pub async fn delete_connector(
 
 /// `POST /api/v1/connectors/{name}/restart`: also revives a `failed`
 /// connector.
+#[utoipa::path(
+    post,
+    path = "/api/v1/connectors/{name}/restart",
+    tag = "connectors",
+    security(("bearer" = [])),
+    params(("name" = String, Path, description = "Connector name")),
+    responses(
+        (status = 200, description = "Restarted: `{\"restarted\": name}`", body = Object),
+        (status = 404, description = "No such connector", body = crate::openapi::ErrorBody),
+        (status = 503, description = "Not the leader", body = crate::openapi::ErrorBody),
+    )
+)]
 pub async fn restart_connector(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,

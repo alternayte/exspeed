@@ -21,10 +21,25 @@ pub(crate) fn consumer_error(e: ConsumerError) -> Response {
     (status, Json(json!({"error": e.to_string()}))).into_response()
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListParams {
+    /// Only consumers of this stream.
     pub stream: Option<String>,
 }
+
+/// List consumers with their state (only those on streams the caller
+/// administers).
+#[utoipa::path(
+    get,
+    path = "/api/v1/consumers",
+    tag = "consumers",
+    security(("bearer" = [])),
+    params(ListParams),
+    responses(
+        (status = 200, description = "Consumers", body = Vec<crate::openapi::ConsumerInfoDoc>),
+    )
+)]
 
 pub async fn list_consumers(
     State(state): State<Arc<AppState>>,
@@ -66,6 +81,22 @@ async fn authorize(
     }
 }
 
+/// Create a durable consumer. Idempotent for an identical spec.
+#[utoipa::path(
+    post,
+    path = "/api/v1/consumers",
+    tag = "consumers",
+    security(("bearer" = [])),
+    request_body = crate::openapi::ConsumerSpecDoc,
+    responses(
+        (status = 201, description = "Created (or already existed with this spec)", body = crate::openapi::ConsumerInfoDoc),
+        (status = 400, description = "Invalid spec, or ephemeral", body = crate::openapi::ErrorBody),
+        (status = 403, description = "No admin permission on the stream or DLQ stream", body = crate::openapi::ErrorBody),
+        (status = 404, description = "No such stream", body = crate::openapi::ErrorBody),
+        (status = 409, description = "Exists with a different spec", body = crate::openapi::ErrorBody),
+        (status = 503, description = "Not the leader", body = crate::openapi::ErrorBody),
+    )
+)]
 pub async fn create_consumer(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<Arc<Identity>>>,
@@ -102,6 +133,19 @@ pub async fn create_consumer(
     }
 }
 
+/// One consumer's spec and live state.
+#[utoipa::path(
+    get,
+    path = "/api/v1/consumers/{name}",
+    tag = "consumers",
+    security(("bearer" = [])),
+    params(("name" = String, Path, description = "Consumer name")),
+    responses(
+        (status = 200, description = "The consumer", body = crate::openapi::ConsumerInfoDoc),
+        (status = 403, description = "No admin permission on its stream", body = crate::openapi::ErrorBody),
+        (status = 404, description = "No such consumer", body = crate::openapi::ErrorBody),
+    )
+)]
 pub async fn get_consumer(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -116,6 +160,19 @@ pub async fn get_consumer(
     }
 }
 
+/// Delete a consumer; its subscriptions end with code 404.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/consumers/{name}",
+    tag = "consumers",
+    security(("bearer" = [])),
+    params(("name" = String, Path, description = "Consumer name")),
+    responses(
+        (status = 200, description = "Deleted: `{\"deleted\": name}`", body = Object),
+        (status = 403, description = "No admin permission on its stream", body = crate::openapi::ErrorBody),
+        (status = 404, description = "No such consumer", body = crate::openapi::ErrorBody),
+    )
+)]
 pub async fn delete_consumer(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -130,8 +187,9 @@ pub async fn delete_consumer(
     }
 }
 
-/// Body of `POST /api/v1/consumers/{name}/seek`: exactly one field.
-#[derive(Deserialize)]
+/// Body of `POST /api/v1/consumers/{name}/seek`: `"earliest"`,
+/// `"latest"`, `{"offset": n}` or `{"timestamp_ms": t}`.
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SeekBody {
     Earliest,
@@ -141,6 +199,20 @@ pub enum SeekBody {
     TimestampMs(u64),
 }
 
+/// Reposition a consumer; drops its unacked state.
+#[utoipa::path(
+    post,
+    path = "/api/v1/consumers/{name}/seek",
+    tag = "consumers",
+    security(("bearer" = [])),
+    params(("name" = String, Path, description = "Consumer name")),
+    request_body = SeekBody,
+    responses(
+        (status = 200, description = "The consumer after the seek", body = crate::openapi::ConsumerInfoDoc),
+        (status = 403, description = "No admin permission on its stream", body = crate::openapi::ErrorBody),
+        (status = 404, description = "No such consumer", body = crate::openapi::ErrorBody),
+    )
+)]
 pub async fn seek_consumer(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,

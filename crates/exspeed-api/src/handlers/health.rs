@@ -14,6 +14,15 @@ use crate::state::AppState;
 /// holds the cluster-leader lease, `503` with `{"leader": false}`
 /// otherwise. Load balancers should probe this endpoint and route traffic
 /// only to pods returning 200.
+#[utoipa::path(
+    get,
+    path = "/healthz",
+    tag = "health",
+    responses(
+        (status = 200, description = "This pod is the leader: `{leader: true, holder}`", body = Object),
+        (status = 503, description = "Standby: `{leader: false, holder}`", body = Object),
+    )
+)]
 pub async fn healthz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let leader = state.leadership.is_currently_leader();
     let status = if leader {
@@ -37,6 +46,15 @@ pub async fn healthz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 /// against `data_dir` fails (read-only mount, full disk, permission
 /// loss, etc.). Returns 200 only when both checks pass. Intended for
 /// k8s readiness gates; `/healthz` is the load-balancer routing probe.
+#[utoipa::path(
+    get,
+    path = "/readyz",
+    tag = "health",
+    responses(
+        (status = 200, description = "`{status: \"ready\"}`", body = Object),
+        (status = 503, description = "`{status}`: `starting`, `dedup_rebuild_in_progress` or `data_dir_unwritable`", body = Object),
+    )
+)]
 pub async fn readyz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     use std::sync::atomic::Ordering;
     if !state.ready.load(Ordering::Acquire) {
