@@ -422,12 +422,13 @@ fn to_record(r: PublishRecord) -> Record {
     }
 }
 
-fn stream_config(s: &StreamSpec) -> StreamConfig {
-    let mut cfg = StreamConfig::from_request(
+fn stream_config(s: &StreamSpec, default_window_secs: u64) -> StreamConfig {
+    let mut cfg = StreamConfig::from_request_with_window(
         s.max_age_secs,
         s.max_bytes,
         s.dedup_window_secs,
         s.dedup_max_entries,
+        default_window_secs,
     );
     cfg.compaction = s.compaction;
     cfg.dedup_window_secs = cfg.dedup_window_secs.min(cfg.max_age_secs);
@@ -716,7 +717,7 @@ async fn dispatch(
             if !identity.authorize(Action::Admin, &name) {
                 return forbid(&ctx, out, corr, "CreateStream").await;
             }
-            let cfg = stream_config(&spec);
+            let cfg = stream_config(&spec, broker.log.default_dedup_window_secs());
             let resp = match broker.log.create_stream(&name, &cfg).await {
                 Ok(()) => Response::Ok,
                 // Idempotent: same config → Ok, different → 409.
@@ -743,7 +744,10 @@ async fn dispatch(
             }
             let resp = match broker
                 .log
-                .update_stream_config(&name, &stream_config(&spec))
+                .update_stream_config(
+                    &name,
+                    &stream_config(&spec, broker.log.default_dedup_window_secs()),
+                )
                 .await
             {
                 Ok(()) => Response::Ok,

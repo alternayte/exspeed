@@ -148,6 +148,11 @@ pub struct BrokerAppend {
 }
 
 impl BrokerAppend {
+    /// The dedup window streams get when they don't set one.
+    pub fn default_window_secs(&self) -> u64 {
+        self.default_window.as_secs()
+    }
+
     pub fn new(storage: Arc<dyn StorageEngine>, default_window_secs: u64) -> Self {
         Self::new_with_cap(storage, default_window_secs, 500_000)
     }

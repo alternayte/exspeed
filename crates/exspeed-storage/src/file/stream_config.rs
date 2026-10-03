@@ -52,6 +52,17 @@ mod tests {
     }
 
     #[test]
+    fn from_request_with_window_uses_the_server_default() {
+        let cfg = StreamConfig::from_request_with_window(3600, 0, 0, 0, 60);
+        assert_eq!(cfg.dedup_window_secs, 60);
+        // Still capped by retention, and an explicit window wins.
+        let cfg = StreamConfig::from_request_with_window(30, 0, 0, 0, 60);
+        assert_eq!(cfg.dedup_window_secs, 30);
+        let cfg = StreamConfig::from_request_with_window(3600, 0, 120, 0, 60);
+        assert_eq!(cfg.dedup_window_secs, 120);
+    }
+
+    #[test]
     fn from_request_zeros_use_defaults() {
         let cfg = StreamConfig::from_request(0, 0, 0, 0);
         assert_eq!(cfg.max_age_secs, DEFAULT_MAX_AGE_SECS);

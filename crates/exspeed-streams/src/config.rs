@@ -59,6 +59,24 @@ impl StreamConfig {
         dedup_window_secs: u64,
         dedup_max_entries: u64,
     ) -> Self {
+        Self::from_request_with_window(
+            max_age_secs,
+            max_bytes,
+            dedup_window_secs,
+            dedup_max_entries,
+            DEFAULT_DEDUP_WINDOW_SECS,
+        )
+    }
+
+    /// Like [`from_request`](Self::from_request), with the server's default
+    /// dedup window (`storage.dedup_window_secs`) for a zero window.
+    pub fn from_request_with_window(
+        max_age_secs: u64,
+        max_bytes: u64,
+        dedup_window_secs: u64,
+        dedup_max_entries: u64,
+        default_window_secs: u64,
+    ) -> Self {
         fn or(v: u64, d: u64) -> u64 {
             if v == 0 {
                 d
@@ -70,7 +88,7 @@ impl StreamConfig {
         // A defaulted dedup window never exceeds retention (a 1 s stream
         // gets a 1 s window); an explicit one is validated by `check`.
         let dedup_window_secs = if dedup_window_secs == 0 {
-            DEFAULT_DEDUP_WINDOW_SECS.min(max_age_secs)
+            default_window_secs.max(1).min(max_age_secs)
         } else {
             dedup_window_secs
         };
