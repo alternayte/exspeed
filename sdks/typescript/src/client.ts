@@ -529,11 +529,16 @@ async function openLeader(
     tried.add(addr);
     const { host, port } = parseAddr(addr, opts.port);
     let conn: Connection;
+    // `onClose` can fire while the handshake is still failing, before
+    // `open` resolves; such a connection was never handed out, so ignore it.
+    let opened: Connection | undefined;
     try {
-      const opened: Connection = await Connection.open(
+      opened = await Connection.open(
         { ...opts, host, port },
         {
-          onClose: (err) => handlers.onClose(opened, err),
+          onClose: (err) => {
+            if (opened) handlers.onClose(opened, err);
+          },
           onAsyncError: (err) => handlers.onAsyncError(err),
         },
       );
