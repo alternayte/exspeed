@@ -1,0 +1,59 @@
+# Single-node Kafka (KRaft) and NATS JetStream for `bench/compare/run.sh`.
+#
+# Durability is selected with BENCH_MODE (default: sync), matching Exspeed's
+# --storage-sync:
+#   sync  - every broker fsyncs before it acknowledges a write
+#           (Kafka log.flush.interval.messages=1, JetStream sync_interval=always)
+#   async - acknowledged writes may sit in the page cache
+#           (Kafka and JetStream defaults)
+#
+# Data lives in named volumes; `docker compose down -v` wipes it.
+services:
+  kafka:
+    image: apache/kafka:3.8.1
+    container_name: exspeed-bench-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://localhost:9092"
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # 1 = fsync after every append (sync mode). The Kafka default is
+      # Long.MAX_VALUE (rely on the page cache and replication).
+      KAFKA_LOG_FLUSH_INTERVAL_MESSAGES: "${KAFKA_FLUSH_MESSAGES:-1}"
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+  nats:
+    image: nats:2.10.22
+    container_name: exspeed-bench-nats
+    command: ["--config", "/etc/nats/${BENCH_MODE:-sync}.conf"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - ./nats-sync.conf:/etc/nats/sync.conf:ro
+      - ./nats-async.conf:/etc/nats/async.conf:ro
+      - nats-data:/data
+
+  # `nats bench` client. Run with:
+  #   docker compose run --rm nats-box nats -s nats://nats:4222 bench ...
+  nats-box:
+    image: natsio/nats-box:0.16.0
+    profiles: ["tools"]
+    depends_on: [nats]
+
+volumes:
+  kafka-data:
+  nats-data:

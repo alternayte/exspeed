@@ -267,9 +267,8 @@ async fn backup_of_compacted_stream() {
     for (a, b) in got.iter().zip(&original) {
         same(a, b);
     }
-    assert_eq!(
+    assert!(
         restored.stream_config(&s).await.unwrap().compaction,
-        true,
         "stream.json is restored"
     );
 }
