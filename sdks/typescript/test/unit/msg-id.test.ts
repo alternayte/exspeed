@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { newMsgId } from "../src/msg-id.js";
+import { newMsgId } from "../../src/msg-id.js";
 
 describe("newMsgId", () => {
   it("returns a non-empty string", () => {

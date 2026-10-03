@@ -1,191 +1,186 @@
-import { Connection } from "./connection.js";
-import { OpCode } from "./protocol/opcodes.js";
-import { encodePublishBatch, decodePublishBatchOk } from "./protocol/publish-batch.js";
-import type { PublishOptions, PublishResult, BrokerEndpoint } from "./types.js";
+import { ConnectionError, ProtocolError } from "./errors.js";
+import type { Request, Response, WirePublishRecord } from "./protocol/messages.js";
+import { toWirePublishRecord, type PublishInput, type PublishResult } from "./types.js";
 
 export interface PublisherOptions {
-  endpoints: BrokerEndpoint[];
-  clientId?: string;
+  /**
+   * How long to gather records before sending a batch. `0` (default) sends
+   * everything published in the same event-loop turn as one batch, without
+   * adding latency.
+   */
+  batchWindowMs?: number;
+  /** Most records per batch request. Default 512. */
+  maxBatchRecords?: number;
+  /** Records accepted but not yet acknowledged; `publish` waits when full. Default 4096. */
   maxInFlight?: number;
-  batchWindowMs?: number;      // default 0.1 (100µs)
-  maxBatchRecords?: number;    // default 256
+}
+
+/** @internal */
+export interface PublisherTransport {
+  request(req: Request): Promise<Response>;
 }
 
 interface Queued {
   stream: string;
-  subject: string;
-  key?: Buffer;
-  msgId?: string;
-  value: Buffer;
-  headers: Array<[string, string]>;
-  resolve: (r: PublishResult) => void;
-  reject: (e: Error) => void;
+  record: WirePublishRecord;
+  size: number;
+  resolve(r: PublishResult): void;
+  reject(e: Error): void;
 }
 
+/** Keep each batch frame well below the 16 MiB frame limit. */
+const MAX_BATCH_BYTES = 4 * 1024 * 1024;
+
 /**
- * Pipelined publisher with transparent coalescing. Owns one Connection.
- * Multiple `publish()` calls coalesce into one PublishBatch frame per
- * batchWindowMs (default 100µs) or when maxBatchRecords queue up.
+ * A pipelined, coalescing publisher. Concurrent `publish` calls are
+ * gathered into `PublishBatch` requests (one per run of records for the
+ * same stream) and many batches can be in flight at once. Records reach the
+ * stream in the order `publish` was called, and every call gets its own
+ * record's result.
+ *
+ * Create one with `client.publisher(options)`.
  */
 export class Publisher {
-  private conn: Connection;
-  private closed = false;
-  private queue: Queued[] = [];
-  private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly batchWindowMs: number;
   private readonly maxBatchRecords: number;
-  private inFlightSends: Set<Promise<void>> = new Set();
+  private readonly maxInFlight: number;
 
-  constructor(opts: PublisherOptions) {
-    this.conn = new Connection({
-      endpoints: opts.endpoints,
-      clientId: opts.clientId ?? "exspeed-publisher",
-      reconnect: true,
-      requestTimeout: 30_000,
-      pingInterval: 30_000,
-    });
-    this.batchWindowMs = opts.batchWindowMs ?? 0.1;
-    this.maxBatchRecords = opts.maxBatchRecords ?? 256;
+  private queue: Queued[] = [];
+  private scheduled = false;
+  private inFlight = 0;
+  private permitWaiters: Array<() => void> = [];
+  private idleWaiters: Array<() => void> = [];
+  private closed = false;
+
+  /** @internal */
+  constructor(
+    private readonly transport: PublisherTransport,
+    opts: PublisherOptions = {},
+  ) {
+    this.batchWindowMs = Math.max(0, opts.batchWindowMs ?? 0);
+    this.maxBatchRecords = Math.max(1, opts.maxBatchRecords ?? 512);
+    this.maxInFlight = Math.max(1, opts.maxInFlight ?? 4096);
   }
 
-  static async open(opts: PublisherOptions): Promise<Publisher> {
-    const p = new Publisher(opts);
-    await p.conn.connect();
-    return p;
+  /** Records accepted and not yet acknowledged. */
+  get pending(): number {
+    return this.inFlight;
   }
 
-  async publish(stream: string, options: PublishOptions): Promise<PublishResult> {
-    if (this.closed) throw new Error("Publisher closed");
+  /** Publish one record; resolves with its offset once the server has it. */
+  async publish(stream: string, record: PublishInput): Promise<PublishResult> {
+    if (this.closed) throw new ConnectionError("publisher is closed");
+    const wire = toWirePublishRecord(record);
+    await this.acquire();
+    if (this.closed) {
+      this.release();
+      throw new ConnectionError("publisher is closed");
+    }
     return new Promise<PublishResult>((resolve, reject) => {
-      this.queue.push({
-        stream,
-        subject: options.subject,
-        key: this.coerceKey(options),
-        msgId: options.msgId,
-        value: this.coerceValue(options),
-        headers: options.headers ?? [],
-        resolve,
-        reject,
-      });
-      if (this.queue.length >= this.maxBatchRecords) {
-        this.flushNow();
-      } else if (this.flushTimer === null) {
-        this.flushTimer = setTimeout(() => this.flushNow(), this.batchWindowMs);
-      }
+      const size =
+        64 + wire.subject.length + wire.value.length + (wire.key?.length ?? 0) + (wire.msgId?.length ?? 0) +
+        wire.headers.reduce((n, [k, v]) => n + 4 + k.length * 3 + v.length * 3, 0);
+      this.queue.push({ stream, record: wire, size, resolve, reject });
+      if (this.queue.length >= this.maxBatchRecords) this.flushQueue();
+      else this.schedule();
     });
   }
 
-  async publishBatch(stream: string, reqs: PublishOptions[]): Promise<PublishResult[]> {
-    if (this.closed) throw new Error("Publisher closed");
-    if (reqs.length === 0) return [];
-
-    const records = reqs.map((r) => ({
-      subject: r.subject,
-      key: this.coerceKey(r),
-      msgId: r.msgId,
-      value: this.coerceValue(r),
-      headers: r.headers ?? [],
-    }));
-    const payload = encodePublishBatch({ stream, records });
-    const response = await this.conn.request(OpCode.PublishBatch, payload);
-    const decoded = decodePublishBatchOk(response.payload);
-    return decoded.results.map((r) => {
-      if (r.type === "Written" || r.type === "Duplicate") {
-        return { offset: r.offset, duplicate: r.type === "Duplicate", toJSON: () => ({ offset: r.offset.toString() }) };
-      }
-      throw new Error(`Publish error code=${r.code} msg=${r.message}`);
-    });
-  }
-
-  private flushNow(): void {
-    if (this.flushTimer !== null) {
-      clearTimeout(this.flushTimer);
-      this.flushTimer = null;
-    }
-    if (this.queue.length === 0) return;
-
-    const byStream = new Map<string, Queued[]>();
-    for (const q of this.queue) {
-      const arr = byStream.get(q.stream);
-      if (arr) arr.push(q);
-      else byStream.set(q.stream, [q]);
-    }
-    this.queue = [];
-
-    for (const [stream, group] of byStream) {
-      const sendPromise = this.sendBatch(stream, group).catch((e) => {
-        for (const q of group) q.reject(e);
-      });
-      // Track in flight; remove when done so flush() can await accurately.
-      this.inFlightSends.add(sendPromise);
-      sendPromise.finally(() => {
-        this.inFlightSends.delete(sendPromise);
-      });
-    }
-  }
-
-  private async sendBatch(stream: string, group: Queued[]): Promise<void> {
-    const records = group.map((q) => ({
-      subject: q.subject,
-      key: q.key,
-      msgId: q.msgId,
-      value: q.value,
-      headers: q.headers,
-    }));
-    const payload = encodePublishBatch({ stream, records });
-    try {
-      const response = await this.conn.request(OpCode.PublishBatch, payload);
-      const decoded = decodePublishBatchOk(response.payload);
-      group.forEach((q, i) => {
-        const r = decoded.results[i];
-        if (!r) {
-          q.reject(new Error("server returned fewer results than records in batch"));
-          return;
-        }
-        if (r.type === "Written" || r.type === "Duplicate") {
-          q.resolve({
-            offset: r.offset,
-            duplicate: r.type === "Duplicate",
-            toJSON: () => ({ offset: r.offset.toString() }),
-          });
-        } else {
-          q.reject(new Error(`Publish error code=${r.code} msg=${r.message}`));
-        }
-      });
-    } catch (e) {
-      for (const q of group) q.reject(e as Error);
-    }
-  }
-
+  /** Wait until every accepted record has been acknowledged (or failed). */
   async flush(): Promise<void> {
-    // Drain queue into in-flight sends.
-    if (this.queue.length > 0) this.flushNow();
-    // Wait for all in-flight batch sends to complete.
-    // Loop in case a flushNow during the await enqueues new sends
-    // (e.g. from concurrent publish() calls racing with close()).
-    while (this.inFlightSends.size > 0) {
-      await Promise.allSettled(Array.from(this.inFlightSends));
-    }
+    if (this.queue.length > 0) this.flushQueue();
+    if (this.inFlight === 0 && this.permitWaiters.length === 0) return;
+    await new Promise<void>((resolve) => this.idleWaiters.push(resolve));
   }
 
+  /** Flush, then reject further publishes. */
   async close(): Promise<void> {
-    this.closed = true;
     await this.flush();
-    await this.conn.close();
+    this.closed = true;
   }
 
-  private coerceValue(options: PublishOptions): Buffer {
-    if ("data" in options && options.data !== undefined) {
-      return Buffer.from(JSON.stringify(options.data), "utf8");
+  private acquire(): Promise<void> {
+    if (this.inFlight < this.maxInFlight && this.permitWaiters.length === 0) {
+      this.inFlight++;
+      return Promise.resolve();
     }
-    if ("value" in options && options.value !== undefined) {
-      return Buffer.isBuffer(options.value) ? options.value : Buffer.from(options.value);
-    }
-    throw new Error("Either data or value must be provided");
+    // FIFO hand-off keeps call order intact while waiting for capacity.
+    return new Promise((resolve) => this.permitWaiters.push(resolve));
   }
 
-  private coerceKey(options: PublishOptions): Buffer | undefined {
-    if (options.key === undefined) return undefined;
-    return typeof options.key === "string" ? Buffer.from(options.key, "utf8") : options.key;
+  private release(): void {
+    const next = this.permitWaiters.shift();
+    if (next) {
+      next(); // the permit passes straight to the next waiter
+      return;
+    }
+    this.inFlight--;
+    if (this.inFlight === 0) {
+      const waiters = this.idleWaiters;
+      this.idleWaiters = [];
+      for (const w of waiters) w();
+    }
+  }
+
+  private schedule(): void {
+    if (this.scheduled) return;
+    this.scheduled = true;
+    const run = () => {
+      this.scheduled = false;
+      this.flushQueue();
+    };
+    if (this.batchWindowMs === 0) setImmediate(run);
+    else setTimeout(run, this.batchWindowMs);
+  }
+
+  /** Send everything queued, as runs of the same stream, in arrival order. */
+  private flushQueue(): void {
+    while (this.queue.length > 0) {
+      const stream = this.queue[0]!.stream;
+      const run: Queued[] = [];
+      let bytes = 0;
+      while (
+        this.queue.length > 0 &&
+        this.queue[0]!.stream === stream &&
+        run.length < this.maxBatchRecords &&
+        (run.length === 0 || bytes + this.queue[0]!.size <= MAX_BATCH_BYTES)
+      ) {
+        const q = this.queue.shift()!;
+        bytes += q.size;
+        run.push(q);
+      }
+      this.sendRun(stream, run);
+    }
+  }
+
+  /** The request is written synchronously, so wire order matches arrival order. */
+  private sendRun(stream: string, run: Queued[]): void {
+    const single = run.length === 1;
+    const req: Request = single
+      ? { type: "Publish", stream, record: run[0]!.record }
+      : { type: "PublishBatch", stream, records: run.map((q) => q.record) };
+    let sent: Promise<Response>;
+    try {
+      sent = this.transport.request(req);
+    } catch (err) {
+      sent = Promise.reject(err);
+    }
+    sent.then(
+      (resp) => {
+        if (single && resp.type === "PublishOk") {
+          run[0]!.resolve({ offset: resp.offset, duplicate: resp.duplicate });
+        } else if (resp.type === "PublishBatchOk" && resp.results.length === run.length) {
+          resp.results.forEach((r, i) => run[i]!.resolve({ offset: r.offset, duplicate: r.duplicate }));
+        } else {
+          const err = new ProtocolError(`unexpected reply to ${req.type}: ${resp.type}`);
+          for (const q of run) q.reject(err);
+        }
+        for (let i = 0; i < run.length; i++) this.release();
+      },
+      (err: Error) => {
+        for (const q of run) q.reject(err);
+        for (let i = 0; i < run.length; i++) this.release();
+      },
+    );
   }
 }
