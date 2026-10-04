@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::core::{Core, Due};
 use super::store::ConsumerStore;
-use super::{ConsumerError, ConsumerInfo, SubEvent};
+use super::{ConsumerError, ConsumerInfo, FloorReport, SubEvent};
 use crate::log::Log;
 
 /// Persist at most this often while state changes (acks, deliveries).
@@ -125,6 +125,9 @@ pub(crate) struct Actor {
     /// changes.
     stream_cfg: StreamConfig,
     cfg_seen: Option<u64>,
+    /// Where persisted ack floors go (work-queue / interest retention).
+    floors: mpsc::UnboundedSender<FloorReport>,
+    reported_floor: Option<u64>,
 }
 
 /// What the stream's time settings mean for one record right now.
@@ -151,6 +154,7 @@ impl Actor {
         log: Arc<Log>,
         store: Arc<ConsumerStore>,
         metrics: Arc<Metrics>,
+        floors: mpsc::UnboundedSender<FloorReport>,
     ) -> Result<Self, ConsumerError> {
         let stream = StreamName::try_from(core.spec.stream.as_str())
             .map_err(|e| ConsumerError::Invalid(e.to_string()))?;
@@ -172,7 +176,23 @@ impl Actor {
             caught_up: false,
             stream_cfg: StreamConfig::default(),
             cfg_seen: None,
+            floors,
+            reported_floor: None,
         })
+    }
+
+    /// Tell the manager the persisted ack floor when it moved (only
+    /// persisted acks may let retention remove records).
+    fn report_floor(&mut self) {
+        let floor = self.core.ack_floor();
+        if self.reported_floor != Some(floor) {
+            self.reported_floor = Some(floor);
+            let _ = self.floors.send(FloorReport::Floor {
+                stream: self.stream.as_str().to_string(),
+                consumer: self.core.spec.name.clone(),
+                floor,
+            });
+        }
     }
 
     /// Reload the stream config after a metadata change (or the first time).
@@ -224,6 +244,8 @@ impl Actor {
 
     pub(crate) async fn run(mut self, mut rx: mpsc::Receiver<Cmd>, token: CancellationToken) {
         let mut watch = self.log.storage().watch_appends(&self.stream);
+        // The restored state is persisted already.
+        self.report_floor();
         loop {
             self.pump().await;
             if self.dirty && self.last_persist.elapsed() >= PERSIST_INTERVAL {
@@ -266,6 +288,12 @@ impl Actor {
                         drain(&mut rx, code::NOT_FOUND, "consumer deleted");
                         let r = self.store.delete(&self.core.spec.name).await
                             .map_err(|e| ConsumerError::Storage(e.to_string()));
+                        if r.is_ok() {
+                            let _ = self.floors.send(FloorReport::Gone {
+                                stream: self.stream.as_str().to_string(),
+                                consumer: self.core.spec.name.clone(),
+                            });
+                        }
                         let _ = reply.send(r);
                         return;
                     }
@@ -455,6 +483,7 @@ impl Actor {
             Ok(()) => {
                 self.dirty = false;
                 self.last_persist = Instant::now();
+                self.report_floor();
             }
             Err(e) => {
                 // Try again on the next persist tick.

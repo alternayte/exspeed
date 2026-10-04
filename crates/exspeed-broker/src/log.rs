@@ -446,6 +446,16 @@ impl Log {
         Ok(())
     }
 
+    /// Remove every record below `keep_from` (work-queue and interest
+    /// retention). Records not yet visible to readers are never removed.
+    pub async fn trim(&self, stream: &StreamName, keep_from: u64) -> Result<(), LogError> {
+        self.check_writable()?;
+        self.storage
+            .trim_up_to(stream, exspeed_common::Offset(keep_from))
+            .await?;
+        Ok(())
+    }
+
     /// Delete a stream and forget its dedup state.
     pub async fn delete_stream(&self, stream: &StreamName) -> Result<(), LogError> {
         self.check_writable()?;
