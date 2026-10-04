@@ -54,6 +54,52 @@ impl SubjectFilter {
         self.tokens.is_empty()
     }
 
+    /// Whether every subject `other` matches also matches `self`.
+    pub fn covers(&self, other: &SubjectFilter) -> bool {
+        if self.is_all() {
+            return true;
+        }
+        if other.is_all() {
+            return false;
+        }
+        let (a, b) = (&self.tokens, &other.tokens);
+        for (i, ta) in a.iter().enumerate() {
+            let Some(tb) = b.get(i) else {
+                return false;
+            };
+            match (ta, tb) {
+                (FilterToken::Rest, _) => return true,
+                (_, FilterToken::Rest) => return false,
+                (FilterToken::One, _) => {}
+                (FilterToken::Literal(x), FilterToken::Literal(y)) if x == y => {}
+                _ => return false,
+            }
+        }
+        a.len() == b.len()
+    }
+
+    /// The filter's text form.
+    pub fn as_pattern(&self) -> String {
+        self.tokens
+            .iter()
+            .map(|t| match t {
+                FilterToken::Literal(l) => l.as_str(),
+                FilterToken::One => "*",
+                FilterToken::Rest => ">",
+            })
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+
+    /// True when the filter has no wildcard (it names one subject).
+    pub fn is_literal(&self) -> bool {
+        !self.tokens.is_empty()
+            && self
+                .tokens
+                .iter()
+                .all(|t| matches!(t, FilterToken::Literal(_)))
+    }
+
     /// Whether some subject matches both filters.
     pub fn overlaps(&self, other: &SubjectFilter) -> bool {
         if self.is_all() || other.is_all() {
@@ -143,6 +189,29 @@ mod tests {
 
     fn subject_matches(subject: &str, pattern: &str) -> bool {
         SubjectFilter::parse(pattern).unwrap().matches(subject)
+    }
+
+    #[test]
+    fn covers() {
+        let c = |a: &str, b: &str| {
+            SubjectFilter::parse(a)
+                .unwrap()
+                .covers(&SubjectFilter::parse(b).unwrap())
+        };
+        assert!(c("", "a.b"));
+        assert!(!c("a.b", ""));
+        assert!(c("orders.>", "orders.*"));
+        assert!(c("orders.>", "orders.eu.>"));
+        assert!(c("orders.*", "orders.eu"));
+        assert!(!c("orders.*", "orders.>"));
+        assert!(!c("orders.*", "orders.eu.x"));
+        assert!(!c("orders.eu", "orders.*"));
+        assert!(!c("orders.>", "orders"));
+        assert!(!c("orders.>", ">"));
+        assert!(c("*.created", "eu.created"));
+        assert_eq!(SubjectFilter::parse("a.*.>").unwrap().as_pattern(), "a.*.>");
+        assert!(SubjectFilter::parse("a.b").unwrap().is_literal());
+        assert!(!SubjectFilter::parse("a.*").unwrap().is_literal());
     }
 
     #[test]

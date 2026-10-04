@@ -7,6 +7,7 @@ pub mod consumer;
 pub mod leadership;
 pub mod lease;
 pub mod log;
+pub mod pubsub;
 pub mod retention_task;
 pub mod snapshot_task;
 

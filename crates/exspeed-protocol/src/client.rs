@@ -471,6 +471,23 @@ pub enum Request {
         /// NATS-style subject filter; empty = all.
         filter: String,
     },
+    /// Publish a core (non-persistent) message to the subscriptions live
+    /// now. With `reply_to` it is a request: the server answers
+    /// `NOT_FOUND` ("no responders") when nobody received it. Correlation
+    /// id 0 = fire-and-forget.
+    CorePublish {
+        subject: String,
+        reply_to: Option<String>,
+        headers: Vec<(String, String)>,
+        value: Bytes,
+    },
+    /// Receive core messages on subjects matching `subject` (a filter). In
+    /// a `queue` group, each message goes to one member. Answered with
+    /// `SubscribeOk`; `Unsubscribe` with that id ends it.
+    CoreSubscribe {
+        subject: String,
+        queue: Option<String>,
+    },
 }
 
 impl Request {
@@ -501,6 +518,8 @@ impl Request {
             Request::Term { .. } => OpCode::Term,
             Request::InProgress { .. } => OpCode::InProgress,
             Request::Read { .. } => OpCode::Read,
+            Request::CorePublish { .. } => OpCode::CorePublish,
+            Request::CoreSubscribe { .. } => OpCode::CoreSubscribe,
         }
     }
 
@@ -618,6 +637,21 @@ impl Request {
                 w.u32(*wait_ms);
                 w.str(filter);
             }
+            Request::CorePublish {
+                subject,
+                reply_to,
+                headers,
+                value,
+            } => {
+                w.str(subject);
+                w.opt(reply_to.as_ref(), |w, r| w.str(r));
+                w.headers(headers);
+                w.bytes(value);
+            }
+            Request::CoreSubscribe { subject, queue } => {
+                w.str(subject);
+                w.opt(queue.as_ref(), |w, q| w.str(q));
+            }
         }
     }
 
@@ -723,6 +757,16 @@ impl Request {
                 wait_ms: r.u32()?,
                 filter: r.str()?,
             },
+            OpCode::CorePublish => Request::CorePublish {
+                subject: r.str()?,
+                reply_to: r.opt(|r| r.str())?,
+                headers: r.headers()?,
+                value: r.bytes()?,
+            },
+            OpCode::CoreSubscribe => Request::CoreSubscribe {
+                subject: r.str()?,
+                queue: r.opt(|r| r.str())?,
+            },
             other => {
                 return Err(ProtocolError::Decode(format!(
                     "opcode {other:?} is not a client request"
@@ -789,6 +833,14 @@ pub enum Response {
     },
     /// JSON reply (stream/consumer info and lists, query results, metadata).
     Json(Bytes),
+    /// Push of a core message for a `CoreSubscribe` (correlation id 0).
+    CoreMsg {
+        sub_id: u32,
+        subject: String,
+        reply_to: Option<String>,
+        headers: Vec<(String, String)>,
+        value: Bytes,
+    },
 }
 
 impl Response {
@@ -857,6 +909,7 @@ impl Response {
             Response::Messages { .. } => OpCode::Messages,
             Response::ReadResult { .. } => OpCode::ReadResult,
             Response::Json(_) => OpCode::Json,
+            Response::CoreMsg { .. } => OpCode::CoreMsg,
         }
     }
 
@@ -938,6 +991,19 @@ impl Response {
                 w.records(records);
             }
             Response::Json(b) => w.raw(b),
+            Response::CoreMsg {
+                sub_id,
+                subject,
+                reply_to,
+                headers,
+                value,
+            } => {
+                w.u32(*sub_id);
+                w.str(subject);
+                w.opt(reply_to.as_ref(), |w, r| w.str(r));
+                w.headers(headers);
+                w.bytes(value);
+            }
         }
     }
 
@@ -976,6 +1042,13 @@ impl Response {
                 Response::PublishBatchOk { results }
             }
             OpCode::SubscribeOk => Response::SubscribeOk { sub_id: r.u32()? },
+            OpCode::CoreMsg => Response::CoreMsg {
+                sub_id: r.u32()?,
+                subject: r.str()?,
+                reply_to: r.opt(|r| r.str())?,
+                headers: r.headers()?,
+                value: r.bytes()?,
+            },
             OpCode::Deliver => Response::Deliver {
                 sub_id: r.u32()?,
                 records: r.records()?,
@@ -1456,6 +1529,26 @@ mod tests {
                 wait_ms: 1000,
                 filter: "a.*".into(),
             },
+            Request::CorePublish {
+                subject: "svc.echo".into(),
+                reply_to: Some("_INBOX.abc.1".into()),
+                headers: vec![("h".into(), "v".into())],
+                value: Bytes::from_static(b"ping"),
+            },
+            Request::CorePublish {
+                subject: "events.x".into(),
+                reply_to: None,
+                headers: vec![],
+                value: Bytes::new(),
+            },
+            Request::CoreSubscribe {
+                subject: "svc.>".into(),
+                queue: Some("workers".into()),
+            },
+            Request::CoreSubscribe {
+                subject: "a".into(),
+                queue: None,
+            },
         ] {
             roundtrip_req(req);
         }
@@ -1499,6 +1592,13 @@ mod tests {
                 records: (0..3).map(rec).collect(),
             },
             Response::Json(Bytes::from_static(b"{\"a\":1}")),
+            Response::CoreMsg {
+                sub_id: 0x8000_0001,
+                subject: "svc.echo".into(),
+                reply_to: Some("_INBOX.abc.1".into()),
+                headers: vec![("h".into(), "v".into())],
+                value: Bytes::from_static(b"ping"),
+            },
         ] {
             roundtrip_resp(resp);
         }

@@ -8,7 +8,8 @@ use sha2::{Digest, Sha256};
 
 use crate::auth::error::AuthError;
 use crate::auth::glob::StreamGlob;
-use crate::auth::types::{Action, Identity, IdentityRef, Permission};
+use crate::auth::types::{Action, Identity, IdentityRef, Permission, SubjectPermission};
+use crate::subject::SubjectFilter;
 
 /// Synthetic credential name used when `EXSPEED_AUTH_TOKEN` is set. Cannot
 /// collide with a TOML-defined credential — the TOML loader rejects an
@@ -33,7 +34,12 @@ struct WireCredential {
 
 #[derive(Debug, Deserialize)]
 struct WirePermission {
-    streams: String,
+    /// Stream-name glob.
+    #[serde(default)]
+    streams: Option<String>,
+    /// Core-message subject filter (NATS-style), instead of `streams`.
+    #[serde(default)]
+    subjects: Option<String>,
     actions: Vec<String>,
 }
 
@@ -122,6 +128,7 @@ impl CredentialStore {
                     streams: StreamGlob::compile("*", LEGACY_ADMIN_NAME)?,
                     actions: Action::Publish | Action::Subscribe | Action::Admin,
                 }],
+                subject_permissions: Vec::new(),
             });
             by_hash.insert(digest, id);
             legacy_admin_present = true;
@@ -170,8 +177,8 @@ fn compile_credential(wc: &WireCredential) -> Result<Identity, AuthError> {
     validate_name_charset(&wc.name)?;
 
     let mut permissions = Vec::with_capacity(wc.permissions.len());
+    let mut subject_permissions = Vec::new();
     for wp in &wc.permissions {
-        let streams = StreamGlob::compile(&wp.streams, &wc.name)?;
         let mut actions = EnumSet::<Action>::new();
         for a in &wp.actions {
             match a.as_str() {
@@ -201,12 +208,41 @@ fn compile_credential(wc: &WireCredential) -> Result<Identity, AuthError> {
                 }
             }
         }
-        permissions.push(Permission { streams, actions });
+        let invalid = |reason: String| AuthError::InvalidPermission {
+            name: wc.name.clone(),
+            reason,
+        };
+        match (&wp.streams, &wp.subjects) {
+            (Some(glob), None) => permissions.push(Permission {
+                streams: StreamGlob::compile(glob, &wc.name)?,
+                actions,
+            }),
+            (None, Some(filter)) => {
+                if actions
+                    .iter()
+                    .any(|a| !matches!(a, Action::Publish | Action::Subscribe))
+                {
+                    return Err(invalid(format!(
+                        "subjects = \"{filter}\" takes only publish and subscribe"
+                    )));
+                }
+                subject_permissions.push(SubjectPermission {
+                    subjects: SubjectFilter::parse(filter).map_err(invalid)?,
+                    actions,
+                })
+            }
+            _ => {
+                return Err(invalid(
+                    "each permission names exactly one of `streams` or `subjects`".into(),
+                ))
+            }
+        }
     }
 
     Ok(Identity {
         name: wc.name.clone(),
         permissions,
+        subject_permissions,
     })
 }
 
@@ -470,6 +506,52 @@ permissions = [{{ streams = "*", actions = ["replicate"] }}]
             "expected Replicate in action set; got {:?}",
             id.permissions,
         );
+    }
+
+    #[test]
+    fn subject_permissions_compile_from_toml() {
+        let f = write_tmp(&format!(
+            r#"
+[[credentials]]
+name = "svc"
+token_sha256 = "{}"
+permissions = [
+  {{ streams = "orders-*", actions = ["publish"] }},
+  {{ subjects = "rpc.>", actions = ["publish", "subscribe"] }},
+]
+"#,
+            hash_of("tok")
+        ));
+        let store = CredentialStore::build(Some(f.path()), None).unwrap();
+        let digest: [u8; 32] = sha2::Sha256::digest(b"tok").into();
+        let id = store.lookup(&digest).unwrap();
+        assert_eq!(id.subject_permissions.len(), 1);
+        let rpc = SubjectFilter::parse("rpc.users.get").unwrap();
+        assert!(id.authorize_subject(Action::Subscribe, &rpc));
+        let other = SubjectFilter::parse("events.x").unwrap();
+        assert!(!id.authorize_subject(Action::Publish, &other));
+    }
+
+    #[test]
+    fn a_permission_names_streams_or_subjects() {
+        for perm in [
+            r#"{ actions = ["publish"] }"#,
+            r#"{ streams = "*", subjects = "a.>", actions = ["publish"] }"#,
+            r#"{ subjects = "a.>", actions = ["admin"] }"#,
+            r#"{ subjects = "a.>.b", actions = ["publish"] }"#,
+        ] {
+            let f = write_tmp(&format!(
+                "[[credentials]]\nname = \"x\"\ntoken_sha256 = \"{}\"\npermissions = [{perm}]\n",
+                hash_of("t")
+            ));
+            assert!(
+                matches!(
+                    CredentialStore::build(Some(f.path()), None),
+                    Err(AuthError::InvalidPermission { .. })
+                ),
+                "{perm}"
+            );
+        }
     }
 
     #[test]

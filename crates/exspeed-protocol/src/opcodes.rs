@@ -82,6 +82,8 @@ opcodes! {
         Term = 0x56,
         InProgress = 0x57,
         Read = 0x60,
+        CorePublish = 0x70,
+        CoreSubscribe = 0x71,
         Ping = 0xF0,
     }
     server {
@@ -96,6 +98,7 @@ opcodes! {
         ConnectOk = 0x88,
         SubscribeOk = 0x89,
         SubscriptionEnded = 0x8A,
+        CoreMsg = 0x8B,
         Pong = 0xF1,
     }
     both {}

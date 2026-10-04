@@ -34,6 +34,7 @@ use tracing::{info, warn};
 use exspeed_broker::broker_append::{AppendResult, IDEMPOTENCY_HEADER};
 use exspeed_broker::consumer::{ConsumerError, SubEvent};
 use exspeed_broker::log::LogError;
+use exspeed_broker::pubsub::{BusError, CoreEvent, CoreMessage, CORE_SUB_ID_BIT};
 use exspeed_broker::Broker;
 use exspeed_common::auth::{Action, CredentialStore, Identity, Permission, StreamGlob};
 use exspeed_common::record_format;
@@ -81,6 +82,7 @@ fn anonymous_identity() -> Identity {
             streams: StreamGlob::compile("*", "anonymous").expect("* is a valid glob"),
             actions: Action::Publish | Action::Subscribe | Action::Admin,
         }],
+        subject_permissions: Vec::new(),
     }
 }
 
@@ -139,10 +141,19 @@ struct SubEntry {
     forwarder: tokio::task::JoinHandle<()>,
 }
 
+/// Core messages queued for one connection before newer ones are dropped
+/// (a slow subscriber loses messages instead of slowing everyone down).
+const CORE_QUEUE: usize = 65_536;
+
 /// Per-connection state that must be cleaned up when the connection ends.
 struct ConnState {
     ctx: Arc<SessionContext>,
     subs: HashMap<u32, SubEntry>,
+    /// Core subscription ids, and the queue (plus its forwarder) that
+    /// carries their messages to this connection.
+    core_subs: Vec<u32>,
+    core_tx: Option<mpsc::Sender<CoreEvent>>,
+    core_forwarder: Option<tokio::task::JoinHandle<()>>,
     ephemeral: Vec<String>,
     /// This connection's publish pipeline (started on the first publish).
     publishes: Option<mpsc::Sender<PublishJob>>,
@@ -154,6 +165,12 @@ struct ConnState {
 impl Drop for ConnState {
     fn drop(&mut self) {
         self.closed.cancel();
+        for id in self.core_subs.drain(..) {
+            self.ctx.broker.bus.unsubscribe(id);
+        }
+        if let Some(f) = self.core_forwarder.take() {
+            f.abort();
+        }
         let consumers = self.ctx.broker.consumers.clone();
         let subs: Vec<(u32, SubEntry)> = self.subs.drain().collect();
         let ephemeral = std::mem::take(&mut self.ephemeral);
@@ -291,6 +308,9 @@ where
     let mut state = ConnState {
         ctx: ctx.clone(),
         subs: HashMap::new(),
+        core_subs: Vec::new(),
+        core_tx: None,
+        core_forwarder: None,
         ephemeral: Vec::new(),
         publishes: None,
         closed: cancel.child_token(),
@@ -333,6 +353,46 @@ where
     drop(out);
     let _ = tokio::time::timeout(Duration::from_secs(5), writer_task).await;
     result
+}
+
+/// Parse a subject a core message is published to: one concrete subject
+/// (no wildcards, no empty tokens).
+fn check_core_subject(subject: &str, what: &str) -> Result<SubjectFilter, Response> {
+    let bad = |m: String| Response::error(code::BAD_REQUEST, m);
+    let f = SubjectFilter::parse(subject).map_err(|e| bad(format!("{what}: {e}")))?;
+    if !f.is_literal() {
+        return Err(bad(format!(
+            "{what} '{subject}' must be a concrete subject (no wildcards, not empty)"
+        )));
+    }
+    Ok(f)
+}
+
+/// Write a connection's core messages to its socket.
+async fn forward_core(mut rx: mpsc::Receiver<CoreEvent>, out: Out) {
+    while let Some(ev) = rx.recv().await {
+        let resp = match ev {
+            CoreEvent::Message { sub_id, msg } => Response::CoreMsg {
+                sub_id,
+                subject: msg.subject.clone(),
+                reply_to: msg.reply_to.clone(),
+                headers: msg.headers.clone(),
+                value: msg.value.clone(),
+            },
+            CoreEvent::Ended {
+                sub_id,
+                code,
+                message,
+            } => Response::SubscriptionEnded {
+                sub_id,
+                code,
+                message,
+            },
+        };
+        if out.0.send(resp.into_frame(0).into()).await.is_err() {
+            return;
+        }
+    }
 }
 
 /// Respond with a 403 and count it.
@@ -974,11 +1034,101 @@ async fn dispatch(
             }
         }
         Request::Unsubscribe { sub_id } => {
-            if let Some(entry) = state.subs.remove(&sub_id) {
+            if sub_id & CORE_SUB_ID_BIT != 0 {
+                if let Some(i) = state.core_subs.iter().position(|&s| s == sub_id) {
+                    state.core_subs.swap_remove(i);
+                    broker.bus.unsubscribe(sub_id);
+                }
+            } else if let Some(entry) = state.subs.remove(&sub_id) {
                 entry.forwarder.abort();
                 broker.consumers.unsubscribe(&entry.consumer, sub_id).await;
             }
             reply_ok(corr).await;
+        }
+
+        // ---- Core messaging (non-persistent) -------------------------------
+        Request::CoreSubscribe { subject, queue } => {
+            let filter = match SubjectFilter::parse(&subject) {
+                Ok(f) if !subject.is_empty() => f,
+                Ok(_) => {
+                    return out
+                        .send(
+                            corr,
+                            Response::error(code::BAD_REQUEST, "a subject filter is required"),
+                        )
+                        .await
+                }
+                Err(e) => return out.send(corr, Response::error(code::BAD_REQUEST, e)).await,
+            };
+            if !identity.authorize_subject(Action::Subscribe, &filter) {
+                return forbid(&ctx, out, corr, "CoreSubscribe").await;
+            }
+            if queue.as_ref().is_some_and(|q| q.len() > 256) {
+                return out
+                    .send(
+                        corr,
+                        Response::error(code::BAD_REQUEST, "queue group name over 256 bytes"),
+                    )
+                    .await;
+            }
+            let tx = state.core_tx.get_or_insert_with(|| {
+                let (tx, rx) = mpsc::channel(CORE_QUEUE);
+                state.core_forwarder = Some(tokio::spawn(forward_core(rx, out.clone())));
+                tx
+            });
+            match broker.bus.subscribe(filter, queue, tx.clone()) {
+                Ok(sub_id) => {
+                    state.core_subs.push(sub_id);
+                    out.send(corr, Response::SubscribeOk { sub_id }).await;
+                }
+                Err(BusError::NotLeader) => out.send(corr, not_leader(&ctx)).await,
+                Err(e) => {
+                    out.send(corr, Response::error(code::INTERNAL, e.to_string()))
+                        .await
+                }
+            }
+        }
+        Request::CorePublish {
+            subject,
+            reply_to,
+            headers,
+            value,
+        } => {
+            let filter = match check_core_subject(&subject, "subject").and_then(|f| match &reply_to
+            {
+                Some(r) => check_core_subject(r, "reply_to").map(|_| f),
+                None => Ok(f),
+            }) {
+                Ok(f) => f,
+                Err(r) => return out.send(corr, r).await,
+            };
+            if !identity.authorize_subject(Action::Publish, &filter) {
+                return forbid(&ctx, out, corr, "CorePublish").await;
+            }
+            let probe = Record {
+                key: None,
+                value: value.clone(),
+                subject: subject.clone(),
+                headers: headers.clone(),
+                timestamp_ns: None,
+            };
+            if let Err(e) = broker.log.limits().check(&probe) {
+                return out.send(corr, Response::error(code::BAD_REQUEST, e)).await;
+            }
+            let msg = CoreMessage {
+                subject,
+                reply_to,
+                headers,
+                value,
+            };
+            match broker.bus.publish(msg) {
+                Ok(_) => reply_ok(corr).await,
+                Err(BusError::NotLeader) => out.send(corr, not_leader(&ctx)).await,
+                Err(e @ BusError::NoResponders(_)) => {
+                    out.send(corr, Response::error(code::NOT_FOUND, e.to_string()))
+                        .await
+                }
+            }
         }
         Request::Pull {
             consumer,

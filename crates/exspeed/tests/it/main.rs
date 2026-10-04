@@ -24,6 +24,7 @@ mod limits_test;
 mod multi_tenant_auth_test;
 mod observability_test;
 mod protocol_test;
+mod pubsub_test;
 mod retention_test;
 mod stream_delete_test;
 mod tls_test;

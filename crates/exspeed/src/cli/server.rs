@@ -799,6 +799,7 @@ where
         let exql_sup = exql_for_supervisor;
         let storage_sup = file_storage.clone();
         let consumers_sup = broker.consumers.clone();
+        let bus_sup = broker.bus.clone();
         let supervisor_cancel = cancel_token.clone();
         // Leader supervisor. While idle (awaiting promotion or demotion) it
         // exits on `supervisor_cancel`. An active tenure ends only when the
@@ -845,7 +846,10 @@ where
                         .start(token.clone())
                         .await
                         .map(|_| ())
-                        .map_err(|e| format!("failed to start consumers: {e}"))
+                        .map_err(|e| format!("failed to start consumers: {e}"))?;
+                    // Core messaging, for this tenure.
+                    bus_sup.serve(token.clone());
+                    Ok(())
                 }
                 .await;
                 if let Err(e) = started {

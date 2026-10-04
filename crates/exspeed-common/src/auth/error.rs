@@ -23,6 +23,9 @@ pub enum AuthError {
     #[error("invalid stream glob '{glob}' on credential '{name}': only [a-zA-Z0-9_-*] allowed")]
     InvalidGlob { name: String, glob: String },
 
+    #[error("invalid permission on credential '{name}': {reason}")]
+    InvalidPermission { name: String, reason: String },
+
     #[error("unknown action '{action}' on credential '{name}'")]
     UnknownAction { name: String, action: String },
 
