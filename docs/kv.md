@@ -28,11 +28,11 @@ bytes). Bucket names are `[A-Za-z0-9_-]`.
 
 | Operation | What it does |
 |-----------|--------------|
-| create bucket | `history` (default 1), `ttl_ms` (every key expires this long after its last put; 0 = never), `max_bytes`. Idempotent for the same settings. |
+| `create(options)` | `history` (default 1), `ttl_ms` (every key expires this long after its last put; 0 = never), `max_bytes`. Idempotent for the same settings. |
 | `get(key)` | The current value and revision; nothing when absent, deleted or expired |
-| `get_revision(key, rev)` | A specific revision, while the bucket still keeps it |
+| `get_revision(key, rev)` (TS `getRevision`) | A specific revision, while the bucket still keeps it |
 | `put(key, value)` | Set the key; returns the new revision. Optionally with a TTL for this value |
-| `create(key, value)` | Set the key only if it doesn't exist (or was deleted) |
+| `create_key(key, value)` (TS `createKey`) | Set the key only if it doesn't exist (or was deleted) |
 | `update(key, value, rev)` | Set the key only if it is at revision `rev` (compare-and-set) |
 | `delete(key)` / `purge(key)` | Tombstone the key (purge also hides its history) |
 | `keys(filter)` | Keys that currently have a value, sorted; `filter` is a subject filter (`users.*`) |
