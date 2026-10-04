@@ -488,6 +488,53 @@ pub enum Request {
         subject: String,
         queue: Option<String>,
     },
+    /// Create a key-value bucket (the stream `KV_<bucket>`). Idempotent for
+    /// the same settings.
+    KvCreateBucket {
+        bucket: String,
+        /// Values kept per key (1..=64; 0 = 1).
+        history: u64,
+        /// Keys expire this long after their last put (0 = never).
+        ttl_ms: u64,
+        /// Size limit (0 = server default).
+        max_bytes: u64,
+    },
+    /// Set a key; answered with `PublishOk` (offset = the new revision).
+    /// `expected_revision`: only if the key is at that revision (0 = absent),
+    /// else `CONFLICT`.
+    KvPut {
+        bucket: String,
+        key: String,
+        value: Bytes,
+        expected_revision: Option<u64>,
+        ttl_ms: Option<u64>,
+    },
+    /// Read a key (its current value, or `revision` while kept); answered
+    /// with `Messages` holding one record, or `NOT_FOUND`.
+    KvGet {
+        bucket: String,
+        key: String,
+        revision: Option<u64>,
+    },
+    /// Delete (or purge) a key; answered with `PublishOk`.
+    KvDelete {
+        bucket: String,
+        key: String,
+        purge: bool,
+        expected_revision: Option<u64>,
+    },
+    /// Keys with a value, matching `filter` ("" = all); answered with a
+    /// JSON array of strings.
+    KvKeys {
+        bucket: String,
+        filter: String,
+    },
+    /// Kept revisions of a key, oldest first (tombstones included); answered
+    /// with `Messages`.
+    KvHistory {
+        bucket: String,
+        key: String,
+    },
 }
 
 impl Request {
@@ -520,6 +567,12 @@ impl Request {
             Request::Read { .. } => OpCode::Read,
             Request::CorePublish { .. } => OpCode::CorePublish,
             Request::CoreSubscribe { .. } => OpCode::CoreSubscribe,
+            Request::KvCreateBucket { .. } => OpCode::KvCreateBucket,
+            Request::KvPut { .. } => OpCode::KvPut,
+            Request::KvGet { .. } => OpCode::KvGet,
+            Request::KvDelete { .. } => OpCode::KvDelete,
+            Request::KvKeys { .. } => OpCode::KvKeys,
+            Request::KvHistory { .. } => OpCode::KvHistory,
         }
     }
 
@@ -652,6 +705,58 @@ impl Request {
                 w.str(subject);
                 w.opt(queue.as_ref(), |w, q| w.str(q));
             }
+            Request::KvCreateBucket {
+                bucket,
+                history,
+                ttl_ms,
+                max_bytes,
+            } => {
+                w.str(bucket);
+                w.u64(*history);
+                w.u64(*ttl_ms);
+                w.u64(*max_bytes);
+            }
+            Request::KvPut {
+                bucket,
+                key,
+                value,
+                expected_revision,
+                ttl_ms,
+            } => {
+                w.str(bucket);
+                w.str(key);
+                w.bytes(value);
+                w.opt(*expected_revision, |w, r| w.u64(r));
+                w.opt(*ttl_ms, |w, t| w.u64(t));
+            }
+            Request::KvGet {
+                bucket,
+                key,
+                revision,
+            } => {
+                w.str(bucket);
+                w.str(key);
+                w.opt(*revision, |w, r| w.u64(r));
+            }
+            Request::KvDelete {
+                bucket,
+                key,
+                purge,
+                expected_revision,
+            } => {
+                w.str(bucket);
+                w.str(key);
+                w.u8(*purge as u8);
+                w.opt(*expected_revision, |w, r| w.u64(r));
+            }
+            Request::KvKeys { bucket, filter } => {
+                w.str(bucket);
+                w.str(filter);
+            }
+            Request::KvHistory { bucket, key } => {
+                w.str(bucket);
+                w.str(key);
+            }
         }
     }
 
@@ -766,6 +871,38 @@ impl Request {
             OpCode::CoreSubscribe => Request::CoreSubscribe {
                 subject: r.str()?,
                 queue: r.opt(|r| r.str())?,
+            },
+            OpCode::KvCreateBucket => Request::KvCreateBucket {
+                bucket: r.str()?,
+                history: r.u64()?,
+                ttl_ms: r.u64()?,
+                max_bytes: r.u64()?,
+            },
+            OpCode::KvPut => Request::KvPut {
+                bucket: r.str()?,
+                key: r.str()?,
+                value: r.bytes()?,
+                expected_revision: r.opt(|r| r.u64())?,
+                ttl_ms: r.opt(|r| r.u64())?,
+            },
+            OpCode::KvGet => Request::KvGet {
+                bucket: r.str()?,
+                key: r.str()?,
+                revision: r.opt(|r| r.u64())?,
+            },
+            OpCode::KvDelete => Request::KvDelete {
+                bucket: r.str()?,
+                key: r.str()?,
+                purge: r.u8()? != 0,
+                expected_revision: r.opt(|r| r.u64())?,
+            },
+            OpCode::KvKeys => Request::KvKeys {
+                bucket: r.str()?,
+                filter: r.str()?,
+            },
+            OpCode::KvHistory => Request::KvHistory {
+                bucket: r.str()?,
+                key: r.str()?,
             },
             other => {
                 return Err(ProtocolError::Decode(format!(
@@ -1548,6 +1685,45 @@ mod tests {
             Request::CoreSubscribe {
                 subject: "a".into(),
                 queue: None,
+            },
+            Request::KvCreateBucket {
+                bucket: "cfg".into(),
+                history: 5,
+                ttl_ms: 60_000,
+                max_bytes: 0,
+            },
+            Request::KvPut {
+                bucket: "cfg".into(),
+                key: "a.b".into(),
+                value: Bytes::from_static(b"v"),
+                expected_revision: Some(0),
+                ttl_ms: Some(1000),
+            },
+            Request::KvPut {
+                bucket: "cfg".into(),
+                key: "a".into(),
+                value: Bytes::new(),
+                expected_revision: None,
+                ttl_ms: None,
+            },
+            Request::KvGet {
+                bucket: "cfg".into(),
+                key: "a".into(),
+                revision: Some(3),
+            },
+            Request::KvDelete {
+                bucket: "cfg".into(),
+                key: "a".into(),
+                purge: true,
+                expected_revision: Some(4),
+            },
+            Request::KvKeys {
+                bucket: "cfg".into(),
+                filter: "a.>".into(),
+            },
+            Request::KvHistory {
+                bucket: "cfg".into(),
+                key: "a".into(),
             },
         ] {
             roundtrip_req(req);

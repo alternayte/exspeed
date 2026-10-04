@@ -713,6 +713,20 @@ impl StorageEngine for LogBackedStorage {
         self.log.storage.stream_config(stream).await
     }
 
+    fn latest_for_subject(&self, stream: &StreamName, subject: &str) -> Option<u64> {
+        self.log.storage.latest_for_subject(stream, subject)
+    }
+
+    fn latest_committed_for_subject(&self, stream: &StreamName, subject: &str) -> Option<u64> {
+        self.log
+            .storage
+            .latest_committed_for_subject(stream, subject)
+    }
+
+    fn subjects_latest(&self, stream: &StreamName) -> Vec<(String, u64)> {
+        self.log.storage.subjects_latest(stream)
+    }
+
     async fn update_stream_config(
         &self,
         stream: &StreamName,

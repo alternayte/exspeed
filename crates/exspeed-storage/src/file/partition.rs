@@ -234,6 +234,25 @@ impl PartitionShared {
             .filter(|&o| o >= self.earliest())
     }
 
+    /// The newest offset of `subject` in the committed log, visible or not
+    /// yet (compare-and-set must see writes still replicating).
+    pub fn latest_committed_for_subject(&self, subject: &str) -> Option<u64> {
+        let ix = self.subjects.read().unwrap();
+        ix.as_ref()?
+            .latest(subject, u64::MAX)
+            .filter(|&o| o >= self.committed_earliest())
+    }
+
+    /// Every subject with its newest visible offset.
+    pub fn subjects_latest(&self) -> Vec<(String, u64)> {
+        let hwm = self.high_watermark();
+        let earliest = self.earliest();
+        let ix = self.subjects.read().unwrap();
+        ix.as_ref()
+            .map(|ix| ix.all_latest(hwm, earliest))
+            .unwrap_or_default()
+    }
+
     /// What readers must hide right now; `None` when nothing (the common
     /// case, so plain streams pay nothing).
     fn visibility(&self, hwm: u64, include_expired: bool) -> Option<Visibility<'_>> {

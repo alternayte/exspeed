@@ -904,6 +904,18 @@ impl StorageEngine for FileStorage {
             .latest_for_subject(subject)
     }
 
+    fn latest_committed_for_subject(&self, stream: &StreamName, subject: &str) -> Option<u64> {
+        self.handle_by_name(stream.as_str())?
+            .shared
+            .latest_committed_for_subject(subject)
+    }
+
+    fn subjects_latest(&self, stream: &StreamName) -> Vec<(String, u64)> {
+        self.handle_by_name(stream.as_str())
+            .map(|h| h.shared.subjects_latest())
+            .unwrap_or_default()
+    }
+
     fn set_read_floor(&self, stream: &StreamName, floor: Option<u64>) {
         self.set_replication_floor(stream.as_str(), floor);
     }

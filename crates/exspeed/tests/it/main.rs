@@ -20,6 +20,7 @@ mod jdbc_sink_mssql_test;
 mod jdbc_sink_mysql_test;
 mod jdbc_sink_postgres_test;
 mod jdbc_sink_sqlite_test;
+mod kv_test;
 mod limits_test;
 mod multi_tenant_auth_test;
 mod observability_test;

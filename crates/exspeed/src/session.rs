@@ -33,6 +33,7 @@ use tracing::{info, warn};
 
 use exspeed_broker::broker_append::{AppendResult, IDEMPOTENCY_HEADER};
 use exspeed_broker::consumer::{ConsumerError, SubEvent};
+use exspeed_broker::kv::{BucketConfig, KvEntry, KvError};
 use exspeed_broker::log::LogError;
 use exspeed_broker::pubsub::{BusError, CoreEvent, CoreMessage, CORE_SUB_ID_BIT};
 use exspeed_broker::Broker;
@@ -353,6 +354,52 @@ where
     drop(out);
     let _ = tokio::time::timeout(Duration::from_secs(5), writer_task).await;
     result
+}
+
+/// Check `action` on a bucket's stream.
+fn authorize_bucket(
+    ctx: &SessionContext,
+    identity: &Identity,
+    bucket: &str,
+    action: Action,
+) -> Result<(), Response> {
+    let stream = exspeed_broker::kv::bucket_stream(bucket)
+        .map_err(|e| Response::error(code::BAD_REQUEST, e.to_string()))?;
+    if identity.authorize(action, &stream) {
+        Ok(())
+    } else {
+        ctx.metrics.auth_denied("forbidden", "tcp", "Kv");
+        Err(Response::error(code::FORBIDDEN, "forbidden"))
+    }
+}
+
+fn kv_error_response(ctx: &SessionContext, e: KvError) -> Response {
+    match e {
+        KvError::Invalid(_) | KvError::NotABucket(_) => {
+            Response::error(code::BAD_REQUEST, e.to_string())
+        }
+        KvError::BucketNotFound(_) => Response::error(code::NOT_FOUND, e.to_string()),
+        KvError::WrongRevision { current, .. } => Response::error_with(
+            code::CONFLICT,
+            e.to_string(),
+            serde_json::json!({ "current_revision": current }),
+        ),
+        KvError::Log(e) => log_error_response(ctx, e),
+    }
+}
+
+/// A KV revision as a wire record (offset = revision, subject = key).
+fn kv_wire(e: KvEntry) -> exspeed_protocol::client::WireRecord {
+    let r = e.record;
+    exspeed_protocol::client::WireRecord {
+        offset: r.offset.0,
+        timestamp_ns: r.timestamp,
+        delivery_count: 0,
+        subject: r.subject,
+        key: r.key,
+        value: r.value,
+        headers: r.headers,
+    }
 }
 
 /// Parse a subject a core message is published to: one concrete subject
@@ -1044,6 +1091,136 @@ async fn dispatch(
                 broker.consumers.unsubscribe(&entry.consumer, sub_id).await;
             }
             reply_ok(corr).await;
+        }
+
+        // ---- Key-value buckets ---------------------------------------------
+        Request::KvCreateBucket {
+            bucket,
+            history,
+            ttl_ms,
+            max_bytes,
+        } => {
+            if let Err(r) = authorize_bucket(&ctx, identity, &bucket, Action::Admin) {
+                return out.send(corr, r).await;
+            }
+            let cfg = BucketConfig {
+                history: history.max(1),
+                ttl_ms,
+                max_bytes,
+            };
+            match broker.kv.create_bucket(&bucket, &cfg).await {
+                Ok(()) => out.send(corr, Response::Ok).await,
+                Err(e) => out.send(corr, kv_error_response(&ctx, e)).await,
+            }
+        }
+        Request::KvPut {
+            bucket,
+            key,
+            value,
+            expected_revision,
+            ttl_ms,
+        } => {
+            if let Err(r) = authorize_bucket(&ctx, identity, &bucket, Action::Publish) {
+                return out.send(corr, r).await;
+            }
+            match broker
+                .kv
+                .put(&bucket, &key, value, expected_revision, ttl_ms)
+                .await
+            {
+                Ok(rev) => {
+                    out.send(
+                        corr,
+                        Response::PublishOk {
+                            offset: rev,
+                            duplicate: false,
+                        },
+                    )
+                    .await
+                }
+                Err(e) => out.send(corr, kv_error_response(&ctx, e)).await,
+            }
+        }
+        Request::KvDelete {
+            bucket,
+            key,
+            purge,
+            expected_revision,
+        } => {
+            if let Err(r) = authorize_bucket(&ctx, identity, &bucket, Action::Publish) {
+                return out.send(corr, r).await;
+            }
+            match broker
+                .kv
+                .delete(&bucket, &key, purge, expected_revision)
+                .await
+            {
+                Ok(rev) => {
+                    out.send(
+                        corr,
+                        Response::PublishOk {
+                            offset: rev,
+                            duplicate: false,
+                        },
+                    )
+                    .await
+                }
+                Err(e) => out.send(corr, kv_error_response(&ctx, e)).await,
+            }
+        }
+        Request::KvGet {
+            bucket,
+            key,
+            revision,
+        } => {
+            if let Err(r) = authorize_bucket(&ctx, identity, &bucket, Action::Subscribe) {
+                return out.send(corr, r).await;
+            }
+            match broker.kv.get(&bucket, &key, revision).await {
+                Ok(Some(e)) => {
+                    out.send(
+                        corr,
+                        Response::Messages {
+                            records: vec![kv_wire(e)],
+                        },
+                    )
+                    .await
+                }
+                Ok(None) => {
+                    out.send(
+                        corr,
+                        Response::error(code::NOT_FOUND, format!("key '{key}' not found")),
+                    )
+                    .await
+                }
+                Err(e) => out.send(corr, kv_error_response(&ctx, e)).await,
+            }
+        }
+        Request::KvKeys { bucket, filter } => {
+            if let Err(r) = authorize_bucket(&ctx, identity, &bucket, Action::Subscribe) {
+                return out.send(corr, r).await;
+            }
+            match broker.kv.keys(&bucket, &filter).await {
+                Ok(keys) => out.send(corr, Response::json(&keys)).await,
+                Err(e) => out.send(corr, kv_error_response(&ctx, e)).await,
+            }
+        }
+        Request::KvHistory { bucket, key } => {
+            if let Err(r) = authorize_bucket(&ctx, identity, &bucket, Action::Subscribe) {
+                return out.send(corr, r).await;
+            }
+            match broker.kv.history(&bucket, &key).await {
+                Ok(entries) => {
+                    out.send(
+                        corr,
+                        Response::Messages {
+                            records: entries.into_iter().map(kv_wire).collect(),
+                        },
+                    )
+                    .await
+                }
+                Err(e) => out.send(corr, kv_error_response(&ctx, e)).await,
+            }
         }
 
         // ---- Core messaging (non-persistent) -------------------------------

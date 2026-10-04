@@ -84,6 +84,12 @@ opcodes! {
         Read = 0x60,
         CorePublish = 0x70,
         CoreSubscribe = 0x71,
+        KvPut = 0x74,
+        KvGet = 0x75,
+        KvDelete = 0x76,
+        KvKeys = 0x77,
+        KvHistory = 0x78,
+        KvCreateBucket = 0x79,
         Ping = 0xF0,
     }
     server {

@@ -63,6 +63,21 @@ impl SubjectIndex {
         below.checked_sub(1).map(|i| q[i])
     }
 
+    /// Every subject with its newest offset in `[earliest, hwm)`.
+    pub fn all_latest(&self, hwm: u64, earliest: u64) -> Vec<(String, u64)> {
+        let mut v: Vec<(String, u64)> = self
+            .map
+            .iter()
+            .filter_map(|(s, q)| {
+                let below = q.partition_point(|&o| o < hwm);
+                let last = q.get(below.checked_sub(1)?)?;
+                (*last >= earliest).then(|| (s.to_string(), *last))
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
     /// Forget subjects whose every record is below `start` (trimmed).
     pub fn forget_below(&mut self, start: u64) {
         self.map

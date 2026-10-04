@@ -4,6 +4,7 @@ pub mod broker_append_snapshot;
 pub mod catalog;
 pub mod cluster;
 pub mod consumer;
+pub mod kv;
 pub mod leadership;
 pub mod lease;
 pub mod log;

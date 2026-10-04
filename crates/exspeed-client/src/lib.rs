@@ -118,7 +118,9 @@ impl Error {
     }
 }
 
+mod kv;
 mod publisher;
+pub use kv::{BucketOptions, Kv, KvEntry, KvOp, KvWatch};
 pub use publisher::{Publisher, PublisherBuilder};
 
 #[derive(Debug, Clone)]
