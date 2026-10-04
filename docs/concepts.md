@@ -1,8 +1,8 @@
 # Concepts
 
-Exspeed combines a Kafka-style durable log, NATS-style subjects, and a SQL
-engine in one binary. This page defines the vocabulary used across the rest
-of the docs.
+Exspeed combines a Kafka-style durable log, NATS-style subjects and
+messaging, RabbitMQ-style queues, a key-value store and a SQL engine in one
+binary. This page defines the vocabulary used across the rest of the docs.
 
 ## Streams
 
@@ -10,9 +10,21 @@ A **stream** is an append-only, ordered log of records. Each stream has
 exactly one partition: there is no partition count to choose, and ordering
 is total within the stream.
 
-Each stream has a retention policy: `max_age` (default 7 days) and
-`max_bytes` (default 10 GB). A background task deletes whole sealed segments
-that exceed either limit. Segments roll at 256 MB.
+Each stream has limits: `max_age` (default 7 days) and `max_bytes` (default
+10 GB). A background task deletes whole sealed segments that exceed either
+limit. Segments roll at 256 MB.
+
+A stream can also behave like a queue. These settings are off by default and
+described in [queues.md](queues.md):
+
+- **Message lifetime:** a TTL for every record (`msg_ttl_ms`) or per record
+  (`exspeed-ttl` header); a count limit (`max_msgs`) that drops the oldest
+  records or rejects new ones (`discard`); a per-subject limit
+  (`max_msgs_per_subject`) that keeps only the newest records of each subject.
+- **Delayed delivery:** a record can ask consumers to hold it until a time
+  (`exspeed-delay`, `exspeed-deliver-at`).
+- **Retention by acknowledgement:** `retention = "work_queue"` removes a
+  record once its consumer acked it; `interest` once every consumer did.
 
 ## Records
 
@@ -65,6 +77,12 @@ HTTP (`POST /api/v1/consumers`):
 | `max_ack_pending` | 1000 | Unacked records allowed before delivery pauses |
 | `dlq_stream` | — | Where records go after `max_deliver` attempts or a `term`. Unset: they are dropped and counted |
 | `ephemeral` | false | Deleted when the creating connection closes (TCP only) |
+| `filter_headers` / `header_match` | — / `all` | Only records whose headers have these values |
+| `single_active` | false | One subscription receives at a time; the next takes over when it leaves |
+| `priority_window` | 0 | Look this many records ahead and deliver higher `exspeed-priority` first |
+| `dead_letter_expired` | false | Dead-letter records whose TTL expires instead of dropping them |
+
+The last four are described in [queues.md](queues.md#consumer-delivery-options).
 
 **Delivery.** Clients either **subscribe** (push, with a credit window the
 SDK tops up automatically) or **pull** batches with a long-poll. Each
@@ -98,6 +116,21 @@ over HTTP) return records from any offset without a consumer, and can
 long-poll for new data.
 
 The wire-level details are in [protocol.md](protocol.md#consumers).
+
+## Core messaging
+
+Besides stream records, clients can publish **core messages**: delivered to
+the subscriptions live at that moment (at most once) and never stored.
+Subscriptions in a **queue group** share a subject's messages. A message with
+a `reply_to` subject is a request; clients wrap this as request-reply, and a
+request nobody is subscribed to fails at once. See
+[messaging.md](messaging.md).
+
+## Key-value buckets
+
+A **bucket** maps keys to values, with a history of the last N values per
+key, compare-and-set, TTLs and watches. A bucket is a stream (`KV_<name>`)
+where each key is a subject. See [kv.md](kv.md).
 
 ## Idempotent publish
 

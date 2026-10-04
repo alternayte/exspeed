@@ -1095,3 +1095,112 @@ async fn unreplicated_records_are_invisible_to_leader_readers() {
     let all = read_all(&ca, "hw").await;
     assert_eq!(all.len(), 2);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queues_messaging_and_kv_across_a_failover() {
+    use exspeed_client::{code, BucketOptions, RetentionPolicy, StreamLimits};
+
+    let o = Opts::new();
+    let dirs = Dirs::new(2);
+    let a = start_node(&o, dirs.path(0)).await;
+    let b = start_node(&o, dirs.path(1)).await;
+    assert_eq!(leader_of(&[&a, &b]).await, 0);
+    eventually(Duration::from_secs(10), || async {
+        let s: serde_json::Value = reqwest::get(a.api_url("/api/v1/cluster"))
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        (s["isr"].as_array()?.len() == 2).then_some(())
+    })
+    .await;
+
+    let la = a.client().await;
+    // A work queue: acked jobs are trimmed on the leader and the follower.
+    la.create_stream(StreamSpec {
+        limits: StreamLimits {
+            retention: RetentionPolicy::WorkQueue,
+            ..Default::default()
+        },
+        ..StreamSpec::named("jobs")
+    })
+    .await
+    .unwrap();
+    la.create_consumer(ConsumerSpec::new("w", "jobs"))
+        .await
+        .unwrap();
+    for i in 0..5 {
+        la.publish("jobs", PublishRecord::new("j", i.to_string()))
+            .await
+            .unwrap();
+    }
+    let got = la.pull("w", 3, Duration::from_secs(1)).await.unwrap();
+    la.ack("w", got.iter().map(|r| r.offset).collect())
+        .await
+        .unwrap();
+    let lb = b.client().await;
+    eventually(Duration::from_secs(10), || async {
+        let info = lb.stream_info("jobs").await.ok()?;
+        (info["earliest_offset"] == 3).then_some(())
+    })
+    .await;
+
+    // A KV value.
+    let kv = la.kv("cfg");
+    kv.create(BucketOptions::default()).await.unwrap();
+    let rev = kv.put("mode", "prod").await.unwrap();
+
+    // Core messaging runs on the leader only.
+    let err = lb.subscribe_core("events.>", None).await.unwrap_err();
+    assert_eq!(err.code(), Some(code::UNAVAILABLE), "{err}");
+    let mut sub = la.subscribe_core("events.>", None).await.unwrap();
+    la.publish_core("events.x", "hi").await.unwrap();
+    assert_eq!(
+        &sub.next_timeout(Duration::from_secs(5))
+            .await
+            .unwrap()
+            .value[..],
+        b"hi"
+    );
+
+    // Fail over to b.
+    o.backend().set_partitioned(&node_id(&a), true);
+    eventually(Duration::from_secs(20), || async {
+        is_leader(&b).await.then_some(())
+    })
+    .await;
+
+    // The core subscription on the old leader ends with 503.
+    assert!(sub.next_timeout(Duration::from_secs(10)).await.is_none());
+    assert_eq!(sub.end_reason().map(|(c, _)| c), Some(code::UNAVAILABLE));
+
+    let lb = b.client().await;
+    // Acked jobs stay gone; the rest are still queued for the consumer.
+    let rest = eventually(Duration::from_secs(10), || {
+        let lb = lb.clone();
+        async move {
+            let r = lb.pull("w", 10, Duration::from_millis(500)).await.ok()?;
+            (!r.is_empty()).then_some(r)
+        }
+    })
+    .await;
+    assert_eq!(rest.iter().map(|r| r.offset).collect::<Vec<_>>(), [3, 4]);
+    // The KV value survived, and compare-and-set continues from it.
+    let kv = lb.kv("cfg");
+    let e = kv.get("mode").await.unwrap().unwrap();
+    assert_eq!((e.revision, &e.value[..]), (rev, &b"prod"[..]));
+    kv.update("mode", "maintenance", rev).await.unwrap();
+    // Core messaging now works on the new leader.
+    let mut sub = lb.subscribe_core("events.>", None).await.unwrap();
+    lb.publish_core("events.y", "again").await.unwrap();
+    assert_eq!(
+        &sub.next_timeout(Duration::from_secs(5))
+            .await
+            .unwrap()
+            .value[..],
+        b"again"
+    );
+
+    o.backend().set_partitioned(&node_id(&a), false);
+}

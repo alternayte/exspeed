@@ -94,8 +94,9 @@ Each response carries:
   changes, deletes streams the leader no longer has, and recreates a stream
   whose uid changed (it was deleted and recreated on the leader).
 - **Per stream:** records, a truncation point, or only the leader's earliest
-  offset. The follower trims up to the leader's earliest offset, which is how
-  retention reaches followers.
+  offset. The follower trims up to the leader's earliest offset, record by
+  record (it moves its log start offset), which is how retention, `max_msgs`
+  and acked work-queue records reach followers.
 
 ```mermaid
 sequenceDiagram
@@ -347,6 +348,10 @@ traffic and less tolerance for slow backends.
 - **Followers apply compaction themselves.** Compacted streams converge on
   the same contents, but a follower may keep superseded records slightly
   longer than the leader.
+- **Core messaging and KV writes run on the leader.** Core subscriptions end
+  with `503` when leadership moves, and messages published during a failover
+  are lost (they are never stored). KV buckets are streams, so their values
+  survive a failover like any record.
 - **One lease backend.** Its availability bounds the cluster's: if Postgres
   or Redis is unreachable for longer than the lease TTL, the leader steps
   down and no one can take over until the backend returns.

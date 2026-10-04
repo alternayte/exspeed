@@ -350,6 +350,7 @@ removed when it is deleted.
 | Process | `exspeed_uptime_seconds`, `exspeed_connections_active`, `exspeed_connections_rejected_total` |
 | Streams | `exspeed_records_published_total{stream}`, `exspeed_publish_latency_seconds{stream}` (histogram), `exspeed_storage_bytes{stream}`, `exspeed_storage_write_errors_total{stream,kind}`, `exspeed_partition_failed{stream}` |
 | Consumers | `exspeed_consumer_lag{stream,consumer}` (leader only), `exspeed_consumer_dead_letters_total{consumer,outcome}` |
+| Core messaging | `exspeed_core_messages_delivered_total`, `exspeed_core_messages_dropped_total` (a subscriber's queue was full) |
 | Dedup | `exspeed_dedup_writes_total{stream,result}`, `exspeed_dedup_collisions_total{stream}`, `exspeed_dedup_map_full_total{stream}`, `exspeed_dedup_map_entries{stream}`, `exspeed_dedup_window_secs{stream}`, `exspeed_dedup_rebuild_duration_seconds{stream,source}`, `exspeed_dedup_snapshot_write_duration_seconds` |
 | Leadership | `exspeed_is_leader`, `exspeed_leader_transitions_total{direction}` (`acquired`, `lost`, `stepped_down`, `resigned`), `exspeed_lease_held{name}`, `exspeed_lease_acquire_total{name,result}`, `exspeed_lease_lost_total{name}` |
 | Replication | `exspeed_replication_*` (see [high-availability.md](high-availability.md#observability)) |
