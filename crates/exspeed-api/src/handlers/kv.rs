@@ -129,15 +129,13 @@ fn op_name(e: &KvEntry) -> &'static str {
 }
 
 /// Expected revision from `If-Match: <rev>` or `If-None-Match: *` (absent).
-fn expected_revision(headers: &HeaderMap) -> Result<Option<u64>, Response> {
+fn expected_revision(headers: &HeaderMap) -> Result<Option<u64>, &'static str> {
     if let Some(v) = headers.get(axum::http::header::IF_MATCH) {
         let s = v.to_str().unwrap_or_default().trim().trim_matches('"');
-        return s.parse().map(Some).map_err(|_| {
-            err(
-                StatusCode::BAD_REQUEST,
-                "If-Match must be a revision number",
-            )
-        });
+        return s
+            .parse()
+            .map(Some)
+            .map_err(|_| "If-Match must be a revision number");
     }
     if headers
         .get(axum::http::header::IF_NONE_MATCH)
@@ -281,7 +279,7 @@ pub async fn put_key(
     }
     let expected = match expected_revision(&headers) {
         Ok(e) => e,
-        Err(r) => return r,
+        Err(m) => return err(StatusCode::BAD_REQUEST, m),
     };
     match state
         .broker
@@ -323,7 +321,7 @@ pub async fn delete_key(
     }
     let expected = match expected_revision(&headers) {
         Ok(e) => e,
-        Err(r) => return r,
+        Err(m) => return err(StatusCode::BAD_REQUEST, m),
     };
     match state
         .broker
