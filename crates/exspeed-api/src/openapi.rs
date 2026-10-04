@@ -106,6 +106,9 @@ pub struct ConsumerSpecDoc {
     /// Must be false over HTTP (ephemeral consumers are tied to a TCP
     /// connection).
     pub ephemeral: Option<bool>,
+    /// Dead-letter records whose TTL expires before they are acked (reason
+    /// `expired`) instead of dropping them.
+    pub dead_letter_expired: Option<bool>,
 }
 
 /// Consumer counters (`exspeed_broker::consumer::ConsumerStats`).
@@ -136,6 +139,8 @@ pub struct ConsumerInfoDoc {
     pub ack_floor: u64,
     pub num_unacked: u64,
     pub num_in_flight: u64,
+    /// Records held back until their delivery time.
+    pub num_delayed: u64,
     /// Records not yet delivered (approximate).
     pub num_waiting: u64,
     /// `high_watermark - ack_floor`.
@@ -387,6 +392,7 @@ mod tests {
             ack_floor: 0,
             num_unacked: 0,
             num_in_flight: 0,
+            num_delayed: 0,
             num_waiting: 0,
             lag: 0,
             subscribers: 0,

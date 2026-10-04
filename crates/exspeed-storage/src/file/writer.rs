@@ -22,24 +22,30 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
-use exspeed_common::Offset;
-use exspeed_streams::{Record, StorageError, StoredRecord};
+use exspeed_common::{record_format, Offset};
+use exspeed_streams::{DiscardPolicy, Record, StorageError, StoredRecord, StreamConfig};
 use tracing::{error, info, warn};
 
 use crate::encoding::{encode_frame, RecordRef};
 use crate::file::fsutil::{fsync_dir, remove_if_exists};
 use crate::file::io_errors::is_storage_full;
 use crate::file::partition::{
-    apply_truncation, recover, write_truncate_marker, Durability, PartitionShared, Recovered,
-    TRUNCATE_MARKER,
+    apply_truncation, recover, save_log_start, write_truncate_marker, Durability, PartitionShared,
+    Recovered, TRUNCATE_MARKER,
 };
 use crate::file::segment::{
     create_segment_file, encode_index, idx_path, meta_path, save_meta, seg_path, IndexBuilder,
     IndexEntry, Segment, SegmentMeta, SegmentStats, INDEX_ENTRY_LEN, SEGMENT_HEADER_LEN,
 };
+use crate::file::subjects::SubjectIndex;
 
 /// Default maximum segment size before rolling: 256 MiB.
 pub const DEFAULT_SEGMENT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// A moved log start offset is persisted within this long. Losing the last
+/// moves in a crash only brings back records that were already gone
+/// (trimmed, discarded or acked), never loses any.
+const START_PERSIST_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Group-commit tunables. A commit happens when `flush_window` has passed
 /// since the first queued request, or when the queued requests reach either
@@ -195,11 +201,33 @@ pub enum Cmd {
         reply: Reply<Result<bool, StorageError>>,
     },
     SetSegmentMaxBytes(u64),
+    /// The stream config changed: rebuild what depends on it.
+    ConfigChanged,
     #[allow(dead_code)] // only constructed by tests
     SetHooks(Option<Arc<dyn IoHooks>>),
     Shutdown {
         reply: Option<Reply<()>>,
     },
+}
+
+/// Which limit a `discard = new` append would break, if any: `count` records
+/// are stored, `incoming` arrive; `stored_bytes` are on disk and `pending`
+/// more are queued in this group commit.
+fn over_limit(
+    cfg: &StreamConfig,
+    count: u64,
+    incoming: usize,
+    stored_bytes: u64,
+    pending: usize,
+    req: &AppendReq,
+) -> Option<String> {
+    if cfg.max_msgs > 0 && count + incoming as u64 > cfg.max_msgs {
+        return Some(format!("max_msgs = {}", cfg.max_msgs));
+    }
+    if stored_bytes + (pending + req.approx_bytes()) as u64 > cfg.max_bytes {
+        return Some(format!("max_bytes = {}", cfg.max_bytes));
+    }
+    None
 }
 
 pub fn now_nanos() -> u64 {
@@ -230,6 +258,9 @@ struct Writer {
     last_sync: Instant,
     buf: Vec<u8>,
     hooks: Option<Arc<dyn IoHooks>>,
+    /// The log start offset moved since it was last persisted.
+    start_dirty: bool,
+    start_saved: Instant,
 }
 
 /// Start the writer thread for a recovered partition.
@@ -252,10 +283,13 @@ pub fn spawn(
         last_sync: Instant::now(),
         buf: Vec::new(),
         hooks: None,
+        start_dirty: false,
+        start_saved: Instant::now(),
         shared,
         opts,
     };
     w.install(rec);
+    w.rebuild_subject_index();
     let name = format!("exspeed-writer-{}", w.shared.stream);
     let handle = std::thread::Builder::new()
         .name(name)
@@ -287,25 +321,42 @@ impl Writer {
         self.synced_len = rec.active_stats.len;
         self.shared.set_segments(rec.segments);
         self.shared.publish_committed(rec.next_offset);
+        if self.shared.log_start() > rec.next_offset {
+            self.shared.set_log_start(rec.next_offset);
+            self.start_dirty = true;
+            self.persist_start(true);
+        }
     }
 
     fn run(mut self, rx: Receiver<Cmd>) {
         loop {
-            let first = if self.opts.durability == Durability::Async && self.dirty() {
-                let deadline = self.last_sync + self.opts.async_interval;
-                match rx.recv_deadline(deadline) {
+            let mut deadline = None;
+            if self.opts.durability == Durability::Async && self.dirty() {
+                deadline = Some(self.last_sync + self.opts.async_interval);
+            }
+            if self.start_dirty {
+                let d = self.start_saved + START_PERSIST_INTERVAL;
+                deadline = Some(deadline.map_or(d, |x: Instant| x.min(d)));
+            }
+            let first = match deadline {
+                Some(deadline) => match rx.recv_deadline(deadline) {
                     Ok(c) => c,
                     Err(RecvTimeoutError::Timeout) => {
-                        self.async_sync();
+                        if self.opts.durability == Durability::Async
+                            && self.dirty()
+                            && self.last_sync.elapsed() >= self.opts.async_interval
+                        {
+                            self.async_sync();
+                        }
+                        self.persist_start(false);
                         continue;
                     }
                     Err(RecvTimeoutError::Disconnected) => break,
-                }
-            } else {
-                match rx.recv() {
+                },
+                None => match rx.recv() {
                     Ok(c) => c,
                     Err(_) => break,
-                }
+                },
             };
             match first {
                 Cmd::Append(req) => {
@@ -376,6 +427,7 @@ impl Writer {
             } => reply.send(self.retention(max_age_secs, max_bytes)),
             Cmd::InstallCompacted { job, reply } => reply.send(self.install_compacted(job)),
             Cmd::SetSegmentMaxBytes(n) => self.opts.segment_max_bytes = n.max(1),
+            Cmd::ConfigChanged => self.rebuild_subject_index(),
             Cmd::SetHooks(h) => self.hooks = h,
             Cmd::Shutdown { reply } => {
                 self.shutdown();
@@ -389,6 +441,7 @@ impl Writer {
     }
 
     fn shutdown(&mut self) {
+        self.persist_start(true);
         if let Some(idx) = self.idx.as_mut() {
             let _ = idx.flush();
         }
@@ -524,10 +577,28 @@ impl Writer {
         let mut next = self.next_offset;
         let mut frames: Vec<(u64, usize, u64)> = Vec::new();
         let mut accepted: Vec<(AppendReq, Vec<(Offset, u64)>)> = Vec::with_capacity(group.len());
+        let cfg = self.shared.config();
+        let reject_new = cfg.as_ref().filter(|c| c.discard == DiscardPolicy::New);
+        let earliest = self.shared.committed_earliest();
+        let stored_bytes = self.shared.total_bytes();
         for req in group {
             if req.len() == 0 {
                 req.succeed(Vec::new());
                 continue;
+            }
+            // `discard = new`: a client append that doesn't fit is rejected
+            // whole. Replicated appends (`At`) mirror the leader, which
+            // already decided.
+            if let (Some(c), AppendReq::Records { .. }) = (reject_new, &req) {
+                if let Some(limit) =
+                    over_limit(c, next - earliest, req.len(), stored_bytes, buf.len(), &req)
+                {
+                    req.fail(StorageError::StreamFull {
+                        stream: self.shared.stream.clone(),
+                        limit,
+                    });
+                    continue;
+                }
             }
             let (mark, mark_next, mark_frames) = (buf.len(), next, frames.len());
             match Self::encode(&mut buf, &req, &mut next, &mut frames) {
@@ -592,10 +663,30 @@ impl Writer {
         self.active.publish(&new_entries, self.stats);
         self.append_index(&new_entries);
         self.shared.publish_committed(next);
+        if self.shared.has_subject_index() {
+            let hwm = self.shared.high_watermark();
+            self.shared.with_subject_index(|ix| {
+                for &(offset, pos, _) in &frames {
+                    if let Ok(subject) = record_format::subject(&buf[pos..]) {
+                        ix.observe(subject, offset, hwm);
+                    }
+                }
+            });
+        }
         for (req, results) in accepted {
             req.succeed(results);
         }
         self.buf = buf;
+        // `discard = old`: drop the oldest records beyond `max_msgs`.
+        if let Some(c) = cfg.as_ref() {
+            if c.max_msgs > 0 && c.discard == DiscardPolicy::Old {
+                let target = next.saturating_sub(c.max_msgs);
+                if target > self.shared.log_start() {
+                    self.advance_start(target);
+                }
+            }
+        }
+        self.persist_start(false);
 
         if !sync && self.stats.len - self.synced_len >= self.opts.async_threshold_bytes as u64 {
             self.async_sync();
@@ -788,15 +879,81 @@ impl Writer {
         Ok(self.remove_segments(&doomed))
     }
 
+    /// Drop every record below `keep_from` (record-exact: the log start
+    /// moves; whole segments below it are deleted).
     fn trim(&mut self, keep_from: u64) -> Result<RetentionStats, StorageError> {
+        if let Some(e) = self.shared.failed_error() {
+            return Err(e);
+        }
+        Ok(self.advance_start(keep_from))
+    }
+
+    /// Move the log start offset up to `to` (never past the high watermark:
+    /// records readers can't see yet are never removed) and delete the
+    /// segments entirely below it.
+    fn advance_start(&mut self, to: u64) -> RetentionStats {
+        let to = to.min(self.shared.high_watermark()).min(self.next_offset);
+        if to <= self.shared.log_start() {
+            return RetentionStats::default();
+        }
+        self.shared.set_log_start(to);
+        self.start_dirty = true;
+        self.shared.with_subject_index(|ix| ix.forget_below(to));
         let list = self.shared.segments();
-        // As in `retention`: nothing at or above the high watermark goes.
-        let keep_from = keep_from.min(self.shared.high_watermark());
         // Segment i holds only offsets below segment i+1's base.
         let doomed: Vec<usize> = (0..list.len() - 1)
-            .take_while(|&i| list[i + 1].base_offset <= keep_from)
+            .take_while(|&i| list[i + 1].base_offset <= to)
             .collect();
-        Ok(self.remove_segments(&doomed))
+        self.remove_segments(&doomed)
+    }
+
+    /// Persist a moved log start offset: now when `force`, otherwise at
+    /// most every [`START_PERSIST_INTERVAL`].
+    fn persist_start(&mut self, force: bool) {
+        if !self.start_dirty || (!force && self.start_saved.elapsed() < START_PERSIST_INTERVAL) {
+            return;
+        }
+        let start = self.shared.log_start();
+        match save_log_start(&self.shared.dir, start) {
+            Ok(()) => self.start_dirty = false,
+            Err(e) => warn!(
+                stream = self.shared.stream.as_str(),
+                error = %e,
+                "failed to persist the log start offset; will retry"
+            ),
+        }
+        self.start_saved = Instant::now();
+    }
+
+    /// (Re)build the per-subject index from the log when the stream has a
+    /// `max_msgs_per_subject` limit; drop it otherwise.
+    fn rebuild_subject_index(&mut self) {
+        let limit = self.shared.config().map_or(0, |c| c.max_msgs_per_subject);
+        if limit == 0 {
+            self.shared.set_subject_index(None);
+            return;
+        }
+        let mut ix = SubjectIndex::new(limit);
+        let hwm = self.shared.high_watermark();
+        let mut from = self.shared.committed_earliest();
+        loop {
+            let batch = match self.shared.read_committed(from, 4096, 8 << 20) {
+                Ok(b) => b,
+                Err(e) => {
+                    error!(stream = self.shared.stream.as_str(), error = %e,
+                           "failed to build the per-subject index");
+                    break;
+                }
+            };
+            for r in &batch.records {
+                ix.observe(&r.subject, r.offset.0, hwm);
+            }
+            if batch.records.is_empty() || batch.next_offset.0 <= from {
+                break;
+            }
+            from = batch.next_offset.0;
+        }
+        self.shared.set_subject_index(Some(ix));
     }
 
     fn truncate(&mut self, drop_from: u64) -> Result<(), StorageError> {
@@ -805,6 +962,11 @@ impl Writer {
         }
         if drop_from >= self.next_offset {
             return Ok(());
+        }
+        if self.shared.log_start() > drop_from {
+            self.shared.set_log_start(drop_from);
+            self.start_dirty = true;
+            self.persist_start(true);
         }
         // Hide the doomed records first.
         self.shared.begin_truncation();
@@ -828,6 +990,7 @@ impl Writer {
                     drop_from, "truncated partition"
                 );
                 self.install(rec);
+                self.rebuild_subject_index();
                 Ok(())
             }
             Err(e) => {

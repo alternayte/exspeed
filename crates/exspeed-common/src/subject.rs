@@ -54,6 +54,30 @@ impl SubjectFilter {
         self.tokens.is_empty()
     }
 
+    /// Whether some subject matches both filters.
+    pub fn overlaps(&self, other: &SubjectFilter) -> bool {
+        if self.is_all() || other.is_all() {
+            return true;
+        }
+        let (a, b) = (&self.tokens, &other.tokens);
+        for i in 0..a.len().max(b.len()) {
+            match (a.get(i), b.get(i)) {
+                (Some(FilterToken::Rest), Some(_)) | (Some(_), Some(FilterToken::Rest)) => {
+                    return true
+                }
+                (Some(FilterToken::Literal(x)), Some(FilterToken::Literal(y))) if x != y => {
+                    return false
+                }
+                (Some(_), Some(_)) => {}
+                // One filter ran out: only a trailing `>` on the other could
+                // still match, and it needs at least one more token, which the
+                // shorter filter can't produce.
+                _ => return false,
+            }
+        }
+        true
+    }
+
     pub fn matches(&self, subject: &str) -> bool {
         if self.tokens.is_empty() {
             return true;
@@ -103,6 +127,14 @@ impl SubjectFilters {
     pub fn is_all(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// Whether some subject matches both filter sets.
+    pub fn overlaps(&self, other: &SubjectFilters) -> bool {
+        if self.is_all() || other.is_all() {
+            return true;
+        }
+        self.0.iter().any(|a| other.0.iter().any(|b| a.overlaps(b)))
+    }
 }
 
 #[cfg(test)]
@@ -111,6 +143,37 @@ mod tests {
 
     fn subject_matches(subject: &str, pattern: &str) -> bool {
         SubjectFilter::parse(pattern).unwrap().matches(subject)
+    }
+
+    #[test]
+    fn overlap() {
+        let o = |a: &str, b: &str| {
+            let (fa, fb) = (
+                SubjectFilter::parse(a).unwrap(),
+                SubjectFilter::parse(b).unwrap(),
+            );
+            assert_eq!(
+                fa.overlaps(&fb),
+                fb.overlaps(&fa),
+                "symmetric for {a} / {b}"
+            );
+            fa.overlaps(&fb)
+        };
+        assert!(o("", "a.b"));
+        assert!(o("a.b", "a.b"));
+        assert!(!o("a.b", "a.c"));
+        assert!(o("a.*", "a.b"));
+        assert!(o("a.>", "a.b.c"));
+        assert!(!o("a.>", "a"));
+        assert!(!o("a.*", "a.b.c"));
+        assert!(o("*.b", "a.*"));
+        assert!(!o("orders.eu.*", "orders.us.>"));
+        assert!(o("orders.*.created", "orders.eu.>"));
+        assert!(!o("a.b", "a.b.c"));
+        let fs = |v: &[&str]| SubjectFilters::parse(v).unwrap();
+        assert!(!fs(&["eu.>"]).overlaps(&fs(&["us.>", "asia.*"])));
+        assert!(fs(&["eu.>"]).overlaps(&fs(&["us.>", "eu.x"])));
+        assert!(fs(&[]).overlaps(&fs(&["us.>"])));
     }
 
     #[test]

@@ -385,6 +385,9 @@ pub fn log_error_response(ctx: &SessionContext, e: LogError) -> Response {
         LogError::Storage(StorageError::StreamNotFound(s)) => {
             Response::error(code::NOT_FOUND, format!("stream '{s}' not found"))
         }
+        LogError::Storage(e @ StorageError::StreamFull { .. }) => {
+            Response::error(code::TOO_MANY_REQUESTS, e.to_string())
+        }
         LogError::Storage(StorageError::StreamAlreadyExists(s)) => {
             Response::error(code::CONFLICT, format!("stream '{s}' already exists"))
         }
@@ -432,7 +435,7 @@ fn stream_config(s: &StreamSpec, default_window_secs: u64) -> StreamConfig {
     );
     cfg.compaction = s.compaction;
     cfg.dedup_window_secs = cfg.dedup_window_secs.min(cfg.max_age_secs);
-    cfg
+    cfg.with_limits(&s.limits)
 }
 
 /// Resolve the consumer's stream and check `action` on it.

@@ -19,7 +19,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use exspeed_common::{Metrics, StreamName};
+use exspeed_common::{msg_time, Metrics, StreamName};
 use exspeed_streams::{Record, StorageEngine, StorageError, StreamConfig};
 
 use crate::broker_append::{AppendResult, BrokerAppend, IDEMPOTENCY_HEADER};
@@ -199,6 +199,7 @@ impl LogError {
             LogError::Storage(e) => matches!(
                 e,
                 StorageError::DedupMapFull { .. }
+                    | StorageError::StreamFull { .. }
                     | StorageError::Io(_)
                     | StorageError::ChannelClosed
             ),
@@ -318,6 +319,32 @@ impl Log {
         Ok(())
     }
 
+    /// Validate time headers (`exspeed-ttl`, `exspeed-delay`,
+    /// `exspeed-deliver-at`) against the stream's settings. Only looks up the
+    /// config when a record carries one of them.
+    async fn check_time_headers(
+        &self,
+        stream: &StreamName,
+        records: &[&Record],
+    ) -> Result<(), LogError> {
+        let has = |r: &Record| {
+            r.headers.iter().any(|(k, _)| {
+                k == msg_time::TTL_HEADER
+                    || k == msg_time::DELAY_HEADER
+                    || k == msg_time::DELIVER_AT_HEADER
+            })
+        };
+        if !records.iter().any(|r| has(r)) {
+            return Ok(());
+        }
+        let cfg = self.storage.stream_config(stream).await?;
+        for r in records {
+            msg_time::check_headers(&r.headers, cfg.allow_msg_ttl, cfg.allow_delayed)
+                .map_err(LogError::InvalidRecord)?;
+        }
+        Ok(())
+    }
+
     /// Append one record.
     pub async fn append(
         &self,
@@ -326,6 +353,7 @@ impl Log {
     ) -> Result<AppendResult, LogError> {
         self.check_appendable()?;
         self.check_record(&record)?;
+        self.check_time_headers(stream, &[&record]).await?;
         let result = self.dedup.append(stream, &record).await?;
         if let AppendResult::Written(..) = result {
             self.metrics.record_publish(stream.as_str());
@@ -346,6 +374,8 @@ impl Log {
         for r in &records {
             self.check_record(r)?;
         }
+        self.check_time_headers(stream, &records.iter().collect::<Vec<_>>())
+            .await?;
         let results = self.dedup.append_batch(stream, records).await?;
         for r in &results {
             if let AppendResult::Written(..) = r {

@@ -22,6 +22,7 @@ pub mod io_errors;
 pub mod partition;
 pub mod segment;
 pub mod stream_config;
+pub mod subjects;
 pub mod writer;
 
 use std::fs;
@@ -170,18 +171,14 @@ impl PartitionHandle {
                 format!("stream.json of {} is unreadable", self.shared.stream),
             ))
         })?;
-        if !cfg.compaction {
+        if !compaction::wanted(&cfg) {
             return Ok(CompactionStats::default());
         }
         if let Some(e) = self.shared.failed_error() {
             return Err(e);
         }
         let _g = self.compaction_lock.lock().unwrap();
-        let jobs = compaction::prepare(
-            &self.shared,
-            cfg.tombstone_retention_secs,
-            writer::now_nanos(),
-        )?;
+        let jobs = compaction::prepare(&self.shared, &cfg, writer::now_nanos())?;
         let mut total = CompactionStats::default();
         for (job, stats) in jobs {
             if self.call_blocking(|reply| Cmd::InstallCompacted { job, reply })?? {
@@ -359,6 +356,12 @@ impl FileStorage {
         self.handle_by_name(stream).map(|h| h.shared.total_bytes())
     }
 
+    /// Offset of the first retained record. `None` if the stream is unknown.
+    pub fn earliest_offset(&self, stream: &StreamName) -> Option<u64> {
+        self.handle_by_name(stream.as_str())
+            .map(|h| h.shared.earliest())
+    }
+
     /// The high watermark (offset the next visible record gets). `None` if
     /// the stream is unknown.
     pub fn stream_head_offset(&self, stream: &str) -> Option<u64> {
@@ -472,8 +475,15 @@ impl FileStorage {
                 );
                 continue;
             };
+            // A stream-wide TTL that no record can override expires whole
+            // segments as surely as `max_age`.
+            let max_age_secs = if cfg.msg_ttl_ms > 0 && !cfg.allow_msg_ttl {
+                cfg.max_age_secs.min(cfg.msg_ttl_ms.div_ceil(1000))
+            } else {
+                cfg.max_age_secs
+            };
             match h.call_blocking(|reply| Cmd::Retention {
-                max_age_secs: cfg.max_age_secs,
+                max_age_secs,
                 max_bytes: cfg.max_bytes,
                 reply,
             }) {
@@ -580,6 +590,7 @@ fn start_partition(
         rec.segments.clone(),
         rec.next_offset,
         config,
+        partition::load_log_start(dir),
     ));
     let (tx, thread) = writer::spawn(shared.clone(), rec, wopts)?;
     Ok(Arc::new(PartitionHandle {
@@ -610,7 +621,10 @@ fn fenced_partition(
          PartitionFailed); other streams are unaffected. Restore or remove the damaged \
          segment and restart"
     );
-    let shared = Arc::new(PartitionShared::new(stream, dir, segments, next, config));
+    let start = partition::load_log_start(dir);
+    let shared = Arc::new(PartitionShared::new(
+        stream, dir, segments, next, config, start,
+    ));
     shared.fail(format!("recovery failed: {err}"));
     // No writer: the receiver is dropped, so every command fails to send and
     // `call` reports the partition failure.
@@ -628,7 +642,7 @@ fn compact_all(inner: &Inner) -> CompactionStats {
         inner.partitions.iter().map(|e| e.value().clone()).collect();
     let mut total = CompactionStats::default();
     for h in handles {
-        if !h.shared.config().is_some_and(|c| c.compaction) {
+        if !h.shared.config().is_some_and(|c| compaction::wanted(&c)) {
             continue;
         }
         match h.compact() {
@@ -725,6 +739,7 @@ impl StorageEngine for FileStorage {
         let cfg = config.clone();
         blocking(move || cfg.save(&dir).map_err(StorageError::Io)).await?;
         h.shared.set_config(config.clone());
+        let _ = h.tx.send(Cmd::ConfigChanged);
         Ok(())
     }
 
@@ -849,14 +864,10 @@ impl StorageEngine for FileStorage {
         stream: &StreamName,
     ) -> Result<(Offset, Offset), StorageError> {
         let h = self.handle(stream)?;
-        let committed = h.shared.committed();
-        let earliest = h
-            .shared
-            .segments()
-            .first()
-            .map_or(committed, |s| s.base_offset)
-            .min(committed);
-        Ok((Offset(earliest), Offset(committed)))
+        Ok((
+            Offset(h.shared.committed_earliest()),
+            Offset(h.shared.committed()),
+        ))
     }
 
     async fn read_batch_committed(
@@ -871,6 +882,26 @@ impl StorageEngine for FileStorage {
                 .read_committed(from.0, limits.max_records.max(1), limits.max_bytes)
         })
         .await
+    }
+
+    async fn read_raw_including_expired(
+        &self,
+        stream: &StreamName,
+        from: Offset,
+        limits: ReadLimits,
+    ) -> Result<RawBatch, StorageError> {
+        let h = self.handle(stream)?;
+        blocking(move || {
+            h.shared
+                .read_raw_with(from.0, limits.max_records.max(1), limits.max_bytes, true)
+        })
+        .await
+    }
+
+    fn latest_for_subject(&self, stream: &StreamName, subject: &str) -> Option<u64> {
+        self.handle_by_name(stream.as_str())?
+            .shared
+            .latest_for_subject(subject)
     }
 
     fn set_read_floor(&self, stream: &StreamName, floor: Option<u64>) {

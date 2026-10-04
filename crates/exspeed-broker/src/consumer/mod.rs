@@ -85,6 +85,8 @@ pub struct ConsumerInfo {
     pub ack_floor: u64,
     pub num_unacked: u64,
     pub num_in_flight: u64,
+    /// Records held back until their delivery time (`exspeed-delay`).
+    pub num_delayed: u64,
     /// Records not yet delivered (approximate: includes filtered-out ones).
     pub num_waiting: u64,
     /// `high_watermark - ack_floor`.

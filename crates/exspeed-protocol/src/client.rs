@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 
 use exspeed_common::record_format;
 
+pub use exspeed_common::limits::{DiscardPolicy, RetentionPolicy, StreamLimits};
+
 use crate::error::ProtocolError;
 use crate::frame::{Frame, OutFrame};
 use crate::opcodes::OpCode;
@@ -88,6 +90,33 @@ impl PublishRecord {
     pub fn msg_id(mut self, id: impl Into<String>) -> Self {
         self.msg_id = Some(id.into());
         self
+    }
+
+    /// Expire the record this long after it is appended (the stream must
+    /// allow per-message TTLs).
+    pub fn ttl(self, ttl: std::time::Duration) -> Self {
+        self.header(
+            exspeed_common::msg_time::TTL_HEADER,
+            format!("{}ms", ttl.as_millis().max(1)),
+        )
+    }
+
+    /// Deliver the record to consumers no earlier than this long after it is
+    /// appended (the stream must allow delayed delivery).
+    pub fn delay(self, delay: std::time::Duration) -> Self {
+        self.header(
+            exspeed_common::msg_time::DELAY_HEADER,
+            format!("{}ms", delay.as_millis()),
+        )
+    }
+
+    /// Deliver the record to consumers no earlier than this time
+    /// (milliseconds since the Unix epoch).
+    pub fn deliver_at(self, epoch_ms: u64) -> Self {
+        self.header(
+            exspeed_common::msg_time::DELIVER_AT_HEADER,
+            epoch_ms.to_string(),
+        )
     }
 }
 
@@ -231,6 +260,9 @@ pub struct StreamSpec {
     pub dedup_max_entries: u64,
     /// Keep only the latest record per key (log compaction).
     pub compaction: bool,
+    /// Message limits, TTLs, delayed delivery and the retention policy.
+    /// Encoded as a trailing JSON object, sent only when not all defaults.
+    pub limits: StreamLimits,
 }
 
 /// Where a consumer starts reading when it is created.
@@ -304,6 +336,10 @@ pub struct ConsumerSpec {
     /// Deleted automatically when the connection that created it closes.
     #[serde(default)]
     pub ephemeral: bool,
+    /// Dead-letter records whose TTL expires before they are acked (to
+    /// `dlq_stream`, reason `expired`) instead of silently dropping them.
+    #[serde(default)]
+    pub dead_letter_expired: bool,
 }
 
 impl ConsumerSpec {
@@ -321,6 +357,7 @@ impl ConsumerSpec {
             max_ack_pending: default_max_ack_pending(),
             dlq_stream: None,
             ephemeral: false,
+            dead_letter_expired: false,
         }
     }
 }
@@ -1083,6 +1120,9 @@ impl Writer {
         self.u64(s.dedup_window_secs);
         self.u64(s.dedup_max_entries);
         self.u8(s.compaction as u8);
+        if !s.limits.is_default() {
+            self.bytes(&serde_json::to_vec(&s.limits).expect("StreamLimits serializes"));
+        }
     }
     /// Encode one record. Panics if a field exceeds its width (the
     /// broker's write path rejects such records before they are stored).
@@ -1228,6 +1268,13 @@ impl Reader {
             dedup_window_secs: self.u64()?,
             dedup_max_entries: self.u64()?,
             compaction: self.u8()? != 0,
+            limits: if self.buf.has_remaining() {
+                let raw = self.bytes()?;
+                serde_json::from_slice(&raw)
+                    .map_err(|e| ProtocolError::Decode(format!("invalid stream limits: {e}")))?
+            } else {
+                StreamLimits::default()
+            },
         })
     }
     /// Decode one record, verifying its length field, structure and CRC.
@@ -1305,6 +1352,20 @@ mod tests {
             dedup_window_secs: 3,
             dedup_max_entries: 4,
             compaction: true,
+            limits: StreamLimits::default(),
+        };
+        let limited = StreamSpec {
+            name: "q".into(),
+            limits: StreamLimits {
+                max_msgs: 10,
+                discard: DiscardPolicy::New,
+                max_msgs_per_subject: 1,
+                allow_msg_ttl: true,
+                msg_ttl_ms: 5_000,
+                allow_delayed: true,
+                retention: RetentionPolicy::WorkQueue,
+            },
+            ..StreamSpec::default()
         };
         let mut cs = ConsumerSpec::new("c", "s");
         cs.filter_subjects = vec!["orders.>".into()];
@@ -1332,6 +1393,7 @@ mod tests {
             },
             Request::CreateStream(spec.clone()),
             Request::UpdateStream(spec),
+            Request::CreateStream(limited),
             Request::DeleteStream { name: "s".into() },
             Request::StreamInfo { name: "s".into() },
             Request::ListStreams,

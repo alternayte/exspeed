@@ -293,7 +293,7 @@ async fn crash_before_install_keeps_original_data() {
             .unwrap();
         written = fill(&storage, name, 20).await;
         let shared = storage.shared(name).unwrap();
-        let jobs = crate::file::compaction::prepare(&shared, 86_400, now_ns()).unwrap();
+        let jobs = crate::file::compaction::prepare(&shared, &compacted(86_400), now_ns()).unwrap();
         assert!(!jobs.is_empty());
         // "Crash": never install.
     }
@@ -337,7 +337,7 @@ async fn crash_mid_install_is_recovered() {
         written = fill(&storage, name, 20).await;
         let shared = storage.shared(name).unwrap();
         active_base = shared.segments().last().unwrap().base_offset;
-        let jobs = crate::file::compaction::prepare(&shared, 86_400, now_ns()).unwrap();
+        let jobs = crate::file::compaction::prepare(&shared, &compacted(86_400), now_ns()).unwrap();
         let mut removed: HashSet<u64> = HashSet::new();
         for (job, _) in &jobs {
             // Only the segment file is renamed before the "crash".

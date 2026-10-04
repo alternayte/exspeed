@@ -9,6 +9,11 @@
 //! Everything below the lowest unacked offset (or `next_read` when nothing
 //! is unacked) is done: the **ack floor**. Records that don't match the
 //! consumer's subject filter are skipped without ever being in flight.
+//!
+//! A record with a delivery time in the future (`exspeed-delay`,
+//! `exspeed-deliver-at`) is *delayed*: held until due, then delivered like a
+//! new record. Delayed records don't count against `max_ack_pending` (there
+//! may be many), but they hold the ack floor until delivered and acked.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -65,12 +70,19 @@ pub enum Due {
     DeadLetter { offset: u64, deliveries: u16 },
 }
 
+/// Most delayed records one consumer holds; reading new records pauses
+/// while it holds this many.
+pub const MAX_DELAYED: usize = 100_000;
+
 pub struct Core {
     pub spec: ConsumerSpec,
     /// Next stream offset to read for a first delivery.
     pub next_read: u64,
     in_flight: BTreeMap<u64, InFlight>,
     scheduled: BTreeMap<u64, Scheduled>,
+    /// Not yet delivered: due at the instant. Persisted as pending with zero
+    /// deliveries; the due time is re-read from the record after a restart.
+    delayed: BTreeMap<u64, Instant>,
     pub stats: ConsumerStats,
 }
 
@@ -81,6 +93,7 @@ impl Core {
             next_read,
             in_flight: BTreeMap::new(),
             scheduled: BTreeMap::new(),
+            delayed: BTreeMap::new(),
             stats: ConsumerStats::default(),
         }
     }
@@ -91,7 +104,11 @@ impl Core {
         let mut core = Self::new(snapshot.spec, snapshot.next_read);
         core.stats = snapshot.stats;
         for (offset, deliveries) in snapshot.pending {
-            if offset < core.next_read {
+            if offset < core.next_read && deliveries == 0 {
+                // Delayed: due "now", which makes the actor re-read the
+                // record and either deliver it or delay it again.
+                core.delayed.insert(offset, now);
+            } else if offset < core.next_read {
                 core.scheduled.insert(
                     offset,
                     Scheduled {
@@ -110,6 +127,7 @@ impl Core {
             .iter()
             .map(|(o, f)| (*o, f.deliveries))
             .chain(self.scheduled.iter().map(|(o, s)| (*o, s.deliveries)))
+            .chain(self.delayed.keys().map(|o| (*o, 0)))
             .collect();
         pending.sort_unstable();
         Snapshot {
@@ -133,8 +151,16 @@ impl Core {
         self.in_flight.len()
     }
 
+    /// Records held back until their delivery time.
+    pub fn delayed(&self) -> usize {
+        self.delayed.len()
+    }
+
     /// How many *new* records may be handed out now (`max_ack_pending`).
     pub fn capacity_for_new(&self) -> usize {
+        if self.delayed.len() >= MAX_DELAYED {
+            return 0;
+        }
         if !self.explicit() || self.spec.max_ack_pending == 0 {
             return usize::MAX;
         }
@@ -143,13 +169,21 @@ impl Core {
 
     /// Lowest offset not yet acked; everything below it is done.
     pub fn ack_floor(&self) -> u64 {
-        let a = self.in_flight.keys().next().copied();
-        let b = self.scheduled.keys().next().copied();
-        match (a, b) {
-            (Some(a), Some(b)) => a.min(b),
-            (Some(x), None) | (None, Some(x)) => x,
-            (None, None) => self.next_read,
-        }
+        [
+            self.in_flight.keys().next(),
+            self.scheduled.keys().next(),
+            self.delayed.keys().next(),
+        ]
+        .into_iter()
+        .flatten()
+        .copied()
+        .min()
+        .unwrap_or(self.next_read)
+    }
+
+    /// Hold `offset` (never delivered yet) until `due`.
+    pub fn delay(&mut self, offset: u64, due: Instant) {
+        self.delayed.insert(offset, due);
     }
 
     fn ack_wait(&self) -> Duration {
@@ -170,6 +204,7 @@ impl Core {
     /// this one (0 for a first delivery).
     pub fn delivered(&mut self, offset: u64, prior: u16, now: Instant) {
         self.scheduled.remove(&offset);
+        self.delayed.remove(&offset);
         if prior == 0 {
             self.stats.delivered += 1;
         } else {
@@ -271,9 +306,12 @@ impl Core {
         expired.len()
     }
 
-    /// Up to `max` scheduled records that are due now, lowest offset first.
+    /// Up to `max` scheduled or delayed records that are due now, lowest
+    /// offset first. A due delayed record is a `Redeliver` with zero prior
+    /// deliveries (its first delivery).
     pub fn due(&self, now: Instant, max: usize) -> Vec<Due> {
-        self.scheduled
+        let mut out: Vec<Due> = self
+            .scheduled
             .iter()
             .filter(|(_, s)| s.due <= now)
             .take(max)
@@ -290,31 +328,59 @@ impl Core {
                     }
                 }
             })
-            .collect()
+            .collect();
+        out.extend(
+            self.delayed
+                .iter()
+                .filter(|(_, &d)| d <= now)
+                .take(max)
+                .map(|(&offset, _)| Due::Redeliver {
+                    offset,
+                    deliveries: 0,
+                }),
+        );
+        out.sort_by_key(|d| match d {
+            Due::Redeliver { offset, .. } | Due::DeadLetter { offset, .. } => *offset,
+        });
+        out.truncate(max);
+        out
     }
 
     /// Drop a scheduled record that no longer exists in the stream.
     pub fn gone(&mut self, offset: u64) {
-        if self.scheduled.remove(&offset).is_some() || self.in_flight.remove(&offset).is_some() {
+        if self.scheduled.remove(&offset).is_some()
+            || self.in_flight.remove(&offset).is_some()
+            || self.delayed.remove(&offset).is_some()
+        {
             self.stats.gone += 1;
         }
+    }
+
+    /// Drop a record without delivering it (it expired). Returns its
+    /// delivery count when it was unacked or delayed.
+    pub fn take_any(&mut self, offset: u64) -> Option<u16> {
+        self.take_unacked(offset)
+            .or_else(|| self.delayed.remove(&offset).map(|_| 0))
     }
 
     /// Earliest instant something needs attention (an ack deadline or a
     /// scheduled redelivery).
     pub fn next_wakeup(&self) -> Option<Instant> {
-        let a = self.in_flight.values().map(|f| f.deadline).min();
-        let b = self.scheduled.values().map(|s| s.due).min();
-        match (a, b) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (x, None) | (None, x) => x,
-        }
+        [
+            self.in_flight.values().map(|f| f.deadline).min(),
+            self.scheduled.values().map(|s| s.due).min(),
+            self.delayed.values().copied().min(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Reposition: forget all unacked records and continue from `offset`.
     pub fn seek(&mut self, offset: u64) {
         self.in_flight.clear();
         self.scheduled.clear();
+        self.delayed.clear();
         self.next_read = offset;
     }
 }
@@ -460,6 +526,54 @@ mod tests {
                 deliveries: 1
             }]
         );
+    }
+
+    #[test]
+    fn delayed_records_hold_the_floor_but_not_capacity() {
+        let t0 = Instant::now();
+        let mut c = Core::new(spec(), 0);
+        c.delay(0, t0 + Duration::from_secs(5));
+        c.next_read = 1;
+        assert_eq!(
+            c.capacity_for_new(),
+            2,
+            "delayed records don't use max_ack_pending"
+        );
+        assert_eq!(c.ack_floor(), 0);
+        assert!(c.due(t0, 10).is_empty());
+        assert_eq!(c.next_wakeup(), Some(t0 + Duration::from_secs(5)));
+        let later = t0 + Duration::from_secs(5);
+        assert_eq!(
+            c.due(later, 10),
+            vec![Due::Redeliver {
+                offset: 0,
+                deliveries: 0
+            }]
+        );
+        c.delivered(0, 0, later);
+        assert_eq!(c.delayed(), 0);
+        assert_eq!(c.unacked(), 1);
+        assert_eq!(c.stats.delivered, 1);
+    }
+
+    #[test]
+    fn delayed_records_survive_a_restart_as_due_now() {
+        let t0 = Instant::now();
+        let mut c = Core::new(spec(), 0);
+        c.delay(3, t0 + Duration::from_secs(60));
+        c.next_read = 4;
+        let snap = c.snapshot();
+        assert_eq!(snap.pending, vec![(3, 0)]);
+        let r = Core::restore(snap, t0);
+        // Due now: the actor re-reads the record and delays it again.
+        assert_eq!(
+            r.due(t0, 10),
+            vec![Due::Redeliver {
+                offset: 3,
+                deliveries: 0
+            }]
+        );
+        assert_eq!(r.ack_floor(), 3);
     }
 
     #[test]

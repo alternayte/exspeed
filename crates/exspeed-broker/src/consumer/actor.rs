@@ -8,10 +8,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
-use exspeed_common::record_format;
+use exspeed_common::{msg_time, record_format};
 use exspeed_common::{Metrics, Offset, StreamName, SubjectFilters, MAX_RECORDS_BYTES_PER_FRAME};
 use exspeed_protocol::client::{code, EncodedRecords, SeekTo};
-use exspeed_streams::{ReadLimits, Record, StorageError, StoredRecord};
+use exspeed_streams::{RawBatch, ReadLimits, Record, StorageError, StoredRecord, StreamConfig};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -121,6 +121,19 @@ pub(crate) struct Actor {
     last_persist: Instant,
     /// True when the last read reached the end of the log.
     caught_up: bool,
+    /// The stream's settings (delays, TTLs), reloaded when stream metadata
+    /// changes.
+    stream_cfg: StreamConfig,
+    cfg_seen: Option<u64>,
+}
+
+/// What the stream's time settings mean for one record right now.
+enum Timing {
+    Ready,
+    /// Not before this instant.
+    Delayed(Instant),
+    /// TTL passed and the consumer dead-letters expired records.
+    Expired,
 }
 
 /// A run of consecutive records from one read buffer that all go to the
@@ -157,7 +170,56 @@ impl Actor {
             dirty: false,
             last_persist: Instant::now(),
             caught_up: false,
+            stream_cfg: StreamConfig::default(),
+            cfg_seen: None,
         })
+    }
+
+    /// Reload the stream config after a metadata change (or the first time).
+    async fn refresh_stream_config(&mut self) {
+        let seen = self.log.metadata_counter();
+        if self.cfg_seen == Some(seen) {
+            return;
+        }
+        if let Ok(cfg) = self.log.storage().stream_config(&self.stream).await {
+            self.stream_cfg = cfg;
+        }
+        self.cfg_seen = Some(seen);
+    }
+
+    /// Whether expired records must be read (to dead-letter them).
+    fn sees_expired(&self) -> bool {
+        self.core.spec.dead_letter_expired && self.stream_cfg.has_ttl()
+    }
+
+    fn timing(&self, raw: &[u8], now_ns: u64, now: Instant) -> Timing {
+        if self.sees_expired()
+            && msg_time::expires_at_ns(
+                raw,
+                self.stream_cfg.allow_msg_ttl,
+                self.stream_cfg.msg_ttl_ms,
+            )
+            .is_some_and(|e| e <= now_ns)
+        {
+            return Timing::Expired;
+        }
+        if self.stream_cfg.allow_delayed {
+            if let Some(at) = msg_time::deliver_at_ns(raw).filter(|&at| at > now_ns) {
+                return Timing::Delayed(now + Duration::from_nanos(at - now_ns));
+            }
+        }
+        Timing::Ready
+    }
+
+    async fn read_raw(&self, from: u64, limits: ReadLimits) -> Result<RawBatch, StorageError> {
+        let storage = self.log.storage();
+        if self.sees_expired() {
+            storage
+                .read_raw_including_expired(&self.stream, Offset(from), limits)
+                .await
+        } else {
+            storage.read_raw(&self.stream, Offset(from), limits).await
+        }
     }
 
     pub(crate) async fn run(mut self, mut rx: mpsc::Receiver<Cmd>, token: CancellationToken) {
@@ -303,7 +365,7 @@ impl Actor {
             Cmd::Term { offset, reason } => {
                 if let Some(deliveries) = self.core.take_unacked(offset) {
                     self.dirty = true;
-                    if !self.dead_letter(offset, deliveries, &reason).await {
+                    if !self.dead_letter(offset, deliveries, &reason, None).await {
                         self.core
                             .reschedule(offset, deliveries, now + Duration::from_secs(1));
                     }
@@ -359,6 +421,7 @@ impl Actor {
             ack_floor: self.core.ack_floor(),
             num_unacked: self.core.unacked() as u64,
             num_in_flight: self.core.in_flight() as u64,
+            num_delayed: self.core.delayed() as u64,
             // Approximate: counts filtered-out records too.
             num_waiting: hwm.0.saturating_sub(self.core.next_read.max(earliest.0)),
             lag: hwm.0.saturating_sub(self.core.ack_floor().max(earliest.0)),
@@ -465,7 +528,9 @@ impl Actor {
     /// zero-copy slices of the read buffer. Only the subject is parsed (in
     /// place, without allocating) when the consumer has subject filters.
     async fn pump(&mut self) {
+        self.refresh_stream_config().await;
         let now = Instant::now();
+        let now_ns = now_nanos();
         self.subs.retain(|s| !s.tx.is_closed());
         // Pullers that gave up (connection closed) must not be handed records.
         self.pulls.retain(|p| !p.reply.is_closed());
@@ -480,7 +545,7 @@ impl Actor {
                     self.core.take_unacked(offset);
                     self.dirty = true;
                     if !self
-                        .dead_letter(offset, deliveries, "max_deliver exceeded")
+                        .dead_letter(offset, deliveries, "max_deliver exceeded", None)
                         .await
                     {
                         self.core
@@ -493,6 +558,20 @@ impl Actor {
                     }
                     match self.read_one_raw(offset).await {
                         Ok(Some(mut rec)) => {
+                            match self.timing(&rec, now_ns, now) {
+                                Timing::Ready => {}
+                                // A delayed record restored after a restart
+                                // that isn't due yet.
+                                Timing::Delayed(due) if deliveries == 0 => {
+                                    self.core.delay(offset, due);
+                                    continue;
+                                }
+                                Timing::Delayed(_) => {}
+                                Timing::Expired => {
+                                    self.expire(offset, &rec, now).await;
+                                    continue;
+                                }
+                            }
                             let Some(taker) = self.next_taker(rec.len(), None) else {
                                 break;
                             };
@@ -528,11 +607,8 @@ impl Actor {
             }
             let want = capacity.min(READ_BATCH);
             let batch = match self
-                .log
-                .storage()
                 .read_raw(
-                    &self.stream,
-                    Offset(self.core.next_read),
+                    self.core.next_read,
                     ReadLimits {
                         max_records: want,
                         max_bytes: 4 * 1024 * 1024,
@@ -562,9 +638,15 @@ impl Actor {
                 }
             };
             if batch.count == 0 {
-                if batch.next_offset.0 > self.core.next_read {
+                let advanced = batch.next_offset.0 > self.core.next_read;
+                if advanced {
                     self.core.next_read = batch.next_offset.0;
                     self.dirty = true;
+                }
+                // Everything read was hidden (expired, superseded): keep
+                // going while there is more below the high watermark.
+                if advanced && batch.next_offset.0 < batch.high_watermark.0 {
+                    continue;
                 }
                 exhausted = true;
                 break;
@@ -590,6 +672,7 @@ impl Actor {
             let mut run: Option<Run> = None;
             let mut run_offsets: Vec<u64> = Vec::new();
             let mut progressed = false;
+            let timed = self.stream_cfg.allow_delayed || self.sees_expired();
             for p in &positions {
                 if p.offset < self.core.next_read {
                     continue;
@@ -603,6 +686,31 @@ impl Actor {
                         self.dirty = true;
                         progressed = true;
                         continue;
+                    }
+                }
+                if timed {
+                    match self.timing(&buf[p.range()], now_ns, now) {
+                        Timing::Ready => {}
+                        Timing::Delayed(due) => {
+                            self.flush_run(&buf, run.take(), &mut run_offsets, &mut batches);
+                            self.core.delay(p.offset, due);
+                            self.core.next_read = p.offset + 1;
+                            self.dirty = true;
+                            progressed = true;
+                            if self.core.capacity_for_new() == 0 {
+                                break;
+                            }
+                            continue;
+                        }
+                        Timing::Expired => {
+                            self.flush_run(&buf, run.take(), &mut run_offsets, &mut batches);
+                            self.core.next_read = p.offset + 1;
+                            self.dirty = true;
+                            progressed = true;
+                            let raw = buf.slice(p.range());
+                            self.expire(p.offset, &raw, now).await;
+                            continue;
+                        }
                     }
                 }
                 let Some(taker) = self.next_taker(p.end() - p.start, run.as_ref()) else {
@@ -728,11 +836,8 @@ impl Actor {
     /// The record at exactly `offset`, in its wire encoding.
     async fn read_one_raw(&self, offset: u64) -> Result<Option<BytesMut>, StorageError> {
         match self
-            .log
-            .storage()
             .read_raw(
-                &self.stream,
-                Offset(offset),
+                offset,
                 ReadLimits {
                     max_records: 1,
                     max_bytes: 1,
@@ -771,9 +876,29 @@ impl Actor {
         }
     }
 
+    /// An expired record (consumer with `dead_letter_expired`): forget it
+    /// and dead-letter it with reason `expired`. A failed dead-letter write
+    /// is retried like any other.
+    async fn expire(&mut self, offset: u64, raw: &[u8], now: Instant) {
+        let deliveries = self.core.take_any(offset).unwrap_or(0);
+        self.dirty = true;
+        let rec = decode_raw(raw);
+        if !self.dead_letter(offset, deliveries, "expired", rec).await {
+            self.core
+                .reschedule(offset, deliveries.max(1), now + Duration::from_secs(1));
+        }
+    }
+
     /// Copy a record to the consumer's DLQ stream (or drop it when none is
-    /// configured). Returns false if it should be retried later.
-    async fn dead_letter(&mut self, offset: u64, deliveries: u16, reason: &str) -> bool {
+    /// configured). Returns false if it should be retried later. `known` is
+    /// the record when the caller already has it.
+    async fn dead_letter(
+        &mut self,
+        offset: u64,
+        deliveries: u16,
+        reason: &str,
+        known: Option<StoredRecord>,
+    ) -> bool {
         let name = self.core.spec.name.clone();
         let Some(dlq) = self.core.spec.dlq_stream.clone() else {
             tracing::warn!(consumer = %name, offset, reason, "dropping record (no dlq_stream)");
@@ -781,13 +906,16 @@ impl Actor {
             self.metrics.record_consumer_dead_letter(&name, "dropped");
             return true;
         };
-        let rec = match self.read_one(offset).await {
-            Ok(Some(r)) => r,
-            Ok(None) => {
-                self.core.stats.gone += 1;
-                return true;
-            }
-            Err(_) => return false,
+        let rec = match known {
+            Some(r) => r,
+            None => match self.read_one(offset).await {
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    self.core.stats.gone += 1;
+                    return true;
+                }
+                Err(_) => return false,
+            },
         };
         let Ok(dlq_name) = StreamName::try_from(dlq.as_str()) else {
             tracing::error!(consumer = %name, dlq = %dlq, "invalid dlq_stream name; dropping");
@@ -904,6 +1032,26 @@ fn drain(rx: &mut mpsc::Receiver<Cmd>, code: u16, message: &str) {
 enum Taker {
     Pull(usize),
     Push(usize),
+}
+
+fn now_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
+}
+
+/// Decode one raw (wire-encoded) record.
+fn decode_raw(raw: &[u8]) -> Option<StoredRecord> {
+    let l = record_format::layout(raw).ok()?;
+    let b = Bytes::copy_from_slice(raw);
+    Some(StoredRecord {
+        offset: Offset(l.offset),
+        timestamp: l.timestamp_ns,
+        subject: l.subject(raw).to_owned(),
+        key: l.key.clone().map(|r| b.slice(r)),
+        value: b.slice(l.value.clone()),
+        headers: l.headers(raw),
+    })
 }
 
 fn storage_err(e: StorageError) -> ConsumerError {
