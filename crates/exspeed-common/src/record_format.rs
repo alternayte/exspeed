@@ -310,6 +310,35 @@ pub fn key_and_value_len(rec: &[u8]) -> Result<(Option<&[u8]>, usize), FormatErr
     Ok((key, c.u32()?))
 }
 
+/// The value of the first header named `name`, parsed in place without
+/// allocating. `None` when the record has no such header or is malformed.
+pub fn header<'a>(rec: &'a [u8], name: &str) -> Option<&'a str> {
+    let mut c = Cursor::new(rec, SUBJECT_AT);
+    let n = c.u16().ok()?;
+    c.take(n).ok()?;
+    match c.u8().ok()? {
+        0 => {}
+        1 => {
+            let n = c.u32().ok()?;
+            c.take(n).ok()?;
+        }
+        _ => return None,
+    }
+    let n = c.u32().ok()?;
+    c.take(n).ok()?;
+    let count = c.u16().ok()?;
+    for _ in 0..count {
+        let n = c.u16().ok()?;
+        let k = c.take(n).ok()?;
+        let n = c.u16().ok()?;
+        let v = c.take(n).ok()?;
+        if &rec[k] == name.as_bytes() {
+            return std::str::from_utf8(&rec[v]).ok();
+        }
+    }
+    None
+}
+
 /// One record inside a buffer of back-to-back records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordPos {

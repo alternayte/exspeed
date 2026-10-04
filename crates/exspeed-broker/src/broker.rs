@@ -20,6 +20,10 @@ pub struct Broker {
     pub log: Arc<Log>,
     /// Durable consumers (push and pull delivery, acks, redelivery, DLQ).
     pub consumers: Arc<ConsumerManager>,
+    /// Core (non-persistent) publish/subscribe and request-reply.
+    pub bus: Arc<crate::pubsub::CoreBus>,
+    /// Key-value buckets.
+    pub kv: Arc<crate::kv::Kv>,
     pub data_dir: PathBuf,
     pub lease: Arc<dyn LeaderLease>,
     pub metrics: Arc<Metrics>,
@@ -43,11 +47,15 @@ impl Broker {
             dedup_ready.clone(),
         ));
         let consumers = ConsumerManager::new(log.clone(), metrics.clone());
+        let bus = crate::pubsub::CoreBus::new(metrics.clone());
+        let kv = crate::kv::Kv::new(log.clone());
         Self {
+            kv,
             storage,
             broker_append,
             log,
             consumers,
+            bus,
             data_dir,
             lease,
             metrics,

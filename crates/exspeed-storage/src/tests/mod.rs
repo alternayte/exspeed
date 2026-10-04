@@ -6,6 +6,7 @@ mod compaction_tests;
 mod durability_tests;
 mod enospc_tests;
 mod file_tests;
+mod limits_tests;
 mod property_tests;
 mod read_tests;
 mod trait_tests;
@@ -153,10 +154,9 @@ mod file_trait_tests {
     use crate::file::FileStorage;
     use tempfile::TempDir;
 
-    // `exact_retention = false` — FileStorage's `trim_up_to` is
-    // segment-granular. `truncate_from` IS record-exact and does not
-    // need a flag.
-    const EXACT_RETENTION: bool = false;
+    // FileStorage's `trim_up_to` is record-exact: it moves the log start
+    // offset (and deletes the segments entirely below it).
+    const EXACT_RETENTION: bool = true;
 
     fn make_storage() -> (FileStorage, TempDir) {
         let dir = TempDir::new().unwrap();
@@ -252,6 +252,12 @@ mod file_trait_tests {
     async fn trim_up_to_past_latest_still_advances() {
         let (s, _d) = make_storage();
         trait_tests::test_trim_up_to_past_latest_still_advances(&s, EXACT_RETENTION).await;
+    }
+
+    #[tokio::test]
+    async fn read_below_earliest_returns_out_of_range() {
+        let (s, _d) = make_storage();
+        trait_tests::test_read_below_earliest_returns_out_of_range(&s).await;
     }
 
     #[tokio::test]

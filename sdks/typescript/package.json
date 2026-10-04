@@ -1,6 +1,6 @@
 {
   "name": "@exspeed/sdk",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "TypeScript client for Exspeed (client protocol v2): streams, publishing, durable consumers with push and pull delivery, and ExQL queries",
   "type": "module",
   "main": "./dist/index.cjs",

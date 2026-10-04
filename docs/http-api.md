@@ -14,10 +14,11 @@ curl -s localhost:8080/api/v1/openapi.json | jq '.paths | keys'
 ## Authentication
 
 When auth is enabled, every `/api/v1/*` request must carry
-`Authorization: Bearer <token>`. Every `/api/v1/*` route except `whoami`
-and the record browser (`GET /api/v1/streams/{name}/records`, which takes
-`subscribe` or `admin` on the stream) requires an **admin** permission
-(`openapi.json` needs none):
+`Authorization: Bearer <token>`. Every `/api/v1/*` route except `whoami`,
+the record browser (`GET /api/v1/streams/{name}/records`, which takes
+`subscribe` or `admin` on the stream) and the key-value routes (which check
+the bucket's stream, see [below](#key-value-buckets)) requires an **admin**
+permission (`openapi.json` needs none):
 
 - **Global admin** (`admin` on `streams = "*"`) for queries, tables,
   connectors, connections and backups.
@@ -62,11 +63,11 @@ publishing to or deleting one answers `403`.
 | Method | Path | Body / query | Description |
 |--------|------|--------------|-------------|
 | `GET` | `/api/v1/streams` | `?internal=true` | List the streams the caller has any permission on. Internal `__` streams are included only with `internal=true`, for global admins. |
-| `POST` | `/api/v1/streams` | `{"name", "max_age_secs"?, "max_bytes"?, "dedup_window_secs"?, "dedup_max_entries"?, "compaction"?}` | Create a stream. `compaction: true` keeps only the latest record per key. |
-| `GET` | `/api/v1/streams/{name}` | | `storage_bytes`, `head_offset` (the next offset), retention, dedup and compaction settings, and `status` (`healthy`, or `failed` with a `failure` reason when the partition is fenced read-only) |
-| `PATCH` | `/api/v1/streams/{name}` | `{"max_age_secs"?, "max_bytes"?, "dedup_window_secs"?, "dedup_max_entries"?}` | Update settings; absent fields keep their value |
+| `POST` | `/api/v1/streams` | `{"name", "max_age_secs"?, "max_bytes"?, "dedup_window_secs"?, "dedup_max_entries"?, "compaction"?, "max_msgs"?, "discard"?, "max_msgs_per_subject"?, "allow_msg_ttl"?, "msg_ttl_ms"?, "allow_delayed"?, "retention"?}` | Create a stream. `compaction: true` keeps only the latest record per key. The limit, TTL, delay and `retention` (`limits`, `work_queue`, `interest`) settings are described in [queues.md](queues.md). |
+| `GET` | `/api/v1/streams/{name}` | | `storage_bytes`, `earliest_offset`, `head_offset` (the next offset), every setting, and `status` (`healthy`, or `failed` with a `failure` reason when the partition is fenced read-only) |
+| `PATCH` | `/api/v1/streams/{name}` | any setting except `name` and `compaction` | Update settings; absent fields keep their value |
 | `DELETE` | `/api/v1/streams/{name}` | `?force=true` | Delete. Without `force`, answers `409` with the `blockers` (connectors, queries, consumers, subscriptions) that still reference the stream; with it, deletes them too. |
-| `POST` | `/api/v1/streams/{name}/publish` | `{"data", "subject"?, "key"?, "msg_id"?}` | Publish one record. `data` is any JSON value, stored as its JSON encoding; `subject` defaults to the stream name. The `x-idempotency-key` header can be used instead of `msg_id`. `201` when stored, `200` for a duplicate, `409` when the `msg_id` was used with a different body, `503` while not leader, during the dedup rebuild or when the dedup map is full (with `Retry-After`). |
+| `POST` | `/api/v1/streams/{name}/publish` | `{"data", "subject"?, "key"?, "msg_id"?}` | Publish one record. `data` is any JSON value, stored as its JSON encoding; `subject` defaults to the stream name. The `x-idempotency-key` header can be used instead of `msg_id`. `201` when stored, `200` for a duplicate, `409` when the `msg_id` was used with a different body, `429` when the stream is full and its discard policy is `new`, `503` while not leader, during the dedup rebuild or when the dedup map is full (with `Retry-After`). |
 | `GET` | `/api/v1/streams/{name}/records?from=&limit=&filter=&wait_ms=` | | Browse records without a consumer: `{records, next_offset, high_watermark}`. Needs `subscribe` or `admin`; any node answers. `wait_ms` (≤ 30000) long-polls: with nothing new at `from`, the server waits for records before answering. `from` defaults to the earliest retained record, `limit` to 100 (≤ 1000); each record has `offset`, `timestamp_ms`, `subject`, `key`, `value` (JSON when it parses, else a UTF-8 string, else base64; see `encoding`), `headers`. |
 
 ```bash
@@ -87,12 +88,37 @@ consumers. See [concepts.md](concepts.md#consumers) for the model.
 |--------|------|------|-------------|
 | `GET` | `/api/v1/consumers[?stream=]` | | List consumers (with state) |
 | `POST` | `/api/v1/consumers` | consumer spec, e.g. `{"name": "billing", "stream": "orders", "filter_subjects": ["orders.placed"], "dlq_stream": "orders-dlq"}` | Create a durable consumer. Idempotent for an identical spec, `409` if it differs. Returns `201` with consumer info. |
-| `GET` | `/api/v1/consumers/{name}` | | Spec, `next_offset`, `ack_floor`, `num_unacked`, `num_in_flight`, `num_waiting`, `lag`, `subscribers`, `pull_waiters`, `stats` |
+| `GET` | `/api/v1/consumers/{name}` | | Spec, `next_offset`, `ack_floor`, `num_unacked`, `num_in_flight`, `num_delayed`, `num_waiting`, `lag`, `subscribers`, `pull_waiters`, `stats` |
 | `POST` | `/api/v1/consumers/{name}/seek` | one of `"earliest"`, `"latest"`, `{"offset": n}`, `{"timestamp_ms": t}` | Reposition; drops unacked state |
 | `DELETE` | `/api/v1/consumers/{name}` | | Delete; active subscriptions end with code 404 |
 
 Ephemeral consumers belong to a TCP connection, so `POST /api/v1/consumers`
-rejects `"ephemeral": true` with `400`.
+rejects `"ephemeral": true` with `400`. The delivery options
+(`filter_headers`, `header_match`, `single_active`, `priority_window`,
+`dead_letter_expired`) are described in [queues.md](queues.md#consumer-delivery-options).
+
+### Key-value buckets
+
+A bucket `B` is the stream `KV_B` (see [kv.md](kv.md)). These routes take
+any authenticated caller and check the bucket's stream: reads need
+`subscribe` (or `admin`), writes `publish`, creating a bucket `admin`. Like
+every write route they answer `503` on a standby.
+
+| Method | Path | Body / headers | Description |
+|--------|------|----------------|-------------|
+| `POST` | `/api/v1/kv` | `{"bucket", "history"?, "ttl_ms"?, "max_bytes"?}` | Create a bucket (`201`; idempotent for the same settings) |
+| `GET` | `/api/v1/kv/{bucket}?filter=` | | Keys that have a value, sorted; `filter` is a subject filter over keys |
+| `GET` | `/api/v1/kv/{bucket}/{key}?revision=` | | The value as raw bytes, with `X-Exspeed-Revision`, `ETag` and `X-Exspeed-Kv-Op`; `404` when absent or deleted |
+| `PUT` | `/api/v1/kv/{bucket}/{key}?ttl_ms=` | raw body; `If-Match: <revision>` or `If-None-Match: *` | Set the key; `{"revision"}`. `If-Match` makes it a compare-and-set, `If-None-Match: *` creates it only if absent; `409` (with `current_revision`) otherwise |
+| `DELETE` | `/api/v1/kv/{bucket}/{key}?purge=` | optional `If-Match` | Delete (or purge) the key; `{"revision"}` of the tombstone |
+| `GET` | `/api/v1/kv/{bucket}/{key}/history` | | Kept revisions, oldest first: `[{key, revision, timestamp_ms, op, value_base64}]` |
+
+```bash
+curl -X POST localhost:8080/api/v1/kv -d '{"bucket": "config", "history": 5}' -H 'Content-Type: application/json'
+curl -X PUT localhost:8080/api/v1/kv/config/app.mode -H 'If-None-Match: *' --data 'prod'
+# {"revision": 1}
+curl -i localhost:8080/api/v1/kv/config/app.mode
+```
 
 ### Queries (ExQL)
 

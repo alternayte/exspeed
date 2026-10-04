@@ -34,6 +34,14 @@ export enum OpCode {
   Term = 0x56,
   InProgress = 0x57,
   Read = 0x60,
+  CorePublish = 0x70,
+  CoreSubscribe = 0x71,
+  KvPut = 0x74,
+  KvGet = 0x75,
+  KvDelete = 0x76,
+  KvKeys = 0x77,
+  KvHistory = 0x78,
+  KvCreateBucket = 0x79,
   Ping = 0xf0,
 
   // Responses and pushes (server -> client)
@@ -48,6 +56,7 @@ export enum OpCode {
   ConnectOk = 0x88,
   SubscribeOk = 0x89,
   SubscriptionEnded = 0x8a,
+  CoreMsg = 0x8b,
   Pong = 0xf1,
 }
 
@@ -59,9 +68,12 @@ export const ErrorCode = {
   Unauthorized: 401,
   /** The credential lacks the needed action on the stream. */
   Forbidden: 403,
-  /** Stream or consumer not found. */
+  /** Stream, consumer, bucket or key not found; or a request (core publish with a reply subject) had no responders. */
   NotFound: 404,
-  /** Exists with different settings, stream still has consumers, or `msgId` reused with a different body. */
+  /**
+   * Exists with different settings, stream still has consumers, `msgId`
+   * reused with a different body, or a KV key is not at the expected revision.
+   */
   Conflict: 409,
   /** Retry later (dedup map full, too many concurrent waiting requests). */
   TooManyRequests: 429,

@@ -4,6 +4,7 @@ pub mod connections;
 pub mod connectors;
 pub mod consumers;
 pub mod health;
+pub mod kv;
 pub mod leases;
 pub mod metrics;
 pub mod queries;
@@ -121,6 +122,27 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         ))
         .with_state(state.clone());
 
+    // Key-value buckets: any authenticated caller (handlers check
+    // subscribe / publish / admin on the bucket's stream), leader-gated like
+    // every write.
+    let kv_router = Router::new()
+        .route("/api/v1/kv", post(kv::create_bucket))
+        .route("/api/v1/kv/{bucket}", get(kv::list_keys))
+        .route(
+            "/api/v1/kv/{bucket}/{key}",
+            get(kv::get_key).put(kv::put_key).delete(kv::delete_key),
+        )
+        .route("/api/v1/kv/{bucket}/{key}/history", get(kv::key_history))
+        .layer(from_fn_with_state(
+            state.clone(),
+            crate::middleware::leader_gate,
+        ))
+        .layer(from_fn_with_state(
+            state.clone(),
+            crate::middleware::require_authenticated,
+        ))
+        .with_state(state.clone());
+
     // Main authenticated router: admin-gated AND leader-gated.
     // Tower wrapping: `.layer(A).layer(B)` produces `B(A(handler))`, so
     // B (the LAST .layer() call) is the outermost wrapper and runs first.
@@ -209,5 +231,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(leases_router)
         .merge(whoami_router)
         .merge(readers_router)
+        .merge(kv_router)
         .merge(authed)
 }

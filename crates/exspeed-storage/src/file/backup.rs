@@ -330,6 +330,13 @@ impl FileStorage {
             });
         }
 
+        let log_start = shared.log_start().min(hwm);
+        if log_start > 0 {
+            files.push(SnapshotFile {
+                path: format!("partitions/0/{}", crate::file::partition::LOG_START_FILE),
+                data: SnapshotData::Bytes(log_start.to_string().into_bytes()),
+            });
+        }
         let mut earliest: Option<u64> = None;
         let mut records = 0u64;
         for seg in list.iter() {
@@ -380,7 +387,7 @@ impl FileStorage {
 
         Ok(StreamSnapshot {
             name: stream.to_string(),
-            earliest_offset: earliest.unwrap_or(hwm),
+            earliest_offset: earliest.map_or(hwm, |e| e.max(log_start)),
             next_offset: hwm,
             records,
             files,

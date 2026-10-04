@@ -87,7 +87,11 @@ pure state machine (`consumer/core.rs`), which holds:
 - the next offset to read;
 - the ack floor;
 - the in-flight records, with deadlines and delivery counts;
-- the records scheduled for redelivery.
+- the records scheduled for redelivery;
+- the records held back: delayed records (`exspeed-delay`) until they are
+  due, and a prioritized consumer's lookahead buffer, ordered by priority.
+  They are persisted as pending with zero deliveries; after a restart their
+  due time is read back from the record.
 
 The actor feeds push subscriptions (credit-based) and pull waiters from the
 log, reacting to `watch_appends` notifications. It redelivers on timeout,
@@ -95,6 +99,26 @@ nack, or subscriber loss; dead-letters through `Log` with idempotency keys;
 and persists a snapshot to the compacted `__consumers` stream at most every
 100 ms. On promotion, a new leader restores every consumer from
 `__consumers`. Delivery is at-least-once.
+
+**Retention by acknowledgement.** After each successful persist, an actor
+reports its ack floor to the manager. A task on the leader keeps the floors
+per stream and trims `work_queue` and `interest` streams to the lowest one
+(an `interest` stream with no consumers to its head) through `Log::trim`,
+so the trim takes the single write path and replicates.
+
+## Core messaging and key-value
+
+`exspeed_broker::pubsub::CoreBus` holds the core-message subscriptions in
+memory: a publish matches each subscription's filter, picks one member per
+queue group, and `try_send`s to the subscriber connection's bounded queue
+(a full queue drops the message). The bus is open only during a leadership
+tenure; when the tenure's token is cancelled it ends every subscription.
+
+`exspeed_broker::kv::Kv` maps a bucket to the stream `KV_<bucket>` with
+`max_msgs_per_subject` = history. Gets go through the storage's per-subject
+index; puts run under a per-bucket lock and compare the expected revision
+against the committed log (`latest_committed_for_subject`), then append
+through `Log`.
 
 ## Wire protocol
 
@@ -131,9 +155,10 @@ Frame payloads are capped at 16 MiB.
   .trash/                            streams being deleted (cleared on startup)
   cluster/epochs/<stream>.json       per-stream leader-epoch history (cluster mode)
   streams/<stream>/
-    stream.json                      retention, dedup and compaction config
+    stream.json                      retention, limits, dedup and compaction config
     dedup_snapshot.bin               periodic dedup-map snapshot (single node)
     partitions/0/
+      log_start                      log start offset (only once records were trimmed)
       00000000000000000000.seg       append-only segment (wire-encoded records), rolls at 256 MiB
       00000000000000000000.idx       sparse offset + time index, one entry about every 4 KiB
       00000000000000000000.meta      sealed-segment metadata (offsets, timestamps, length)
@@ -164,6 +189,25 @@ the catalogs from those streams, so a promoted follower runs exactly what
 the old leader had. Files under `connectors.d/` and `connections.d/` stay
 node-local on purpose: operators ship the same files to every pod. Dedup
 snapshots are node-local caches that can be rebuilt from the log.
+
+**Log start offset.** Retention and compaction work on whole segments, but
+some removals are record-exact: `trim_up_to` (a work queue's acks, a
+follower mirroring the leader), and `max_msgs` with `discard = "old"`. They
+move the partition's log start offset: readers treat records below it as
+gone, and segments entirely below it are deleted. The offset is persisted in
+`log_start` within a second of moving (losing the last move in a crash only
+brings back records that were already removed), never moves past the high
+watermark, and is carried by backups and replication.
+
+**Read-time visibility.** A stream with a TTL or `max_msgs_per_subject`
+hides records from readers (reads, SQL, consumers) as it serves them:
+expired records, and records that N newer records of the same subject
+superseded. The per-subject check uses an in-memory index of each subject's
+newest offsets, maintained by the writer thread after each commit and
+rebuilt from the log on startup or when the limit changes. A record above
+the high watermark (not yet replicated) never supersedes an older one.
+Compaction later removes hidden records from disk. Replication and state
+rebuilds read the committed log without these filters.
 
 Segment files are named after their base offset (20 digits, zero-padded)
 and start with a 16-byte header: magic `EXSG`, format version 3, base

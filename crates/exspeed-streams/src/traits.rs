@@ -374,4 +374,37 @@ pub trait StorageEngine: Send + Sync {
     ) -> Result<ReadBatch, StorageError> {
         self.read_batch(stream, from, limits).await
     }
+
+    /// Like [`read_raw`](Self::read_raw), but records hidden only because
+    /// their TTL expired are included (a consumer that dead-letters expired
+    /// records needs to see them).
+    async fn read_raw_including_expired(
+        &self,
+        stream: &StreamName,
+        from: Offset,
+        limits: ReadLimits,
+    ) -> Result<RawBatch, StorageError> {
+        self.read_raw(stream, from, limits).await
+    }
+
+    /// The newest visible offset of `subject` in a stream with
+    /// `max_msgs_per_subject`; `None` when it has none or the engine doesn't
+    /// track subjects.
+    fn latest_for_subject(&self, stream: &StreamName, subject: &str) -> Option<u64> {
+        let _ = (stream, subject);
+        None
+    }
+
+    /// Like [`latest_for_subject`](Self::latest_for_subject), counting
+    /// records not yet visible to readers (still replicating).
+    fn latest_committed_for_subject(&self, stream: &StreamName, subject: &str) -> Option<u64> {
+        self.latest_for_subject(stream, subject)
+    }
+
+    /// Every subject of a stream with `max_msgs_per_subject`, with its
+    /// newest visible offset; empty when the engine doesn't track subjects.
+    fn subjects_latest(&self, stream: &StreamName) -> Vec<(String, u64)> {
+        let _ = stream;
+        Vec::new()
+    }
 }

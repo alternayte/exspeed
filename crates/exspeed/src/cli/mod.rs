@@ -40,6 +40,34 @@ pub struct Cli {
     pub command: Command,
 }
 
+/// Message limits, lifetimes and the retention policy of a stream. On
+/// `update-stream`, only the flags given change.
+#[derive(clap::Args, Debug, Default)]
+pub struct StreamLimitArgs {
+    /// Keep at most this many records (e.g. 10000, 1M); 0 = no limit
+    #[arg(long)]
+    pub max_msgs: Option<String>,
+    /// At the limit: `old` drops the oldest records, `new` rejects new ones
+    #[arg(long, value_parser = ["old", "new"])]
+    pub discard: Option<String>,
+    /// Keep only the newest N records per subject; 0 = no limit
+    #[arg(long)]
+    pub max_msgs_per_subject: Option<u64>,
+    /// Accept a per-record TTL (`exspeed-ttl` header): true or false
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    pub allow_msg_ttl: Option<bool>,
+    /// TTL of records without their own (e.g. 30s, 5m, 1h); 0 = none
+    #[arg(long)]
+    pub msg_ttl: Option<String>,
+    /// Accept delayed delivery (`exspeed-delay` / `exspeed-deliver-at`): true or false
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    pub allow_delayed: Option<bool>,
+    /// `limits`, `work_queue` (removed once acked by the one consumer) or
+    /// `interest` (removed once every consumer acked)
+    #[arg(long, value_parser = ["limits", "work_queue", "interest"])]
+    pub retention_policy: Option<String>,
+}
+
 #[derive(Subcommand)]
 pub enum Command {
     /// Start the exspeed server
@@ -65,6 +93,8 @@ pub enum Command {
         /// Dedup max entries (e.g. 2M, 500k, 100000)
         #[arg(long)]
         dedup_max_entries: Option<String>,
+        #[command(flatten)]
+        limits: StreamLimitArgs,
     },
     /// Update an existing stream's configuration
     UpdateStream {
@@ -82,6 +112,8 @@ pub enum Command {
         /// Dedup max entries (e.g. 2M, 500k, 100000)
         #[arg(long)]
         dedup_max_entries: Option<String>,
+        #[command(flatten)]
+        limits: StreamLimitArgs,
     },
     /// Delete a stream
     Delete {

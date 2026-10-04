@@ -8,16 +8,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
-use exspeed_common::record_format;
+use exspeed_common::{msg_time, record_format};
 use exspeed_common::{Metrics, Offset, StreamName, SubjectFilters, MAX_RECORDS_BYTES_PER_FRAME};
-use exspeed_protocol::client::{code, EncodedRecords, SeekTo};
-use exspeed_streams::{ReadLimits, Record, StorageError, StoredRecord};
+use exspeed_protocol::client::{code, EncodedRecords, HeaderMatch, SeekTo, PRIORITY_HEADER};
+use exspeed_streams::{RawBatch, ReadLimits, Record, StorageError, StoredRecord, StreamConfig};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::core::{Core, Due};
 use super::store::ConsumerStore;
-use super::{ConsumerError, ConsumerInfo, SubEvent};
+use super::{ConsumerError, ConsumerInfo, FloorReport, SubEvent};
 use crate::log::Log;
 
 /// Persist at most this often while state changes (acks, deliveries).
@@ -121,6 +121,43 @@ pub(crate) struct Actor {
     last_persist: Instant,
     /// True when the last read reached the end of the log.
     caught_up: bool,
+    /// The stream's settings (delays, TTLs), reloaded when stream metadata
+    /// changes.
+    stream_cfg: StreamConfig,
+    cfg_seen: Option<u64>,
+    /// Where persisted ack floors go (work-queue / interest retention).
+    floors: mpsc::UnboundedSender<FloorReport>,
+    reported_floor: Option<u64>,
+}
+
+/// Why a record was dead-lettered (`exspeed-dlq-cause`).
+#[derive(Clone, Copy)]
+enum DlqCause {
+    /// `max_deliver` deliveries used up.
+    MaxDeliver,
+    /// The client terminated it (`Term`).
+    Rejected,
+    /// Its TTL expired before it was acked.
+    Expired,
+}
+
+impl DlqCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            DlqCause::MaxDeliver => "max_deliver",
+            DlqCause::Rejected => "rejected",
+            DlqCause::Expired => "expired",
+        }
+    }
+}
+
+/// What the stream's time settings mean for one record right now.
+enum Timing {
+    Ready,
+    /// Not before this instant.
+    Delayed(Instant),
+    /// TTL passed and the consumer dead-letters expired records.
+    Expired,
 }
 
 /// A run of consecutive records from one read buffer that all go to the
@@ -138,6 +175,7 @@ impl Actor {
         log: Arc<Log>,
         store: Arc<ConsumerStore>,
         metrics: Arc<Metrics>,
+        floors: mpsc::UnboundedSender<FloorReport>,
     ) -> Result<Self, ConsumerError> {
         let stream = StreamName::try_from(core.spec.stream.as_str())
             .map_err(|e| ConsumerError::Invalid(e.to_string()))?;
@@ -157,11 +195,97 @@ impl Actor {
             dirty: false,
             last_persist: Instant::now(),
             caught_up: false,
+            stream_cfg: StreamConfig::default(),
+            cfg_seen: None,
+            floors,
+            reported_floor: None,
         })
+    }
+
+    /// Tell the manager the persisted ack floor when it moved (only
+    /// persisted acks may let retention remove records).
+    fn report_floor(&mut self) {
+        let floor = self.core.ack_floor();
+        if self.reported_floor != Some(floor) {
+            self.reported_floor = Some(floor);
+            let _ = self.floors.send(FloorReport::Floor {
+                stream: self.stream.as_str().to_string(),
+                consumer: self.core.spec.name.clone(),
+                floor,
+            });
+        }
+    }
+
+    /// Reload the stream config after a metadata change (or the first time).
+    async fn refresh_stream_config(&mut self) {
+        let seen = self.log.metadata_counter();
+        if self.cfg_seen == Some(seen) {
+            return;
+        }
+        if let Ok(cfg) = self.log.storage().stream_config(&self.stream).await {
+            self.stream_cfg = cfg;
+        }
+        self.cfg_seen = Some(seen);
+    }
+
+    /// Whether a record passes the consumer's header filter.
+    fn headers_match(&self, raw: &[u8]) -> bool {
+        let f = &self.core.spec.filter_headers;
+        if f.is_empty() {
+            return true;
+        }
+        let hit = |(k, v): (&String, &String)| record_format::header(raw, k) == Some(v.as_str());
+        match self.core.spec.header_match {
+            HeaderMatch::All => f.iter().all(hit),
+            HeaderMatch::Any => f.iter().any(hit),
+        }
+    }
+
+    /// Priority ordering is on: records are buffered (up to the window)
+    /// and handed out highest priority first.
+    fn prioritized(&self) -> bool {
+        self.core.spec.priority_window > 0
+    }
+
+    /// Whether expired records must be read (to dead-letter them).
+    fn sees_expired(&self) -> bool {
+        self.core.spec.dead_letter_expired && self.stream_cfg.has_ttl()
+    }
+
+    fn timing(&self, raw: &[u8], now_ns: u64, now: Instant) -> Timing {
+        if self.sees_expired()
+            && msg_time::expires_at_ns(
+                raw,
+                self.stream_cfg.allow_msg_ttl,
+                self.stream_cfg.msg_ttl_ms,
+            )
+            .is_some_and(|e| e <= now_ns)
+        {
+            return Timing::Expired;
+        }
+        if self.stream_cfg.allow_delayed {
+            if let Some(at) = msg_time::deliver_at_ns(raw).filter(|&at| at > now_ns) {
+                return Timing::Delayed(now + Duration::from_nanos(at - now_ns));
+            }
+        }
+        Timing::Ready
+    }
+
+    async fn read_raw(&self, from: u64, limits: ReadLimits) -> Result<RawBatch, StorageError> {
+        let storage = self.log.storage();
+        if self.sees_expired() {
+            storage
+                .read_raw_including_expired(&self.stream, Offset(from), limits)
+                .await
+        } else {
+            storage.read_raw(&self.stream, Offset(from), limits).await
+        }
     }
 
     pub(crate) async fn run(mut self, mut rx: mpsc::Receiver<Cmd>, token: CancellationToken) {
         let mut watch = self.log.storage().watch_appends(&self.stream);
+        // The restored state is persisted already.
+        self.report_floor();
         loop {
             self.pump().await;
             if self.dirty && self.last_persist.elapsed() >= PERSIST_INTERVAL {
@@ -204,6 +328,12 @@ impl Actor {
                         drain(&mut rx, code::NOT_FOUND, "consumer deleted");
                         let r = self.store.delete(&self.core.spec.name).await
                             .map_err(|e| ConsumerError::Storage(e.to_string()));
+                        if r.is_ok() {
+                            let _ = self.floors.send(FloorReport::Gone {
+                                stream: self.stream.as_str().to_string(),
+                                consumer: self.core.spec.name.clone(),
+                            });
+                        }
                         let _ = reply.send(r);
                         return;
                     }
@@ -270,6 +400,14 @@ impl Actor {
                 expires,
                 reply,
             } => {
+                if self.core.spec.single_active {
+                    let _ = reply.send(Err(ConsumerError::Invalid(
+                        "a single_active consumer delivers to one push subscription; \
+                         subscribe instead of pulling"
+                            .into(),
+                    )));
+                    return;
+                }
                 self.pulls.push_back(PullWaiter {
                     max_messages: max_messages.clamp(1, 10_000) as usize,
                     // Capped like Read so the `Messages` frame fits.
@@ -303,7 +441,10 @@ impl Actor {
             Cmd::Term { offset, reason } => {
                 if let Some(deliveries) = self.core.take_unacked(offset) {
                     self.dirty = true;
-                    if !self.dead_letter(offset, deliveries, &reason).await {
+                    if !self
+                        .dead_letter(offset, deliveries, DlqCause::Rejected, &reason, None)
+                        .await
+                    {
                         self.core
                             .reschedule(offset, deliveries, now + Duration::from_secs(1));
                     }
@@ -359,6 +500,7 @@ impl Actor {
             ack_floor: self.core.ack_floor(),
             num_unacked: self.core.unacked() as u64,
             num_in_flight: self.core.in_flight() as u64,
+            num_delayed: self.core.delayed() as u64,
             // Approximate: counts filtered-out records too.
             num_waiting: hwm.0.saturating_sub(self.core.next_read.max(earliest.0)),
             lag: hwm.0.saturating_sub(self.core.ack_floor().max(earliest.0)),
@@ -392,6 +534,7 @@ impl Actor {
             Ok(()) => {
                 self.dirty = false;
                 self.last_persist = Instant::now();
+                self.report_floor();
             }
             Err(e) => {
                 // Try again on the next persist tick.
@@ -421,6 +564,13 @@ impl Actor {
 
     /// Whether any taker has room for at least one more record.
     fn has_room(&self) -> bool {
+        if self.core.spec.single_active {
+            return self
+                .subs
+                .iter()
+                .find(|s| !s.tx.is_closed())
+                .is_some_and(|s| s.credits > 0);
+        }
         self.pulls.iter().any(|p| !p.full())
             || self.subs.iter().any(|s| s.credits > 0 && !s.tx.is_closed())
     }
@@ -446,6 +596,15 @@ impl Actor {
             }
             p.stuffed = true;
         }
+        if self.core.spec.single_active {
+            // Only the oldest live subscription receives.
+            return self
+                .subs
+                .iter()
+                .position(|s| !s.tx.is_closed())
+                .filter(|&i| self.subs[i].credits > 0)
+                .map(Taker::Push);
+        }
         let n = self.subs.len();
         for k in 0..n {
             let i = (self.rr + k) % n;
@@ -465,7 +624,9 @@ impl Actor {
     /// zero-copy slices of the read buffer. Only the subject is parsed (in
     /// place, without allocating) when the consumer has subject filters.
     async fn pump(&mut self) {
+        self.refresh_stream_config().await;
         let now = Instant::now();
+        let now_ns = now_nanos();
         self.subs.retain(|s| !s.tx.is_closed());
         // Pullers that gave up (connection closed) must not be handed records.
         self.pulls.retain(|p| !p.reply.is_closed());
@@ -480,7 +641,13 @@ impl Actor {
                     self.core.take_unacked(offset);
                     self.dirty = true;
                     if !self
-                        .dead_letter(offset, deliveries, "max_deliver exceeded")
+                        .dead_letter(
+                            offset,
+                            deliveries,
+                            DlqCause::MaxDeliver,
+                            "max_deliver exceeded",
+                            None,
+                        )
                         .await
                     {
                         self.core
@@ -493,6 +660,20 @@ impl Actor {
                     }
                     match self.read_one_raw(offset).await {
                         Ok(Some(mut rec)) => {
+                            match self.timing(&rec, now_ns, now) {
+                                Timing::Ready => {}
+                                // A delayed record restored after a restart
+                                // that isn't due yet.
+                                Timing::Delayed(due) if deliveries == 0 => {
+                                    self.core.delay(offset, due);
+                                    continue;
+                                }
+                                Timing::Delayed(_) => {}
+                                Timing::Expired => {
+                                    self.expire(offset, &rec, now).await;
+                                    continue;
+                                }
+                            }
                             let Some(taker) = self.next_taker(rec.len(), None) else {
                                 break;
                             };
@@ -528,11 +709,8 @@ impl Actor {
             }
             let want = capacity.min(READ_BATCH);
             let batch = match self
-                .log
-                .storage()
                 .read_raw(
-                    &self.stream,
-                    Offset(self.core.next_read),
+                    self.core.next_read,
                     ReadLimits {
                         max_records: want,
                         max_bytes: 4 * 1024 * 1024,
@@ -562,9 +740,15 @@ impl Actor {
                 }
             };
             if batch.count == 0 {
-                if batch.next_offset.0 > self.core.next_read {
+                let advanced = batch.next_offset.0 > self.core.next_read;
+                if advanced {
                     self.core.next_read = batch.next_offset.0;
                     self.dirty = true;
+                }
+                // Everything read was hidden (expired, superseded): keep
+                // going while there is more below the high watermark.
+                if advanced && batch.next_offset.0 < batch.high_watermark.0 {
+                    continue;
                 }
                 exhausted = true;
                 break;
@@ -590,6 +774,7 @@ impl Actor {
             let mut run: Option<Run> = None;
             let mut run_offsets: Vec<u64> = Vec::new();
             let mut progressed = false;
+            let timed = self.stream_cfg.allow_delayed || self.sees_expired();
             for p in &positions {
                 if p.offset < self.core.next_read {
                     continue;
@@ -604,6 +789,55 @@ impl Actor {
                         progressed = true;
                         continue;
                     }
+                }
+                if !self.headers_match(&buf[p.range()]) {
+                    self.flush_run(&buf, run.take(), &mut run_offsets, &mut batches);
+                    self.core.next_read = p.offset + 1;
+                    self.dirty = true;
+                    progressed = true;
+                    continue;
+                }
+                if timed {
+                    match self.timing(&buf[p.range()], now_ns, now) {
+                        Timing::Ready => {}
+                        Timing::Delayed(due) => {
+                            self.flush_run(&buf, run.take(), &mut run_offsets, &mut batches);
+                            self.core.delay(p.offset, due);
+                            self.core.next_read = p.offset + 1;
+                            self.dirty = true;
+                            progressed = true;
+                            if self.core.capacity_for_new() == 0 {
+                                break;
+                            }
+                            continue;
+                        }
+                        Timing::Expired => {
+                            self.flush_run(&buf, run.take(), &mut run_offsets, &mut batches);
+                            self.core.next_read = p.offset + 1;
+                            self.dirty = true;
+                            progressed = true;
+                            let raw = buf.slice(p.range());
+                            self.expire(p.offset, &raw, now).await;
+                            continue;
+                        }
+                    }
+                }
+                if self.prioritized() {
+                    // Buffer it; the due step hands buffered records out
+                    // highest priority first.
+                    if self.core.delayed() >= self.core.spec.priority_window as usize {
+                        break;
+                    }
+                    let prio = record_format::header(&buf[p.range()], PRIORITY_HEADER)
+                        .and_then(|v| v.trim().parse::<u8>().ok())
+                        .unwrap_or(0)
+                        .min(9);
+                    self.flush_run(&buf, run.take(), &mut run_offsets, &mut batches);
+                    self.core.delay_with_priority(p.offset, now, prio);
+                    self.core.next_read = p.offset + 1;
+                    self.dirty = true;
+                    progressed = true;
+                    continue;
                 }
                 let Some(taker) = self.next_taker(p.end() - p.start, run.as_ref()) else {
                     break;
@@ -728,11 +962,8 @@ impl Actor {
     /// The record at exactly `offset`, in its wire encoding.
     async fn read_one_raw(&self, offset: u64) -> Result<Option<BytesMut>, StorageError> {
         match self
-            .log
-            .storage()
             .read_raw(
-                &self.stream,
-                Offset(offset),
+                offset,
                 ReadLimits {
                     max_records: 1,
                     max_bytes: 1,
@@ -771,9 +1002,33 @@ impl Actor {
         }
     }
 
+    /// An expired record (consumer with `dead_letter_expired`): forget it
+    /// and dead-letter it with reason `expired`. A failed dead-letter write
+    /// is retried like any other.
+    async fn expire(&mut self, offset: u64, raw: &[u8], now: Instant) {
+        let deliveries = self.core.take_any(offset).unwrap_or(0);
+        self.dirty = true;
+        let rec = decode_raw(raw);
+        if !self
+            .dead_letter(offset, deliveries, DlqCause::Expired, "expired", rec)
+            .await
+        {
+            self.core
+                .reschedule(offset, deliveries.max(1), now + Duration::from_secs(1));
+        }
+    }
+
     /// Copy a record to the consumer's DLQ stream (or drop it when none is
-    /// configured). Returns false if it should be retried later.
-    async fn dead_letter(&mut self, offset: u64, deliveries: u16, reason: &str) -> bool {
+    /// configured). Returns false if it should be retried later. `known` is
+    /// the record when the caller already has it.
+    async fn dead_letter(
+        &mut self,
+        offset: u64,
+        deliveries: u16,
+        cause: DlqCause,
+        reason: &str,
+        known: Option<StoredRecord>,
+    ) -> bool {
         let name = self.core.spec.name.clone();
         let Some(dlq) = self.core.spec.dlq_stream.clone() else {
             tracing::warn!(consumer = %name, offset, reason, "dropping record (no dlq_stream)");
@@ -781,13 +1036,16 @@ impl Actor {
             self.metrics.record_consumer_dead_letter(&name, "dropped");
             return true;
         };
-        let rec = match self.read_one(offset).await {
-            Ok(Some(r)) => r,
-            Ok(None) => {
-                self.core.stats.gone += 1;
-                return true;
-            }
-            Err(_) => return false,
+        let rec = match known {
+            Some(r) => r,
+            None => match self.read_one(offset).await {
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    self.core.stats.gone += 1;
+                    return true;
+                }
+                Err(_) => return false,
+            },
         };
         let Ok(dlq_name) = StreamName::try_from(dlq.as_str()) else {
             tracing::error!(consumer = %name, dlq = %dlq, "invalid dlq_stream name; dropping");
@@ -802,6 +1060,11 @@ impl Actor {
         let mut reason = reason.to_string();
         reason.truncate(4096);
         headers.push(("exspeed-dlq-reason".into(), reason));
+        headers.push(("exspeed-dlq-cause".into(), cause.as_str().into()));
+        headers.push((
+            "exspeed-dlq-time".into(),
+            (now_nanos() / 1_000_000).to_string(),
+        ));
         // Deterministic idempotency key: a retried dead-letter write after a
         // crash doesn't duplicate the DLQ record. The payload hash is part of
         // the key: after the source stream is deleted and recreated, a
@@ -904,6 +1167,26 @@ fn drain(rx: &mut mpsc::Receiver<Cmd>, code: u16, message: &str) {
 enum Taker {
     Pull(usize),
     Push(usize),
+}
+
+fn now_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
+}
+
+/// Decode one raw (wire-encoded) record.
+fn decode_raw(raw: &[u8]) -> Option<StoredRecord> {
+    let l = record_format::layout(raw).ok()?;
+    let b = Bytes::copy_from_slice(raw);
+    Some(StoredRecord {
+        offset: Offset(l.offset),
+        timestamp: l.timestamp_ns,
+        subject: l.subject(raw).to_owned(),
+        key: l.key.clone().map(|r| b.slice(r)),
+        value: b.slice(l.value.clone()),
+        headers: l.headers(raw),
+    })
 }
 
 fn storage_err(e: StorageError) -> ConsumerError {

@@ -105,9 +105,20 @@ since a JavaScript CRC costs more than the rest of decoding). Records in a
 
 **StreamSpec**
 : `str name`, `u64 max_age_secs`, `u64 max_bytes`, `u64 dedup_window_secs`,
-  `u64 dedup_max_entries`, `u8 compaction`
+  `u64 dedup_max_entries`, `u8 compaction`, then optionally `bytes limits`
 
-0 means "server default" for every numeric field.
+0 means "server default" for every numeric field. `limits` is a JSON
+object, sent only when one of its settings isn't the default (so a plain
+spec is understood by every server version):
+
+```json
+{"max_msgs": 0, "discard": "old", "max_msgs_per_subject": 0,
+ "allow_msg_ttl": false, "msg_ttl_ms": 0, "allow_delayed": false,
+ "retention": "limits"}
+```
+
+`discard` is `old` or `new`; `retention` is `limits`, `work_queue` or
+`interest`. Missing keys take these defaults. See [queues.md](queues.md).
 
 **ConsumerSpec** (JSON, carried as `bytes`):
 
@@ -123,11 +134,17 @@ since a JavaScript CRC costs more than the rest of decoding). Records in a
   "backoff_ms": [1000, 5000, 30000],
   "max_ack_pending": 1000,
   "dlq_stream": "orders-dlq",
-  "ephemeral": false
+  "ephemeral": false,
+  "dead_letter_expired": false,
+  "filter_headers": {"region": "eu"},
+  "header_match": "all",
+  "single_active": false,
+  "priority_window": 0
 }
 ```
 
-Only `name` and `stream` are required.
+Only `name` and `stream` are required. The last five are described in
+[queues.md](queues.md#consumer-delivery-options).
 
 - `deliver` takes one of these forms:
   - `"all"`
@@ -164,6 +181,14 @@ Only `name` and `stream` are required.
 | 0x56 | Term | `str consumer`, `u64 offset`, `str reason` | `Ok` (dead-letters immediately) |
 | 0x57 | InProgress | `str consumer`, `vec<u64> offsets` | `Ok` (resets the ack timers) |
 | 0x60 | Read | `str stream`, `u64 from`, `u32 max_records`, `u32 max_bytes`, `u32 wait_ms`, `str filter` | `ReadResult` |
+| 0x70 | CorePublish | `str subject`, `opt<str> reply_to`, `headers`, `bytes value` | `Ok` (nothing with corr 0); `404` "no responders" when `reply_to` is set and nobody received it |
+| 0x71 | CoreSubscribe | `str subject_filter`, `opt<str> queue_group` | `SubscribeOk`, then `CoreMsg` pushes |
+| 0x74 | KvPut | `str bucket`, `str key`, `bytes value`, `opt<u64> expected_revision`, `opt<u64> ttl_ms` | `PublishOk` (offset = the new revision); `409` on a revision mismatch |
+| 0x75 | KvGet | `str bucket`, `str key`, `opt<u64> revision` | `Messages` with one record; `404` when absent |
+| 0x76 | KvDelete | `str bucket`, `str key`, `u8 purge`, `opt<u64> expected_revision` | `PublishOk` |
+| 0x77 | KvKeys | `str bucket`, `str filter` | `Json` array of keys |
+| 0x78 | KvHistory | `str bucket`, `str key` | `Messages` |
+| 0x79 | KvCreateBucket | `str bucket`, `u64 history`, `u64 ttl_ms`, `u64 max_bytes` | `Ok` |
 | 0xF0 | Ping | — | `Pong` |
 
 ## Responses and pushes (server → client)
@@ -181,6 +206,7 @@ Only `name` and `stream` are required.
 | 0x88 | ConnectOk | `str server_version`, `str node_id`, `opt<str> leader` |
 | 0x89 | SubscribeOk | `u32 sub_id` |
 | 0x8A | SubscriptionEnded | `u32 sub_id`, `u16 code`, `str message` (push, corr 0) |
+| 0x8B | CoreMsg | `u32 sub_id`, `str subject`, `opt<str> reply_to`, `headers`, `bytes value` (push, corr 0) |
 | 0xF1 | Pong | — |
 
 ### Size limits
@@ -215,9 +241,9 @@ servers uses its own protocol on the cluster port (see
 | 400 | Malformed request, invalid name or filter, invalid config | |
 | 401 | Not authenticated | |
 | 403 | The credential lacks the needed action on the stream | |
-| 404 | Stream or consumer not found | |
-| 409 | Exists with different settings; stream still has consumers; `msg_id` reused with a different body | `{"stored_offset": n}`, `{"consumers": [...]}` |
-| 429 | Retry later: dedup map full, or too many concurrent waiting requests on this connection (max 64) | `{"retry_after_secs": n}` |
+| 404 | Stream, consumer, bucket or key not found; a core request with no responders | |
+| 409 | Exists with different settings; stream still has consumers; `msg_id` reused with a different body; a work-queue consumer overlapping another; a KV revision mismatch | `{"stored_offset": n}`, `{"consumers": [...]}`, `{"current_revision": n}` |
+| 429 | Retry later: dedup map full, the stream is full (`discard = new`), or too many concurrent waiting requests on this connection (max 64) | `{"retry_after_secs": n}` |
 | 500 | Internal error | |
 | 503 | Not the leader, still starting, or (cluster with `acks = all`) not enough in-sync replicas / replication timed out | `{"leader": "host:port"}` when known; `{"in_sync": n, "required": m}` |
 | 507 | The server's disk is full; nothing was written. Retry once space is freed. | |
@@ -259,7 +285,9 @@ counted in a metric. Dead letters carry these headers:
 - `exspeed-dlq-stream`
 - `exspeed-dlq-original-offset`
 - `exspeed-dlq-deliveries`
-- `exspeed-dlq-reason`
+- `exspeed-dlq-cause` (`max_deliver`, `rejected` or `expired`)
+- `exspeed-dlq-reason` (free text)
+- `exspeed-dlq-time` (ms since the epoch)
 
 They are written idempotently, so a crash mid-dead-letter produces no
 duplicates.
@@ -277,6 +305,39 @@ A subscription ends with a `SubscriptionEnded` push in these cases:
 | 404 | The consumer or its stream was deleted. |
 | 503 | This node lost leadership. Reconnect, and follow `leader` if one is given. |
 
+## Core messaging
+
+`CoreSubscribe` returns a subscription id with the high bit set
+(`0x80000000`); `CoreMsg` pushes carry it, and `Unsubscribe` with it ends
+the subscription. Messages a connection can't keep up with (its queue of
+65,536 messages is full) are dropped. Core messaging runs on the leader: a
+standby answers `503` with `leader`, and leadership moving ends every core
+subscription with `SubscriptionEnded` code 503. See
+[messaging.md](messaging.md).
+
+To send a request, subscribe once to an inbox (`_INBOX.<id>.*`), publish
+with `reply_to` set to `_INBOX.<id>.<token>` and a non-zero correlation id,
+and match the `CoreMsg` whose subject ends in `<token>`.
+
+## Key-value
+
+A bucket `B` is the stream `KV_B`. A key's revision is its record's offset
+plus one; records returned by `KvGet` and `KvHistory` carry the plain stream
+offset, so clients add one. A tombstone has the header `exspeed-kv-op`
+(`DEL` or `PURGE`). See [kv.md](kv.md).
+
+## Time and priority headers
+
+These record headers have meaning to the server:
+
+| Header | Meaning |
+|--------|---------|
+| `exspeed-ttl` | Expire this long after the append (`500ms`, `30s`, `5m`, `2h`, `1d`, or milliseconds). Needs `allow_msg_ttl` on the stream, else the publish fails with 400. |
+| `exspeed-delay` | Consumers deliver it no earlier than this long after the append. Needs `allow_delayed`. |
+| `exspeed-deliver-at` | Consumers deliver it no earlier than this time (ms since the epoch). Needs `allow_delayed`. |
+| `exspeed-priority` | 0–9, for consumers with a `priority_window` |
+| `x-idempotency-key` | The `msg_id` (see [idempotent-publish.md](idempotent-publish.md)) |
+
 ## Authorization
 
 With auth enabled, every operation is checked against the credential's
@@ -292,6 +353,10 @@ per-stream actions:
 | StreamInfo | `admin` or `subscribe` |
 | ListStreams, ListConsumers | Return only the streams and consumers the credential can see (internal streams only to a global admin). |
 | Query | Global admin (`streams = "*"`), since SQL can read any stream. |
+| CorePublish, CoreSubscribe | `publish` / `subscribe` on the subject (a `subjects` permission, or `streams = "*"`); replies to `_INBOX.…` and subscribing to one's own inbox are always allowed |
+| KvGet, KvKeys, KvHistory | `subscribe` on `KV_<bucket>` |
+| KvPut, KvDelete | `publish` on `KV_<bucket>` |
+| KvCreateBucket | `admin` on `KV_<bucket>` |
 
 Streams whose names start with `__` are internal. Clients can't create,
 update, publish to or delete them.

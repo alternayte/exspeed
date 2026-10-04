@@ -13,7 +13,7 @@ use exspeed_broker::broker_append::AppendResult;
 use exspeed_common::auth::Identity;
 use exspeed_common::StreamName;
 use exspeed_storage::file::stream_config::{StreamConfig, StreamConfigFile};
-use exspeed_streams::{Record, StorageError};
+use exspeed_streams::{DiscardPolicy, Record, RetentionPolicy, StorageError, StreamLimits};
 
 use crate::openapi::ErrorBody;
 use crate::state::AppState;
@@ -32,6 +32,30 @@ pub struct CreateStreamRequest {
     /// Keep only the latest record per key (plus unkeyed records).
     #[serde(default)]
     pub compaction: bool,
+    /// Keep at most this many records; 0 or absent = no limit.
+    #[serde(default)]
+    pub max_msgs: u64,
+    /// At `max_msgs` / `max_bytes`: `old` (default) drops the oldest
+    /// records, `new` rejects new ones with 429.
+    #[serde(default)]
+    #[schema(value_type = String, example = "old")]
+    pub discard: DiscardPolicy,
+    /// Keep only the newest N records per subject; 0 = no limit.
+    #[serde(default)]
+    pub max_msgs_per_subject: u64,
+    /// Accept a per-record TTL in the `exspeed-ttl` header.
+    #[serde(default)]
+    pub allow_msg_ttl: bool,
+    /// TTL of records without their own, in milliseconds; 0 = none.
+    #[serde(default)]
+    pub msg_ttl_ms: u64,
+    /// Accept delayed delivery (`exspeed-delay`, `exspeed-deliver-at`).
+    #[serde(default)]
+    pub allow_delayed: bool,
+    /// `limits` (default), `work_queue` or `interest`.
+    #[serde(default)]
+    #[schema(value_type = String, example = "limits")]
+    pub retention: RetentionPolicy,
 }
 
 /// A stream's size, offsets and settings.
@@ -47,6 +71,17 @@ pub struct StreamInfo {
     pub dedup_window_secs: u64,
     pub dedup_max_entries: u64,
     pub compaction: bool,
+    /// Offset of the first retained record.
+    pub earliest_offset: u64,
+    pub max_msgs: u64,
+    #[schema(value_type = String)]
+    pub discard: DiscardPolicy,
+    pub max_msgs_per_subject: u64,
+    pub allow_msg_ttl: bool,
+    pub msg_ttl_ms: u64,
+    pub allow_delayed: bool,
+    #[schema(value_type = String)]
+    pub retention: RetentionPolicy,
     /// Internal streams start with `__` (consumer state, offsets, ...).
     pub internal: bool,
     /// `healthy`, or `failed`: the partition is fenced read-only after an
@@ -59,12 +94,17 @@ pub struct StreamInfo {
 }
 
 fn stream_info_json(
+    state: &AppState,
     name: &str,
     config: &StreamConfig,
     storage_bytes: u64,
     head_offset: u64,
     failure: Option<String>,
 ) -> StreamInfo {
+    let earliest_offset = StreamName::try_from(name)
+        .ok()
+        .and_then(|n| state.storage.earliest_offset(&n))
+        .unwrap_or(head_offset);
     StreamInfo {
         status: if failure.is_some() {
             "failed"
@@ -81,6 +121,14 @@ fn stream_info_json(
         dedup_window_secs: config.dedup_window_secs,
         dedup_max_entries: config.dedup_max_entries,
         compaction: config.compaction,
+        earliest_offset,
+        max_msgs: config.max_msgs,
+        discard: config.discard,
+        max_msgs_per_subject: config.max_msgs_per_subject,
+        allow_msg_ttl: config.allow_msg_ttl,
+        msg_ttl_ms: config.msg_ttl_ms,
+        allow_delayed: config.allow_delayed,
+        retention: config.retention,
         internal: name.starts_with(exspeed_common::INTERNAL_STREAM_PREFIX),
     }
 }
@@ -152,6 +200,7 @@ pub async fn list_streams(
         let config = StreamConfig::load(&stream_dir).unwrap_or_default();
 
         streams.push(stream_info_json(
+            &state,
             name,
             &config,
             storage_bytes,
@@ -215,14 +264,18 @@ pub async fn create_stream(
         state.broker.log.default_dedup_window_secs(),
     );
     cfg.compaction = body.compaction;
+    let cfg = cfg.with_limits(&StreamLimits {
+        max_msgs: body.max_msgs,
+        discard: body.discard,
+        max_msgs_per_subject: body.max_msgs_per_subject,
+        allow_msg_ttl: body.allow_msg_ttl,
+        msg_ttl_ms: body.msg_ttl_ms,
+        allow_delayed: body.allow_delayed,
+        retention: body.retention,
+    });
 
     // Validate before touching storage.
-    if let Err(msg) = StreamConfig::validate(
-        cfg.max_age_secs,
-        cfg.max_bytes,
-        cfg.dedup_window_secs,
-        cfg.dedup_max_entries,
-    ) {
+    if let Err(msg) = cfg.check() {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
     }
 
@@ -297,6 +350,11 @@ pub(crate) fn log_error_response(
             )
                 .into_response()
         }
+        LogError::Storage(e @ StorageError::StreamFull { .. }) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
         LogError::Storage(e) => {
             let kind = match &e {
                 StorageError::Io(io_err)
@@ -376,6 +434,7 @@ pub async fn get_stream(
     (
         StatusCode::OK,
         Json(stream_info_json(
+            &state,
             &name,
             &config,
             storage_bytes,
@@ -397,6 +456,15 @@ pub struct UpdateStreamRequest {
     pub max_bytes: Option<u64>,
     pub dedup_window_secs: Option<u64>,
     pub dedup_max_entries: Option<u64>,
+    pub max_msgs: Option<u64>,
+    #[schema(value_type = Option<String>)]
+    pub discard: Option<DiscardPolicy>,
+    pub max_msgs_per_subject: Option<u64>,
+    pub allow_msg_ttl: Option<bool>,
+    pub msg_ttl_ms: Option<u64>,
+    pub allow_delayed: Option<bool>,
+    #[schema(value_type = Option<String>)]
+    pub retention: Option<RetentionPolicy>,
 }
 
 /// Update retention and dedup settings.
@@ -475,14 +543,30 @@ pub async fn patch_stream(
     if let Some(v) = req.dedup_max_entries {
         cfg.dedup_max_entries = v;
     }
+    if let Some(v) = req.max_msgs {
+        cfg.max_msgs = v;
+    }
+    if let Some(v) = req.discard {
+        cfg.discard = v;
+    }
+    if let Some(v) = req.max_msgs_per_subject {
+        cfg.max_msgs_per_subject = v;
+    }
+    if let Some(v) = req.allow_msg_ttl {
+        cfg.allow_msg_ttl = v;
+    }
+    if let Some(v) = req.msg_ttl_ms {
+        cfg.msg_ttl_ms = v;
+    }
+    if let Some(v) = req.allow_delayed {
+        cfg.allow_delayed = v;
+    }
+    if let Some(v) = req.retention {
+        cfg.retention = v;
+    }
 
     // Validate the merged config.
-    if let Err(msg) = StreamConfig::validate(
-        cfg.max_age_secs,
-        cfg.max_bytes,
-        cfg.dedup_window_secs,
-        cfg.dedup_max_entries,
-    ) {
+    if let Err(msg) = cfg.check() {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
     }
 
@@ -517,6 +601,7 @@ pub async fn patch_stream(
     (
         StatusCode::OK,
         Json(stream_info_json(
+            &state,
             &name,
             &cfg,
             storage_bytes,

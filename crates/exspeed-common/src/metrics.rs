@@ -226,6 +226,12 @@ pub struct Metrics {
     /// `exspeed_consumer_dead_letters_total{consumer,outcome}`: `outcome`
     /// is `dlq` or `dropped`.
     pub consumer_dead_letters_total: Counter,
+    /// `exspeed_core_messages_delivered_total`: core (non-persistent)
+    /// messages handed to subscriptions.
+    pub core_messages_delivered_total: Counter,
+    /// `exspeed_core_messages_dropped_total`: core messages a slow
+    /// subscriber's full queue lost.
+    pub core_messages_dropped_total: Counter,
     /// `exspeed_connector_state{connector,state}`: 1 for the current state.
     pub connector_state: Gauge,
     /// `exspeed_connector_restarts_total{connector}`.
@@ -384,6 +390,16 @@ impl Metrics {
                 "exspeed_consumer_dead_letters_total",
                 "Records dead-lettered (or dropped) by consumers",
                 &["consumer", "outcome"],
+            ),
+            core_messages_delivered_total: b.counter(
+                "exspeed_core_messages_delivered_total",
+                "Core (non-persistent) messages handed to subscriptions",
+                &[],
+            ),
+            core_messages_dropped_total: b.counter(
+                "exspeed_core_messages_dropped_total",
+                "Core messages lost because a subscriber's queue was full",
+                &[],
             ),
             connector_state: b.gauge(
                 "exspeed_connector_state",
@@ -587,6 +603,18 @@ impl Metrics {
                 KeyValue::new("outcome", outcome),
             ],
         );
+    }
+
+    /// Count core messages handed to `n` subscriptions.
+    pub fn record_core_published(&self, n: u64) {
+        if n > 0 {
+            self.core_messages_delivered_total.add(n, &[]);
+        }
+    }
+
+    /// Count a core message a slow subscriber lost.
+    pub fn record_core_dropped(&self) {
+        self.core_messages_dropped_total.add(1, &[]);
     }
 
     /// Count one record written to `stream`.

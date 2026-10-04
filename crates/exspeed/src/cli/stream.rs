@@ -3,6 +3,37 @@ use serde_json::json;
 
 use crate::cli::client::CliClient;
 use crate::cli::format;
+use crate::cli::StreamLimitArgs;
+
+/// Add the limit flags that were given to a create / update body.
+fn apply_limits(
+    body: &mut serde_json::Map<String, serde_json::Value>,
+    l: &StreamLimitArgs,
+) -> Result<()> {
+    if let Some(v) = &l.max_msgs {
+        body.insert("max_msgs".into(), json!(parse_count_suffix(v)?));
+    }
+    if let Some(v) = &l.discard {
+        body.insert("discard".into(), json!(v));
+    }
+    if let Some(v) = l.max_msgs_per_subject {
+        body.insert("max_msgs_per_subject".into(), json!(v));
+    }
+    if let Some(v) = l.allow_msg_ttl {
+        body.insert("allow_msg_ttl".into(), json!(v));
+    }
+    if let Some(v) = &l.msg_ttl {
+        let ms = exspeed_common::msg_time::parse_duration_ms(v).map_err(|e| anyhow!(e))?;
+        body.insert("msg_ttl_ms".into(), json!(ms));
+    }
+    if let Some(v) = l.allow_delayed {
+        body.insert("allow_delayed".into(), json!(v));
+    }
+    if let Some(v) = &l.retention_policy {
+        body.insert("retention".into(), json!(v));
+    }
+    Ok(())
+}
 
 /// Create a new stream via the HTTP API.
 ///
@@ -17,6 +48,7 @@ pub async fn create(
     max_size: &str,
     dedup_window: Option<&str>,
     dedup_max_entries: Option<&str>,
+    limits: &StreamLimitArgs,
 ) -> Result<()> {
     let retention_secs = parse_duration_secs(retention)?;
     let max_bytes = parse_size_bytes(max_size)?;
@@ -32,6 +64,9 @@ pub async fn create(
     }
     if let Some(e) = dedup_max_entries {
         body["dedup_max_entries"] = json!(parse_count_suffix(e)?);
+    }
+    if let Some(map) = body.as_object_mut() {
+        apply_limits(map, limits)?;
     }
 
     let (status, resp) = client.post("/api/v1/streams", &body).await?;
@@ -59,8 +94,10 @@ pub async fn update(
     max_size: Option<&str>,
     dedup_window: Option<&str>,
     dedup_max_entries: Option<&str>,
+    limits: &StreamLimitArgs,
 ) -> Result<()> {
     let mut body = serde_json::Map::new();
+    apply_limits(&mut body, limits)?;
 
     if let Some(r) = retention {
         body.insert("max_age_secs".into(), json!(parse_duration_secs(r)?));
@@ -179,6 +216,34 @@ pub async fn info(client: &CliClient, name: &str, json_output: bool) -> Result<(
     }
     if let Some(de) = resp["dedup_max_entries"].as_u64() {
         println!("  Dedup max entries: {}", de);
+    }
+    if let Some(e) = resp["earliest_offset"].as_u64() {
+        println!("  Earliest offset: {}", e);
+    }
+    match resp["max_msgs"].as_u64() {
+        Some(n) if n > 0 => println!(
+            "  Max messages: {} (discard {})",
+            n,
+            resp["discard"].as_str().unwrap_or("old")
+        ),
+        _ => {}
+    }
+    match resp["max_msgs_per_subject"].as_u64() {
+        Some(n) if n > 0 => println!("  Max messages per subject: {}", n),
+        _ => {}
+    }
+    if resp["allow_msg_ttl"].as_bool() == Some(true) {
+        println!("  Per-message TTL: allowed");
+    }
+    match resp["msg_ttl_ms"].as_u64() {
+        Some(n) if n > 0 => println!("  Default TTL: {}ms", n),
+        _ => {}
+    }
+    if resp["allow_delayed"].as_bool() == Some(true) {
+        println!("  Delayed delivery: allowed");
+    }
+    if let Some(r) = resp["retention"].as_str() {
+        println!("  Retention policy: {}", r);
     }
 
     Ok(())

@@ -106,6 +106,19 @@ pub struct ConsumerSpecDoc {
     /// Must be false over HTTP (ephemeral consumers are tied to a TCP
     /// connection).
     pub ephemeral: Option<bool>,
+    /// Dead-letter records whose TTL expires before they are acked (reason
+    /// `expired`) instead of dropping them.
+    pub dead_letter_expired: Option<bool>,
+    /// Only records whose headers have these values (omitted when empty).
+    pub filter_headers: Option<std::collections::BTreeMap<String, String>>,
+    /// `all` (default) or `any` of `filter_headers` must match.
+    #[schema(value_type = Option<String>)]
+    pub header_match: Option<String>,
+    /// Deliver to one subscription at a time (the oldest connected).
+    pub single_active: Option<bool>,
+    /// Look this many records ahead and deliver higher `exspeed-priority`
+    /// first; 0 = in order.
+    pub priority_window: Option<u32>,
 }
 
 /// Consumer counters (`exspeed_broker::consumer::ConsumerStats`).
@@ -136,6 +149,8 @@ pub struct ConsumerInfoDoc {
     pub ack_floor: u64,
     pub num_unacked: u64,
     pub num_in_flight: u64,
+    /// Records held back until their delivery time.
+    pub num_delayed: u64,
     /// Records not yet delivered (approximate).
     pub num_waiting: u64,
     /// `high_watermark - ack_floor`.
@@ -295,6 +310,12 @@ impl Modify for BearerAuth {
         handlers::connections::create_connection,
         handlers::connections::delete_connection,
         handlers::whoami::whoami,
+        handlers::kv::create_bucket,
+        handlers::kv::list_keys,
+        handlers::kv::get_key,
+        handlers::kv::put_key,
+        handlers::kv::delete_key,
+        handlers::kv::key_history,
         handlers::backup::backup,
         openapi_json,
         handlers::leases::list_leases,
@@ -306,6 +327,7 @@ impl Modify for BearerAuth {
         (name = "consumers", description = "Durable consumers (delivery itself is TCP-only)"),
         (name = "queries", description = "ExQL statements and continuous queries"),
         (name = "views", description = "Materialized tables"),
+        (name = "kv", description = "Key-value buckets"),
         (name = "connectors", description = "Source and sink connectors"),
         (name = "connections", description = "External databases for bounded queries"),
         (name = "webhooks", description = "Ingest through http_webhook connectors"),
@@ -371,7 +393,9 @@ mod tests {
     #[test]
     fn mirror_schemas_match_the_real_types() {
         let doc = doc();
-        let spec = exspeed_protocol::client::ConsumerSpec::new("c", "s");
+        let mut spec = exspeed_protocol::client::ConsumerSpec::new("c", "s");
+        // Serialized only when set.
+        spec.filter_headers.insert("k".into(), "v".into());
         assert_eq!(
             schema_props(&doc, "ConsumerSpec"),
             keys(serde_json::to_value(&spec).unwrap())
@@ -387,6 +411,7 @@ mod tests {
             ack_floor: 0,
             num_unacked: 0,
             num_in_flight: 0,
+            num_delayed: 0,
             num_waiting: 0,
             lag: 0,
             subscribers: 0,

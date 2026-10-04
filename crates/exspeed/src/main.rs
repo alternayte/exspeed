@@ -37,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
             max_size,
             dedup_window,
             dedup_max_entries,
+            limits,
         } => {
             cli::stream::create(
                 &client,
@@ -45,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
                 &max_size,
                 dedup_window.as_deref(),
                 dedup_max_entries.as_deref(),
+                &limits,
             )
             .await
         }
@@ -54,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
             max_size,
             dedup_window,
             dedup_max_entries,
+            limits,
         } => {
             cli::stream::update(
                 &client,
@@ -62,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
                 max_size.as_deref(),
                 dedup_window.as_deref(),
                 dedup_max_entries.as_deref(),
+                &limits,
             )
             .await
         }

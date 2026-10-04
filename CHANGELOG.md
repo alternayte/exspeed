@@ -7,6 +7,163 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-10-04
+
+**TL;DR:** Exspeed 0.7 adds the features people stay on NATS or RabbitMQ
+for. Streams can now behave like queues: messages can expire, wait before
+delivery, be removed once acknowledged, and be capped with "reject when
+full". Consumers can filter on headers, deliver urgent messages first, or
+keep one active subscriber with automatic failover. Beyond streams there is
+non-persistent publish/subscribe with request-reply, a key-value store with
+compare-and-set, and client-certificate (mTLS) authentication. Everything is
+off by default; existing streams, clients and data directories keep working
+unchanged.
+
+### What's new
+
+- **Messages that expire.** Give a stream a TTL, or let each message carry
+  its own (`exspeed-ttl` header). Expired messages disappear from reads,
+  SQL and consumers; a consumer can send them to its dead-letter stream
+  instead.
+- **Delayed delivery.** A message can ask to be delivered later
+  (`exspeed-delay: 30s`) or at a time (`exspeed-deliver-at`). It survives
+  restarts and failover while it waits.
+- **Real work queues.** `retention = "work_queue"` removes a message once it
+  is acknowledged; `interest` removes it once every consumer has. Combine
+  with `max_msgs` and `discard = "new"` for a bounded queue that tells
+  publishers "full" (429) instead of growing without limit.
+- **Ring buffers and last-value streams.** `max_msgs` with `discard =
+  "old"` keeps the newest N messages; `max_msgs_per_subject` keeps only the
+  newest N per subject.
+- **Smarter consumers.** Filter on header values (like a RabbitMQ headers
+  exchange), deliver higher-priority messages first, or run a single
+  active consumer that fails over to a standby. Dead-lettered messages say
+  why (`max_deliver`, `rejected` or `expired`).
+- **Publish/subscribe and request-reply.** Core messages go straight to
+  whoever is subscribed, with queue groups to share the load and
+  request-reply that fails fast when no service is listening. Nothing is
+  stored, like core NATS.
+- **Key-value buckets.** Get, put, delete, history, compare-and-set,
+  per-key TTLs and live watches, over TCP and HTTP. Buckets are streams, so
+  they persist, replicate and fail over like everything else.
+- **Client certificates.** The TCP port can require certificates from your
+  CA, and a credential can be bound to a certificate instead of a token.
+  Credentials can also grant publish/subscribe on subjects for core
+  messaging.
+- **SDKs.** The TypeScript SDK and the Rust client support all of the above.
+
+### Upgrading from 0.6
+
+Upgrade in place: 0.7 opens 0.6 data directories, speaks to 0.6 clients,
+and reads 0.6 config and credentials files. In a cluster, upgrade the
+followers first and the leader last, so a node that becomes leader always
+understands every stream setting. Don't downgrade a data directory after
+using the new features: 0.6 ignores them (expired, superseded and acked
+work-queue records would reappear).
+
+TypeScript SDK: the low-level `client.request(req)` that sends a raw
+protocol request is now `client.rawRequest(req)`; `client.request` is the
+new request-reply call.
+
+### Get it
+
+- Docker (amd64 and arm64): `docker pull ghcr.io/alternayte/exspeed:0.7.0`
+- Binaries and installers for macOS, Linux and Windows: below.
+- TypeScript SDK: `@exspeed/sdk` 0.7.0, in [`sdks/typescript`](https://github.com/alternayte/exspeed/tree/v0.7.0/sdks/typescript).
+- Docs: [queues](https://github.com/alternayte/exspeed/blob/v0.7.0/docs/queues.md),
+  [messaging](https://github.com/alternayte/exspeed/blob/v0.7.0/docs/messaging.md),
+  [key-value](https://github.com/alternayte/exspeed/blob/v0.7.0/docs/kv.md),
+  [everything else](https://github.com/alternayte/exspeed/tree/v0.7.0/docs).
+
+<details>
+<summary>Full list of changes</summary>
+
+#### Streams
+
+- New stream settings (`StreamConfig`, the protocol's stream spec, the HTTP
+  API and `exspeed create` / `update-stream`): `max_msgs`, `discard`
+  (`old`/`new`), `max_msgs_per_subject`, `allow_msg_ttl`, `msg_ttl_ms`,
+  `allow_delayed`, `retention` (`limits`/`work_queue`/`interest`). On the
+  wire they travel as an optional JSON trailer on the stream spec, sent only
+  when set.
+- Storage has a record-exact log start offset (`partitions/0/log_start`):
+  `trim_up_to` no longer works on whole segments only. Backups carry it and
+  followers mirror it.
+- Reads, SQL and consumers hide expired records and records superseded under
+  `max_msgs_per_subject` (an in-memory per-subject index, rebuilt on start
+  and when the limit changes). Compaction removes them from disk; a
+  stream-wide TTL that records can't override also expires whole segments.
+- `discard = new` rejects a publish that doesn't fit with `429`
+  (`StorageError::StreamFull`), whole batches at a time.
+- Publishing an `exspeed-ttl`, `exspeed-delay` or `exspeed-deliver-at`
+  header to a stream that doesn't allow it, or with an invalid value, fails
+  with `400`.
+- `GET /api/v1/streams/{name}` and stream info include `earliest_offset`
+  and every new setting.
+
+#### Retention by acknowledgement
+
+- Consumers report their ack floor after each persisted state; the leader
+  trims `work_queue` and `interest` streams to the lowest floor (an
+  `interest` stream with no consumers to its head).
+- Work-queue streams accept only `deliver: all` consumers whose subject
+  filters don't overlap (`409` otherwise). Retention policies can't be
+  combined with compaction.
+
+#### Consumers
+
+- Delayed records are held until due (at most 100,000 per consumer), don't
+  count against `max_ack_pending`, hold the ack floor, and are persisted;
+  consumer info reports `num_delayed`.
+- New consumer settings: `dead_letter_expired`, `filter_headers` +
+  `header_match`, `single_active` (pulls are refused), `priority_window`
+  (records carry `exspeed-priority` 0–9).
+- Dead letters gain `exspeed-dlq-cause` and `exspeed-dlq-time`.
+- A consumer no longer stalls when a whole read batch is hidden (expired or
+  superseded records).
+
+#### Core messaging
+
+- Protocol: `CorePublish` (0x70), `CoreSubscribe` (0x71), `CoreMsg` push
+  (0x8B); `Unsubscribe` ends core subscriptions (ids with the high bit set).
+- Queue groups, request-reply with `404` "no responders", a 65,536-message
+  queue per connection with drops counted in
+  `exspeed_core_messages_dropped_total` (and
+  `exspeed_core_messages_delivered_total`).
+- Leader only; subscriptions end with `503` when leadership moves.
+
+#### Key-value
+
+- Protocol: `KvPut`, `KvGet`, `KvDelete`, `KvKeys`, `KvHistory`,
+  `KvCreateBucket` (0x74–0x79). HTTP: `POST /api/v1/kv`,
+  `GET /api/v1/kv/{bucket}`, `GET/PUT/DELETE /api/v1/kv/{bucket}/{key}`
+  (`If-Match` / `If-None-Match: *`), `.../history`.
+- A bucket is the stream `KV_<bucket>`; revisions are offset + 1.
+  Compare-and-set runs under a per-bucket lock against the committed log.
+
+#### Security
+
+- `tls.client_ca` (`EXSPEED_TLS_CLIENT_CA`, `--tls-client-ca`) requires
+  client certificates on the TCP port.
+- Credentials: `cert_cn` binds a credential to a certificate name instead of
+  `token_sha256`; `subjects = "…"` permissions grant publish/subscribe on
+  core-message subjects. Replies to `_INBOX.…` are always allowed.
+
+#### Clients
+
+- Rust client: stream limits in `StreamSpec`, `PublishRecord::ttl` /
+  `delay` / `deliver_at` / `priority`, `publish_core`, `subscribe_core`,
+  `respond`, `request_core`, and `Client::kv` (get, put, create_key,
+  update, delete, purge, keys, history, watch).
+- TypeScript SDK: stream limits, `ttl` / `delay` / `deliverAt` / `priority`
+  publish options, the new consumer settings and `numDelayed`,
+  `publishCore`, `subscribeCore`, `request` (request-reply), `client.kv`
+  (`KvBucket` with `createKey`, `update`, `getRevision`, `watch`, …), and
+  mutual TLS documented. The raw protocol call `request(req)` is renamed
+  `rawRequest(req)`.
+
+</details>
+
 ## [0.6.0] — 2026-10-03
 
 **TL;DR:** Exspeed 0.6 is a ground-up rebuild of the broker for correctness.

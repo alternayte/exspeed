@@ -7,6 +7,10 @@ pub const DEFAULT_MAX_BYTES: u64 = 10_737_418_240; // 10 GB
 pub const DEFAULT_DEDUP_WINDOW_SECS: u64 = 300;
 pub const DEFAULT_DEDUP_MAX_ENTRIES: u64 = 500_000;
 pub const DEFAULT_TOMBSTONE_RETENTION_SECS: u64 = 86_400; // 24 h
+/// Longest accepted stream-wide message TTL: 10 years.
+pub const MAX_MSG_TTL_MS: u64 = 10 * 365 * 24 * 3600 * 1000;
+
+pub use exspeed_common::limits::{DiscardPolicy, RetentionPolicy, StreamLimits};
 
 /// Retention, dedup and compaction settings for one stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +30,31 @@ pub struct StreamConfig {
     /// How long a tombstone survives compaction before it is removed too.
     #[serde(default = "default_tombstone_retention_secs")]
     pub tombstone_retention_secs: u64,
+    /// Keep at most this many records (0 = no limit). What happens at the
+    /// limit is decided by `discard`.
+    #[serde(default)]
+    pub max_msgs: u64,
+    /// At `max_msgs` (or `max_bytes`, for `New`): drop the oldest records or
+    /// reject new ones.
+    #[serde(default)]
+    pub discard: DiscardPolicy,
+    /// Keep only the newest N records per subject (0 = no limit). Older
+    /// records of a subject are invisible as soon as N newer ones exist.
+    #[serde(default)]
+    pub max_msgs_per_subject: u64,
+    /// Accept a per-record TTL in the `exspeed-ttl` header.
+    #[serde(default)]
+    pub allow_msg_ttl: bool,
+    /// TTL of every record without its own `exspeed-ttl` (0 = none), in
+    /// milliseconds. Expired records are invisible to readers and consumers.
+    #[serde(default)]
+    pub msg_ttl_ms: u64,
+    /// Accept delayed delivery (`exspeed-delay` / `exspeed-deliver-at`).
+    #[serde(default)]
+    pub allow_delayed: bool,
+    /// Whether acknowledgements remove records (`work_queue`, `interest`).
+    #[serde(default)]
+    pub retention: RetentionPolicy,
 }
 
 fn default_dedup_window_secs() -> u64 {
@@ -47,6 +76,13 @@ impl Default for StreamConfig {
             dedup_max_entries: DEFAULT_DEDUP_MAX_ENTRIES,
             compaction: false,
             tombstone_retention_secs: DEFAULT_TOMBSTONE_RETENTION_SECS,
+            max_msgs: 0,
+            discard: DiscardPolicy::Old,
+            max_msgs_per_subject: 0,
+            allow_msg_ttl: false,
+            msg_ttl_ms: 0,
+            allow_delayed: false,
+            retention: RetentionPolicy::Limits,
         }
     }
 }
@@ -127,7 +163,49 @@ impl StreamConfig {
             self.max_bytes,
             self.dedup_window_secs,
             self.dedup_max_entries,
-        )
+        )?;
+        if self.msg_ttl_ms > crate::config::MAX_MSG_TTL_MS {
+            return Err("msg_ttl_ms is longer than 10 years".into());
+        }
+        if !self.retention.is_limits() && self.compaction {
+            return Err(
+                "compaction keeps the latest record per key; it can't be combined with \
+                 work_queue or interest retention, which remove records once acked"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// The limit and lifetime settings, as sent over the wire.
+    pub fn limits(&self) -> StreamLimits {
+        StreamLimits {
+            max_msgs: self.max_msgs,
+            discard: self.discard,
+            max_msgs_per_subject: self.max_msgs_per_subject,
+            allow_msg_ttl: self.allow_msg_ttl,
+            msg_ttl_ms: self.msg_ttl_ms,
+            allow_delayed: self.allow_delayed,
+            retention: self.retention,
+        }
+    }
+
+    /// Set the limit and lifetime settings.
+    pub fn with_limits(mut self, l: &StreamLimits) -> Self {
+        self.max_msgs = l.max_msgs;
+        self.discard = l.discard;
+        self.max_msgs_per_subject = l.max_msgs_per_subject;
+        self.allow_msg_ttl = l.allow_msg_ttl;
+        self.msg_ttl_ms = l.msg_ttl_ms;
+        self.allow_delayed = l.allow_delayed;
+        self.retention = l.retention;
+        self
+    }
+
+    /// Whether readers must look at each record's time headers or
+    /// timestamp to hide expired records.
+    pub fn has_ttl(&self) -> bool {
+        self.allow_msg_ttl || self.msg_ttl_ms > 0
     }
 }
 

@@ -47,6 +47,11 @@ pub enum StorageError {
     #[error("stream {stream} is read-only after an unrecoverable storage error: {reason}")]
     PartitionFailed { stream: String, reason: String },
 
+    /// The stream is at its `max_msgs` / `max_bytes` limit and its discard
+    /// policy is `new`: nothing was written. Retryable once records leave.
+    #[error("stream {stream} is full ({limit}); nothing was written (discard policy: new)")]
+    StreamFull { stream: String, limit: String },
+
     /// The engine doesn't implement this operation.
     #[error("unsupported: {0}")]
     Unsupported(String),

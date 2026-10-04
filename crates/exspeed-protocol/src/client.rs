@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 
 use exspeed_common::record_format;
 
+pub use exspeed_common::limits::{DiscardPolicy, RetentionPolicy, StreamLimits};
+
 use crate::error::ProtocolError;
 use crate::frame::{Frame, OutFrame};
 use crate::opcodes::OpCode;
@@ -88,6 +90,39 @@ impl PublishRecord {
     pub fn msg_id(mut self, id: impl Into<String>) -> Self {
         self.msg_id = Some(id.into());
         self
+    }
+
+    /// Expire the record this long after it is appended (the stream must
+    /// allow per-message TTLs).
+    pub fn ttl(self, ttl: std::time::Duration) -> Self {
+        self.header(
+            exspeed_common::msg_time::TTL_HEADER,
+            format!("{}ms", ttl.as_millis().max(1)),
+        )
+    }
+
+    /// Deliver the record to consumers no earlier than this long after it is
+    /// appended (the stream must allow delayed delivery).
+    pub fn delay(self, delay: std::time::Duration) -> Self {
+        self.header(
+            exspeed_common::msg_time::DELAY_HEADER,
+            format!("{}ms", delay.as_millis()),
+        )
+    }
+
+    /// Priority 0..=9 (higher first) for consumers with a
+    /// `priority_window`.
+    pub fn priority(self, p: u8) -> Self {
+        self.header(PRIORITY_HEADER, p.min(9).to_string())
+    }
+
+    /// Deliver the record to consumers no earlier than this time
+    /// (milliseconds since the Unix epoch).
+    pub fn deliver_at(self, epoch_ms: u64) -> Self {
+        self.header(
+            exspeed_common::msg_time::DELIVER_AT_HEADER,
+            epoch_ms.to_string(),
+        )
     }
 }
 
@@ -231,6 +266,9 @@ pub struct StreamSpec {
     pub dedup_max_entries: u64,
     /// Keep only the latest record per key (log compaction).
     pub compaction: bool,
+    /// Message limits, TTLs, delayed delivery and the retention policy.
+    /// Encoded as a trailing JSON object, sent only when not all defaults.
+    pub limits: StreamLimits,
 }
 
 /// Where a consumer starts reading when it is created.
@@ -270,6 +308,24 @@ fn default_max_ack_pending() -> u32 {
     1_000
 }
 
+/// How `filter_headers` combines its entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HeaderMatch {
+    /// Every header must match.
+    #[default]
+    All,
+    /// At least one must.
+    Any,
+}
+
+/// Header carrying a record's priority for consumers with a
+/// `priority_window`: 0 (default) to 9, higher first.
+pub const PRIORITY_HEADER: &str = "exspeed-priority";
+
+/// Most records a consumer looks ahead to order by priority.
+pub const MAX_PRIORITY_WINDOW: u32 = 10_000;
+
 /// A durable (or ephemeral) consumer: a cursor plus delivery state over one
 /// stream. Several subscribers on one consumer share its records (a work
 /// queue); each record goes to one of them.
@@ -304,6 +360,24 @@ pub struct ConsumerSpec {
     /// Deleted automatically when the connection that created it closes.
     #[serde(default)]
     pub ephemeral: bool,
+    /// Dead-letter records whose TTL expires before they are acked (to
+    /// `dlq_stream`, reason `expired`) instead of silently dropping them.
+    #[serde(default)]
+    pub dead_letter_expired: bool,
+    /// Only records whose headers have these values (exact match), combined
+    /// by `header_match`. Empty = no header filter.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub filter_headers: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub header_match: HeaderMatch,
+    /// Deliver to one subscription at a time (the oldest one connected);
+    /// the next takes over when it goes away. Pull requests are refused.
+    #[serde(default)]
+    pub single_active: bool,
+    /// Look this many records ahead and deliver higher `exspeed-priority`
+    /// first (0 = in order). Priority applies within the window only.
+    #[serde(default)]
+    pub priority_window: u32,
 }
 
 impl ConsumerSpec {
@@ -321,6 +395,11 @@ impl ConsumerSpec {
             max_ack_pending: default_max_ack_pending(),
             dlq_stream: None,
             ephemeral: false,
+            dead_letter_expired: false,
+            filter_headers: std::collections::BTreeMap::new(),
+            header_match: HeaderMatch::All,
+            single_active: false,
+            priority_window: 0,
         }
     }
 }
@@ -434,6 +513,70 @@ pub enum Request {
         /// NATS-style subject filter; empty = all.
         filter: String,
     },
+    /// Publish a core (non-persistent) message to the subscriptions live
+    /// now. With `reply_to` it is a request: the server answers
+    /// `NOT_FOUND` ("no responders") when nobody received it. Correlation
+    /// id 0 = fire-and-forget.
+    CorePublish {
+        subject: String,
+        reply_to: Option<String>,
+        headers: Vec<(String, String)>,
+        value: Bytes,
+    },
+    /// Receive core messages on subjects matching `subject` (a filter). In
+    /// a `queue` group, each message goes to one member. Answered with
+    /// `SubscribeOk`; `Unsubscribe` with that id ends it.
+    CoreSubscribe {
+        subject: String,
+        queue: Option<String>,
+    },
+    /// Create a key-value bucket (the stream `KV_<bucket>`). Idempotent for
+    /// the same settings.
+    KvCreateBucket {
+        bucket: String,
+        /// Values kept per key (1..=64; 0 = 1).
+        history: u64,
+        /// Keys expire this long after their last put (0 = never).
+        ttl_ms: u64,
+        /// Size limit (0 = server default).
+        max_bytes: u64,
+    },
+    /// Set a key; answered with `PublishOk` (offset = the new revision).
+    /// `expected_revision`: only if the key is at that revision (0 = absent),
+    /// else `CONFLICT`.
+    KvPut {
+        bucket: String,
+        key: String,
+        value: Bytes,
+        expected_revision: Option<u64>,
+        ttl_ms: Option<u64>,
+    },
+    /// Read a key (its current value, or `revision` while kept); answered
+    /// with `Messages` holding one record, or `NOT_FOUND`.
+    KvGet {
+        bucket: String,
+        key: String,
+        revision: Option<u64>,
+    },
+    /// Delete (or purge) a key; answered with `PublishOk`.
+    KvDelete {
+        bucket: String,
+        key: String,
+        purge: bool,
+        expected_revision: Option<u64>,
+    },
+    /// Keys with a value, matching `filter` ("" = all); answered with a
+    /// JSON array of strings.
+    KvKeys {
+        bucket: String,
+        filter: String,
+    },
+    /// Kept revisions of a key, oldest first (tombstones included); answered
+    /// with `Messages`.
+    KvHistory {
+        bucket: String,
+        key: String,
+    },
 }
 
 impl Request {
@@ -464,6 +607,14 @@ impl Request {
             Request::Term { .. } => OpCode::Term,
             Request::InProgress { .. } => OpCode::InProgress,
             Request::Read { .. } => OpCode::Read,
+            Request::CorePublish { .. } => OpCode::CorePublish,
+            Request::CoreSubscribe { .. } => OpCode::CoreSubscribe,
+            Request::KvCreateBucket { .. } => OpCode::KvCreateBucket,
+            Request::KvPut { .. } => OpCode::KvPut,
+            Request::KvGet { .. } => OpCode::KvGet,
+            Request::KvDelete { .. } => OpCode::KvDelete,
+            Request::KvKeys { .. } => OpCode::KvKeys,
+            Request::KvHistory { .. } => OpCode::KvHistory,
         }
     }
 
@@ -581,6 +732,73 @@ impl Request {
                 w.u32(*wait_ms);
                 w.str(filter);
             }
+            Request::CorePublish {
+                subject,
+                reply_to,
+                headers,
+                value,
+            } => {
+                w.str(subject);
+                w.opt(reply_to.as_ref(), |w, r| w.str(r));
+                w.headers(headers);
+                w.bytes(value);
+            }
+            Request::CoreSubscribe { subject, queue } => {
+                w.str(subject);
+                w.opt(queue.as_ref(), |w, q| w.str(q));
+            }
+            Request::KvCreateBucket {
+                bucket,
+                history,
+                ttl_ms,
+                max_bytes,
+            } => {
+                w.str(bucket);
+                w.u64(*history);
+                w.u64(*ttl_ms);
+                w.u64(*max_bytes);
+            }
+            Request::KvPut {
+                bucket,
+                key,
+                value,
+                expected_revision,
+                ttl_ms,
+            } => {
+                w.str(bucket);
+                w.str(key);
+                w.bytes(value);
+                w.opt(*expected_revision, |w, r| w.u64(r));
+                w.opt(*ttl_ms, |w, t| w.u64(t));
+            }
+            Request::KvGet {
+                bucket,
+                key,
+                revision,
+            } => {
+                w.str(bucket);
+                w.str(key);
+                w.opt(*revision, |w, r| w.u64(r));
+            }
+            Request::KvDelete {
+                bucket,
+                key,
+                purge,
+                expected_revision,
+            } => {
+                w.str(bucket);
+                w.str(key);
+                w.u8(*purge as u8);
+                w.opt(*expected_revision, |w, r| w.u64(r));
+            }
+            Request::KvKeys { bucket, filter } => {
+                w.str(bucket);
+                w.str(filter);
+            }
+            Request::KvHistory { bucket, key } => {
+                w.str(bucket);
+                w.str(key);
+            }
         }
     }
 
@@ -686,6 +904,48 @@ impl Request {
                 wait_ms: r.u32()?,
                 filter: r.str()?,
             },
+            OpCode::CorePublish => Request::CorePublish {
+                subject: r.str()?,
+                reply_to: r.opt(|r| r.str())?,
+                headers: r.headers()?,
+                value: r.bytes()?,
+            },
+            OpCode::CoreSubscribe => Request::CoreSubscribe {
+                subject: r.str()?,
+                queue: r.opt(|r| r.str())?,
+            },
+            OpCode::KvCreateBucket => Request::KvCreateBucket {
+                bucket: r.str()?,
+                history: r.u64()?,
+                ttl_ms: r.u64()?,
+                max_bytes: r.u64()?,
+            },
+            OpCode::KvPut => Request::KvPut {
+                bucket: r.str()?,
+                key: r.str()?,
+                value: r.bytes()?,
+                expected_revision: r.opt(|r| r.u64())?,
+                ttl_ms: r.opt(|r| r.u64())?,
+            },
+            OpCode::KvGet => Request::KvGet {
+                bucket: r.str()?,
+                key: r.str()?,
+                revision: r.opt(|r| r.u64())?,
+            },
+            OpCode::KvDelete => Request::KvDelete {
+                bucket: r.str()?,
+                key: r.str()?,
+                purge: r.u8()? != 0,
+                expected_revision: r.opt(|r| r.u64())?,
+            },
+            OpCode::KvKeys => Request::KvKeys {
+                bucket: r.str()?,
+                filter: r.str()?,
+            },
+            OpCode::KvHistory => Request::KvHistory {
+                bucket: r.str()?,
+                key: r.str()?,
+            },
             other => {
                 return Err(ProtocolError::Decode(format!(
                     "opcode {other:?} is not a client request"
@@ -752,6 +1012,14 @@ pub enum Response {
     },
     /// JSON reply (stream/consumer info and lists, query results, metadata).
     Json(Bytes),
+    /// Push of a core message for a `CoreSubscribe` (correlation id 0).
+    CoreMsg {
+        sub_id: u32,
+        subject: String,
+        reply_to: Option<String>,
+        headers: Vec<(String, String)>,
+        value: Bytes,
+    },
 }
 
 impl Response {
@@ -820,6 +1088,7 @@ impl Response {
             Response::Messages { .. } => OpCode::Messages,
             Response::ReadResult { .. } => OpCode::ReadResult,
             Response::Json(_) => OpCode::Json,
+            Response::CoreMsg { .. } => OpCode::CoreMsg,
         }
     }
 
@@ -901,6 +1170,19 @@ impl Response {
                 w.records(records);
             }
             Response::Json(b) => w.raw(b),
+            Response::CoreMsg {
+                sub_id,
+                subject,
+                reply_to,
+                headers,
+                value,
+            } => {
+                w.u32(*sub_id);
+                w.str(subject);
+                w.opt(reply_to.as_ref(), |w, r| w.str(r));
+                w.headers(headers);
+                w.bytes(value);
+            }
         }
     }
 
@@ -939,6 +1221,13 @@ impl Response {
                 Response::PublishBatchOk { results }
             }
             OpCode::SubscribeOk => Response::SubscribeOk { sub_id: r.u32()? },
+            OpCode::CoreMsg => Response::CoreMsg {
+                sub_id: r.u32()?,
+                subject: r.str()?,
+                reply_to: r.opt(|r| r.str())?,
+                headers: r.headers()?,
+                value: r.bytes()?,
+            },
             OpCode::Deliver => Response::Deliver {
                 sub_id: r.u32()?,
                 records: r.records()?,
@@ -1083,6 +1372,9 @@ impl Writer {
         self.u64(s.dedup_window_secs);
         self.u64(s.dedup_max_entries);
         self.u8(s.compaction as u8);
+        if !s.limits.is_default() {
+            self.bytes(&serde_json::to_vec(&s.limits).expect("StreamLimits serializes"));
+        }
     }
     /// Encode one record. Panics if a field exceeds its width (the
     /// broker's write path rejects such records before they are stored).
@@ -1228,6 +1520,13 @@ impl Reader {
             dedup_window_secs: self.u64()?,
             dedup_max_entries: self.u64()?,
             compaction: self.u8()? != 0,
+            limits: if self.buf.has_remaining() {
+                let raw = self.bytes()?;
+                serde_json::from_slice(&raw)
+                    .map_err(|e| ProtocolError::Decode(format!("invalid stream limits: {e}")))?
+            } else {
+                StreamLimits::default()
+            },
         })
     }
     /// Decode one record, verifying its length field, structure and CRC.
@@ -1305,6 +1604,20 @@ mod tests {
             dedup_window_secs: 3,
             dedup_max_entries: 4,
             compaction: true,
+            limits: StreamLimits::default(),
+        };
+        let limited = StreamSpec {
+            name: "q".into(),
+            limits: StreamLimits {
+                max_msgs: 10,
+                discard: DiscardPolicy::New,
+                max_msgs_per_subject: 1,
+                allow_msg_ttl: true,
+                msg_ttl_ms: 5_000,
+                allow_delayed: true,
+                retention: RetentionPolicy::WorkQueue,
+            },
+            ..StreamSpec::default()
         };
         let mut cs = ConsumerSpec::new("c", "s");
         cs.filter_subjects = vec!["orders.>".into()];
@@ -1332,6 +1645,7 @@ mod tests {
             },
             Request::CreateStream(spec.clone()),
             Request::UpdateStream(spec),
+            Request::CreateStream(limited),
             Request::DeleteStream { name: "s".into() },
             Request::StreamInfo { name: "s".into() },
             Request::ListStreams,
@@ -1394,6 +1708,65 @@ mod tests {
                 wait_ms: 1000,
                 filter: "a.*".into(),
             },
+            Request::CorePublish {
+                subject: "svc.echo".into(),
+                reply_to: Some("_INBOX.abc.1".into()),
+                headers: vec![("h".into(), "v".into())],
+                value: Bytes::from_static(b"ping"),
+            },
+            Request::CorePublish {
+                subject: "events.x".into(),
+                reply_to: None,
+                headers: vec![],
+                value: Bytes::new(),
+            },
+            Request::CoreSubscribe {
+                subject: "svc.>".into(),
+                queue: Some("workers".into()),
+            },
+            Request::CoreSubscribe {
+                subject: "a".into(),
+                queue: None,
+            },
+            Request::KvCreateBucket {
+                bucket: "cfg".into(),
+                history: 5,
+                ttl_ms: 60_000,
+                max_bytes: 0,
+            },
+            Request::KvPut {
+                bucket: "cfg".into(),
+                key: "a.b".into(),
+                value: Bytes::from_static(b"v"),
+                expected_revision: Some(0),
+                ttl_ms: Some(1000),
+            },
+            Request::KvPut {
+                bucket: "cfg".into(),
+                key: "a".into(),
+                value: Bytes::new(),
+                expected_revision: None,
+                ttl_ms: None,
+            },
+            Request::KvGet {
+                bucket: "cfg".into(),
+                key: "a".into(),
+                revision: Some(3),
+            },
+            Request::KvDelete {
+                bucket: "cfg".into(),
+                key: "a".into(),
+                purge: true,
+                expected_revision: Some(4),
+            },
+            Request::KvKeys {
+                bucket: "cfg".into(),
+                filter: "a.>".into(),
+            },
+            Request::KvHistory {
+                bucket: "cfg".into(),
+                key: "a".into(),
+            },
         ] {
             roundtrip_req(req);
         }
@@ -1437,6 +1810,13 @@ mod tests {
                 records: (0..3).map(rec).collect(),
             },
             Response::Json(Bytes::from_static(b"{\"a\":1}")),
+            Response::CoreMsg {
+                sub_id: 0x8000_0001,
+                subject: "svc.echo".into(),
+                reply_to: Some("_INBOX.abc.1".into()),
+                headers: vec![("h".into(), "v".into())],
+                value: Bytes::from_static(b"ping"),
+            },
         ] {
             roundtrip_resp(resp);
         }

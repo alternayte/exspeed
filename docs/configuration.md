@@ -50,6 +50,7 @@ makes `exspeed server` exit with an error instead of running half-started.
 | `auth.credentials_file` | `EXSPEED_CREDENTIALS_FILE` | `--credentials-file` | `{data_dir}/credentials.toml` if present | Scoped credentials ([security.md](security.md)) |
 | `tls.cert` | `EXSPEED_TLS_CERT` | `--tls-cert` | — | PEM certificate chain. Set together with the key. |
 | `tls.key` | `EXSPEED_TLS_KEY` | `--tls-key` | — | PEM private key |
+| `tls.client_ca` | `EXSPEED_TLS_CLIENT_CA` | `--tls-client-ca` | — | Require client certificates signed by this CA on the TCP port (mutual TLS; see [security.md](security.md#client-certificates-mutual-tls)) |
 
 Auth is on as soon as either a token or a credentials file is configured,
 including a `credentials.toml` that merely exists in the data directory.

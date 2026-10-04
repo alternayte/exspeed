@@ -2,8 +2,8 @@ apiVersion: v2
 name: exspeed
 description: Exspeed — a streaming platform in one binary (durable log, subjects, SQL, connectors)
 type: application
-version: 0.2.0
-appVersion: "0.6.0"
+version: 0.3.0
+appVersion: "0.7.0"
 home: https://github.com/alternayte/exspeed
 sources:
   - https://github.com/alternayte/exspeed

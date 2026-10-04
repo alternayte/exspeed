@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -42,8 +43,9 @@ use exspeed_protocol::codec::ExspeedCodec;
 use exspeed_protocol::frame::Frame;
 
 pub use exspeed_protocol::client::{
-    code, AckPolicy, ConsumerSpec, DeliverPolicy, PublishRecord, Request, Response, SeekTo,
-    StreamSpec, WireRecord,
+    code, AckPolicy, ConsumerSpec, DeliverPolicy, DiscardPolicy, HeaderMatch, PublishRecord,
+    Request, Response, RetentionPolicy, SeekTo, StreamLimits, StreamSpec, WireRecord,
+    PRIORITY_HEADER,
 };
 
 /// Default time to wait for a response (on top of any server-side wait the
@@ -117,7 +119,9 @@ impl Error {
     }
 }
 
+mod kv;
 mod publisher;
+pub use kv::{BucketOptions, Kv, KvEntry, KvOp, KvWatch};
 pub use publisher::{Publisher, PublisherBuilder};
 
 #[derive(Debug, Clone)]
@@ -181,13 +185,36 @@ pub struct ReadResult {
 
 enum SubMsg {
     Records(Vec<WireRecord>),
+    Core(CoreMsg),
     Ended { code: u16, message: String },
+}
+
+/// A core (non-persistent) message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreMsg {
+    pub subject: String,
+    /// Set on a request: publish the response to this subject
+    /// ([`Client::respond`]).
+    pub reply_to: Option<String>,
+    pub headers: Vec<(String, String)>,
+    pub value: Bytes,
+}
+
+impl CoreMsg {
+    /// Parse the value as JSON.
+    pub fn json<T: DeserializeOwned>(&self) -> Result<T> {
+        serde_json::from_slice(&self.value).map_err(|e| Error::Protocol(format!("bad JSON: {e}")))
+    }
 }
 
 #[derive(Default)]
 struct Routes {
     pending: HashMap<u32, oneshot::Sender<Response>>,
     subs: HashMap<u32, mpsc::UnboundedSender<SubMsg>>,
+    /// The connection's request-reply inbox subscription, once set up.
+    inbox_sub: Option<u32>,
+    /// Outstanding requests by reply token.
+    replies: HashMap<String, oneshot::Sender<CoreMsg>>,
     /// Receivers created by the reader when it sees `SubscribeOk`, waiting
     /// for the subscribing call to pick them up. Creating them in the reader
     /// guarantees no `Deliver` that follows `SubscribeOk` is lost.
@@ -198,6 +225,9 @@ struct Routes {
 struct Inner {
     out: mpsc::Sender<Frame>,
     routes: Mutex<Routes>,
+    /// `_INBOX.<id>` of this connection, set up on the first request.
+    inbox: tokio::sync::OnceCell<String>,
+    next_reply: AtomicU32,
     next_corr: AtomicU32,
     opts: ConnectOptions,
     info: ServerInfo,
@@ -329,6 +359,8 @@ impl Client {
         let inner = Arc::new(Inner {
             out: out_tx,
             routes: Mutex::new(Routes::default()),
+            inbox: tokio::sync::OnceCell::new(),
+            next_reply: AtomicU32::new(1),
             next_corr: AtomicU32::new(2),
             opts,
             info,
@@ -784,6 +816,251 @@ impl Client {
     pub async fn raw(&self, req: Request) -> Result<Response> {
         self.request(req).await
     }
+
+    // ---- core messaging (non-persistent) ----------------------------------
+
+    /// Publish a core message to the subscriptions live now (at most once;
+    /// nothing is stored). Waits for the server to accept it.
+    pub async fn publish_core(&self, subject: &str, value: impl Into<Bytes>) -> Result<()> {
+        self.publish_core_with(subject, value, Vec::new()).await
+    }
+
+    /// [`publish_core`](Self::publish_core) with headers.
+    pub async fn publish_core_with(
+        &self,
+        subject: &str,
+        value: impl Into<Bytes>,
+        headers: Vec<(String, String)>,
+    ) -> Result<()> {
+        self.request_ok(Request::CorePublish {
+            subject: subject.to_string(),
+            reply_to: None,
+            headers,
+            value: value.into(),
+        })
+        .await
+    }
+
+    /// Answer a request (a message with `reply_to`).
+    pub async fn respond(&self, request: &CoreMsg, value: impl Into<Bytes>) -> Result<()> {
+        let to = request
+            .reply_to
+            .as_deref()
+            .ok_or_else(|| Error::Protocol("message has no reply_to".into()))?;
+        self.publish_core(to, value).await
+    }
+
+    /// Receive core messages on subjects matching `subject` (a filter such as
+    /// `orders.*`). In a `queue` group, each message goes to one member.
+    pub async fn subscribe_core(
+        &self,
+        subject: &str,
+        queue: Option<&str>,
+    ) -> Result<CoreSubscription> {
+        let sub_id = match self
+            .request(Request::CoreSubscribe {
+                subject: subject.to_string(),
+                queue: queue.map(str::to_string),
+            })
+            .await?
+        {
+            Response::SubscribeOk { sub_id } => sub_id,
+            other => return Err(unexpected(other)),
+        };
+        let rx = self
+            .inner
+            .routes
+            .lock()
+            .unwrap()
+            .new_subs
+            .remove(&sub_id)
+            .ok_or_else(|| Error::Protocol("subscription receiver missing".into()))?;
+        Ok(CoreSubscription {
+            client: self.clone(),
+            sub_id,
+            rx,
+            ended: None,
+        })
+    }
+
+    /// Send a request and wait up to `timeout` for the first response. Fails
+    /// with code 404 at once when nobody is subscribed to `subject`.
+    pub async fn request_core(
+        &self,
+        subject: &str,
+        value: impl Into<Bytes>,
+        timeout: Duration,
+    ) -> Result<CoreMsg> {
+        let inbox = self
+            .inner
+            .inbox
+            .get_or_try_init(|| async {
+                let prefix = format!("{}.{}", exspeed_common::auth::INBOX_PREFIX, random_id());
+                let sub_id = match self
+                    .request(Request::CoreSubscribe {
+                        subject: format!("{prefix}.*"),
+                        queue: None,
+                    })
+                    .await?
+                {
+                    Response::SubscribeOk { sub_id } => sub_id,
+                    other => return Err(unexpected(other)),
+                };
+                let mut routes = self.inner.routes.lock().unwrap();
+                routes.new_subs.remove(&sub_id);
+                routes.subs.remove(&sub_id);
+                routes.inbox_sub = Some(sub_id);
+                Ok::<_, Error>(prefix)
+            })
+            .await?;
+        let token = self
+            .inner
+            .next_reply
+            .fetch_add(1, Ordering::Relaxed)
+            .to_string();
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .routes
+            .lock()
+            .unwrap()
+            .replies
+            .insert(token.clone(), tx);
+        let forget = |c: &Client| {
+            c.inner.routes.lock().unwrap().replies.remove(&token);
+        };
+        if let Err(e) = self
+            .request_ok(Request::CorePublish {
+                subject: subject.to_string(),
+                reply_to: Some(format!("{inbox}.{token}")),
+                headers: Vec::new(),
+                value: value.into(),
+            })
+            .await
+        {
+            forget(self);
+            return Err(e);
+        }
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(msg)) => Ok(msg),
+            Ok(Err(_)) => Err(Error::Closed),
+            Err(_) => {
+                forget(self);
+                Err(Error::Timeout)
+            }
+        }
+    }
+}
+
+/// A hard-to-guess id for this connection's reply inbox.
+fn random_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut out = String::new();
+    for _ in 0..2 {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
+        );
+        out.push_str(&format!("{:016x}", h.finish()));
+    }
+    out
+}
+
+/// A core-message subscription. Dropping it unsubscribes.
+pub struct CoreSubscription {
+    client: Client,
+    sub_id: u32,
+    rx: mpsc::UnboundedReceiver<SubMsg>,
+    ended: Option<(u16, String)>,
+}
+
+impl std::fmt::Debug for CoreSubscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoreSubscription")
+            .field("sub_id", &self.sub_id)
+            .field("ended", &self.ended)
+            .finish()
+    }
+}
+
+impl CoreSubscription {
+    pub fn id(&self) -> u32 {
+        self.sub_id
+    }
+
+    /// Why the server ended the subscription, once [`next`](Self::next)
+    /// has returned `None` (e.g. 503 when leadership moved).
+    pub fn end_reason(&self) -> Option<(u16, &str)> {
+        self.ended.as_ref().map(|(c, m)| (*c, m.as_str()))
+    }
+
+    /// Next message, or `None` when the subscription has ended.
+    pub async fn next(&mut self) -> Option<CoreMsg> {
+        if self.ended.is_some() {
+            return None;
+        }
+        loop {
+            match self.rx.recv().await {
+                Some(SubMsg::Core(m)) => return Some(m),
+                Some(SubMsg::Records(_)) => {}
+                Some(SubMsg::Ended { code, message }) => {
+                    self.ended = Some((code, message));
+                    return None;
+                }
+                None => {
+                    self.ended = Some((code::UNAVAILABLE, "connection closed".into()));
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// Like [`next`](Self::next) but gives up after `timeout`.
+    pub async fn next_timeout(&mut self, timeout: Duration) -> Option<CoreMsg> {
+        tokio::time::timeout(timeout, self.next())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Stop delivery and wait for the server to confirm.
+    pub async fn unsubscribe(mut self) -> Result<()> {
+        self.client
+            .inner
+            .routes
+            .lock()
+            .unwrap()
+            .subs
+            .remove(&self.sub_id);
+        self.ended = Some((0, "unsubscribed".into()));
+        self.client
+            .request_ok(Request::Unsubscribe {
+                sub_id: self.sub_id,
+            })
+            .await
+    }
+}
+
+impl Drop for CoreSubscription {
+    fn drop(&mut self) {
+        if self.ended.is_some() {
+            return;
+        }
+        self.client
+            .inner
+            .routes
+            .lock()
+            .unwrap()
+            .subs
+            .remove(&self.sub_id);
+        let _ = self.client.inner.out.try_send(
+            Request::Unsubscribe {
+                sub_id: self.sub_id,
+            }
+            .into_frame(0),
+        );
+    }
 }
 
 impl Inner {
@@ -812,11 +1089,37 @@ impl Inner {
                     let _ = tx.send(SubMsg::Records(records));
                 }
             }
+            Response::CoreMsg {
+                sub_id,
+                subject,
+                reply_to,
+                headers,
+                value,
+            } => {
+                let msg = CoreMsg {
+                    subject,
+                    reply_to,
+                    headers,
+                    value,
+                };
+                if routes.inbox_sub == Some(sub_id) {
+                    let token = msg.subject.rsplit('.').next().unwrap_or_default();
+                    if let Some(tx) = routes.replies.remove(token) {
+                        let _ = tx.send(msg);
+                    }
+                } else if let Some(tx) = routes.subs.get(&sub_id) {
+                    let _ = tx.send(SubMsg::Core(msg));
+                }
+            }
             Response::SubscriptionEnded {
                 sub_id,
                 code,
                 message,
             } => {
+                if routes.inbox_sub == Some(sub_id) {
+                    routes.inbox_sub = None;
+                    routes.replies.clear();
+                }
                 if let Some(tx) = routes.subs.remove(&sub_id) {
                     let _ = tx.send(SubMsg::Ended { code, message });
                 }
@@ -847,6 +1150,7 @@ impl Inner {
         let mut routes = self.routes.lock().unwrap();
         routes.closed = true;
         routes.pending.clear();
+        routes.replies.clear();
         for (_, tx) in routes.subs.drain() {
             let _ = tx.send(SubMsg::Ended {
                 code: code::UNAVAILABLE,
@@ -944,6 +1248,7 @@ impl Subscription {
             }
             match self.rx.recv().await {
                 Some(SubMsg::Records(rs)) => self.buffered.extend(rs),
+                Some(SubMsg::Core(_)) => {}
                 Some(SubMsg::Ended { code, message }) => self.ended = Some((code, message)),
                 None => {
                     self.ended = Some((code::UNAVAILABLE, "connection closed".into()));

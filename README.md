@@ -1,7 +1,8 @@
 # Exspeed
 
 **A streaming platform in one binary: a Kafka-style durable log, NATS-style
-subjects, SQL over streams, and built-in connectors.**
+subjects and request-reply, RabbitMQ-style queues, a key-value store, SQL over
+streams, and built-in connectors.**
 
 ```
 exspeed server        # that's the whole deployment
@@ -19,6 +20,12 @@ upgrade).
   `order.*.created` or `order.>`.
 - **Replayable and retained.** Records are kept by time and size. You can
   seek by offset or timestamp and replay from anywhere.
+- **Queues when you need them.** Work-queue and interest retention, TTLs,
+  delayed delivery, bounded streams that reject when full, header routing,
+  priorities and single active consumers, on the same streams.
+- **Messaging and key-value too.** Non-persistent pub/sub with queue groups
+  and request-reply, and key-value buckets with history, compare-and-set and
+  watches.
 - **SQL built in.** Run one-shot queries (on Apache DataFusion), continuous
   queries into new streams, materialized tables, event-time windows and
   stream joins.
@@ -26,7 +33,8 @@ upgrade).
   RabbitMQ and HTTP, configured with TOML files that hot-reload.
 - **Simple to operate.** It is a single static binary with a Docker image,
   Prometheus metrics, health and readiness probes, a JSON log mode, token
-  auth with per-stream scopes, and TLS.
+  auth with per-stream and per-subject scopes, and TLS with client
+  certificates.
 
 ## Install
 
@@ -68,11 +76,14 @@ or the Rust [`exspeed-client`](crates/exspeed-client) on TCP port 5933
 |------|--------------|
 | Streams | Durable, crash-safe append-only logs with subjects, retention by time and size, compaction, and reads by offset or timestamp |
 | Consumers | Push (credit flow control) and pull, per-message ack / nack / term / in-progress, ack timeout, redelivery with backoff, `max_deliver` and dead-letter streams; one consumer can be shared by many subscribers to split work across app instances. State lives in the log |
+| Queues | Work-queue and interest retention, per-message and stream TTLs, delayed delivery, `max_msgs` with discard old/new, last-N-per-subject, header filters, priority, single active consumers, dead-letter causes ([queues.md](docs/queues.md)) |
+| Core messaging | Non-persistent publish/subscribe, queue groups, request-reply with "no responders" ([messaging.md](docs/messaging.md)) |
+| Key-value | Buckets with history, compare-and-set, TTLs, keys and watch, over TCP and HTTP ([kv.md](docs/kv.md)) |
 | Idempotent publish | `msg_id` deduplication on every write path, within batches, from startup and across failover ([idempotent-publish.md](docs/idempotent-publish.md)) |
 | ExQL | SQL on Apache DataFusion: bounded queries (joins, aggregates, window functions, subqueries, JSON numerics, offset/time pushdown) and continuous queries (event-time windows, stream-stream and stream-table joins, durable tables, checkpointed state, effectively-once output) ([exql.md](docs/exql.md)) |
 | Connectors | Postgres CDC, outbox and poll; JDBC sink and poll (Postgres, MySQL, SQL Server); SQL Server CDC; RabbitMQ source and sink; S3 sink; HTTP poll, sink and webhook. Supervised, checkpointed, at-least-once or effectively-once, each tested against the real service ([guarantees](docs/connectors.md#delivery-guarantees)) |
 | High availability | Epoch-fenced leader lease (Postgres or Redis), pull replication of every stream with divergence truncation, `acks = all` / `quorum`, TLS between nodes ([high-availability.md](docs/high-availability.md)) |
-| Operations | One config file, Helm chart, ordered graceful shutdown, online backup and restore, Prometheus metrics, OpenAPI spec, scoped tokens and TLS ([operations.md](docs/operations.md), [security.md](docs/security.md)) |
+| Operations | One config file, Helm chart, ordered graceful shutdown, online backup and restore, Prometheus metrics, OpenAPI spec, scoped tokens, TLS and client certificates ([operations.md](docs/operations.md), [security.md](docs/security.md)) |
 
 Each stream is a single partition, so one stream's write rate is bounded by
 one node; spread load across streams and nodes. Clients speak Exspeed's own
@@ -99,7 +110,7 @@ numbers, the machine details and the exact commands are in
 | | |
 |---|---|
 | **Learn** | [Getting started](docs/getting-started.md) · [Concepts](docs/concepts.md) |
-| **Use** | [CLI](docs/cli.md) · [HTTP API](docs/http-api.md) · [ExQL](docs/exql.md) · [Connectors](docs/connectors.md) · [Idempotent publish](docs/idempotent-publish.md) · [TypeScript SDK](sdks/typescript/README.md) · [Protocol](docs/protocol.md) |
+| **Use** | [Queues](docs/queues.md) · [Core messaging](docs/messaging.md) · [Key-value](docs/kv.md) · [CLI](docs/cli.md) · [HTTP API](docs/http-api.md) · [ExQL](docs/exql.md) · [Connectors](docs/connectors.md) · [Idempotent publish](docs/idempotent-publish.md) · [TypeScript SDK](sdks/typescript/README.md) · [Protocol](docs/protocol.md) |
 | **Run** | [Configuration](docs/configuration.md) · [Operations](docs/operations.md) · [Security](docs/security.md) · [High availability](docs/high-availability.md) |
 | **Contribute** | [Architecture](docs/architecture.md) · [Development](docs/development.md) · [Benchmarks](BENCHMARKS.md) · [Changelog](CHANGELOG.md) · [2026-10 design review](docs/history/2026-10-review.md) |
 

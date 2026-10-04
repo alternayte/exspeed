@@ -12,10 +12,11 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use arc_swap::ArcSwap;
 use bytes::BytesMut;
+use exspeed_common::msg_time;
 use exspeed_common::record_format;
 use exspeed_common::Offset;
 use exspeed_streams::{RawBatch, ReadBatch, StorageError, StoredRecord, StreamConfig};
@@ -32,9 +33,25 @@ use crate::file::segment::{
     FrameIter, IndexEntry, Segment, SegmentMeta, SegmentStats, INDEX_ENTRY_LEN,
     INDEX_INTERVAL_BYTES, SEGMENT_HEADER_LEN,
 };
+use crate::file::subjects::SubjectIndex;
 
 /// Name of the truncation intent marker inside a partition directory.
 pub const TRUNCATE_MARKER: &str = "truncate.json";
+/// The persisted log start offset (decimal) inside a partition directory.
+pub const LOG_START_FILE: &str = "log_start";
+
+/// Read the persisted log start offset (0 when absent or unreadable).
+pub fn load_log_start(dir: &Path) -> u64 {
+    fs::read_to_string(dir.join(LOG_START_FILE))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Persist the log start offset (tmp + rename + dir fsync).
+pub fn save_log_start(dir: &Path, start: u64) -> io::Result<()> {
+    atomic_write(&dir.join(LOG_START_FILE), start.to_string().as_bytes())
+}
 
 /// Health of a partition.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +88,40 @@ pub struct PartitionShared {
     /// Cached `stream.json`. `None` when the file exists but can't be parsed
     /// — retention and compaction then skip this stream instead of guessing.
     config: Mutex<Option<StreamConfig>>,
+    /// Log start offset: records below it are gone (trimmed, discarded by
+    /// `max_msgs`, acked from a work queue) even while their segment is
+    /// still on disk. Whole segments below it are deleted.
+    start: AtomicU64,
+    /// Newest offsets per subject, when `max_msgs_per_subject` is set.
+    subjects: RwLock<Option<SubjectIndex>>,
+}
+
+/// Hides records a reader must not see: expired (TTL) or superseded by
+/// newer records of the same subject (`max_msgs_per_subject`).
+struct Visibility<'a> {
+    shared: &'a PartitionShared,
+    hwm: u64,
+    now: u64,
+    ttl: Option<(bool, u64)>,
+    per_subject: bool,
+}
+
+impl Visibility<'_> {
+    fn hides(&self, raw: &[u8], offset: u64) -> bool {
+        if let Some((allow_header, default_ms)) = self.ttl {
+            if msg_time::expires_at_ns(raw, allow_header, default_ms).is_some_and(|e| e <= self.now)
+            {
+                return true;
+            }
+        }
+        if self.per_subject {
+            let subject = record_format::subject(raw).unwrap_or_default();
+            if let Some(ix) = self.shared.subjects.read().unwrap().as_ref() {
+                return ix.superseded(subject, offset, self.hwm);
+            }
+        }
+        false
+    }
 }
 
 impl PartitionShared {
@@ -80,6 +131,7 @@ impl PartitionShared {
         segments: Vec<Arc<Segment>>,
         next_offset: u64,
         config: Option<StreamConfig>,
+        start: u64,
     ) -> Self {
         let (watch_tx, _) = watch::channel(next_offset);
         Self {
@@ -95,6 +147,8 @@ impl PartitionShared {
             failed_reason: Mutex::new(None),
             truncations: AtomicU64::new(0),
             config: Mutex::new(config),
+            start: AtomicU64::new(start.min(next_offset)),
+            subjects: RwLock::new(None),
         }
     }
 
@@ -116,15 +170,107 @@ impl PartitionShared {
         self.committed.load(Ordering::Acquire)
     }
 
-    /// Offset of the first retained record (the first segment's base),
-    /// never above the high watermark.
+    /// Offset of the first retained record (the first segment's base or
+    /// the log start, whichever is higher), never above the high watermark.
     pub fn earliest(&self) -> u64 {
+        self.earliest_of(&self.segments(), self.high_watermark())
+    }
+
+    fn earliest_of(&self, list: &[Arc<Segment>], end: u64) -> u64 {
+        list.first()
+            .map_or(end, |s| s.base_offset)
+            .max(self.log_start())
+            .min(end)
+    }
+
+    /// The first offset of the committed log (ignoring the read floor).
+    pub fn committed_earliest(&self) -> u64 {
+        self.earliest_of(&self.segments(), self.committed())
+    }
+
+    /// The log start offset (see `start`).
+    pub fn log_start(&self) -> u64 {
+        self.start.load(Ordering::Acquire)
+    }
+
+    /// Writer only: move the log start offset.
+    pub fn set_log_start(&self, start: u64) {
+        self.start.store(start, Ordering::Release);
+    }
+
+    /// Writer only: replace the per-subject index.
+    pub fn set_subject_index(&self, ix: Option<SubjectIndex>) {
+        *self.subjects.write().unwrap() = ix;
+    }
+
+    /// Writer only: update the per-subject index.
+    pub fn with_subject_index(&self, f: impl FnOnce(&mut SubjectIndex)) {
+        if let Some(ix) = self.subjects.write().unwrap().as_mut() {
+            f(ix);
+        }
+    }
+
+    /// Whether `offset` (holding `subject`) is superseded under the
+    /// per-subject limit as of `hwm`.
+    pub fn superseded(&self, subject: &str, offset: u64, hwm: u64) -> bool {
+        self.subjects
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|ix| ix.superseded(subject, offset, hwm))
+    }
+
+    pub fn has_subject_index(&self) -> bool {
+        self.subjects.read().unwrap().is_some()
+    }
+
+    /// The newest visible offset of `subject` (streams with
+    /// `max_msgs_per_subject` only).
+    pub fn latest_for_subject(&self, subject: &str) -> Option<u64> {
         let hwm = self.high_watermark();
-        self.segments
-            .load()
-            .first()
-            .map_or(hwm, |s| s.base_offset)
-            .min(hwm)
+        let ix = self.subjects.read().unwrap();
+        ix.as_ref()?
+            .latest(subject, hwm)
+            .filter(|&o| o >= self.earliest())
+    }
+
+    /// The newest offset of `subject` in the committed log, visible or not
+    /// yet (compare-and-set must see writes still replicating).
+    pub fn latest_committed_for_subject(&self, subject: &str) -> Option<u64> {
+        let ix = self.subjects.read().unwrap();
+        ix.as_ref()?
+            .latest(subject, u64::MAX)
+            .filter(|&o| o >= self.committed_earliest())
+    }
+
+    /// Every subject with its newest visible offset.
+    pub fn subjects_latest(&self) -> Vec<(String, u64)> {
+        let hwm = self.high_watermark();
+        let earliest = self.earliest();
+        let ix = self.subjects.read().unwrap();
+        ix.as_ref()
+            .map(|ix| ix.all_latest(hwm, earliest))
+            .unwrap_or_default()
+    }
+
+    /// What readers must hide right now; `None` when nothing (the common
+    /// case, so plain streams pay nothing).
+    fn visibility(&self, hwm: u64, include_expired: bool) -> Option<Visibility<'_>> {
+        let cfg = self.config.lock().unwrap();
+        let cfg = cfg.as_ref()?;
+        let ttl =
+            (cfg.has_ttl() && !include_expired).then_some((cfg.allow_msg_ttl, cfg.msg_ttl_ms));
+        let per_subject = cfg.max_msgs_per_subject > 0;
+        if ttl.is_none() && !per_subject {
+            return None;
+        }
+        Some(Visibility {
+            shared: self,
+            hwm,
+            now: crate::file::writer::now_nanos(),
+            ttl,
+            per_subject,
+        })
     }
 
     pub fn total_bytes(&self) -> u64 {
@@ -301,7 +447,12 @@ impl PartitionShared {
             self.high_watermark()
         };
         let list = self.segments();
-        let earliest = list.first().map_or(hwm, |s| s.base_offset).min(hwm);
+        let earliest = self.earliest_of(&list, hwm);
+        let vis = if committed {
+            None
+        } else {
+            self.visibility(hwm, false)
+        };
         let mut from = from;
         if from < earliest {
             if strict && from < hwm {
@@ -315,6 +466,9 @@ impl PartitionShared {
 
         let mut out: Vec<StoredRecord> = Vec::new();
         let mut bytes = 0usize;
+        // One past the last record returned or hidden; `None` until then.
+        let mut next: Option<u64> = None;
+        let mut stopped_early = false;
         if from < hwm && max_records > 0 {
             let start = list
                 .partition_point(|s| s.base_offset <= from)
@@ -354,6 +508,10 @@ impl PartitionShared {
                     if f.offset < from {
                         continue;
                     }
+                    if vis.as_ref().is_some_and(|v| v.hides(&f.raw, f.offset)) {
+                        next = Some(f.offset + 1);
+                        continue;
+                    }
                     let rec =
                         decode_frame(&f.raw).map_err(|reason| StorageError::CorruptedRecord {
                             offset: f.offset,
@@ -363,19 +521,25 @@ impl PartitionShared {
                     // size (headers and framing included), like `read_raw`.
                     let size = f.raw.len();
                     if !out.is_empty() && bytes + size > max_bytes {
+                        stopped_early = true;
                         break 'segments;
                     }
                     bytes += size;
+                    next = Some(f.offset + 1);
                     out.push(rec);
                     if out.len() >= max_records {
+                        stopped_early = true;
                         break 'segments;
                     }
                 }
             }
         }
-        // An empty read below the high watermark means every offset in
-        // `[from, hwm)` is a gap (compaction); skip past it.
-        let next_offset = out.last().map_or(from.max(hwm), |r| r.offset.0 + 1);
+        // Having scanned to the end, every offset left in `[from, hwm)` is a
+        // gap (compaction) or hidden; skip past it.
+        let next_offset = match next {
+            Some(n) if stopped_early => n,
+            _ => from.max(hwm),
+        };
         Ok(ReadBatch {
             records: out,
             next_offset: Offset(next_offset),
@@ -396,10 +560,28 @@ impl PartitionShared {
         max_records: usize,
         max_bytes: usize,
     ) -> Result<RawBatch, StorageError> {
-        self.read_consistent(
+        self.read_raw_with(from, max_records, max_bytes, false)
+    }
+
+    /// [`read_raw`](Self::read_raw), optionally including expired records
+    /// (for a consumer that dead-letters them).
+    pub fn read_raw_with(
+        &self,
+        from: u64,
+        max_records: usize,
+        max_bytes: usize,
+        include_expired: bool,
+    ) -> Result<RawBatch, StorageError> {
+        let batch = self.read_consistent(
             || self.read_raw_once(from, max_records, max_bytes),
             |b| b.high_watermark.0,
             false,
+        )?;
+        Ok(
+            match self.visibility(batch.high_watermark.0, include_expired) {
+                Some(vis) if batch.count > 0 => filter_raw(batch, &vis),
+                _ => batch,
+            },
         )
     }
 
@@ -411,7 +593,7 @@ impl PartitionShared {
     ) -> Result<RawBatch, StorageError> {
         let hwm = self.high_watermark();
         let list = self.segments();
-        let earliest = list.first().map_or(hwm, |s| s.base_offset).min(hwm);
+        let earliest = self.earliest_of(&list, hwm);
         let from = from.max(earliest);
         let empty = |next: u64| RawBatch {
             bytes: BytesMut::new(),
@@ -484,6 +666,32 @@ impl PartitionShared {
             }
         }
         Ok(hwm)
+    }
+}
+
+/// Drop hidden records from a raw batch, keeping its `next_offset` (the
+/// reader continues after them).
+fn filter_raw(batch: RawBatch, vis: &Visibility<'_>) -> RawBatch {
+    let hidden: Vec<bool> = record_format::iter(&batch.bytes)
+        .map(|p| p.is_ok_and(|p| vis.hides(&batch.bytes[p.range()], p.offset)))
+        .collect();
+    if !hidden.iter().any(|&h| h) {
+        return batch;
+    }
+    let mut out = BytesMut::with_capacity(batch.bytes.len());
+    let mut count = 0;
+    for (p, hide) in record_format::iter(&batch.bytes).zip(hidden) {
+        let Ok(p) = p else { break };
+        if !hide {
+            out.extend_from_slice(&batch.bytes[p.range()]);
+            count += 1;
+        }
+    }
+    RawBatch {
+        bytes: out,
+        count,
+        next_offset: batch.next_offset,
+        high_watermark: batch.high_watermark,
     }
 }
 
@@ -931,7 +1139,7 @@ mod tests {
     use std::cell::Cell;
 
     fn shared(next: u64) -> PartitionShared {
-        PartitionShared::new("t", Path::new("/nonexistent"), Vec::new(), next, None)
+        PartitionShared::new("t", Path::new("/nonexistent"), Vec::new(), next, None, 0)
     }
 
     /// §3.1 #10: a read that raced a truncation (epoch moved) is retried

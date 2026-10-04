@@ -8,7 +8,8 @@ use sha2::{Digest, Sha256};
 
 use crate::auth::error::AuthError;
 use crate::auth::glob::StreamGlob;
-use crate::auth::types::{Action, Identity, IdentityRef, Permission};
+use crate::auth::types::{Action, Identity, IdentityRef, Permission, SubjectPermission};
+use crate::subject::SubjectFilter;
 
 /// Synthetic credential name used when `EXSPEED_AUTH_TOKEN` is set. Cannot
 /// collide with a TOML-defined credential — the TOML loader rejects an
@@ -26,14 +27,25 @@ struct WireFile {
 #[derive(Debug, Deserialize)]
 struct WireCredential {
     name: String,
-    token_sha256: String,
+    /// sha256 of the bearer token, or…
+    #[serde(default)]
+    token_sha256: Option<String>,
+    /// …the common name (else first DNS name) of a client certificate the
+    /// server's `tls.client_ca` verified.
+    #[serde(default)]
+    cert_cn: Option<String>,
     #[serde(default)]
     permissions: Vec<WirePermission>,
 }
 
 #[derive(Debug, Deserialize)]
 struct WirePermission {
-    streams: String,
+    /// Stream-name glob.
+    #[serde(default)]
+    streams: Option<String>,
+    /// Core-message subject filter (NATS-style), instead of `streams`.
+    #[serde(default)]
+    subjects: Option<String>,
     actions: Vec<String>,
 }
 
@@ -44,6 +56,8 @@ struct WirePermission {
 #[derive(Debug)]
 pub struct CredentialStore {
     by_hash: HashMap<[u8; 32], IdentityRef>,
+    /// Credentials bound to a client certificate name.
+    by_cert: HashMap<String, IdentityRef>,
     /// Breakdown for the startup log line.
     file_count: usize,
     legacy_admin_present: bool,
@@ -60,6 +74,7 @@ impl CredentialStore {
     ///   in a store); this returns an empty store anyway for robustness.
     pub fn build(from_file: Option<&Path>, env_token: Option<&str>) -> Result<Self, AuthError> {
         let mut by_hash: HashMap<[u8; 32], IdentityRef> = HashMap::new();
+        let mut by_cert: HashMap<String, IdentityRef> = HashMap::new();
         let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut hash_to_name: HashMap<[u8; 32], String> = HashMap::new();
         let mut file_count = 0usize;
@@ -86,22 +101,43 @@ impl CredentialStore {
                     return Err(AuthError::LegacyAdminReserved);
                 }
                 validate_name_charset(&wc.name)?;
-                let digest = decode_hash(&wc.token_sha256, &wc.name)?;
-
                 if names.contains(&wc.name) {
                     return Err(AuthError::DuplicateName(wc.name.clone()));
                 }
-                if let Some(other) = hash_to_name.get(&digest) {
-                    return Err(AuthError::DuplicateTokenHash {
-                        first: other.clone(),
-                        second: wc.name.clone(),
-                    });
+                match (&wc.token_sha256, &wc.cert_cn) {
+                    (Some(hash), None) => {
+                        let digest = decode_hash(hash, &wc.name)?;
+                        if let Some(other) = hash_to_name.get(&digest) {
+                            return Err(AuthError::DuplicateTokenHash {
+                                first: other.clone(),
+                                second: wc.name.clone(),
+                            });
+                        }
+                        let id = Arc::new(compile_credential(&wc)?);
+                        hash_to_name.insert(digest, wc.name.clone());
+                        by_hash.insert(digest, id);
+                    }
+                    (None, Some(cn)) if !cn.is_empty() => {
+                        if by_cert.contains_key(cn) {
+                            return Err(AuthError::InvalidPermission {
+                                name: wc.name.clone(),
+                                reason: format!(
+                                    "cert_cn '{cn}' is already bound to another credential"
+                                ),
+                            });
+                        }
+                        let id = Arc::new(compile_credential(&wc)?);
+                        by_cert.insert(cn.clone(), id);
+                    }
+                    _ => {
+                        return Err(AuthError::InvalidPermission {
+                            name: wc.name.clone(),
+                            reason: "a credential has exactly one of token_sha256 or cert_cn"
+                                .into(),
+                        })
+                    }
                 }
-
-                let id = Arc::new(compile_credential(&wc)?);
                 names.insert(wc.name.clone());
-                hash_to_name.insert(digest, wc.name.clone());
-                by_hash.insert(digest, id);
                 file_count += 1;
             }
         }
@@ -122,6 +158,7 @@ impl CredentialStore {
                     streams: StreamGlob::compile("*", LEGACY_ADMIN_NAME)?,
                     actions: Action::Publish | Action::Subscribe | Action::Admin,
                 }],
+                subject_permissions: Vec::new(),
             });
             by_hash.insert(digest, id);
             legacy_admin_present = true;
@@ -129,6 +166,7 @@ impl CredentialStore {
 
         Ok(Self {
             by_hash,
+            by_cert,
             file_count,
             legacy_admin_present,
         })
@@ -137,6 +175,11 @@ impl CredentialStore {
     /// O(1) lookup by sha256 of the raw token bytes.
     pub fn lookup(&self, digest: &[u8; 32]) -> Option<IdentityRef> {
         self.by_hash.get(digest).cloned()
+    }
+
+    /// The credential bound to a verified client certificate's name.
+    pub fn lookup_cert(&self, name: &str) -> Option<IdentityRef> {
+        self.by_cert.get(name).cloned()
     }
 
     pub fn len(&self) -> usize {
@@ -170,8 +213,8 @@ fn compile_credential(wc: &WireCredential) -> Result<Identity, AuthError> {
     validate_name_charset(&wc.name)?;
 
     let mut permissions = Vec::with_capacity(wc.permissions.len());
+    let mut subject_permissions = Vec::new();
     for wp in &wc.permissions {
-        let streams = StreamGlob::compile(&wp.streams, &wc.name)?;
         let mut actions = EnumSet::<Action>::new();
         for a in &wp.actions {
             match a.as_str() {
@@ -201,12 +244,41 @@ fn compile_credential(wc: &WireCredential) -> Result<Identity, AuthError> {
                 }
             }
         }
-        permissions.push(Permission { streams, actions });
+        let invalid = |reason: String| AuthError::InvalidPermission {
+            name: wc.name.clone(),
+            reason,
+        };
+        match (&wp.streams, &wp.subjects) {
+            (Some(glob), None) => permissions.push(Permission {
+                streams: StreamGlob::compile(glob, &wc.name)?,
+                actions,
+            }),
+            (None, Some(filter)) => {
+                if actions
+                    .iter()
+                    .any(|a| !matches!(a, Action::Publish | Action::Subscribe))
+                {
+                    return Err(invalid(format!(
+                        "subjects = \"{filter}\" takes only publish and subscribe"
+                    )));
+                }
+                subject_permissions.push(SubjectPermission {
+                    subjects: SubjectFilter::parse(filter).map_err(invalid)?,
+                    actions,
+                })
+            }
+            _ => {
+                return Err(invalid(
+                    "each permission names exactly one of `streams` or `subjects`".into(),
+                ))
+            }
+        }
     }
 
     Ok(Identity {
         name: wc.name.clone(),
         permissions,
+        subject_permissions,
     })
 }
 
@@ -470,6 +542,87 @@ permissions = [{{ streams = "*", actions = ["replicate"] }}]
             "expected Replicate in action set; got {:?}",
             id.permissions,
         );
+    }
+
+    #[test]
+    fn subject_permissions_compile_from_toml() {
+        let f = write_tmp(&format!(
+            r#"
+[[credentials]]
+name = "svc"
+token_sha256 = "{}"
+permissions = [
+  {{ streams = "orders-*", actions = ["publish"] }},
+  {{ subjects = "rpc.>", actions = ["publish", "subscribe"] }},
+]
+"#,
+            hash_of("tok")
+        ));
+        let store = CredentialStore::build(Some(f.path()), None).unwrap();
+        let digest: [u8; 32] = sha2::Sha256::digest(b"tok").into();
+        let id = store.lookup(&digest).unwrap();
+        assert_eq!(id.subject_permissions.len(), 1);
+        let rpc = SubjectFilter::parse("rpc.users.get").unwrap();
+        assert!(id.authorize_subject(Action::Subscribe, &rpc));
+        let other = SubjectFilter::parse("events.x").unwrap();
+        assert!(!id.authorize_subject(Action::Publish, &other));
+    }
+
+    #[test]
+    fn a_permission_names_streams_or_subjects() {
+        for perm in [
+            r#"{ actions = ["publish"] }"#,
+            r#"{ streams = "*", subjects = "a.>", actions = ["publish"] }"#,
+            r#"{ subjects = "a.>", actions = ["admin"] }"#,
+            r#"{ subjects = "a.>.b", actions = ["publish"] }"#,
+        ] {
+            let f = write_tmp(&format!(
+                "[[credentials]]\nname = \"x\"\ntoken_sha256 = \"{}\"\npermissions = [{perm}]\n",
+                hash_of("t")
+            ));
+            assert!(
+                matches!(
+                    CredentialStore::build(Some(f.path()), None),
+                    Err(AuthError::InvalidPermission { .. })
+                ),
+                "{perm}"
+            );
+        }
+    }
+
+    #[test]
+    fn credentials_can_be_bound_to_a_certificate() {
+        let f = write_tmp(&format!(
+            r#"
+[[credentials]]
+name = "orders-svc"
+cert_cn = "orders.internal"
+permissions = [{{ streams = "orders", actions = ["publish"] }}]
+
+[[credentials]]
+name = "human"
+token_sha256 = "{}"
+"#,
+            hash_of("tok")
+        ));
+        let store = CredentialStore::build(Some(f.path()), None).unwrap();
+        let id = store.lookup_cert("orders.internal").unwrap();
+        assert_eq!(id.name, "orders-svc");
+        assert!(store.lookup_cert("other").is_none());
+        for bad in [
+            "[[credentials]]\nname = \"x\"\n",
+            "[[credentials]]\nname = \"x\"\ncert_cn = \"a\"\ntoken_sha256 = \"00\"\n",
+            "[[credentials]]\nname = \"x\"\ncert_cn = \"a\"\n[[credentials]]\nname = \"y\"\ncert_cn = \"a\"\n",
+        ] {
+            let f = write_tmp(bad);
+            assert!(
+                matches!(
+                    CredentialStore::build(Some(f.path()), None),
+                    Err(AuthError::InvalidPermission { .. })
+                ),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

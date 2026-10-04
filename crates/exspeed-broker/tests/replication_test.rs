@@ -175,21 +175,22 @@ async fn follower_mirrors_the_leaders_trims() {
     })
     .await;
 
-    // Retention on the leader (here: a direct trim) drops whole segments
-    // and moves its earliest offset; the follower trims up to it.
+    // A trim on the leader (retention, a work queue's acks) moves its log
+    // start offset, record-exactly; the follower trims to the same offset.
     a.storage.trim_up_to(&sn("s"), Offset(40)).await.unwrap();
     let (leader_earliest, _) = a.bounds("s").await.unwrap();
-    assert!(
-        leader_earliest > 0 && leader_earliest <= 40,
-        "{leader_earliest}"
-    );
+    assert_eq!(leader_earliest, 40);
     wait_until("b trims too", || async {
-        b.bounds("s").await.unwrap().0 > 0
+        b.bounds("s").await == Some((40, 100))
     })
     .await;
-    let (follower_earliest, next) = b.bounds("s").await.unwrap();
-    assert!(follower_earliest <= leader_earliest);
-    assert_eq!(next, 100);
+    // Also inside the active segment, where no file is deleted.
+    a.storage.trim_up_to(&sn("s"), Offset(99)).await.unwrap();
+    wait_until("b trims inside the active segment", || async {
+        b.bounds("s").await == Some((99, 100))
+    })
+    .await;
+    let leader_earliest = 99;
     let leader = a.values("s").await;
     let follower = b.values("s").await;
     assert_eq!(

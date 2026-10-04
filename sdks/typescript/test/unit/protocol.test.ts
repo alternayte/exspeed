@@ -24,7 +24,7 @@ import {
   type WireRecord,
 } from "../../src/protocol/index.js";
 import { ExspeedError, ProtocolError } from "../../src/errors.js";
-import { toWireConsumerSpec } from "../../src/types.js";
+import { toWireConsumerSpec, toWirePublishRecord, toWireStreamSpec } from "../../src/types.js";
 
 /** Hex string (spaces and `|` ignored) to Buffer. */
 function hex(s: string): Buffer {
@@ -55,6 +55,17 @@ const pr: WirePublishRecord = {
 };
 const emptyPr: WirePublishRecord = { subject: "", key: null, value: Buffer.alloc(0), headers: [], msgId: null };
 const spec = { name: "s", maxAgeSecs: 1, maxBytes: 2, dedupWindowSecs: 3, dedupMaxEntries: 4, compaction: true };
+/** Same as `limited` in the Rust round-trip test. */
+const limitedSpec = toWireStreamSpec({
+  name: "q",
+  maxMsgs: 10,
+  discard: "new",
+  maxMsgsPerSubject: 1,
+  allowMsgTtl: true,
+  msgTtlMs: 5000,
+  allowDelayed: true,
+  retention: "work_queue",
+});
 
 const consumerSpec = toWireConsumerSpec({
   name: "c",
@@ -68,6 +79,10 @@ const consumerSpec = toWireConsumerSpec({
   maxAckPending: 1000,
   dlqStream: "s-dlq",
   ephemeral: false,
+  deadLetterExpired: false,
+  headerMatch: "all",
+  singleActive: false,
+  priorityWindow: 0,
 });
 
 const allRequests: Request[] = [
@@ -99,6 +114,20 @@ const allRequests: Request[] = [
   { type: "Term", consumer: "c", offset: 5, reason: "bad" },
   { type: "InProgress", consumer: "c", offsets: [6] },
   { type: "Read", stream: "s", from: 7, maxRecords: 100, maxBytes: 1 << 20, waitMs: 1000, filter: "a.*" },
+  { type: "CreateStream", spec: limitedSpec },
+  { type: "CorePublish", subject: "a.b", replyTo: "r", headers: [["h", "v"]], value: b("x") },
+  { type: "CorePublish", subject: "a", replyTo: null, headers: [], value: Buffer.alloc(0) },
+  { type: "CoreSubscribe", subject: "a.*", queue: "q" },
+  { type: "CoreSubscribe", subject: "a.*", queue: null },
+  { type: "KvCreateBucket", bucket: "b", history: 5, ttlMs: 1000, maxBytes: 0 },
+  { type: "KvPut", bucket: "b", key: "k", value: b("v"), expectedRevision: 0, ttlMs: null },
+  { type: "KvPut", bucket: "b", key: "k", value: b("v"), expectedRevision: null, ttlMs: 500 },
+  { type: "KvGet", bucket: "b", key: "k", revision: 3 },
+  { type: "KvGet", bucket: "b", key: "k", revision: null },
+  { type: "KvDelete", bucket: "b", key: "k", purge: true, expectedRevision: 7 },
+  { type: "KvDelete", bucket: "b", key: "k", purge: false, expectedRevision: null },
+  { type: "KvKeys", bucket: "b", filter: "a.*" },
+  { type: "KvHistory", bucket: "b", key: "k" },
 ];
 
 const allResponses: Response[] = [
@@ -121,6 +150,8 @@ const allResponses: Response[] = [
   { type: "Messages", records: [rec(1)] },
   { type: "ReadResult", nextOffset: 10, highWatermark: 12, records: [0, 1, 2].map(rec) },
   { type: "Json", json: b('{"a":1}') },
+  { type: "CoreMsg", subId: 0x80000001, subject: "a", replyTo: "r", headers: [["h", "v"]], value: b("x") },
+  { type: "CoreMsg", subId: 0x80000002, subject: "a.b", replyTo: null, headers: [], value: Buffer.alloc(0) },
 ];
 
 /** Normalise Buffers/Uint8Arrays so toEqual compares bytes. */
@@ -281,6 +312,53 @@ describe("requests", () => {
       { type: "Read", stream: "s", from: 7, maxRecords: 100, maxBytes: 1 << 20, waitMs: 1000, filter: "a.*" },
       "0100 73 0700000000000000 64000000 00001000 e8030000 0300 612e2a",
     ],
+    // The fixtures below were generated with the Rust encoder (Request::into_frame).
+    [
+      "CreateStream with limits",
+      { type: "CreateStream", spec: limitedSpec },
+      `0100 71 0000000000000000 0000000000000000 0000000000000000 0000000000000000 00
+       8d000000 ${b(
+         '{"max_msgs":10,"discard":"new","max_msgs_per_subject":1,"allow_msg_ttl":true,' +
+           '"msg_ttl_ms":5000,"allow_delayed":true,"retention":"work_queue"}',
+       ).toString("hex")}`,
+    ],
+    [
+      "CorePublish",
+      { type: "CorePublish", subject: "a.b", replyTo: "r", headers: [["h", "v"]], value: b("x") },
+      "0300 612e62 | 01 0100 72 | 0100 0100 68 0100 76 | 01000000 78",
+    ],
+    [
+      "CorePublish bare",
+      { type: "CorePublish", subject: "a", replyTo: null, headers: [], value: Buffer.alloc(0) },
+      "0100 61 | 00 | 0000 | 00000000",
+    ],
+    ["CoreSubscribe", { type: "CoreSubscribe", subject: "a.*", queue: "q" }, "0300 612e2a 01 0100 71"],
+    ["CoreSubscribe bare", { type: "CoreSubscribe", subject: "a.*", queue: null }, "0300 612e2a 00"],
+    [
+      "KvCreateBucket",
+      { type: "KvCreateBucket", bucket: "b", history: 5, ttlMs: 1000, maxBytes: 0 },
+      "0100 62 0500000000000000 e803000000000000 0000000000000000",
+    ],
+    [
+      "KvPut expecting revision 0",
+      { type: "KvPut", bucket: "b", key: "k", value: b("v"), expectedRevision: 0, ttlMs: null },
+      "0100 62 0100 6b 01000000 76 01 0000000000000000 00",
+    ],
+    [
+      "KvPut with TTL",
+      { type: "KvPut", bucket: "b", key: "k", value: b("v"), expectedRevision: null, ttlMs: 500 },
+      "0100 62 0100 6b 01000000 76 00 01 f401000000000000",
+    ],
+    ["KvGet at revision", { type: "KvGet", bucket: "b", key: "k", revision: 3 }, "0100 62 0100 6b 01 0300000000000000"],
+    ["KvGet", { type: "KvGet", bucket: "b", key: "k", revision: null }, "0100 62 0100 6b 00"],
+    [
+      "KvDelete purge",
+      { type: "KvDelete", bucket: "b", key: "k", purge: true, expectedRevision: 7 },
+      "0100 62 0100 6b 01 01 0700000000000000",
+    ],
+    ["KvDelete", { type: "KvDelete", bucket: "b", key: "k", purge: false, expectedRevision: null }, "0100 62 0100 6b 00 00"],
+    ["KvKeys", { type: "KvKeys", bucket: "b", filter: "a.*" }, "0100 62 0300 612e2a"],
+    ["KvHistory", { type: "KvHistory", bucket: "b", key: "k" }, "0100 62 0100 6b"],
   ];
 
   it.each(fixtures)("%s matches the Rust encoding byte for byte", (_name, req, expected) => {
@@ -297,10 +375,40 @@ describe("requests", () => {
     const rust =
       '{"name":"c","stream":"s","filter_subjects":["orders.>"],"deliver":{"from_time":123},' +
       '"ack":"explicit","ack_wait_ms":30000,"max_deliver":5,"backoff_ms":[100,1000],' +
-      '"max_ack_pending":1000,"dlq_stream":"s-dlq","ephemeral":false}';
+      '"max_ack_pending":1000,"dlq_stream":"s-dlq","ephemeral":false,' +
+      '"dead_letter_expired":false,"header_match":"all","single_active":false,"priority_window":0}';
     const payload = encodeRequest({ type: "CreateConsumer", spec: consumerSpec });
     expect(payload.readUInt32LE(0)).toBe(rust.length);
     expect(payload.subarray(4).toString()).toBe(rust);
+  });
+
+  it("maps header filters, single-active and priority settings like serde_json", () => {
+    const full = toWireConsumerSpec({
+      name: "c",
+      stream: "s",
+      filterSubjects: ["orders.>"],
+      deliver: { fromTime: 123 },
+      ack: "explicit",
+      ackWaitMs: 30000,
+      maxDeliver: 5,
+      backoffMs: [100, 1000],
+      maxAckPending: 1000,
+      dlqStream: "s-dlq",
+      ephemeral: false,
+      deadLetterExpired: true,
+      filterHeaders: { tenant: "acme" },
+      headerMatch: "any",
+      singleActive: true,
+      priorityWindow: 50,
+    });
+    expect(JSON.stringify(full)).toBe(
+      '{"name":"c","stream":"s","filter_subjects":["orders.>"],"deliver":{"from_time":123},' +
+        '"ack":"explicit","ack_wait_ms":30000,"max_deliver":5,"backoff_ms":[100,1000],' +
+        '"max_ack_pending":1000,"dlq_stream":"s-dlq","ephemeral":false,"dead_letter_expired":true,' +
+        '"filter_headers":{"tenant":"acme"},"header_match":"any","single_active":true,"priority_window":50}',
+    );
+    // An empty header filter is left out, as serde does.
+    expect(toWireConsumerSpec({ name: "c", stream: "s", filterHeaders: {} })).toEqual({ name: "c", stream: "s" });
   });
 
   it("omits unset ConsumerSpec fields so the server applies its defaults", () => {
@@ -314,6 +422,70 @@ describe("requests", () => {
     expect(toWireConsumerSpec({ name: "c", stream: "s", deliver: { fromTime: new Date(42) } }).deliver).toEqual({
       from_time: 42,
     });
+  });
+});
+
+describe("stream limits", () => {
+  it("sends no limits trailer when every limit is at its default", () => {
+    const plain = toWireStreamSpec({ name: "s", maxAgeSecs: 1, discard: "old", retention: "limits", allowMsgTtl: false });
+    expect(plain.limits).toBeNull();
+    const payload = encodeRequest({ type: "CreateStream", spec: plain });
+    expect(payload.toString("hex")).toBe(
+      hex("0100 73 0100000000000000 0000000000000000 0000000000000000 0000000000000000 00").toString("hex"),
+    );
+    // And an old-style spec without the trailer decodes without limits.
+    expect(decodeRequest(OpCode.CreateStream, payload)).toEqual({
+      type: "CreateStream",
+      spec: { name: "s", maxAgeSecs: 1, maxBytes: 0, dedupWindowSecs: 0, dedupMaxEntries: 0, compaction: false },
+    });
+  });
+
+  it("sends every limit, serde-style, once any one is set", () => {
+    const one = toWireStreamSpec({ name: "s", allowDelayed: true });
+    expect(JSON.stringify(one.limits)).toBe(
+      '{"max_msgs":0,"discard":"old","max_msgs_per_subject":0,"allow_msg_ttl":false,' +
+        '"msg_ttl_ms":0,"allow_delayed":true,"retention":"limits"}',
+    );
+    for (const s of [{ maxMsgs: 1 }, { discard: "new" as const }, { maxMsgsPerSubject: 2 }, { allowMsgTtl: true }, { msgTtlMs: 3 }, { retention: "interest" as const }]) {
+      expect(toWireStreamSpec({ name: "s", ...s }).limits).not.toBeNull();
+    }
+  });
+});
+
+describe("publish options", () => {
+  it("become the same headers as the Rust PublishRecord builders", () => {
+    const r = toWirePublishRecord({
+      subject: "a",
+      value: "v",
+      headers: { "trace-id": "t" },
+      ttl: 500,
+      delay: "2000ms",
+      deliverAt: 1_700_000_000_000,
+      priority: 7,
+    });
+    // PublishRecord::new("a", "v").ttl(500ms).delay(2s).deliver_at(1700000000000).priority(7)
+    expect(r.headers).toEqual([
+      ["trace-id", "t"],
+      ["exspeed-ttl", "500ms"],
+      ["exspeed-delay", "2000ms"],
+      ["exspeed-deliver-at", "1700000000000"],
+      ["exspeed-priority", "7"],
+    ]);
+  });
+
+  it("accepts duration strings and Dates, and rejects bad values", () => {
+    const r = toWirePublishRecord({ subject: "a", value: "v", ttl: "30s", delay: 0, deliverAt: new Date(42) });
+    expect(r.headers).toEqual([
+      ["exspeed-ttl", "30s"],
+      ["exspeed-delay", "0ms"],
+      ["exspeed-deliver-at", "42"],
+    ]);
+    expect(toWirePublishRecord({ subject: "a", value: "v", ttl: 0.2 }).headers).toEqual([["exspeed-ttl", "1ms"]]);
+    expect(() => toWirePublishRecord({ subject: "a", value: "v", ttl: "soon" })).toThrow(ExspeedError);
+    expect(() => toWirePublishRecord({ subject: "a", value: "v", delay: -1 })).toThrow(ExspeedError);
+    expect(() => toWirePublishRecord({ subject: "a", value: "v", priority: 10 })).toThrow(ExspeedError);
+    expect(() => toWirePublishRecord({ subject: "a", value: "v", priority: 1.5 })).toThrow(ExspeedError);
+    expect(() => toWirePublishRecord({ subject: "a", value: "v", deliverAt: -5 })).toThrow(ExspeedError);
   });
 });
 
@@ -393,6 +565,11 @@ describe("responses", () => {
        00
        01000000 01
        0100 0100 68 0200 7631`,
+    ],
+    [
+      "CoreMsg",
+      { type: "CoreMsg", subId: 0x80000001, subject: "a", replyTo: "r", headers: [["h", "v"]], value: b("x") },
+      "01000080 0100 61 01 0100 72 0100 0100 68 0100 76 01000000 78",
     ],
   ];
 

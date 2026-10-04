@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/alternayte/exspeed"
@@ -116,6 +116,7 @@ constant_time_eq = "0.3"
 # TLS
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
+x509-parser = "0.17"
 rcgen = "0.13"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 

@@ -17,6 +17,10 @@ Authorization at a glance:
 - Ack, nack, term and in-progress need `subscribe` on the consumer's stream.
   Any connection with that permission can settle that stream's consumers'
   records, which is what lets several app instances share one consumer.
+- Key-value operations check the bucket's stream `KV_<bucket>`: reads need
+  `subscribe`, puts and deletes `publish`, creating a bucket `admin`.
+- Core messages check subjects, not streams (see
+  [subject permissions](#subject-permissions)).
 - HTTP management routes need an `admin` permission; see
   [http-api.md](http-api.md#authentication) for the per-route rules. The
   HTTP record browser (`GET /api/v1/streams/{name}/records`) needs
@@ -82,6 +86,33 @@ Each permission pairs a stream glob with actions:
 
 Names and token hashes must be unique; an unknown action or an invalid
 pattern stops the server from starting.
+
+### Subject permissions
+
+[Core messages](messaging.md) aren't stored in a stream, so their
+permissions name subjects. A permission entry has `subjects` (a NATS-style
+filter) instead of `streams`, with `publish` and/or `subscribe`:
+
+```toml
+[[credentials]]
+name = "pricing-service"
+token_sha256 = "..."
+permissions = [
+  { subjects = "pricing.>", actions = ["subscribe"] },   # serve requests
+  { subjects = "events.prices.*", actions = ["publish"] },
+]
+```
+
+- Publishing needs a permission whose filter matches the subject.
+- Subscribing needs a permission whose filter covers every subject the
+  subscription's filter can match: `pricing.>` allows subscribing to
+  `pricing.quotes.*` but not to `>`.
+- A wildcard-all stream permission (`streams = "*"`) grants the same verbs
+  on every subject.
+- Request-reply works without extra entries: anyone may publish a reply to an
+  `_INBOX.…` subject, and a client may subscribe to its own inbox
+  (`_INBOX.<id>.>` or `_INBOX.<id>.*`). Subscribing to every inbox
+  (`_INBOX.>`, `_INBOX.*.…`) is refused unless a permission covers it.
 
 **Generate a credential:**
 
@@ -154,8 +185,41 @@ will use. In a cluster, `cluster.tls = true` serves the same certificate on
 the replication port and makes followers verify it; see
 [high-availability.md](high-availability.md#tls-on-the-cluster-port).
 
-TLS uses pure-Rust `rustls`, with TLS 1.2 and 1.3. The server doesn't
-request or verify client certificates.
+TLS uses pure-Rust `rustls`, with TLS 1.2 and 1.3.
+
+### Client certificates (mutual TLS)
+
+```toml
+[tls]
+cert = "/etc/exspeed/tls.crt"
+key = "/etc/exspeed/tls.key"
+client_ca = "/etc/exspeed/clients-ca.crt"   # EXSPEED_TLS_CLIENT_CA, --tls-client-ca
+```
+
+With `client_ca` set, the TCP port accepts only clients that present a
+certificate signed by that CA; the TLS handshake fails for everyone else.
+The HTTP port keeps using bearer tokens.
+
+A credential can be bound to a certificate instead of a token: `cert_cn`
+names the certificate's subject common name (or, when it has none, its first
+DNS subject-alternative name).
+
+```toml
+[[credentials]]
+name = "orders-service"
+cert_cn = "orders.internal"
+permissions = [{ streams = "orders-*", actions = ["publish", "subscribe"] }]
+```
+
+A client that connects with a valid certificate and no token gets the
+permissions of the credential bound to the certificate's name. A token, when
+sent, takes precedence. A valid certificate that no credential names fails
+the handshake with `401` (when auth is on; with auth off, any client holding
+a valid certificate gets full access).
+
+The TypeScript SDK passes `tls: { cert, key, ca }` through to Node's TLS; the
+Rust client takes a rustls `ClientConfig` built with
+`with_client_auth_cert`.
 
 ### Dev certs
 
@@ -196,7 +260,7 @@ default, runs out). Restart the nodes one at a time.
 
 ## Not supported
 
-- mTLS: the server doesn't verify client certificates
+- Client certificates on the HTTP port (it uses bearer tokens)
 - SASL / JWT / OAuth2
 - Reloading certificates or credentials without a restart
 - Rate limiting on failed auth attempts: use an ingress WAF or fail2ban

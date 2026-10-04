@@ -27,11 +27,15 @@ export interface ConnectionOptions {
   keepaliveMs: number;
 }
 
-/** Receives a subscription's pushes. */
+/** A `CoreMsg` push. */
+export type CoreMsgPush = Extract<Response, { type: "CoreMsg" }>;
+
+/** Receives a subscription's pushes (`Deliver` for consumers, `CoreMsg` for core subscriptions). */
 export interface SubscriptionSink {
-  /** Called synchronously when `SubscribeOk` arrives, before any `Deliver` for it is routed. */
+  /** Called synchronously when `SubscribeOk` arrives, before any push for it is routed. */
   onSubscribed(conn: Connection, subId: number): void;
-  onDeliver(records: WireRecord[]): void;
+  onDeliver?(records: WireRecord[]): void;
+  onCoreMsg?(msg: CoreMsgPush): void;
   onEnded(code: number, message: string): void;
 }
 
@@ -52,7 +56,7 @@ interface Pending {
 export interface RequestOptions {
   /** Overrides the default request timeout. */
   timeoutMs?: number;
-  /** For `Subscribe`: where the subscription's pushes go. */
+  /** For `Subscribe` / `CoreSubscribe`: where the subscription's pushes go. */
   sink?: SubscriptionSink;
 }
 
@@ -222,7 +226,10 @@ export class Connection {
     if (corr === 0) {
       switch (resp.type) {
         case "Deliver":
-          this.subs.get(resp.subId)?.onDeliver(resp.records);
+          this.subs.get(resp.subId)?.onDeliver?.(resp.records);
+          return;
+        case "CoreMsg":
+          this.subs.get(resp.subId)?.onCoreMsg?.(resp);
           return;
         case "SubscriptionEnded": {
           const sink = this.subs.get(resp.subId);

@@ -37,8 +37,11 @@ environment the same way `exspeed server` resolves them; `--url` or
 
 ```bash
 exspeed create <name> [--retention 7d] [--max-size 10gb] \
-                      [--dedup-window 5m] [--dedup-max-entries 500k]
-exspeed update-stream <name> [--retention …] [--max-size …] [--dedup-window …] [--dedup-max-entries …]
+                      [--dedup-window 5m] [--dedup-max-entries 500k] \
+                      [--max-msgs 1M] [--discard old|new] [--max-msgs-per-subject N] \
+                      [--allow-msg-ttl] [--msg-ttl 1h] [--allow-delayed] \
+                      [--retention-policy limits|work_queue|interest]
+exspeed update-stream <name> [any of the flags above]   # only the flags given change
 exspeed streams                     # list
 exspeed info <name>                 # offsets, size, retention, dedup config
 exspeed delete <name> [--force]     # --force also removes connectors/queries/consumers that use it
@@ -53,6 +56,12 @@ Values:
 `create` without `--dedup-window` / `--dedup-max-entries` uses the stream
 defaults (5 minutes, 500,000 entries). Log compaction has no CLI flag:
 create a compacted stream over HTTP (`"compaction": true`) or with the SDK.
+
+The limit flags are described in [queues.md](queues.md): `--max-msgs` with
+`--discard`, `--max-msgs-per-subject`, `--allow-msg-ttl` / `--msg-ttl`
+(TTLs; `--msg-ttl` takes `500ms`, `30s`, `5m`, `2h`, `1d`), `--allow-delayed`,
+and `--retention-policy`. On `update-stream`, the boolean flags take an
+explicit value: `--allow-delayed false`.
 
 ## Publish
 

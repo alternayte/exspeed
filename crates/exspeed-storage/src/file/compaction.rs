@@ -1,4 +1,6 @@
-//! Log compaction: keep only the latest record per key in sealed segments.
+//! Log compaction: keep only the latest record per key in sealed segments,
+//! and drop records readers can no longer see (expired by a TTL, or
+//! superseded under `max_msgs_per_subject`).
 //!
 //! * Records without a key are always kept.
 //! * A record with a key survives only if it is the newest record for that
@@ -28,6 +30,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
+use exspeed_common::{msg_time, record_format};
+use exspeed_streams::StreamConfig;
 
 use crate::encoding::frame_key_value_len;
 use crate::file::partition::PartitionShared;
@@ -88,11 +92,16 @@ fn for_each_frame(
     }
 }
 
+/// Whether a stream has anything for compaction to do.
+pub fn wanted(cfg: &StreamConfig) -> bool {
+    cfg.compaction || cfg.max_msgs_per_subject > 0 || cfg.has_ttl()
+}
+
 /// Plan and write compacted copies of every sealed segment that has
 /// something to remove. Nothing is installed yet.
 pub fn prepare(
     shared: &PartitionShared,
-    tombstone_retention_secs: u64,
+    cfg: &StreamConfig,
     now_nanos: u64,
 ) -> io::Result<Vec<(CompactionJob, CompactionStats)>> {
     let hwm = shared.high_watermark();
@@ -103,7 +112,7 @@ pub fn prepare(
 
     // Pass 1: newest offset per key across the whole visible log.
     let mut latest: HashMap<Bytes, u64> = HashMap::new();
-    for seg in list.iter() {
+    for seg in list.iter().filter(|_| cfg.compaction) {
         for_each_frame(seg, hwm, |offset, _, key, _, _| {
             if let Some(k) = key {
                 match latest.get_mut(k) {
@@ -118,18 +127,35 @@ pub fn prepare(
     }
 
     let tombstone_cutoff =
-        now_nanos.saturating_sub(tombstone_retention_secs.saturating_mul(1_000_000_000));
+        now_nanos.saturating_sub(cfg.tombstone_retention_secs.saturating_mul(1_000_000_000));
     let mut jobs = Vec::new();
-    let keep = |offset: u64, ts: u64, key: Option<&[u8]>, tombstone: bool| match key {
-        None => true,
-        Some(k) => latest.get(k) == Some(&offset) && !(tombstone && ts < tombstone_cutoff),
+    let ttl = cfg.has_ttl().then_some((cfg.allow_msg_ttl, cfg.msg_ttl_ms));
+    let per_subject = cfg.max_msgs_per_subject > 0;
+    let keep = |offset: u64, ts: u64, key: Option<&[u8]>, tombstone: bool, raw: &[u8]| {
+        if let Some((allow, default_ms)) = ttl {
+            if msg_time::expires_at_ns(raw, allow, default_ms).is_some_and(|e| e <= now_nanos) {
+                return false;
+            }
+        }
+        if per_subject {
+            let subject = record_format::subject(raw).unwrap_or_default();
+            if shared.superseded(subject, offset, hwm) {
+                return false;
+            }
+        }
+        match key {
+            Some(k) if cfg.compaction => {
+                latest.get(k) == Some(&offset) && !(tombstone && ts < tombstone_cutoff)
+            }
+            _ => true,
+        }
     };
     // Pass 2: count what each sealed segment would lose; pass 3: rewrite
     // the ones that lose something, streaming the kept frames.
     for seg in &list[..list.len() - 1] {
         let mut removed = 0u64;
-        for_each_frame(seg, hwm, |offset, ts, key, tombstone, _| {
-            if !keep(offset, ts, key, tombstone) {
+        for_each_frame(seg, hwm, |offset, ts, key, tombstone, raw| {
+            if !keep(offset, ts, key, tombstone, raw) {
                 removed += 1;
             }
             Ok(())
@@ -148,8 +174,9 @@ pub fn prepare(
     Ok(jobs)
 }
 
-/// Decides whether a frame survives: `(offset, timestamp_ns, key, is_tombstone)`.
-type KeepFn<'a> = dyn Fn(u64, u64, Option<&[u8]>, bool) -> bool + 'a;
+/// Decides whether a frame survives: `(offset, timestamp_ns, key,
+/// is_tombstone, raw_frame)`.
+type KeepFn<'a> = dyn Fn(u64, u64, Option<&[u8]>, bool, &[u8]) -> bool + 'a;
 
 fn write_compacted(
     dir: &Path,
@@ -168,7 +195,7 @@ fn write_compacted(
     let mut last_offset = None;
     let mut records = 0u64;
     for_each_frame(seg, hwm, |offset, ts, key, tombstone, raw| {
-        if !keep(offset, ts, key, tombstone) {
+        if !keep(offset, ts, key, tombstone, raw) {
             return Ok(());
         }
         if let Some(e) = ib.observe(offset, pos, ts) {

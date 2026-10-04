@@ -5,12 +5,15 @@
 | Page | What it covers |
 |------|----------------|
 | [Getting started](getting-started.md) | Install, run, and publish, tail and query your first stream |
-| [Concepts](concepts.md) | Streams, records, subjects, consumers, work sharing, retention |
+| [Concepts](concepts.md) | Streams, records, subjects, consumers, work sharing, retention, core messaging, KV |
 
 ## Using Exspeed
 
 | Page | What it covers |
 |------|----------------|
+| [Queues and message lifetime](queues.md) | TTLs, delayed delivery, `max_msgs`, work-queue and interest retention, header filters, single active consumers, priority, dead-letter causes |
+| [Core messaging](messaging.md) | Non-persistent publish/subscribe, queue groups, request-reply |
+| [Key-value buckets](kv.md) | Get/put/delete, history, compare-and-set, TTLs, watch |
 | [CLI reference](cli.md) | Every `exspeed` command and flag |
 | [HTTP API reference](http-api.md) | Every endpoint and the permission it needs |
 | [ExQL](exql.md) | SQL over streams: bounded and continuous queries, windows, joins, materialized tables, external Postgres tables |
@@ -26,7 +29,7 @@
 |------|----------------|
 | [Configuration](configuration.md) | `exspeed.toml`, environment variables and flags: every server setting |
 | [Operations](operations.md) | Docker, Kubernetes, logging, probes, shutdown, backups, metrics |
-| [Security](security.md) | Tokens, scoped credentials, TLS |
+| [Security](security.md) | Tokens, scoped credentials, subject permissions, TLS and client certificates |
 | [High availability](high-availability.md) | Clusters: leader election, replication, failover, `acks` |
 
 ## Internals and project

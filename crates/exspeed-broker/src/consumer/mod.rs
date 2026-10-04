@@ -13,6 +13,14 @@
 //! [`store`]), so it replicates with the log and survives restarts and
 //! failover. Consumers only run on the leader: [`ConsumerManager::start`]
 //! loads and starts them under the leadership token.
+//!
+//! **Retention by acknowledgement.** On a stream with `work_queue` or
+//! `interest` retention, records are removed once acked: each actor reports
+//! its ack floor after the state carrying it is persisted, and the manager
+//! trims the stream to the lowest floor of its consumers (an `interest`
+//! stream with no consumers is trimmed to its head). A `work_queue` stream
+//! takes only `deliver: all` consumers whose subject filters don't overlap,
+//! so each record is owned by at most one consumer.
 
 mod actor;
 pub mod core;
@@ -25,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use exspeed_common::{validate_resource_name, Metrics, StreamName, SubjectFilters};
 use exspeed_protocol::client::{ConsumerSpec, DeliverPolicy, EncodedRecords, SeekTo};
-use exspeed_streams::StorageError;
+use exspeed_streams::{RetentionPolicy, StorageError};
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -34,6 +42,22 @@ use self::actor::{Actor, Cmd};
 use self::core::{ConsumerStats, Core};
 use self::store::ConsumerStore;
 use crate::log::Log;
+
+/// An actor's persisted ack floor, for retention by acknowledgement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FloorReport {
+    Floor {
+        stream: String,
+        consumer: String,
+        floor: u64,
+    },
+    /// The consumer was deleted.
+    Gone { stream: String, consumer: String },
+}
+
+/// How often streams with `work_queue` / `interest` retention are trimmed
+/// even without floor reports (e.g. an `interest` stream with no consumers).
+const RETENTION_TICK: Duration = Duration::from_secs(1);
 
 /// Event sent to a push subscriber.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +109,8 @@ pub struct ConsumerInfo {
     pub ack_floor: u64,
     pub num_unacked: u64,
     pub num_in_flight: u64,
+    /// Records held back until their delivery time (`exspeed-delay`).
+    pub num_delayed: u64,
     /// Records not yet delivered (approximate: includes filtered-out ones).
     pub num_waiting: u64,
     /// `high_watermark - ack_floor`.
@@ -117,11 +143,16 @@ pub struct ConsumerManager {
     next_sub_id: AtomicU32,
     /// Every actor task, so shutdown can wait for final persists.
     tasks: tokio_util::task::TaskTracker,
+    floors_tx: mpsc::UnboundedSender<FloorReport>,
+    floors_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<FloorReport>>,
 }
 
 impl ConsumerManager {
     pub fn new(log: Arc<Log>, metrics: Arc<Metrics>) -> Arc<Self> {
+        let (floors_tx, floors_rx) = mpsc::unbounded_channel();
         Arc::new(Self {
+            floors_tx,
+            floors_rx: tokio::sync::Mutex::new(floors_rx),
             store: Arc::new(ConsumerStore::new(log.clone())),
             log,
             metrics,
@@ -173,6 +204,11 @@ impl ConsumerManager {
         *self.token.write().await = Some(token.clone());
         drop(map);
 
+        // Retention by acknowledgement, for this leadership tenure.
+        let this = self.clone();
+        let retention_token = token.clone();
+        tokio::spawn(async move { this.run_retention(retention_token).await });
+
         // Forget everything when leadership ends.
         let this = self.clone();
         tokio::spawn(async move {
@@ -183,6 +219,92 @@ impl ConsumerManager {
         Ok(started)
     }
 
+    /// Trim `work_queue` / `interest` streams as their consumers' persisted
+    /// ack floors move. Runs on the leader until `token` is cancelled.
+    async fn run_retention(self: Arc<Self>, token: CancellationToken) {
+        let mut rx = self.floors_rx.lock().await;
+        // Reports from the previous tenure are stale.
+        while rx.try_recv().is_ok() {}
+        let mut floors: HashMap<String, HashMap<String, u64>> = HashMap::new();
+        let mut tick = tokio::time::interval(RETENTION_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            let touched: Option<String> = tokio::select! {
+                _ = token.cancelled() => return,
+                r = rx.recv() => match r {
+                    Some(FloorReport::Floor { stream, consumer, floor }) => {
+                        floors.entry(stream.clone()).or_default().insert(consumer, floor);
+                        Some(stream)
+                    }
+                    Some(FloorReport::Gone { stream, consumer }) => {
+                        if let Some(m) = floors.get_mut(&stream) {
+                            m.remove(&consumer);
+                        }
+                        Some(stream)
+                    }
+                    None => return,
+                },
+                _ = tick.tick() => None,
+            };
+            match touched {
+                Some(stream) => self.retain(&stream, &floors).await,
+                None => {
+                    let streams = self.log.storage().list_streams().await.unwrap_or_default();
+                    for s in streams {
+                        self.retain(s.as_str(), &floors).await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Trim one stream to what its retention policy allows.
+    async fn retain(&self, stream: &str, floors: &HashMap<String, HashMap<String, u64>>) {
+        let Ok(name) = StreamName::try_from(stream) else {
+            return;
+        };
+        let storage = self.log.storage();
+        let Ok(cfg) = storage.stream_config(&name).await else {
+            return;
+        };
+        if cfg.retention.is_limits() {
+            return;
+        }
+        // Only trust floors of consumers that are running now.
+        let running: Vec<String> = self.consumers_of(stream).await;
+        let floor = floors
+            .get(stream)
+            .map(|m| {
+                running
+                    .iter()
+                    .map(|c| m.get(c).copied())
+                    .collect::<Option<Vec<u64>>>()
+            })
+            .unwrap_or_else(|| (running.is_empty()).then(Vec::new));
+        let target = match floor {
+            // A running consumer hasn't reported yet: wait for it.
+            None => return,
+            Some(v) if v.is_empty() => match cfg.retention {
+                // Nobody is interested: nothing is kept.
+                RetentionPolicy::Interest => match storage.stream_bounds(&name).await {
+                    Ok((_, hwm)) => hwm.0,
+                    Err(_) => return,
+                },
+                // A queue keeps its records until a consumer takes them.
+                _ => return,
+            },
+            Some(v) => v.into_iter().min().unwrap_or(0),
+        };
+        match storage.stream_bounds(&name).await {
+            Ok((earliest, _)) if target > earliest.0 => {
+                if let Err(e) = self.log.trim(&name, target).await {
+                    tracing::warn!(stream, error = %e, "retention trim failed");
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn spawn(&self, core: Core, token: CancellationToken) -> Result<Handle, ConsumerError> {
         let spec = core.spec.clone();
         let actor = Actor::new(
@@ -190,6 +312,7 @@ impl ConsumerManager {
             self.log.clone(),
             self.store.clone(),
             self.metrics.clone(),
+            self.floors_tx.clone(),
         )?;
         let (tx, rx) = mpsc::channel(4096);
         self.tasks.spawn(actor.run(rx, token));
@@ -213,6 +336,17 @@ impl ConsumerManager {
         let stream = StreamName::try_from(spec.stream.as_str())
             .map_err(|e| ConsumerError::Invalid(e.to_string()))?;
         SubjectFilters::parse(&spec.filter_subjects).map_err(ConsumerError::Invalid)?;
+        if spec.priority_window > exspeed_protocol::client::MAX_PRIORITY_WINDOW {
+            return Err(ConsumerError::Invalid(format!(
+                "priority_window is at most {}",
+                exspeed_protocol::client::MAX_PRIORITY_WINDOW
+            )));
+        }
+        if spec.filter_headers.len() > 64 {
+            return Err(ConsumerError::Invalid(
+                "filter_headers takes at most 64 headers".into(),
+            ));
+        }
         if let Some(dlq) = &spec.dlq_stream {
             let dlq = StreamName::try_from(dlq.as_str())
                 .map_err(|e| ConsumerError::Invalid(format!("dlq_stream: {e}")))?;
@@ -239,6 +373,11 @@ impl ConsumerManager {
         }
 
         let storage = self.log.storage();
+        if let Ok(cfg) = storage.stream_config(&stream).await {
+            if cfg.retention == RetentionPolicy::WorkQueue {
+                self.check_work_queue(&spec).await?;
+            }
+        }
         let (earliest, hwm) = storage.stream_bounds(&stream).await.map_err(|e| match e {
             StorageError::StreamNotFound(_) => {
                 ConsumerError::NotFound(format!("stream '{}'", spec.stream))
@@ -273,6 +412,32 @@ impl ConsumerManager {
         map.insert(spec.name.clone(), handle);
         drop(map);
         self.info(&spec.name).await
+    }
+
+    /// A `work_queue` stream: every record is owned by at most one
+    /// consumer, which reads from the start.
+    async fn check_work_queue(&self, spec: &ConsumerSpec) -> Result<(), ConsumerError> {
+        if spec.deliver != DeliverPolicy::All {
+            return Err(ConsumerError::Invalid(
+                "consumers of a work_queue stream must use deliver: all".into(),
+            ));
+        }
+        let mine = SubjectFilters::parse(&spec.filter_subjects).map_err(ConsumerError::Invalid)?;
+        let map = self.consumers.read().await;
+        for (name, h) in map.iter() {
+            if h.spec.stream != spec.stream || *name == spec.name {
+                continue;
+            }
+            let theirs = SubjectFilters::parse(&h.spec.filter_subjects).unwrap_or_default();
+            if mine.overlaps(&theirs) {
+                return Err(ConsumerError::Conflict(format!(
+                    "stream '{}' is a work queue and consumer '{name}' already takes \
+                     records matching these subjects; use non-overlapping filter_subjects",
+                    spec.stream
+                )));
+            }
+        }
+        Ok(())
     }
 
     async fn tx(&self, name: &str) -> Result<mpsc::Sender<Cmd>, ConsumerError> {

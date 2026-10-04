@@ -4,7 +4,13 @@ use enumset::{EnumSet, EnumSetType};
 use serde::Deserialize;
 
 use crate::auth::glob::StreamGlob;
+use crate::subject::SubjectFilter;
 use crate::types::StreamName;
+
+/// Subjects of core (non-persistent) messages that carry request-reply
+/// responses. Anyone may publish to them; subscribing needs a concrete inbox
+/// (`_INBOX.<id>`, optionally with a wildcard after it).
+pub const INBOX_PREFIX: &str = "_INBOX";
 
 /// Verbs a credential can hold. `EnumSetType` gives us compact `EnumSet<Action>`
 /// (u8 bitset under the hood) plus ergonomic contains/insert/union.
@@ -25,12 +31,21 @@ pub struct Permission {
     pub actions: EnumSet<Action>,
 }
 
+/// `publish` / `subscribe` on core (non-persistent) message subjects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubjectPermission {
+    pub subjects: SubjectFilter,
+    pub actions: EnumSet<Action>,
+}
+
 /// An authenticated principal. Returned by `CredentialStore::lookup` and
 /// carried on the TCP connection + in HTTP request extensions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     pub name: String,
     pub permissions: Vec<Permission>,
+    /// Permissions on core message subjects.
+    pub subject_permissions: Vec<SubjectPermission>,
 }
 
 impl Identity {
@@ -41,6 +56,25 @@ impl Identity {
         self.permissions
             .iter()
             .any(|p| p.actions.contains(action) && p.streams.matches(stream))
+    }
+
+    /// Whether this identity may publish (`Publish`) to, or subscribe
+    /// (`Subscribe`) with, the core-message subject filter `filter`.
+    /// Subscribing needs a permission covering every subject the filter
+    /// matches. A wildcard-all stream permission (`streams = "*"`) grants
+    /// the same verbs on every subject. Replies (`_INBOX.…`) may always be
+    /// published, and a concrete inbox may always be subscribed to.
+    pub fn authorize_subject(&self, action: Action, filter: &SubjectFilter) -> bool {
+        if is_inbox(filter, action) {
+            return true;
+        }
+        self.permissions
+            .iter()
+            .any(|p| p.actions.contains(action) && p.streams.is_wildcard_all())
+            || self
+                .subject_permissions
+                .iter()
+                .any(|p| p.actions.contains(action) && p.subjects.covers(filter))
     }
 
     /// Does this identity hold the `Admin` verb anywhere? Coarse HTTP gate.
@@ -57,6 +91,21 @@ impl Identity {
         self.permissions
             .iter()
             .any(|p| p.actions.contains(Action::Admin) && p.streams.is_wildcard_all())
+    }
+}
+
+/// `_INBOX.<id>` (plus anything after it) for a subscription; any
+/// `_INBOX.…` subject for a publish.
+fn is_inbox(filter: &SubjectFilter, action: Action) -> bool {
+    let p = filter.as_pattern();
+    let mut tokens = p.split('.');
+    if tokens.next() != Some(INBOX_PREFIX) {
+        return false;
+    }
+    match action {
+        Action::Publish => filter.is_literal() && tokens.next().is_some(),
+        Action::Subscribe => tokens.next().is_some_and(|id| id != "*" && id != ">"),
+        _ => false,
     }
 }
 
@@ -82,7 +131,36 @@ mod tests {
                     actions: acts.iter().copied().collect(),
                 })
                 .collect(),
+            subject_permissions: Vec::new(),
         }
+    }
+
+    fn f(s: &str) -> SubjectFilter {
+        SubjectFilter::parse(s).unwrap()
+    }
+
+    #[test]
+    fn subject_authorization() {
+        let mut id = ident(vec![("orders-*", &[Action::Publish, Action::Subscribe])]);
+        id.subject_permissions.push(SubjectPermission {
+            subjects: f("rpc.>"),
+            actions: Action::Subscribe.into(),
+        });
+        assert!(id.authorize_subject(Action::Subscribe, &f("rpc.users.*")));
+        assert!(!id.authorize_subject(Action::Subscribe, &f(">")));
+        assert!(!id.authorize_subject(Action::Publish, &f("rpc.users.get")));
+        // A stream glob that isn't `*` grants nothing on subjects.
+        assert!(!id.authorize_subject(Action::Publish, &f("orders-1")));
+        // Inboxes: replies may always be published; a concrete inbox may
+        // always be subscribed to, but not every inbox at once.
+        assert!(id.authorize_subject(Action::Publish, &f("_INBOX.abc.1")));
+        assert!(id.authorize_subject(Action::Subscribe, &f("_INBOX.abc.*")));
+        assert!(!id.authorize_subject(Action::Subscribe, &f("_INBOX.>")));
+        assert!(!id.authorize_subject(Action::Subscribe, &f("_INBOX.*.x")));
+        assert!(!id.authorize_subject(Action::Publish, &f("_INBOX")));
+        // Global stream permissions cover subjects too.
+        let admin = ident(vec![("*", &[Action::Publish, Action::Subscribe])]);
+        assert!(admin.authorize_subject(Action::Subscribe, &f(">")));
     }
 
     #[test]
@@ -145,6 +223,7 @@ mod tests {
         let id = Identity {
             name: "empty".into(),
             permissions: vec![],
+            subject_permissions: vec![],
         };
         assert!(!id.authorize(Action::Publish, &n("x")));
         assert!(!id.authorize(Action::Admin, &n("x")));
