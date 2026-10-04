@@ -40,7 +40,25 @@ export interface WireRecord {
   headers: Headers;
 }
 
-/** `StreamSpec`: str name, then u64 fields (0 = server default) and a u8 flag. */
+/**
+ * `StreamLimits` (`crates/exspeed-common/src/limits.rs`) exactly as serde
+ * serializes it: snake_case keys, in declaration order.
+ */
+export interface WireStreamLimits {
+  max_msgs: number;
+  discard: "old" | "new";
+  max_msgs_per_subject: number;
+  allow_msg_ttl: boolean;
+  msg_ttl_ms: number;
+  allow_delayed: boolean;
+  retention: "limits" | "work_queue" | "interest";
+}
+
+/**
+ * `StreamSpec`: str name, then u64 fields (0 = server default) and a u8
+ * flag, then `bytes(JSON)` of the {@link WireStreamLimits} only when they
+ * are not all defaults (so older servers keep accepting the request).
+ */
 export interface WireStreamSpec {
   name: string;
   maxAgeSecs: number;
@@ -48,6 +66,8 @@ export interface WireStreamSpec {
   dedupWindowSecs: number;
   dedupMaxEntries: number;
   compaction: boolean;
+  /** Absent (or null) = every limit at its default; nothing is sent. */
+  limits?: WireStreamLimits | null;
 }
 
 /** Seek kinds: 0 earliest, 1 latest, 2 offset, 3 time (ms since epoch). */
@@ -96,7 +116,27 @@ export type Request =
       maxBytes: number;
       waitMs: number;
       filter: string;
-    };
+    }
+  /** Correlation id 0 = fire-and-forget; with `replyTo`, 404 when nobody received it. */
+  | { type: "CorePublish"; subject: string; replyTo: string | null; headers: Headers; value: Uint8Array }
+  /** Answered with `SubscribeOk` (core sub ids have the high bit set). */
+  | { type: "CoreSubscribe"; subject: string; queue: string | null }
+  | { type: "KvCreateBucket"; bucket: string; history: number; ttlMs: number; maxBytes: number }
+  /** Answered with `PublishOk` (offset = the new revision). */
+  | {
+      type: "KvPut";
+      bucket: string;
+      key: string;
+      value: Uint8Array;
+      expectedRevision: number | null;
+      ttlMs: number | null;
+    }
+  /** Answered with `Messages` (one record, raw stream offset) or 404. */
+  | { type: "KvGet"; bucket: string; key: string; revision: number | null }
+  | { type: "KvDelete"; bucket: string; key: string; purge: boolean; expectedRevision: number | null }
+  /** Answered with a JSON array of strings. */
+  | { type: "KvKeys"; bucket: string; filter: string }
+  | { type: "KvHistory"; bucket: string; key: string };
 
 export type RequestType = Request["type"];
 
@@ -126,6 +166,14 @@ const REQUEST_OPCODES: Record<RequestType, OpCode> = {
   Term: OpCode.Term,
   InProgress: OpCode.InProgress,
   Read: OpCode.Read,
+  CorePublish: OpCode.CorePublish,
+  CoreSubscribe: OpCode.CoreSubscribe,
+  KvCreateBucket: OpCode.KvCreateBucket,
+  KvPut: OpCode.KvPut,
+  KvGet: OpCode.KvGet,
+  KvDelete: OpCode.KvDelete,
+  KvKeys: OpCode.KvKeys,
+  KvHistory: OpCode.KvHistory,
 };
 
 export function requestOpcode(req: Request): OpCode {
@@ -147,6 +195,7 @@ function writeStreamSpec(w: Writer, s: WireStreamSpec): void {
   w.u64(s.dedupWindowSecs);
   w.u64(s.dedupMaxEntries);
   w.u8(s.compaction ? 1 : 0);
+  if (s.limits) w.bytes(Buffer.from(JSON.stringify(s.limits), "utf8"));
 }
 
 function writeOffsets(w: Writer, offsets: number[]): void {
@@ -239,6 +288,48 @@ export function encodeRequest(req: Request): Buffer {
       w.u32(req.waitMs);
       w.str(req.filter);
       break;
+    case "CorePublish":
+      w.str(req.subject);
+      w.opt(req.replyTo, (w, r) => w.str(r));
+      w.headers(req.headers);
+      w.bytes(req.value);
+      break;
+    case "CoreSubscribe":
+      w.str(req.subject);
+      w.opt(req.queue, (w, q) => w.str(q));
+      break;
+    case "KvCreateBucket":
+      w.str(req.bucket);
+      w.u64(req.history);
+      w.u64(req.ttlMs);
+      w.u64(req.maxBytes);
+      break;
+    case "KvPut":
+      w.str(req.bucket);
+      w.str(req.key);
+      w.bytes(req.value);
+      w.opt(req.expectedRevision, (w, r) => w.u64(r));
+      w.opt(req.ttlMs, (w, t) => w.u64(t));
+      break;
+    case "KvGet":
+      w.str(req.bucket);
+      w.str(req.key);
+      w.opt(req.revision, (w, r) => w.u64(r));
+      break;
+    case "KvDelete":
+      w.str(req.bucket);
+      w.str(req.key);
+      w.u8(req.purge ? 1 : 0);
+      w.opt(req.expectedRevision, (w, r) => w.u64(r));
+      break;
+    case "KvKeys":
+      w.str(req.bucket);
+      w.str(req.filter);
+      break;
+    case "KvHistory":
+      w.str(req.bucket);
+      w.str(req.key);
+      break;
     default: {
       const never: never = req;
       throw new ProtocolError(`unknown request ${(never as Request).type}`);
@@ -263,7 +354,7 @@ function readPublishRecord(r: Reader): WirePublishRecord {
 }
 
 function readStreamSpec(r: Reader): WireStreamSpec {
-  return {
+  const spec: WireStreamSpec = {
     name: r.str(),
     maxAgeSecs: r.u64(),
     maxBytes: r.u64(),
@@ -271,6 +362,14 @@ function readStreamSpec(r: Reader): WireStreamSpec {
     dedupMaxEntries: r.u64(),
     compaction: r.u8() !== 0,
   };
+  if (r.remaining > 0) {
+    try {
+      spec.limits = JSON.parse(r.bytes().toString("utf8")) as WireStreamLimits;
+    } catch (e) {
+      throw new ProtocolError(`invalid stream limits: ${(e as Error).message}`);
+    }
+  }
+  return spec;
 }
 
 function readOffsets(r: Reader): number[] {
@@ -394,6 +493,49 @@ export function decodeRequest(opcode: number, payload: Buffer): Request {
         filter: r.str(),
       };
       break;
+    case OpCode.CorePublish:
+      req = {
+        type: "CorePublish",
+        subject: r.str(),
+        replyTo: r.opt((r) => r.str()),
+        headers: r.headers(),
+        value: r.bytes(),
+      };
+      break;
+    case OpCode.CoreSubscribe:
+      req = { type: "CoreSubscribe", subject: r.str(), queue: r.opt((r) => r.str()) };
+      break;
+    case OpCode.KvCreateBucket:
+      req = { type: "KvCreateBucket", bucket: r.str(), history: r.u64(), ttlMs: r.u64(), maxBytes: r.u64() };
+      break;
+    case OpCode.KvPut:
+      req = {
+        type: "KvPut",
+        bucket: r.str(),
+        key: r.str(),
+        value: r.bytes(),
+        expectedRevision: r.opt((r) => r.u64()),
+        ttlMs: r.opt((r) => r.u64()),
+      };
+      break;
+    case OpCode.KvGet:
+      req = { type: "KvGet", bucket: r.str(), key: r.str(), revision: r.opt((r) => r.u64()) };
+      break;
+    case OpCode.KvDelete:
+      req = {
+        type: "KvDelete",
+        bucket: r.str(),
+        key: r.str(),
+        purge: r.u8() !== 0,
+        expectedRevision: r.opt((r) => r.u64()),
+      };
+      break;
+    case OpCode.KvKeys:
+      req = { type: "KvKeys", bucket: r.str(), filter: r.str() };
+      break;
+    case OpCode.KvHistory:
+      req = { type: "KvHistory", bucket: r.str(), key: r.str() };
+      break;
     default:
       throw new ProtocolError(`opcode 0x${opcode.toString(16)} is not a client request`);
   }
@@ -421,7 +563,9 @@ export type Response =
   | { type: "Messages"; records: WireRecord[] }
   | { type: "ReadResult"; nextOffset: number; highWatermark: number; records: WireRecord[] }
   /** Raw UTF-8 JSON. */
-  | { type: "Json"; json: Buffer };
+  | { type: "Json"; json: Buffer }
+  /** Push of a core message for a `CoreSubscribe` (correlation id 0). */
+  | { type: "CoreMsg"; subId: number; subject: string; replyTo: string | null; headers: Headers; value: Buffer };
 
 export type ResponseType = Response["type"];
 
@@ -438,6 +582,7 @@ const RESPONSE_OPCODES: Record<ResponseType, OpCode> = {
   Messages: OpCode.Messages,
   ReadResult: OpCode.ReadResult,
   Json: OpCode.Json,
+  CoreMsg: OpCode.CoreMsg,
 };
 
 export function responseOpcode(resp: Response): OpCode {
@@ -533,6 +678,13 @@ export function encodeResponse(resp: Response): Buffer {
     case "Json":
       w.raw(resp.json);
       break;
+    case "CoreMsg":
+      w.u32(resp.subId);
+      w.str(resp.subject);
+      w.opt(resp.replyTo, (w, r) => w.str(r));
+      w.headers(resp.headers);
+      w.bytes(resp.value);
+      break;
     default: {
       const never: never = resp;
       throw new ProtocolError(`unknown response ${(never as Response).type}`);
@@ -623,6 +775,16 @@ export function decodeResponse(opcode: number, payload: Buffer): Response {
         nextOffset: r.u64(),
         highWatermark: r.u64(),
         records: readRecords(r),
+      };
+      break;
+    case OpCode.CoreMsg:
+      resp = {
+        type: "CoreMsg",
+        subId: r.u32(),
+        subject: r.str(),
+        replyTo: r.opt((r) => r.str()),
+        headers: r.headers(),
+        value: r.bytes(),
       };
       break;
     default:

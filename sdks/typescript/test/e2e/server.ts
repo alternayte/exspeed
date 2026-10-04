@@ -38,6 +38,8 @@ export interface ServerOptions {
   authToken?: string;
   tlsCert?: string;
   tlsKey?: string;
+  /** Require client certificates signed by this CA (mutual TLS). */
+  tlsClientCa?: string;
 }
 
 async function freePort(): Promise<number> {
@@ -77,6 +79,7 @@ export class TestServer {
     const args = ["server", "--bind", `127.0.0.1:${port}`, "--api-bind", `127.0.0.1:${apiPort}`, "--data-dir", dataDir];
     if (opts.authToken) args.push("--auth-token", opts.authToken);
     if (opts.tlsCert && opts.tlsKey) args.push("--tls-cert", opts.tlsCert, "--tls-key", opts.tlsKey);
+    if (opts.tlsClientCa) args.push("--tls-client-ca", opts.tlsClientCa);
     // Don't let the developer's environment change the server under test.
     const env = { ...process.env };
     for (const k of Object.keys(env)) if (k.startsWith("EXSPEED_")) delete env[k];

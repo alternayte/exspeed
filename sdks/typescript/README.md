@@ -9,6 +9,9 @@ over TCP or TLS. Requires Node.js 18 or later.
 - Durable consumers with push (credit-windowed subscriptions) or pull
   delivery, acks, redelivery with backoff, and dead-lettering.
 - A coalescing publisher for high-throughput, order-preserving writes.
+- Stream limits, per-message TTLs, delayed delivery and priorities.
+- Core (non-persistent) publish/subscribe, queue groups and request-reply.
+- Key-value buckets with revisions, compare-and-set, history and watches.
 - Automatic reconnection that re-establishes subscriptions.
 
 ## Install
@@ -66,6 +69,26 @@ when the stream already exists with the same settings, and fails with 409 when
 they differ. `updateStream` replaces all settings, so pass every field you
 want to keep.
 
+### Limits, lifetimes and retention
+
+```ts
+await client.createStream({
+  name: "jobs",
+  maxMsgs: 100_000,        // most records the stream holds (0 = no limit)
+  discard: "old",          // at maxMsgs: "old" drops the oldest, "new" rejects new records
+  maxMsgsPerSubject: 10,   // most records kept per subject
+  allowMsgTtl: true,       // accept the per-record `ttl` publish option
+  msgTtlMs: 86_400_000,    // default lifetime of every record (0 = none)
+  allowDelayed: true,      // accept the `delay` / `deliverAt` publish options
+  retention: "work_queue", // "limits" (default) | "work_queue" | "interest"
+});
+```
+
+With `retention: "work_queue"` the stream has at most one consumer, and a
+record is removed once that consumer acked it. With `"interest"` a record is
+removed once every consumer of the stream acked it. Expired records are
+never read or delivered. These settings show up in `streamInfo(name).config`.
+
 ## Publishing
 
 ```ts
@@ -87,6 +110,24 @@ const results = await client.publishBatch("orders", [
 ```
 
 Each publish resolves with `{ offset, duplicate }`.
+
+### TTLs, delays and priorities
+
+```ts
+await client.publish("jobs", { subject: "jobs.email", value: job, ttl: 30_000 });   // expire after 30 s
+await client.publish("jobs", { subject: "jobs.email", value: job, ttl: "5m" });     // units ms, s, m, h, d
+await client.publish("jobs", { subject: "jobs.email", value: job, delay: "10s" });  // deliver in 10 s
+await client.publish("jobs", { subject: "jobs.email", value: job, deliverAt: new Date("2026-12-24T18:00:00Z") });
+await client.publish("jobs", { subject: "jobs.email", value: job, priority: 9 });   // 0 (default) to 9
+```
+
+These options are headers on the record: `exspeed-ttl`, `exspeed-delay`,
+`exspeed-deliver-at` (ms since the epoch) and `exspeed-priority`. They work
+the same in `publishBatch` and the publisher. A `ttl` needs a stream with
+`allowMsgTtl`, and `delay` / `deliverAt` need `allowDelayed`; otherwise the
+publish fails with 400. A delay holds a record back from consumers only;
+stateless reads see it at once. Priorities take effect for consumers with a
+`priorityWindow`.
 
 **Idempotency.** When a record carries a `msgId`, the server remembers it
 for the stream's dedup window. A retry with the same `msgId` and the same
@@ -150,6 +191,11 @@ await client.createConsumer({
   maxAckPending: 1000,       // pause delivery at this many unacked records
   dlqStream: "orders-dlq",   // where dead letters go (unset = dropped and counted)
   ephemeral: false,          // true = deleted when this connection closes
+  deadLetterExpired: false,  // true = records whose TTL ends before the ack go to dlqStream (reason "expired")
+  filterHeaders: { region: "eu" }, // only records with these header values
+  headerMatch: "all",        // "all" filterHeaders must match, or "any" of them
+  singleActive: false,       // true = one subscription at a time gets records; the next takes over on failure
+  priorityWindow: 0,         // look this many records ahead and deliver higher `priority` first
 });
 ```
 
@@ -165,6 +211,13 @@ await client.seek("billing", "latest");
 await client.seek("billing", { offset: 1000 });
 await client.seek("billing", { timeMs: Date.parse("2026-10-01") }); // or a Date
 ```
+
+`consumerInfo` reports the consumer's position and counters, including
+`numUnacked`, `numInFlight`, `numDelayed` (records waiting for their
+`delay` / `deliverAt`), `numWaiting` and `lag`.
+
+A `singleActive` consumer refuses pulls, and its subscribers form a
+failover group: the oldest live subscription gets every record.
 
 ### Push: subscriptions
 
@@ -250,6 +303,108 @@ Delivery is **at-least-once**, so make handlers idempotent. Because
 `"error"` event. An ack made while the connection is down is dropped, and the
 record is redelivered.
 
+## Core publish/subscribe
+
+Core messages go to the subscriptions live at the moment they are
+published. Nothing is stored, nothing is acked, and delivery is at most
+once. Use them for notifications, cache invalidation and request-reply;
+use streams when a message must not be lost.
+
+```ts
+const sub = await client.subscribeCore("orders.>");          // NATS-style filter
+await client.publishCore("orders.eu.created", { id: 1 }, { headers: { "trace-id": "t1" } });
+
+for await (const m of sub) {
+  // m.subject, m.replyTo, m.headers, m.value (Buffer), m.text(), m.json(), m.header(name)
+  console.log(m.subject, m.json());
+}
+
+// A queue group: each message goes to one member of the group.
+const worker = await client.subscribeCore("jobs.resize", { queue: "resizers" });
+```
+
+`publishCore` resolves once the server has accepted the message. A core
+subscription ends on `sub.unsubscribe()` (or `break`), when the client
+closes, or when the server ends it (`sub.endReason`, code 503 when
+leadership moves to another node). After a reconnect the client subscribes
+again with the same subject and queue group; messages published while it was
+disconnected are missed. `sub.next({ timeoutMs })` works as it does for
+consumer subscriptions.
+
+### Request-reply
+
+```ts
+// The service: answer each request with m.respond(value).
+const requests = await client.subscribeCore("svc.upper", { queue: "svc" });
+for await (const m of requests) await m.respond(m.text().toUpperCase());
+
+// The caller: resolves with the first response, as a core message.
+const reply = await client.request("svc.upper", "hello", { timeoutMs: 2_000 });
+reply.text(); // "HELLO"
+```
+
+`request` publishes with a reply subject and waits for the first response.
+It fails at once with `ServerError` 404 when nobody is subscribed to the
+subject ("no responders"), and with `TimeoutError` after `timeoutMs`
+(default: `requestTimeoutMs`). All requests on a client share one inbox
+subscription, `_INBOX.<random>.*`, which the first request sets up. When the
+connection drops, requests waiting for a response fail with
+`ConnectionError`, and the next request after the reconnect sets up a new
+inbox. Request-reply needs no extra permissions: anyone may publish a reply
+to an `_INBOX.…` subject, and a client may subscribe to its own inbox (see
+[Security](../../docs/security.md)). The caller needs publish permission on
+the request subject and the responder subscribe permission on it.
+
+## Key-value buckets
+
+A bucket is a stream (`KV_<bucket>`) that keeps the latest values of each
+key. Keys are subjects, so they are dot-separated tokens such as
+`app.mode`.
+
+```ts
+const kv = client.kv("config");
+await kv.create({ history: 5, ttlMs: 0, maxBytes: 0 }); // idempotent; all optional
+
+const rev = await kv.put("app.mode", "prod");          // resolves with the new revision
+const entry = await kv.get("app.mode");                // KvEntry, or null when absent or deleted
+// entry.key, entry.value (Buffer), entry.text(), entry.json(), entry.revision, entry.op, entry.timestamp
+
+await kv.createKey("app.port", "8080");                // only if absent: 409 otherwise
+await kv.update("app.mode", "dev", rev);               // compare-and-set: 409 unless still at `rev`
+await kv.put("session.abc", token, { ttlMs: 60_000 }); // this key expires after a minute
+await kv.getRevision("app.mode", rev);                 // an older value, while history keeps it
+await kv.history("app.mode");                          // kept revisions, oldest first, deletes included
+await kv.keys("app.*");                                // keys with a value, sorted ("" or omitted = all)
+await kv.delete("app.port");                           // a tombstone; history stays
+await kv.purge("app.port");                            // a tombstone that also hides older values
+await kv.destroy();                                    // delete the bucket and everything in it
+```
+
+A revision is the position of the write in the bucket's stream, plus one,
+so revisions only grow; 0 means "absent", which is what `createKey` checks.
+`history` is how many values each key keeps (1 to 64, default 1). A failed
+compare-and-set is a `ServerError` 409 with `detail.current_revision`.
+Deletes and purges take `{ expectedRevision }` too. `get` on a missing
+bucket fails with 404.
+
+### Watching
+
+```ts
+const watch = kv.watch("app.*");   // "" or omitted = every key
+for await (const e of watch) {
+  if (e.op === "put") apply(e.key, e.json());
+  else remove(e.key);              // "delete" or "purge"
+}
+```
+
+A watch first yields the current value of every matching key (deleted keys
+left out), ordered by revision, then every change as it happens, deletes
+included. It reads the bucket's stream with stateless long-poll reads, so it
+holds no state on the server. `watch.next({ timeoutMs })` resolves with
+`null` when nothing changed in time, `watch.stop()` (or `break`) ends it, and
+a failed read, such as `ConnectionError` when the connection drops, rejects
+the iterator.
+
 ## Queries and metadata
 
 ```ts
@@ -283,9 +438,9 @@ the two query-only ones (408, 422):
 | 400 | Malformed request, invalid name, filter or config | |
 | 401 | Not authenticated | |
 | 403 | The credential lacks the needed permission | |
-| 404 | Stream or consumer not found | |
+| 404 | Stream, consumer, bucket or key not found; a request with no responders | |
 | 408 | A `query` timed out | |
-| 409 | Exists with different settings; stream still has consumers; `msgId` reused with a different body | `{ stored_offset }`, `{ consumers }` |
+| 409 | Exists with different settings; stream still has consumers; `msgId` reused with a different body; a KV key not at the expected revision | `{ stored_offset }`, `{ consumers }`, `{ current_revision }` |
 | 422 | A `query` exceeded the server's query memory limit | |
 | 429 | Retry later (dedup map full, too many concurrent waits on one connection) | `{ retry_after_secs }` |
 | 500 | Internal error | |
@@ -326,7 +481,9 @@ Reconnection is on by default. When the connection drops:
    not yet handed to your code are discarded, and the server redelivers
    them, along with anything delivered but not acked. A re-subscribe that
    fails (for example, the consumer was deleted meanwhile) ends that
-   subscription with the server's error code.
+   subscription with the server's error code. Core subscriptions are
+   subscribed again too; core messages published during the gap are
+   missed.
 4. The client emits `"reconnect"`.
 
 If the server rejects the credential (401/403) or `maxAttempts` runs out,
@@ -383,19 +540,42 @@ const client = await ExspeedClient.connect({
   token: process.env.EXSPEED_TOKEN, // the server's --auth-token, or a credential token
   tls: true,                        // verify against the system CAs
   // tls: { ca: readFileSync("ca.pem") }               // private CA
-  // tls: { ca, cert, key }                            // client certificate, for a TLS proxy that checks one
   // tls: { servername: "exspeed.internal" }           // SNI / certificate name override
 });
 ```
 
 `tls` takes `true` or any Node
 [`tls.connect` options](https://nodejs.org/api/tls.html#tlsconnectoptions-callback).
-Certificates are verified by default. The Exspeed server itself doesn't
-request client certificates. A wrong or missing token fails
+Certificates are verified by default. A wrong or missing token fails
 `connect()` with `ServerError` 401. A token without permission for an
 operation gets 403. With scoped credentials, `listStreams` and
 `listConsumers` return only what the credential can see. See
 [Security](../../docs/security.md).
+
+### Client certificates (mutual TLS)
+
+When the server runs with `tls.client_ca`, it accepts only clients that
+present a certificate signed by that CA. Pass the certificate and its key
+with the other TLS options:
+
+```ts
+const client = await ExspeedClient.connect({
+  host: "exspeed.example.com",
+  tls: {
+    ca: readFileSync("ca.pem"),            // the server's CA
+    cert: readFileSync("orders-client.pem"),
+    key: readFileSync("orders-client.key"),
+  },
+  // no token: the credential bound to the certificate's name (`cert_cn`) applies
+});
+```
+
+Without a valid client certificate the TLS handshake fails and `connect()`
+rejects with `ConnectionError`. With auth on, a client with a certificate and
+no token gets the permissions of the credential whose `cert_cn` matches the
+certificate's common name (or its first DNS name), and `connect()` fails with
+`ServerError` 401 when no credential names it. A token, when given, takes
+precedence.
 
 ## Options
 
@@ -405,7 +585,7 @@ operation gets 403. With scoped credentials, `listStreams` and
 | `port` | `5933` | |
 | `servers` | none | Cluster seeds (`"host:port"`); connects to the leader. Overrides `host`/`port`. |
 | `token` | none | Bearer token |
-| `tls` | off | `true` or `tls.connect` options |
+| `tls` | off | `true` or `tls.connect` options (`ca`, `cert`, `key`, `servername`, ...) |
 | `clientId` | `"exspeed-ts"` | Shown in server logs |
 | `requestTimeoutMs` | `30000` | Per request, on top of a pull's or read's own wait. Also bounds connecting. |
 | `keepaliveMs` | `20000` | `0` disables pings |

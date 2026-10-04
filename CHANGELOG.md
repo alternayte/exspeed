@@ -61,6 +61,10 @@ understands every stream setting. Don't downgrade a data directory after
 using the new features: 0.6 ignores them (expired, superseded and acked
 work-queue records would reappear).
 
+TypeScript SDK: the low-level `client.request(req)` that sends a raw
+protocol request is now `client.rawRequest(req)`; `client.request` is the
+new request-reply call.
+
 ### Get it
 
 - Docker (amd64 and arm64): `docker pull ghcr.io/alternayte/exspeed:0.7.0`
@@ -151,7 +155,12 @@ work-queue records would reappear).
   `delay` / `deliver_at` / `priority`, `publish_core`, `subscribe_core`,
   `respond`, `request_core`, and `Client::kv` (get, put, create_key,
   update, delete, purge, keys, history, watch).
-- TypeScript SDK: the same features (see its README).
+- TypeScript SDK: stream limits, `ttl` / `delay` / `deliverAt` / `priority`
+  publish options, the new consumer settings and `numDelayed`,
+  `publishCore`, `subscribeCore`, `request` (request-reply), `client.kv`
+  (`KvBucket` with `createKey`, `update`, `getRevision`, `watch`, …), and
+  mutual TLS documented. The raw protocol call `request(req)` is renamed
+  `rawRequest(req)`.
 
 </details>
 

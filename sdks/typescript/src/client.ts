@@ -1,6 +1,9 @@
+import { randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { Connection, type ConnectionOptions, type RequestOptions } from "./connection.js";
-import { ConnectionError, ExspeedError, ProtocolError, ServerError } from "./errors.js";
+import { Connection, type ConnectionOptions, type CoreMsgPush, type RequestOptions } from "./connection.js";
+import { CoreMessage, CoreSubscription, type CoreHost } from "./core.js";
+import { ConnectionError, ExspeedError, ProtocolError, ServerError, TimeoutError } from "./errors.js";
+import { KvBucket } from "./kv.js";
 import { Message, StreamRecord } from "./message.js";
 import { DEFAULT_PORT, ErrorCode } from "./protocol/constants.js";
 import { SeekKind, type Request, type Response } from "./protocol/messages.js";
@@ -8,12 +11,18 @@ import { Publisher, type PublisherOptions } from "./publisher.js";
 import { Subscription, type SubscriptionHost } from "./subscription.js";
 import {
   camelize,
+  encodeValue,
+  toConsumerInfo,
+  toHeaders,
   toWireConsumerSpec,
   toWirePublishRecord,
   toWireStreamSpec,
   type ClientOptions,
   type ConsumerInfo,
   type ConsumerSpec,
+  type CorePublishOptions,
+  type CoreRequestOptions,
+  type CoreSubscribeOptions,
   type Metadata,
   type PublishInput,
   type PublishResult,
@@ -26,6 +35,7 @@ import {
   type StreamInfo,
   type StreamSpec,
   type SubscribeOptions,
+  type Value,
 } from "./types.js";
 
 type ResponseOf<T extends Response["type"]> = Extract<Response, { type: T }>;
@@ -41,6 +51,24 @@ export interface ReadResult {
 
 type State = "connected" | "reconnecting" | "closed";
 
+/** Subjects of request-reply inboxes start with this token. */
+const INBOX_PREFIX = "_INBOX";
+
+/** A request waiting for its response. */
+interface PendingReply {
+  resolve(m: CoreMessage): void;
+  reject(err: Error): void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+/** The connection's request-reply inbox: one core subscription to `<prefix>.*`. */
+interface Inbox {
+  prefix: string;
+  conn: Connection | null;
+  subId: number;
+  ready: Promise<void>;
+}
+
 /**
  * A connection to an Exspeed server (client protocol v2).
  *
@@ -50,7 +78,8 @@ type State = "connected" | "reconnecting" | "closed";
  *
  * Events:
  * - `"disconnect"` `(err: Error)`: the connection dropped; reconnecting.
- * - `"reconnect"` `(info: ServerInfo)`: reconnected; subscriptions restored.
+ * - `"reconnect"` `(info: ServerInfo)`: reconnected; subscriptions (consumer
+ *   and core) restored.
  * - `"close"` `(err?: Error)`: the client is closed for good (by `close()`,
  *   or because reconnecting gave up).
  * - `"error"` `(err: ServerError | ProtocolError)`: a fire-and-forget request
@@ -62,6 +91,11 @@ export class ExspeedClient extends EventEmitter {
   private readonly connOpts: ConnectionOptions;
   private readonly reconnectOpts: Required<ReconnectOptions> | null;
   private readonly subs = new Set<Subscription>();
+  private readonly coreSubs = new Set<CoreSubscription>();
+  private readonly coreHost: CoreHost;
+  private inbox: Inbox | null = null;
+  private readonly replies = new Map<string, PendingReply>();
+  private nextReply = 1;
   /** Ephemeral consumers this client created, re-created after a reconnect. */
   private readonly ephemeral = new Map<string, ConsumerSpec>();
   private readonly host: SubscriptionHost;
@@ -87,6 +121,10 @@ export class ExspeedClient extends EventEmitter {
       nack: (consumer, offset, delayMs) => this.nack(consumer, offset, delayMs),
       term: (consumer, offset, reason) => this.term(consumer, offset, reason),
       inProgress: (consumer, offsets) => this.inProgress(consumer, offsets),
+    };
+    this.coreHost = {
+      publishCore: (subject, value, opts) => this.publishCore(subject, value, opts),
+      forgetCore: (sub) => this.coreSubs.delete(sub),
     };
   }
 
@@ -143,6 +181,8 @@ export class ExspeedClient extends EventEmitter {
     this.flushAcks(); // acks made just before close() still go out
     this.state = "closed";
     for (const sub of [...this.subs]) sub.end({ code: 0, message: "client closed" }, false);
+    for (const sub of [...this.coreSubs]) sub.end({ code: 0, message: "client closed" }, false);
+    this.dropInbox(new ConnectionError("client closed"));
     await this.conn.close();
     this.emit("close");
   }
@@ -210,7 +250,7 @@ export class ExspeedClient extends EventEmitter {
 
   /** A coalescing, order-preserving publisher on this client; see {@link Publisher}. */
   publisher(options: PublisherOptions = {}): Publisher {
-    return new Publisher({ request: (req) => this.request(req) }, options);
+    return new Publisher({ request: (req) => this.rawRequest(req) }, options);
   }
 
   // ---- stateless reads ------------------------------------------------------
@@ -261,7 +301,7 @@ export class ExspeedClient extends EventEmitter {
    * consumer of that name exists with a different spec.
    */
   async createConsumer(spec: ConsumerSpec): Promise<ConsumerInfo> {
-    const info = camelize<ConsumerInfo>(await this.json({ type: "CreateConsumer", spec: toWireConsumerSpec(spec) }));
+    const info = toConsumerInfo(await this.json({ type: "CreateConsumer", spec: toWireConsumerSpec(spec) }));
     if (spec.ephemeral) this.ephemeral.set(spec.name, spec);
     return info;
   }
@@ -272,12 +312,13 @@ export class ExspeedClient extends EventEmitter {
   }
 
   async consumerInfo(name: string): Promise<ConsumerInfo> {
-    return camelize<ConsumerInfo>(await this.json({ type: "ConsumerInfo", name }));
+    return toConsumerInfo(await this.json({ type: "ConsumerInfo", name }));
   }
 
   /** Consumers this credential can see, optionally only those on `stream`. */
   async listConsumers(stream?: string): Promise<ConsumerInfo[]> {
-    return camelize<ConsumerInfo[]>(await this.json({ type: "ListConsumers", stream: stream ?? null }));
+    const list = await this.json({ type: "ListConsumers", stream: stream ?? null });
+    return Array.isArray(list) ? list.map(toConsumerInfo) : camelize<ConsumerInfo[]>(list);
   }
 
   /** Move a consumer's cursor. */
@@ -353,6 +394,147 @@ export class ExspeedClient extends EventEmitter {
     await this.call({ type: "InProgress", consumer, offsets }, "Ok");
   }
 
+  // ---- core messaging (non-persistent) ---------------------------------------
+
+  /**
+   * Publish a core message to the core subscriptions live now. Nothing is
+   * stored and delivery is at most once. Resolves once the server accepted
+   * it.
+   */
+  async publishCore(subject: string, value: Value, opts: CorePublishOptions = {}): Promise<void> {
+    await this.call(
+      {
+        type: "CorePublish",
+        subject,
+        replyTo: opts.replyTo ?? null,
+        headers: toHeaders(opts.headers),
+        value: encodeValue(value),
+      },
+      "Ok",
+    );
+  }
+
+  /**
+   * Receive core messages on subjects matching `subject` (a filter such as
+   * `orders.*`). With a `queue` group, each message goes to one member of
+   * the group.
+   */
+  async subscribeCore(subject: string, opts: CoreSubscribeOptions = {}): Promise<CoreSubscription> {
+    const sub = new CoreSubscription(this.coreHost, subject, opts.queue ?? null);
+    await this.call({ type: "CoreSubscribe", subject, queue: sub.queue }, "SubscribeOk", { sink: sub });
+    this.coreSubs.add(sub);
+    return sub;
+  }
+
+  /**
+   * Send a request (a core message with a reply subject) and resolve with
+   * the first response. Fails with `ServerError` 404 at once when nobody is
+   * subscribed to `subject`, and with `TimeoutError` after `timeoutMs`.
+   *
+   * All requests on a connection share one inbox subscription
+   * (`_INBOX.<random>.*`), set up by the first request.
+   */
+  async request(subject: string, value: Value, opts: CoreRequestOptions = {}): Promise<CoreMessage> {
+    const timeoutMs = opts.timeoutMs ?? this.connOpts.requestTimeoutMs;
+    const payload = encodeValue(value);
+    const headers = toHeaders(opts.headers);
+    const prefix = await this.ensureInbox();
+    const token = String(this.nextReply);
+    this.nextReply = this.nextReply >= Number.MAX_SAFE_INTEGER ? 1 : this.nextReply + 1;
+    const reply = new Promise<CoreMessage>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.replies.delete(token);
+        reject(new TimeoutError(`request to ${subject} timed out after ${timeoutMs} ms`));
+      }, timeoutMs);
+      this.replies.set(token, { resolve, reject, timer });
+    });
+    reply.catch(() => {}); // awaited below, after the publish
+    try {
+      await this.call(
+        { type: "CorePublish", subject, replyTo: `${prefix}.${token}`, headers, value: payload },
+        "Ok",
+        { timeoutMs },
+      );
+    } catch (err) {
+      const p = this.replies.get(token);
+      if (p) {
+        clearTimeout(p.timer);
+        this.replies.delete(token);
+      }
+      throw err;
+    }
+    return reply;
+  }
+
+  /** Subscribe this connection's inbox if needed; resolves with its subject prefix. */
+  private async ensureInbox(): Promise<string> {
+    let inbox = this.inbox;
+    if (!inbox) {
+      const prefix = `${INBOX_PREFIX}.${randomBytes(12).toString("hex")}`;
+      const created: Inbox = { prefix, conn: null, subId: 0, ready: Promise.resolve() };
+      const sink = {
+        onSubscribed: (conn: Connection, subId: number) => {
+          if (this.inbox !== created) {
+            // Replaced (connection lost) while subscribing: release it.
+            conn.removeSub(subId);
+            conn.send({ type: "Unsubscribe", subId });
+            return;
+          }
+          created.conn = conn;
+          created.subId = subId;
+        },
+        onCoreMsg: (m: CoreMsgPush) => this.onReply(m),
+        onEnded: (code: number, message: string) => {
+          if (this.inbox === created) this.dropInbox(new ServerError(code, message));
+        },
+      };
+      created.ready = this.call({ type: "CoreSubscribe", subject: `${prefix}.*`, queue: null }, "SubscribeOk", {
+        sink,
+      }).then(
+        () => {},
+        (err: Error) => {
+          if (this.inbox === created) this.inbox = null; // the next request tries again
+          throw err;
+        },
+      );
+      this.inbox = created;
+      inbox = created;
+    }
+    await inbox.ready;
+    return inbox.prefix;
+  }
+
+  private onReply(m: CoreMsgPush): void {
+    const token = m.subject.slice(m.subject.lastIndexOf(".") + 1);
+    const p = this.replies.get(token);
+    if (!p) return; // late (timed out) or duplicate response
+    this.replies.delete(token);
+    clearTimeout(p.timer);
+    p.resolve(new CoreMessage(m, this.coreHost));
+  }
+
+  /** Forget the inbox (the next request subscribes a new one) and fail the requests waiting on it. */
+  private dropInbox(err: Error): void {
+    const inbox = this.inbox;
+    this.inbox = null;
+    if (inbox?.conn && !inbox.conn.closed) {
+      inbox.conn.removeSub(inbox.subId);
+    }
+    const waiting = [...this.replies.values()];
+    this.replies.clear();
+    for (const p of waiting) {
+      clearTimeout(p.timer);
+      p.reject(err);
+    }
+  }
+
+  // ---- key-value buckets ----------------------------------------------------
+
+  /** A handle to the key-value bucket `bucket` (create it with `create()`). */
+  kv(bucket: string): KvBucket {
+    return new KvBucket(this, bucket);
+  }
+
   // ---- plumbing -------------------------------------------------------------
 
   /**
@@ -383,7 +565,7 @@ export class ExspeedClient extends EventEmitter {
   }
 
   /** @internal Send a request on the current connection. */
-  request(req: Request, opts?: RequestOptions): Promise<Response> {
+  rawRequest(req: Request, opts?: RequestOptions): Promise<Response> {
     if (this.state === "closed") return Promise.reject(new ConnectionError("client is closed"));
     if (this.state === "reconnecting") return Promise.reject(new ConnectionError("not connected (reconnecting)"));
     this.flushAcks();
@@ -395,7 +577,7 @@ export class ExspeedClient extends EventEmitter {
     expect: T,
     opts?: RequestOptions,
   ): Promise<ResponseOf<T>> {
-    const resp = await this.request(req, opts);
+    const resp = await this.rawRequest(req, opts);
     if (resp.type !== expect) throw new ProtocolError(`unexpected reply to ${req.type}: ${resp.type}`);
     return resp as ResponseOf<T>;
   }
@@ -415,15 +597,20 @@ export class ExspeedClient extends EventEmitter {
 
   private onConnectionLost(err: Error): void {
     if (this.state !== "connected") return;
+    // Responses to the inbox can't arrive any more; a request after the
+    // reconnect subscribes a new inbox.
+    this.dropInbox(new ConnectionError(`connection lost: ${err.message}`));
     if (!this.reconnectOpts) {
       this.state = "closed";
       for (const sub of [...this.subs]) sub.end({ code: ErrorCode.Unavailable, message: "connection closed" }, false);
+      for (const sub of [...this.coreSubs]) sub.end({ code: ErrorCode.Unavailable, message: "connection closed" }, false);
       this.emit("close", err);
       return;
     }
     this.state = "reconnecting";
     this.pendingAcks.clear(); // those records will be redelivered
     for (const sub of this.subs) sub.suspend();
+    for (const sub of this.coreSubs) sub.suspend();
     this.emit("disconnect", err);
     void this.reconnectLoop(this.reconnectOpts);
   }
@@ -462,13 +649,13 @@ export class ExspeedClient extends EventEmitter {
     }
     if (this.state !== "reconnecting") return;
     this.state = "closed";
-    for (const sub of [...this.subs]) {
+    for (const sub of [...this.subs, ...this.coreSubs]) {
       sub.end({ code: ErrorCode.Unavailable, message: `connection lost: ${lastErr.message}` }, false);
     }
     this.emit("close", lastErr);
   }
 
-  /** Re-create ephemeral consumers, then re-subscribe every live subscription. */
+  /** Re-create ephemeral consumers, then re-subscribe every live subscription (consumer and core). */
   private async restore(conn: Connection): Promise<void> {
     for (const spec of this.ephemeral.values()) {
       try {
@@ -477,8 +664,8 @@ export class ExspeedClient extends EventEmitter {
         if (err instanceof ConnectionError) return; // lost again; the next loop retries
       }
     }
-    await Promise.all(
-      [...this.subs].map(async (sub) => {
+    await Promise.all([
+      ...[...this.subs].map(async (sub) => {
         try {
           await conn.request({ type: "Subscribe", consumer: sub.consumer, credits: sub.window }, { sink: sub });
         } catch (err) {
@@ -487,7 +674,16 @@ export class ExspeedClient extends EventEmitter {
           sub.end({ code: err instanceof ServerError ? err.code : ErrorCode.Internal, message: e.message }, false);
         }
       }),
-    );
+      ...[...this.coreSubs].map(async (sub) => {
+        try {
+          await conn.request({ type: "CoreSubscribe", subject: sub.subject, queue: sub.queue }, { sink: sub });
+        } catch (err) {
+          if (err instanceof ConnectionError) return;
+          const e = err as Error;
+          sub.end({ code: err instanceof ServerError ? err.code : ErrorCode.Internal, message: e.message }, true);
+        }
+      }),
+    ]);
   }
 }
 

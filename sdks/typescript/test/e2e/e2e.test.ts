@@ -3,7 +3,7 @@
  * the binary is found). Skipped when no binary is available.
  */
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -552,5 +552,60 @@ describe.skipIf(!serverBin || !hasOpenssl)("e2e: TLS", () => {
   it("refuses an untrusted certificate and plain TCP", async () => {
     await expect(server.connect({ tls: true, requestTimeoutMs: 3_000 })).rejects.toBeInstanceOf(ConnectionError);
     await expect(server.connect({ requestTimeoutMs: 3_000 })).rejects.toBeInstanceOf(ConnectionError);
+  });
+});
+
+describe.skipIf(!serverBin || !hasOpenssl)("e2e: mutual TLS", () => {
+  let server: TestServer;
+  let dir: string;
+  let ca: Buffer;
+  let cert: Buffer;
+  let key: Buffer;
+
+  function openssl(...args: string[]): void {
+    const r = spawnSync("openssl", args, { stdio: "pipe", cwd: dir });
+    if (r.status !== 0) throw new Error(`openssl ${args[0]} failed: ${r.stderr}`);
+  }
+
+  beforeAll(async () => {
+    dir = mkdtempSync(join(tmpdir(), "exspeed-sdk-mtls-"));
+    // One CA signs both the server's and the client's certificate.
+    openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-keyout", "ca.key", "-out", "ca.pem", "-subj", "/CN=exspeed-test-ca");
+    for (const [name, cn, san] of [
+      ["server", "localhost", "subjectAltName=DNS:localhost,IP:127.0.0.1"],
+      ["client", "orders.internal", "subjectAltName=DNS:orders.internal"],
+    ] as const) {
+      openssl("req", "-newkey", "rsa:2048", "-nodes", "-keyout", `${name}.key`, "-out", `${name}.csr`, "-subj", `/CN=${cn}`);
+      writeFileSync(join(dir, `${name}.ext`), `${san}\n`);
+      openssl("x509", "-req", "-in", `${name}.csr`, "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial", "-days", "1", "-out", `${name}.pem`, "-extfile", `${name}.ext`);
+    }
+    ca = readFileSync(join(dir, "ca.pem"));
+    cert = readFileSync(join(dir, "client.pem"));
+    key = readFileSync(join(dir, "client.key"));
+    server = await TestServer.start({
+      tlsCert: join(dir, "server.pem"),
+      tlsKey: join(dir, "server.key"),
+      tlsClientCa: join(dir, "ca.pem"),
+    });
+  });
+
+  afterAll(async () => {
+    await server?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("connects with a client certificate", async () => {
+    const c = await server.connect({ tls: { ca, cert, key } });
+    try {
+      const s = uniq("mtls");
+      await c.createStream(s);
+      expect((await c.publish(s, { subject: "mtls.ok", value: "mutual" })).offset).toBe(0);
+    } finally {
+      await c.close();
+    }
+  });
+
+  it("is refused without one", async () => {
+    await expect(server.connect({ tls: { ca }, requestTimeoutMs: 3_000 })).rejects.toBeInstanceOf(ConnectionError);
   });
 });

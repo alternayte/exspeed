@@ -1,6 +1,6 @@
 import type { ConnectionOptions as TlsConnectionOptions } from "node:tls";
 import { ExspeedError } from "./errors.js";
-import type { WirePublishRecord, WireStreamSpec } from "./protocol/messages.js";
+import type { WirePublishRecord, WireStreamLimits, WireStreamSpec } from "./protocol/messages.js";
 import type { Headers } from "./protocol/buffer.js";
 
 // ---------------------------------------------------------------------------
@@ -70,6 +70,24 @@ export interface StreamSpec {
   dedupMaxEntries?: number;
   /** Keep only the latest record per key. */
   compaction?: boolean;
+  /** Most records the stream holds; 0 = no limit. What happens at the limit is `discard`. */
+  maxMsgs?: number;
+  /** At `maxMsgs`: `"old"` (default) drops the oldest records, `"new"` rejects new ones. */
+  discard?: "old" | "new";
+  /** Most records kept per subject (older ones are removed); 0 = no limit. */
+  maxMsgsPerSubject?: number;
+  /** Accept the per-record `ttl` publish option (header `exspeed-ttl`). */
+  allowMsgTtl?: boolean;
+  /** Default lifetime of every record, in ms; 0 = none. */
+  msgTtlMs?: number;
+  /** Accept the `delay` / `deliverAt` publish options (delayed delivery to consumers). */
+  allowDelayed?: boolean;
+  /**
+   * `"limits"` (default): records stay until a limit removes them.
+   * `"work_queue"`: at most one consumer; a record is removed once acked.
+   * `"interest"`: a record is removed once every consumer acked it.
+   */
+  retention?: "limits" | "work_queue" | "interest";
 }
 
 export interface StreamInfo {
@@ -82,6 +100,13 @@ export interface StreamInfo {
     maxBytes: number;
     dedupWindowSecs: number;
     dedupMaxEntries: number;
+    maxMsgs?: number;
+    discard?: "old" | "new";
+    maxMsgsPerSubject?: number;
+    allowMsgTtl?: boolean;
+    msgTtlMs?: number;
+    allowDelayed?: boolean;
+    retention?: "limits" | "work_queue" | "interest";
     [k: string]: unknown;
   };
   internal: boolean;
@@ -98,7 +123,30 @@ export function toWireStreamSpec(spec: StreamSpec | string): WireStreamSpec {
     dedupWindowSecs: s.dedupWindowSecs ?? 0,
     dedupMaxEntries: s.dedupMaxEntries ?? 0,
     compaction: s.compaction ?? false,
+    limits: toWireStreamLimits(s),
   };
+}
+
+/** The limits trailer, or `null` when every limit is at its default (then nothing extra is sent). */
+function toWireStreamLimits(s: StreamSpec): WireStreamLimits | null {
+  const limits: WireStreamLimits = {
+    max_msgs: s.maxMsgs ?? 0,
+    discard: s.discard ?? "old",
+    max_msgs_per_subject: s.maxMsgsPerSubject ?? 0,
+    allow_msg_ttl: s.allowMsgTtl ?? false,
+    msg_ttl_ms: s.msgTtlMs ?? 0,
+    allow_delayed: s.allowDelayed ?? false,
+    retention: s.retention ?? "limits",
+  };
+  const isDefault =
+    limits.max_msgs === 0 &&
+    limits.discard === "old" &&
+    limits.max_msgs_per_subject === 0 &&
+    !limits.allow_msg_ttl &&
+    limits.msg_ttl_ms === 0 &&
+    !limits.allow_delayed &&
+    limits.retention === "limits";
+  return isDefault ? null : limits;
 }
 
 // ---------------------------------------------------------------------------
@@ -125,6 +173,48 @@ export interface PublishInput {
    * `newMsgId()`.
    */
   msgId?: string;
+  /**
+   * Expire the record this long after it is appended: ms, or a duration
+   * string such as `"30s"` (units ms, s, m, h, d). The stream needs
+   * `allowMsgTtl`. Sent as the header `exspeed-ttl`.
+   */
+  ttl?: number | string;
+  /**
+   * Deliver to consumers no earlier than this long after the append: ms, or
+   * a duration string. The stream needs `allowDelayed`. Header `exspeed-delay`.
+   */
+  delay?: number | string;
+  /**
+   * Deliver to consumers no earlier than this time (ms since the epoch, or
+   * a Date). The stream needs `allowDelayed`. Header `exspeed-deliver-at`.
+   */
+  deliverAt?: number | Date;
+  /**
+   * 0 (default) to 9, higher first, for consumers with a `priorityWindow`.
+   * Header `exspeed-priority`.
+   */
+  priority?: number;
+}
+
+/** Header names behind the time and priority publish options. */
+export const TTL_HEADER = "exspeed-ttl";
+export const DELAY_HEADER = "exspeed-delay";
+export const DELIVER_AT_HEADER = "exspeed-deliver-at";
+export const PRIORITY_HEADER = "exspeed-priority";
+
+const DURATION = /^\d+\s*(ms|s|m|h|d)?$/;
+
+/** A duration header value: whole ms as `"<n>ms"`, a duration string as-is. */
+function durationHeader(name: string, v: number | string, min: number): string {
+  if (typeof v === "number") {
+    if (!Number.isFinite(v) || v < 0) throw new ExspeedError(`${name} must be a non-negative number of ms, got ${v}`);
+    return `${Math.max(min, Math.ceil(v))}ms`;
+  }
+  const t = v.trim();
+  if (!DURATION.test(t)) {
+    throw new ExspeedError(`invalid ${name} '${v}': expected a number with an optional unit (ms, s, m, h, d)`);
+  }
+  return t;
 }
 
 export interface PublishResult {
@@ -151,11 +241,25 @@ export function toHeaders(h: HeadersInit | undefined): Headers {
 
 export function toWirePublishRecord(r: PublishInput): WirePublishRecord {
   if (!r || typeof r.subject !== "string") throw new ExspeedError("record.subject is required");
+  const headers = toHeaders(r.headers);
+  if (r.ttl !== undefined) headers.push([TTL_HEADER, durationHeader("ttl", r.ttl, 1)]);
+  if (r.delay !== undefined) headers.push([DELAY_HEADER, durationHeader("delay", r.delay, 0)]);
+  if (r.deliverAt !== undefined) {
+    const t = r.deliverAt instanceof Date ? r.deliverAt.getTime() : r.deliverAt;
+    if (!Number.isSafeInteger(t) || t < 0) throw new ExspeedError(`invalid deliverAt: ${String(r.deliverAt)}`);
+    headers.push([DELIVER_AT_HEADER, String(t)]);
+  }
+  if (r.priority !== undefined) {
+    if (!Number.isInteger(r.priority) || r.priority < 0 || r.priority > 9) {
+      throw new ExspeedError(`priority must be an integer from 0 to 9, got ${r.priority}`);
+    }
+    headers.push([PRIORITY_HEADER, String(r.priority)]);
+  }
   return {
     subject: r.subject,
     key: r.key === undefined ? null : encodeValue(r.key),
     value: encodeValue(r.value),
-    headers: toHeaders(r.headers),
+    headers,
     msgId: r.msgId ?? null,
   };
 }
@@ -210,6 +314,25 @@ export interface ConsumerSpec {
   dlqStream?: string;
   /** Deleted when the connection that created it closes. */
   ephemeral?: boolean;
+  /**
+   * Dead-letter records whose TTL expires before they are acked (to
+   * `dlqStream`, reason `expired`) instead of dropping them silently.
+   */
+  deadLetterExpired?: boolean;
+  /** Only records whose headers have these exact values, combined by `headerMatch`. */
+  filterHeaders?: Record<string, string>;
+  /** `"all"` (default): every `filterHeaders` entry must match. `"any"`: at least one. */
+  headerMatch?: "all" | "any";
+  /**
+   * Deliver to one subscription at a time (the oldest connected); the next
+   * takes over when it goes away. Pulls are refused.
+   */
+  singleActive?: boolean;
+  /**
+   * Look this many records ahead and deliver higher `priority` first
+   * (0 = strictly in order). Server maximum 10 000.
+   */
+  priorityWindow?: number;
 }
 
 export interface ConsumerInfo {
@@ -223,6 +346,8 @@ export interface ConsumerInfo {
   ackFloor: number;
   numUnacked: number;
   numInFlight: number;
+  /** Records held back until their delivery time (`delay` / `deliverAt`). */
+  numDelayed: number;
   numWaiting: number;
   lag: number;
   subscribers: number;
@@ -259,7 +384,25 @@ export function toWireConsumerSpec(spec: ConsumerSpec): Record<string, unknown> 
   set("max_ack_pending", spec.maxAckPending);
   set("dlq_stream", spec.dlqStream);
   set("ephemeral", spec.ephemeral);
+  set("dead_letter_expired", spec.deadLetterExpired);
+  if (spec.filterHeaders && Object.keys(spec.filterHeaders).length > 0) {
+    out.filter_headers = Object.fromEntries(Object.entries(spec.filterHeaders).map(([k, v]) => [k, String(v)]));
+  }
+  set("header_match", spec.headerMatch);
+  set("single_active", spec.singleActive);
+  set("priority_window", spec.priorityWindow);
   return out;
+}
+
+/**
+ * camelize a consumer info reply, keeping `filter_headers` keys (header
+ * names) as they are, and `{}` when the server omitted it.
+ */
+export function toConsumerInfo(raw: unknown): ConsumerInfo {
+  const info = camelize<ConsumerInfo>(raw);
+  const rawSpec = (raw as { spec?: { filter_headers?: Record<string, string> } } | null)?.spec;
+  if (info && typeof info === "object" && info.spec) info.spec.filterHeaders = { ...(rawSpec?.filter_headers ?? {}) };
+  return info;
 }
 
 function toWireDeliver(d: DeliverPolicy): unknown {
@@ -297,6 +440,55 @@ export interface PullOptions {
   maxBytes?: number;
   /** Wait up to this long for at least one message. Default 5000 ms. */
   expiresMs?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Core messaging
+// ---------------------------------------------------------------------------
+
+export interface CorePublishOptions {
+  headers?: HeadersInit;
+  /**
+   * Ask receivers to answer on this subject. The publish then fails with
+   * `ServerError` 404 when nobody received it. `request()` sets this for you.
+   */
+  replyTo?: string;
+}
+
+export interface CoreSubscribeOptions {
+  /** Queue group: each message goes to one member of the group. */
+  queue?: string;
+}
+
+export interface CoreRequestOptions {
+  /** How long to wait for the first response. Default: the client's `requestTimeoutMs`. */
+  timeoutMs?: number;
+  headers?: HeadersInit;
+}
+
+// ---------------------------------------------------------------------------
+// Key-value buckets
+// ---------------------------------------------------------------------------
+
+export interface KvBucketOptions {
+  /** Values kept per key, 1 to 64. Default 1. */
+  history?: number;
+  /** Keys expire this long after their last put (ms). Default: never. */
+  ttlMs?: number;
+  /** Size limit in bytes. Default: the server's. */
+  maxBytes?: number;
+}
+
+export interface KvPutOptions {
+  /** Expire this key this long after the put (ms). */
+  ttlMs?: number;
+  /** Only if the key is at this revision (0 = absent), else `ServerError` 409. */
+  expectedRevision?: number;
+}
+
+export interface KvDeleteOptions {
+  /** Only if the key is at this revision, else `ServerError` 409. */
+  expectedRevision?: number;
 }
 
 // ---------------------------------------------------------------------------

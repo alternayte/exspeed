@@ -677,11 +677,8 @@ impl Writer {
                 }
             });
         }
-        for (req, results) in accepted {
-            req.succeed(results);
-        }
-        self.buf = buf;
-        // `discard = old`: drop the oldest records beyond `max_msgs`.
+        // `discard = old`: drop the oldest records beyond `max_msgs` before
+        // replying, so a read after the acknowledgement never sees them.
         if let Some(c) = cfg.as_ref() {
             if c.max_msgs > 0 && c.discard == DiscardPolicy::Old {
                 let target = next.saturating_sub(c.max_msgs);
@@ -690,6 +687,10 @@ impl Writer {
                 }
             }
         }
+        for (req, results) in accepted {
+            req.succeed(results);
+        }
+        self.buf = buf;
         self.persist_start(false);
 
         if !sync && self.stats.len - self.synced_len >= self.opts.async_threshold_bytes as u64 {
