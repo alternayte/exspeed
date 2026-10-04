@@ -109,6 +109,16 @@ pub struct ConsumerSpecDoc {
     /// Dead-letter records whose TTL expires before they are acked (reason
     /// `expired`) instead of dropping them.
     pub dead_letter_expired: Option<bool>,
+    /// Only records whose headers have these values (omitted when empty).
+    pub filter_headers: Option<std::collections::BTreeMap<String, String>>,
+    /// `all` (default) or `any` of `filter_headers` must match.
+    #[schema(value_type = Option<String>)]
+    pub header_match: Option<String>,
+    /// Deliver to one subscription at a time (the oldest connected).
+    pub single_active: Option<bool>,
+    /// Look this many records ahead and deliver higher `exspeed-priority`
+    /// first; 0 = in order.
+    pub priority_window: Option<u32>,
 }
 
 /// Consumer counters (`exspeed_broker::consumer::ConsumerStats`).
@@ -383,7 +393,9 @@ mod tests {
     #[test]
     fn mirror_schemas_match_the_real_types() {
         let doc = doc();
-        let spec = exspeed_protocol::client::ConsumerSpec::new("c", "s");
+        let mut spec = exspeed_protocol::client::ConsumerSpec::new("c", "s");
+        // Serialized only when set.
+        spec.filter_headers.insert("k".into(), "v".into());
         assert_eq!(
             schema_props(&doc, "ConsumerSpec"),
             keys(serde_json::to_value(&spec).unwrap())

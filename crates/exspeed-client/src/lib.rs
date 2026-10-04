@@ -43,8 +43,9 @@ use exspeed_protocol::codec::ExspeedCodec;
 use exspeed_protocol::frame::Frame;
 
 pub use exspeed_protocol::client::{
-    code, AckPolicy, ConsumerSpec, DeliverPolicy, DiscardPolicy, PublishRecord, Request, Response,
-    RetentionPolicy, SeekTo, StreamLimits, StreamSpec, WireRecord,
+    code, AckPolicy, ConsumerSpec, DeliverPolicy, DiscardPolicy, HeaderMatch, PublishRecord,
+    Request, Response, RetentionPolicy, SeekTo, StreamLimits, StreamSpec, WireRecord,
+    PRIORITY_HEADER,
 };
 
 /// Default time to wait for a response (on top of any server-side wait the

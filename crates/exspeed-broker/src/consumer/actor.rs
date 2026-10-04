@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use bytes::{Bytes, BytesMut};
 use exspeed_common::{msg_time, record_format};
 use exspeed_common::{Metrics, Offset, StreamName, SubjectFilters, MAX_RECORDS_BYTES_PER_FRAME};
-use exspeed_protocol::client::{code, EncodedRecords, SeekTo};
+use exspeed_protocol::client::{code, EncodedRecords, HeaderMatch, SeekTo, PRIORITY_HEADER};
 use exspeed_streams::{RawBatch, ReadLimits, Record, StorageError, StoredRecord, StreamConfig};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -130,6 +130,27 @@ pub(crate) struct Actor {
     reported_floor: Option<u64>,
 }
 
+/// Why a record was dead-lettered (`exspeed-dlq-cause`).
+#[derive(Clone, Copy)]
+enum DlqCause {
+    /// `max_deliver` deliveries used up.
+    MaxDeliver,
+    /// The client terminated it (`Term`).
+    Rejected,
+    /// Its TTL expired before it was acked.
+    Expired,
+}
+
+impl DlqCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            DlqCause::MaxDeliver => "max_deliver",
+            DlqCause::Rejected => "rejected",
+            DlqCause::Expired => "expired",
+        }
+    }
+}
+
 /// What the stream's time settings mean for one record right now.
 enum Timing {
     Ready,
@@ -205,6 +226,25 @@ impl Actor {
             self.stream_cfg = cfg;
         }
         self.cfg_seen = Some(seen);
+    }
+
+    /// Whether a record passes the consumer's header filter.
+    fn headers_match(&self, raw: &[u8]) -> bool {
+        let f = &self.core.spec.filter_headers;
+        if f.is_empty() {
+            return true;
+        }
+        let hit = |(k, v): (&String, &String)| record_format::header(raw, k) == Some(v.as_str());
+        match self.core.spec.header_match {
+            HeaderMatch::All => f.iter().all(hit),
+            HeaderMatch::Any => f.iter().any(hit),
+        }
+    }
+
+    /// Priority ordering is on: records are buffered (up to the window)
+    /// and handed out highest priority first.
+    fn prioritized(&self) -> bool {
+        self.core.spec.priority_window > 0
     }
 
     /// Whether expired records must be read (to dead-letter them).
@@ -360,6 +400,14 @@ impl Actor {
                 expires,
                 reply,
             } => {
+                if self.core.spec.single_active {
+                    let _ = reply.send(Err(ConsumerError::Invalid(
+                        "a single_active consumer delivers to one push subscription; \
+                         subscribe instead of pulling"
+                            .into(),
+                    )));
+                    return;
+                }
                 self.pulls.push_back(PullWaiter {
                     max_messages: max_messages.clamp(1, 10_000) as usize,
                     // Capped like Read so the `Messages` frame fits.
@@ -393,7 +441,10 @@ impl Actor {
             Cmd::Term { offset, reason } => {
                 if let Some(deliveries) = self.core.take_unacked(offset) {
                     self.dirty = true;
-                    if !self.dead_letter(offset, deliveries, &reason, None).await {
+                    if !self
+                        .dead_letter(offset, deliveries, DlqCause::Rejected, &reason, None)
+                        .await
+                    {
                         self.core
                             .reschedule(offset, deliveries, now + Duration::from_secs(1));
                     }
@@ -513,6 +564,13 @@ impl Actor {
 
     /// Whether any taker has room for at least one more record.
     fn has_room(&self) -> bool {
+        if self.core.spec.single_active {
+            return self
+                .subs
+                .iter()
+                .find(|s| !s.tx.is_closed())
+                .is_some_and(|s| s.credits > 0);
+        }
         self.pulls.iter().any(|p| !p.full())
             || self.subs.iter().any(|s| s.credits > 0 && !s.tx.is_closed())
     }
@@ -537,6 +595,15 @@ impl Actor {
                 return Some(Taker::Pull(i));
             }
             p.stuffed = true;
+        }
+        if self.core.spec.single_active {
+            // Only the oldest live subscription receives.
+            return self
+                .subs
+                .iter()
+                .position(|s| !s.tx.is_closed())
+                .filter(|&i| self.subs[i].credits > 0)
+                .map(Taker::Push);
         }
         let n = self.subs.len();
         for k in 0..n {
@@ -574,7 +641,13 @@ impl Actor {
                     self.core.take_unacked(offset);
                     self.dirty = true;
                     if !self
-                        .dead_letter(offset, deliveries, "max_deliver exceeded", None)
+                        .dead_letter(
+                            offset,
+                            deliveries,
+                            DlqCause::MaxDeliver,
+                            "max_deliver exceeded",
+                            None,
+                        )
                         .await
                     {
                         self.core
@@ -717,6 +790,13 @@ impl Actor {
                         continue;
                     }
                 }
+                if !self.headers_match(&buf[p.range()]) {
+                    self.flush_run(&buf, run.take(), &mut run_offsets, &mut batches);
+                    self.core.next_read = p.offset + 1;
+                    self.dirty = true;
+                    progressed = true;
+                    continue;
+                }
                 if timed {
                     match self.timing(&buf[p.range()], now_ns, now) {
                         Timing::Ready => {}
@@ -741,6 +821,23 @@ impl Actor {
                             continue;
                         }
                     }
+                }
+                if self.prioritized() {
+                    // Buffer it; the due step hands buffered records out
+                    // highest priority first.
+                    if self.core.delayed() >= self.core.spec.priority_window as usize {
+                        break;
+                    }
+                    let prio = record_format::header(&buf[p.range()], PRIORITY_HEADER)
+                        .and_then(|v| v.trim().parse::<u8>().ok())
+                        .unwrap_or(0)
+                        .min(9);
+                    self.flush_run(&buf, run.take(), &mut run_offsets, &mut batches);
+                    self.core.delay_with_priority(p.offset, now, prio);
+                    self.core.next_read = p.offset + 1;
+                    self.dirty = true;
+                    progressed = true;
+                    continue;
                 }
                 let Some(taker) = self.next_taker(p.end() - p.start, run.as_ref()) else {
                     break;
@@ -912,7 +1009,10 @@ impl Actor {
         let deliveries = self.core.take_any(offset).unwrap_or(0);
         self.dirty = true;
         let rec = decode_raw(raw);
-        if !self.dead_letter(offset, deliveries, "expired", rec).await {
+        if !self
+            .dead_letter(offset, deliveries, DlqCause::Expired, "expired", rec)
+            .await
+        {
             self.core
                 .reschedule(offset, deliveries.max(1), now + Duration::from_secs(1));
         }
@@ -925,6 +1025,7 @@ impl Actor {
         &mut self,
         offset: u64,
         deliveries: u16,
+        cause: DlqCause,
         reason: &str,
         known: Option<StoredRecord>,
     ) -> bool {
@@ -959,6 +1060,11 @@ impl Actor {
         let mut reason = reason.to_string();
         reason.truncate(4096);
         headers.push(("exspeed-dlq-reason".into(), reason));
+        headers.push(("exspeed-dlq-cause".into(), cause.as_str().into()));
+        headers.push((
+            "exspeed-dlq-time".into(),
+            (now_nanos() / 1_000_000).to_string(),
+        ));
         // Deterministic idempotency key: a retried dead-letter write after a
         // crash doesn't duplicate the DLQ record. The payload hash is part of
         // the key: after the source stream is deleted and recreated, a

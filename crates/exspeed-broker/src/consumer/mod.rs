@@ -336,6 +336,17 @@ impl ConsumerManager {
         let stream = StreamName::try_from(spec.stream.as_str())
             .map_err(|e| ConsumerError::Invalid(e.to_string()))?;
         SubjectFilters::parse(&spec.filter_subjects).map_err(ConsumerError::Invalid)?;
+        if spec.priority_window > exspeed_protocol::client::MAX_PRIORITY_WINDOW {
+            return Err(ConsumerError::Invalid(format!(
+                "priority_window is at most {}",
+                exspeed_protocol::client::MAX_PRIORITY_WINDOW
+            )));
+        }
+        if spec.filter_headers.len() > 64 {
+            return Err(ConsumerError::Invalid(
+                "filter_headers takes at most 64 headers".into(),
+            ));
+        }
         if let Some(dlq) = &spec.dlq_stream {
             let dlq = StreamName::try_from(dlq.as_str())
                 .map_err(|e| ConsumerError::Invalid(format!("dlq_stream: {e}")))?;

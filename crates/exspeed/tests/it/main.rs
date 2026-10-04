@@ -27,5 +27,6 @@ mod observability_test;
 mod protocol_test;
 mod pubsub_test;
 mod retention_test;
+mod routing_test;
 mod stream_delete_test;
 mod tls_test;

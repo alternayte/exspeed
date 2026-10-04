@@ -15,7 +15,7 @@
 //! new record. Delayed records don't count against `max_ack_pending` (there
 //! may be many), but they hold the ack floor until delivered and acked.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 use exspeed_protocol::client::{AckPolicy, ConsumerSpec};
@@ -83,6 +83,8 @@ pub struct Core {
     /// Not yet delivered: due at the instant. Persisted as pending with zero
     /// deliveries; the due time is re-read from the record after a restart.
     delayed: BTreeMap<u64, Instant>,
+    /// Priority of delayed records (priority ordering); absent = 0.
+    priority: HashMap<u64, u8>,
     pub stats: ConsumerStats,
 }
 
@@ -94,6 +96,7 @@ impl Core {
             in_flight: BTreeMap::new(),
             scheduled: BTreeMap::new(),
             delayed: BTreeMap::new(),
+            priority: HashMap::new(),
             stats: ConsumerStats::default(),
         }
     }
@@ -186,6 +189,15 @@ impl Core {
         self.delayed.insert(offset, due);
     }
 
+    /// Hold `offset` (never delivered yet) until `due`; among due records,
+    /// higher `priority` is delivered first.
+    pub fn delay_with_priority(&mut self, offset: u64, due: Instant, priority: u8) {
+        self.delayed.insert(offset, due);
+        if priority > 0 {
+            self.priority.insert(offset, priority);
+        }
+    }
+
     fn ack_wait(&self) -> Duration {
         Duration::from_millis(self.spec.ack_wait_ms.max(1))
     }
@@ -205,6 +217,7 @@ impl Core {
     pub fn delivered(&mut self, offset: u64, prior: u16, now: Instant) {
         self.scheduled.remove(&offset);
         self.delayed.remove(&offset);
+        self.priority.remove(&offset);
         if prior == 0 {
             self.stats.delivered += 1;
         } else {
@@ -329,25 +342,29 @@ impl Core {
                 }
             })
             .collect();
-        out.extend(
-            self.delayed
-                .iter()
-                .filter(|(_, &d)| d <= now)
-                .take(max)
-                .map(|(&offset, _)| Due::Redeliver {
-                    offset,
-                    deliveries: 0,
-                }),
-        );
         out.sort_by_key(|d| match d {
             Due::Redeliver { offset, .. } | Due::DeadLetter { offset, .. } => *offset,
         });
+        // Then records never delivered yet: highest priority first, oldest
+        // first within a priority.
+        let mut fresh: Vec<(u8, u64)> = self
+            .delayed
+            .iter()
+            .filter(|(_, &d)| d <= now)
+            .map(|(&o, _)| (self.priority.get(&o).copied().unwrap_or(0), o))
+            .collect();
+        fresh.sort_by_key(|&(p, o)| (std::cmp::Reverse(p), o));
+        out.extend(fresh.into_iter().map(|(_, offset)| Due::Redeliver {
+            offset,
+            deliveries: 0,
+        }));
         out.truncate(max);
         out
     }
 
     /// Drop a scheduled record that no longer exists in the stream.
     pub fn gone(&mut self, offset: u64) {
+        self.priority.remove(&offset);
         if self.scheduled.remove(&offset).is_some()
             || self.in_flight.remove(&offset).is_some()
             || self.delayed.remove(&offset).is_some()
@@ -359,6 +376,7 @@ impl Core {
     /// Drop a record without delivering it (it expired). Returns its
     /// delivery count when it was unacked or delayed.
     pub fn take_any(&mut self, offset: u64) -> Option<u16> {
+        self.priority.remove(&offset);
         self.take_unacked(offset)
             .or_else(|| self.delayed.remove(&offset).map(|_| 0))
     }
@@ -381,6 +399,7 @@ impl Core {
         self.in_flight.clear();
         self.scheduled.clear();
         self.delayed.clear();
+        self.priority.clear();
         self.next_read = offset;
     }
 }
@@ -574,6 +593,30 @@ mod tests {
             }]
         );
         assert_eq!(r.ack_floor(), 3);
+    }
+
+    #[test]
+    fn due_records_are_ordered_by_priority() {
+        let t0 = Instant::now();
+        let mut c = Core::new(spec(), 0);
+        c.delay_with_priority(0, t0, 0);
+        c.delay_with_priority(1, t0, 9);
+        c.delay_with_priority(2, t0, 5);
+        c.delay_with_priority(3, t0, 9);
+        c.delivered(10, 0, t0);
+        c.expire(t0 + Duration::from_secs(2));
+        let order: Vec<u64> = c
+            .due(t0 + Duration::from_secs(2), 10)
+            .into_iter()
+            .map(|d| match d {
+                Due::Redeliver { offset, .. } | Due::DeadLetter { offset, .. } => offset,
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [10, 1, 3, 2, 0],
+            "redeliveries first, then by priority, oldest first within one"
+        );
     }
 
     #[test]

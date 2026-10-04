@@ -110,6 +110,12 @@ impl PublishRecord {
         )
     }
 
+    /// Priority 0..=9 (higher first) for consumers with a
+    /// `priority_window`.
+    pub fn priority(self, p: u8) -> Self {
+        self.header(PRIORITY_HEADER, p.min(9).to_string())
+    }
+
     /// Deliver the record to consumers no earlier than this time
     /// (milliseconds since the Unix epoch).
     pub fn deliver_at(self, epoch_ms: u64) -> Self {
@@ -302,6 +308,24 @@ fn default_max_ack_pending() -> u32 {
     1_000
 }
 
+/// How `filter_headers` combines its entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HeaderMatch {
+    /// Every header must match.
+    #[default]
+    All,
+    /// At least one must.
+    Any,
+}
+
+/// Header carrying a record's priority for consumers with a
+/// `priority_window`: 0 (default) to 9, higher first.
+pub const PRIORITY_HEADER: &str = "exspeed-priority";
+
+/// Most records a consumer looks ahead to order by priority.
+pub const MAX_PRIORITY_WINDOW: u32 = 10_000;
+
 /// A durable (or ephemeral) consumer: a cursor plus delivery state over one
 /// stream. Several subscribers on one consumer share its records (a work
 /// queue); each record goes to one of them.
@@ -340,6 +364,20 @@ pub struct ConsumerSpec {
     /// `dlq_stream`, reason `expired`) instead of silently dropping them.
     #[serde(default)]
     pub dead_letter_expired: bool,
+    /// Only records whose headers have these values (exact match), combined
+    /// by `header_match`. Empty = no header filter.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub filter_headers: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub header_match: HeaderMatch,
+    /// Deliver to one subscription at a time (the oldest one connected);
+    /// the next takes over when it goes away. Pull requests are refused.
+    #[serde(default)]
+    pub single_active: bool,
+    /// Look this many records ahead and deliver higher `exspeed-priority`
+    /// first (0 = in order). Priority applies within the window only.
+    #[serde(default)]
+    pub priority_window: u32,
 }
 
 impl ConsumerSpec {
@@ -358,6 +396,10 @@ impl ConsumerSpec {
             dlq_stream: None,
             ephemeral: false,
             dead_letter_expired: false,
+            filter_headers: std::collections::BTreeMap::new(),
+            header_match: HeaderMatch::All,
+            single_active: false,
+            priority_window: 0,
         }
     }
 }
