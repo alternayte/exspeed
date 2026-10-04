@@ -579,8 +579,12 @@ impl Writer {
         let mut accepted: Vec<(AppendReq, Vec<(Offset, u64)>)> = Vec::with_capacity(group.len());
         let cfg = self.shared.config();
         let reject_new = cfg.as_ref().filter(|c| c.discard == DiscardPolicy::New);
-        let earliest = self.shared.committed_earliest();
-        let stored_bytes = self.shared.total_bytes();
+        // Only `discard = new` streams need these; skip the segment walk
+        // for everyone else.
+        let (earliest, stored_bytes) = match reject_new {
+            Some(_) => (self.shared.committed_earliest(), self.shared.total_bytes()),
+            None => (0, 0),
+        };
         for req in group {
             if req.len() == 0 {
                 req.succeed(Vec::new());
