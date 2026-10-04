@@ -27,7 +27,13 @@ struct WireFile {
 #[derive(Debug, Deserialize)]
 struct WireCredential {
     name: String,
-    token_sha256: String,
+    /// sha256 of the bearer token, or…
+    #[serde(default)]
+    token_sha256: Option<String>,
+    /// …the common name (else first DNS name) of a client certificate the
+    /// server's `tls.client_ca` verified.
+    #[serde(default)]
+    cert_cn: Option<String>,
     #[serde(default)]
     permissions: Vec<WirePermission>,
 }
@@ -50,6 +56,8 @@ struct WirePermission {
 #[derive(Debug)]
 pub struct CredentialStore {
     by_hash: HashMap<[u8; 32], IdentityRef>,
+    /// Credentials bound to a client certificate name.
+    by_cert: HashMap<String, IdentityRef>,
     /// Breakdown for the startup log line.
     file_count: usize,
     legacy_admin_present: bool,
@@ -66,6 +74,7 @@ impl CredentialStore {
     ///   in a store); this returns an empty store anyway for robustness.
     pub fn build(from_file: Option<&Path>, env_token: Option<&str>) -> Result<Self, AuthError> {
         let mut by_hash: HashMap<[u8; 32], IdentityRef> = HashMap::new();
+        let mut by_cert: HashMap<String, IdentityRef> = HashMap::new();
         let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut hash_to_name: HashMap<[u8; 32], String> = HashMap::new();
         let mut file_count = 0usize;
@@ -92,22 +101,43 @@ impl CredentialStore {
                     return Err(AuthError::LegacyAdminReserved);
                 }
                 validate_name_charset(&wc.name)?;
-                let digest = decode_hash(&wc.token_sha256, &wc.name)?;
-
                 if names.contains(&wc.name) {
                     return Err(AuthError::DuplicateName(wc.name.clone()));
                 }
-                if let Some(other) = hash_to_name.get(&digest) {
-                    return Err(AuthError::DuplicateTokenHash {
-                        first: other.clone(),
-                        second: wc.name.clone(),
-                    });
+                match (&wc.token_sha256, &wc.cert_cn) {
+                    (Some(hash), None) => {
+                        let digest = decode_hash(hash, &wc.name)?;
+                        if let Some(other) = hash_to_name.get(&digest) {
+                            return Err(AuthError::DuplicateTokenHash {
+                                first: other.clone(),
+                                second: wc.name.clone(),
+                            });
+                        }
+                        let id = Arc::new(compile_credential(&wc)?);
+                        hash_to_name.insert(digest, wc.name.clone());
+                        by_hash.insert(digest, id);
+                    }
+                    (None, Some(cn)) if !cn.is_empty() => {
+                        if by_cert.contains_key(cn) {
+                            return Err(AuthError::InvalidPermission {
+                                name: wc.name.clone(),
+                                reason: format!(
+                                    "cert_cn '{cn}' is already bound to another credential"
+                                ),
+                            });
+                        }
+                        let id = Arc::new(compile_credential(&wc)?);
+                        by_cert.insert(cn.clone(), id);
+                    }
+                    _ => {
+                        return Err(AuthError::InvalidPermission {
+                            name: wc.name.clone(),
+                            reason: "a credential has exactly one of token_sha256 or cert_cn"
+                                .into(),
+                        })
+                    }
                 }
-
-                let id = Arc::new(compile_credential(&wc)?);
                 names.insert(wc.name.clone());
-                hash_to_name.insert(digest, wc.name.clone());
-                by_hash.insert(digest, id);
                 file_count += 1;
             }
         }
@@ -136,6 +166,7 @@ impl CredentialStore {
 
         Ok(Self {
             by_hash,
+            by_cert,
             file_count,
             legacy_admin_present,
         })
@@ -144,6 +175,11 @@ impl CredentialStore {
     /// O(1) lookup by sha256 of the raw token bytes.
     pub fn lookup(&self, digest: &[u8; 32]) -> Option<IdentityRef> {
         self.by_hash.get(digest).cloned()
+    }
+
+    /// The credential bound to a verified client certificate's name.
+    pub fn lookup_cert(&self, name: &str) -> Option<IdentityRef> {
+        self.by_cert.get(name).cloned()
     }
 
     pub fn len(&self) -> usize {
@@ -550,6 +586,41 @@ permissions = [
                     Err(AuthError::InvalidPermission { .. })
                 ),
                 "{perm}"
+            );
+        }
+    }
+
+    #[test]
+    fn credentials_can_be_bound_to_a_certificate() {
+        let f = write_tmp(&format!(
+            r#"
+[[credentials]]
+name = "orders-svc"
+cert_cn = "orders.internal"
+permissions = [{{ streams = "orders", actions = ["publish"] }}]
+
+[[credentials]]
+name = "human"
+token_sha256 = "{}"
+"#,
+            hash_of("tok")
+        ));
+        let store = CredentialStore::build(Some(f.path()), None).unwrap();
+        let id = store.lookup_cert("orders.internal").unwrap();
+        assert_eq!(id.name, "orders-svc");
+        assert!(store.lookup_cert("other").is_none());
+        for bad in [
+            "[[credentials]]\nname = \"x\"\n",
+            "[[credentials]]\nname = \"x\"\ncert_cn = \"a\"\ntoken_sha256 = \"00\"\n",
+            "[[credentials]]\nname = \"x\"\ncert_cn = \"a\"\n[[credentials]]\nname = \"y\"\ncert_cn = \"a\"\n",
+        ] {
+            let f = write_tmp(bad);
+            assert!(
+                matches!(
+                    CredentialStore::build(Some(f.path()), None),
+                    Err(AuthError::InvalidPermission { .. })
+                ),
+                "{bad}"
             );
         }
     }

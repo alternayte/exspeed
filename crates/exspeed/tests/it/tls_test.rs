@@ -256,3 +256,132 @@ async fn auth_and_tls_together_end_to_end() {
         .expect("unauthenticated connect must fail");
     assert_eq!(err.code(), Some(401));
 }
+
+/// A test CA plus certificates it signs.
+struct TestCa {
+    cert: rcgen::Certificate,
+    key: rcgen::KeyPair,
+}
+
+impl TestCa {
+    fn new(name: &str) -> Self {
+        let mut p = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        p.distinguished_name
+            .push(rcgen::DnType::CommonName, name.to_string());
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = p.self_signed(&key).unwrap();
+        Self { cert, key }
+    }
+
+    /// A leaf certificate with `cn` and the DNS names `sans`.
+    fn issue(&self, cn: &str, sans: &[&str]) -> (rcgen::Certificate, rcgen::KeyPair) {
+        let mut p =
+            rcgen::CertificateParams::new(sans.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                .unwrap();
+        p.distinguished_name
+            .push(rcgen::DnType::CommonName, cn.to_string());
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = p.signed_by(&key, &self.cert, &self.key).unwrap();
+        (cert, key)
+    }
+}
+
+fn mtls_client(
+    ca: &TestCa,
+    identity: Option<(&rcgen::Certificate, &rcgen::KeyPair)>,
+) -> Arc<tokio_rustls::rustls::ClientConfig> {
+    use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+    roots.add(ca.cert.der().clone()).unwrap();
+    let b = tokio_rustls::rustls::ClientConfig::builder().with_root_certificates(roots);
+    Arc::new(match identity {
+        Some((cert, key)) => b
+            .with_client_auth_cert(
+                vec![cert.der().clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+            )
+            .unwrap(),
+        None => b.with_no_client_auth(),
+    })
+}
+
+#[tokio::test]
+async fn mutual_tls_maps_client_certificates_to_credentials() {
+    let ca = TestCa::new("exspeed test CA");
+    let tmp = tempfile::tempdir().unwrap();
+    let (server_cert, server_key) = ca.issue("exspeed", &["localhost"]);
+    let p = |n: &str| tmp.path().join(n);
+    std::fs::write(p("server.pem"), server_cert.pem()).unwrap();
+    std::fs::write(p("server.key"), server_key.serialize_pem()).unwrap();
+    std::fs::write(p("ca.pem"), ca.cert.pem()).unwrap();
+    std::fs::write(
+        p("credentials.toml"),
+        r#"
+[[credentials]]
+name = "orders-svc"
+cert_cn = "orders.internal"
+permissions = [{ streams = "orders", actions = ["publish", "subscribe", "admin"] }]
+"#,
+    )
+    .unwrap();
+
+    let data = tempfile::tempdir().unwrap();
+    let port_l = exspeed_testkit::bind_local();
+    let port = port_l.local_addr().unwrap().port();
+    let args = exspeed::cli::server::ServerArgs {
+        bind: format!("127.0.0.1:{port}"),
+        tcp_listener: Some(Arc::new(port_l)),
+        api_bind: "127.0.0.1:0".into(),
+        api_listener: Some(Arc::new(exspeed_testkit::bind_local())),
+        data_dir: data.path().to_path_buf(),
+        credentials_file: Some(p("credentials.toml")),
+        tls_cert: Some(p("server.pem")),
+        tls_key: Some(p("server.key")),
+        tls_client_ca: Some(p("ca.pem")),
+        ..Default::default()
+    };
+    tokio::spawn(async move {
+        exspeed::cli::server::run(args).await.unwrap();
+    });
+    wait_for_port(port).await;
+    let addr = format!("127.0.0.1:{port}");
+    let connect = |cfg| Client::connect_tls(&addr, "localhost", cfg, ConnectOptions::default());
+
+    // A valid certificate bound to a credential: no token needed, and its
+    // permissions apply.
+    let (cert, key) = ca.issue("orders.internal", &[]);
+    let c = connect(mtls_client(&ca, Some((&cert, &key))))
+        .await
+        .unwrap();
+    c.create_stream(StreamSpec::named("orders")).await.unwrap();
+    c.publish("orders", PublishRecord::new("o", "x"))
+        .await
+        .unwrap();
+    let err = c
+        .create_stream(StreamSpec::named("billing"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Some(exspeed_client::code::FORBIDDEN));
+
+    // No certificate, or one from another CA: the TLS handshake fails.
+    assert!(connect(mtls_client(&ca, None)).await.is_err());
+    let rogue = TestCa::new("rogue CA");
+    let (rcert, rkey) = rogue.issue("orders.internal", &[]);
+    assert!(connect(mtls_client(&ca, Some((&rcert, &rkey))))
+        .await
+        .is_err());
+
+    // A valid certificate that no credential names: unauthorized.
+    let (ucert, ukey) = ca.issue("stranger", &[]);
+    let err = connect(mtls_client(&ca, Some((&ucert, &ukey))))
+        .await
+        .err()
+        .expect("unbound certificate must not authenticate");
+    assert_eq!(
+        err.code(),
+        Some(exspeed_client::code::UNAUTHORIZED),
+        "{err}"
+    );
+}

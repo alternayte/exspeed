@@ -33,6 +33,61 @@ pub fn load_tls_config(cert_path: &Path, key_path: &Path) -> Result<Arc<ServerCo
     Ok(Arc::new(config))
 }
 
+/// Like [`load_tls_config`]; with `client_ca`, clients must present a
+/// certificate signed by that CA (mutual TLS).
+pub fn load_tls_config_with_clients(
+    cert_path: &Path,
+    key_path: &Path,
+    client_ca: Option<&Path>,
+) -> Result<Arc<ServerConfig>> {
+    let Some(ca) = client_ca else {
+        return load_tls_config(cert_path, key_path);
+    };
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    let certs = load_certs(cert_path)
+        .with_context(|| format!("loading TLS cert {}", cert_path.display()))?;
+    let key = load_private_key(key_path)
+        .with_context(|| format!("loading TLS key {}", key_path.display()))?;
+    let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+    for c in load_certs(ca).with_context(|| format!("loading client CA {}", ca.display()))? {
+        roots
+            .add(c)
+            .with_context(|| format!("adding a client trust root from {}", ca.display()))?;
+    }
+    let verifier = tokio_rustls::rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .context("building the client certificate verifier")?;
+    let config = ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certs, key)
+        .context("building rustls ServerConfig")?;
+    Ok(Arc::new(config))
+}
+
+/// The name a verified client certificate stands for: its subject common
+/// name, else its first DNS subject-alternative name.
+pub fn client_cert_name(certs: Option<&[CertificateDer<'_>]>) -> Option<String> {
+    let der = certs?.first()?;
+    let (_, cert) = x509_parser::parse_x509_certificate(der.as_ref()).ok()?;
+    if let Some(cn) = cert
+        .subject()
+        .iter_common_name()
+        .next()
+        .and_then(|cn| cn.as_str().ok())
+    {
+        return Some(cn.to_string());
+    }
+    cert.subject_alternative_name()
+        .ok()
+        .flatten()
+        .and_then(|san| {
+            san.value.general_names.iter().find_map(|n| match n {
+                x509_parser::extensions::GeneralName::DNSName(d) => Some(d.to_string()),
+                _ => None,
+            })
+        })
+}
+
 /// A rustls ClientConfig trusting the certificates in `ca_path` (PEM).
 pub fn load_client_config(ca_path: &Path) -> Result<Arc<tokio_rustls::rustls::ClientConfig>> {
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();

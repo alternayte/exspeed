@@ -204,6 +204,22 @@ pub async fn run<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    run_with_cert(socket, peer, ctx, cancel, None).await
+}
+
+/// [`run`] for a TLS connection whose client certificate (verified against
+/// `tls.client_ca`) stands for `cert_name`: a Connect without a token gets
+/// the credential bound to that name (`cert_cn`).
+pub async fn run_with_cert<S>(
+    socket: S,
+    peer: SocketAddr,
+    ctx: Arc<SessionContext>,
+    cancel: CancellationToken,
+    cert_name: Option<String>,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (reader, writer) = tokio::io::split(socket);
     let mut frames = FramedRead::new(reader, ExspeedCodec::new());
     let mut sink = FramedWrite::new(writer, ExspeedCodec::new());
@@ -250,10 +266,14 @@ where
     let identity: Arc<Identity> = match ctx.credential_store.as_ref() {
         None => Arc::new(anonymous_identity()),
         Some(store) => {
-            let found = token.as_ref().and_then(|t| {
-                let digest: [u8; 32] = Sha256::digest(t.as_bytes()).into();
-                store.lookup(&digest)
-            });
+            let found = match (&token, &cert_name) {
+                (Some(t), _) => {
+                    let digest: [u8; 32] = Sha256::digest(t.as_bytes()).into();
+                    store.lookup(&digest)
+                }
+                (None, Some(name)) => store.lookup_cert(name),
+                (None, None) => None,
+            };
             match found {
                 Some(id) => id,
                 None => {

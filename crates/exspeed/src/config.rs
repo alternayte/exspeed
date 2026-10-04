@@ -84,6 +84,8 @@ pub struct AuthSection {
 pub struct TlsSection {
     pub cert: Option<PathBuf>,
     pub key: Option<PathBuf>,
+    /// Require client certificates signed by this CA (mutual TLS).
+    pub client_ca: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -178,6 +180,9 @@ pub struct ServeArgs {
     /// PEM private key; requires --tls-cert
     #[arg(long)]
     pub tls_key: Option<PathBuf>,
+    /// Require client certificates signed by this CA (PEM) on the TCP port
+    #[arg(long)]
+    pub tls_client_ca: Option<PathBuf>,
     /// `sync` (fsync per group commit) or `async` (fsync on a timer) [default: sync]
     #[arg(long, value_enum)]
     pub storage_sync: Option<StorageSyncArg>,
@@ -251,6 +256,7 @@ struct Layer {
     credentials_file: Option<PathBuf>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
+    tls_client_ca: Option<PathBuf>,
     storage_sync: Option<StorageSyncArg>,
     flush_window_us: Option<u64>,
     flush_threshold_records: Option<usize>,
@@ -314,6 +320,7 @@ impl Layer {
             credentials_file: f.auth.credentials_file,
             tls_cert: f.tls.cert,
             tls_key: f.tls.key,
+            tls_client_ca: f.tls.client_ca,
             storage_sync: f.storage.sync.as_deref().map(parse_sync).transpose()?,
             flush_window_us: f.storage.flush_window_us,
             flush_threshold_records: f.storage.flush_threshold_records,
@@ -386,6 +393,7 @@ impl Layer {
             credentials_file: s("EXSPEED_CREDENTIALS_FILE").map(PathBuf::from),
             tls_cert: s("EXSPEED_TLS_CERT").map(PathBuf::from),
             tls_key: s("EXSPEED_TLS_KEY").map(PathBuf::from),
+            tls_client_ca: s("EXSPEED_TLS_CLIENT_CA").map(PathBuf::from),
             storage_sync: s("EXSPEED_STORAGE_SYNC")
                 .as_deref()
                 .map(parse_sync)
@@ -475,6 +483,7 @@ impl Layer {
             credentials_file: a.credentials_file.clone(),
             tls_cert: a.tls_cert.clone(),
             tls_key: a.tls_key.clone(),
+            tls_client_ca: a.tls_client_ca.clone(),
             storage_sync: a.storage_sync,
             flush_window_us: a.storage_flush_window_us,
             flush_threshold_records: a.storage_flush_threshold_records,
@@ -515,6 +524,9 @@ impl Layer {
         }
         if self.tls_key.is_some() {
             t.tls_key = self.tls_key;
+        }
+        if self.tls_client_ca.is_some() {
+            t.tls_client_ca = self.tls_client_ca;
         }
         set!(storage_sync => storage_sync);
         set!(flush_window_us => storage_flush_window_us);
@@ -636,9 +648,17 @@ pub fn validate(a: &ServerArgs) -> Result<()> {
     if a.tls_cert.is_some() != a.tls_key.is_some() {
         bail!("TLS needs both a certificate and a key");
     }
-    for p in [&a.tls_cert, &a.tls_key, &a.credentials_file]
-        .into_iter()
-        .flatten()
+    if a.tls_client_ca.is_some() && a.tls_cert.is_none() {
+        bail!("tls.client_ca (mutual TLS) needs tls.cert and tls.key");
+    }
+    for p in [
+        &a.tls_cert,
+        &a.tls_key,
+        &a.tls_client_ca,
+        &a.credentials_file,
+    ]
+    .into_iter()
+    .flatten()
     {
         if !p.exists() {
             bail!("file not found: {}", p.display());
@@ -757,6 +777,7 @@ credentials_file = {creds}
 [tls]
 cert = {cert}
 key = {key}
+client_ca = {cca}
 
 [storage]
 sync = "{sync}"
@@ -823,6 +844,7 @@ level = {ll}
         creds = opt_path(&a.credentials_file),
         cert = opt_path(&a.tls_cert),
         key = opt_path(&a.tls_key),
+        cca = opt_path(&a.tls_client_ca),
         fw = a.storage_flush_window_us,
         ftr = a.storage_flush_threshold_records,
         ftb = a.storage_flush_threshold_bytes,
@@ -889,6 +911,8 @@ idle_timeout_secs = 120          # TCP connections with no frame for this long a
 [tls]
 # cert = "/etc/exspeed/tls.crt"  # PEM chain (EXSPEED_TLS_CERT); requires key
 # key = "/etc/exspeed/tls.key"   # (EXSPEED_TLS_KEY)
+# client_ca = "/etc/exspeed/clients-ca.crt"  # require client certificates signed by
+#                                  this CA on the TCP port (EXSPEED_TLS_CLIENT_CA)
 
 [storage]
 sync = "sync"                    # "sync": fsync per group commit; "async": fsync on a timer (EXSPEED_STORAGE_SYNC)

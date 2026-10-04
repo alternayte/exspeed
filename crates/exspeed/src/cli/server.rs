@@ -51,6 +51,10 @@ pub struct ServerArgs {
     pub credentials_file: Option<PathBuf>,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
+    /// Require client certificates signed by this CA on the TCP port
+    /// (mutual TLS). A certificate's common name can stand for a
+    /// credential (`cert_cn`).
+    pub tls_client_ca: Option<PathBuf>,
     pub storage_sync: StorageSyncArg,
     pub storage_flush_window_us: u64,
     pub storage_flush_threshold_records: usize,
@@ -262,6 +266,7 @@ impl ServerArgs {
             credentials_file: None,
             tls_cert: None,
             tls_key: None,
+            tls_client_ca: None,
             storage_sync: StorageSyncArg::Sync,
             storage_flush_window_us: 500,
             storage_flush_threshold_records: 256,
@@ -911,7 +916,11 @@ where
     // certificate files fail startup.
     let drain_deadline = std::time::Duration::from_secs(args.drain_timeout_secs);
     let tls_config = match &tls_paths {
-        Some(paths) => match crate::cli::server_tls::load_tls_config(&paths.cert, &paths.key) {
+        Some(paths) => match crate::cli::server_tls::load_tls_config_with_clients(
+            &paths.cert,
+            &paths.key,
+            args.tls_client_ca.as_deref(),
+        ) {
             Ok(c) => Some(c),
             Err(e) => {
                 abort_startup(&cancel_token, &leadership, cluster.as_ref(), &file_storage).await;
@@ -1014,7 +1023,13 @@ where
                                     tokio::time::timeout(tls_accept_timeout, acceptor.accept(socket))
                                         .await
                                         .map_err(|_| anyhow::anyhow!("TLS handshake timed out"))??;
-                                session::run(tls_stream, peer, session_ctx, conn_token).await
+                                let cert_name = crate::cli::server_tls::client_cert_name(
+                                    tls_stream.get_ref().1.peer_certificates(),
+                                );
+                                session::run_with_cert(
+                                    tls_stream, peer, session_ctx, conn_token, cert_name,
+                                )
+                                .await
                             } else {
                                 session::run(socket, peer, session_ctx, conn_token).await
                             }
