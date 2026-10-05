@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>Exspeed</RootNamespace>
+    <AssemblyName>Exspeed.Client</AssemblyName>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+
+    <PackageId>Exspeed.Client</PackageId>
+    <Version>0.7.0</Version>
+    <Authors>Exspeed</Authors>
+    <Description>.NET client for Exspeed (client protocol v2): streams, publishing, durable consumers with push and pull delivery, core pub/sub and request-reply, key-value buckets and ExQL queries.</Description>
+    <PackageTags>exspeed;streaming;message-broker;client;sdk;stream-processing</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/alternayte/exspeed/tree/main/sdks/dotnet</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/alternayte/exspeed</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <Copyright>Copyright (c) 2026 Exspeed</Copyright>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Exspeed.Client.Tests" />
+    <None Include="../../README.md" Pack="true" PackagePath="/" />
+    <None Include="../../LICENSE" Pack="true" PackagePath="/" />
+  </ItemGroup>
+
+</Project>

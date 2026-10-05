@@ -248,6 +248,30 @@ jobs:
           cache-dependency-path: sdks/java/pom.xml
       - run: mvn -B verify
 
+  sdk-dotnet:
+    name: .NET SDK
+    needs: server-bin
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdks/dotnet
+    env:
+      EXSPEED_BIN: ${{ github.workspace }}/bin/exspeed
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: exspeed-bin
+          path: bin
+      - run: chmod +x "$EXSPEED_BIN"
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - run: dotnet build -c Release
+      - run: dotnet format --verify-no-changes
+      - run: dotnet test -c Release --no-build
+
   helm:
     name: Helm chart
     runs-on: ubuntu-latest
