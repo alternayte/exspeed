@@ -32,6 +32,10 @@ fn apply_limits(
     if let Some(v) = &l.retention_policy {
         body.insert("retention".into(), json!(v));
     }
+    if let Some(v) = &l.capture {
+        let subjects: Vec<&String> = v.iter().filter(|s| !s.is_empty()).collect();
+        body.insert("capture_subjects".into(), json!(subjects));
+    }
     Ok(())
 }
 
@@ -244,6 +248,13 @@ pub async fn info(client: &CliClient, name: &str, json_output: bool) -> Result<(
     }
     if let Some(r) = resp["retention"].as_str() {
         println!("  Retention policy: {}", r);
+    }
+    if let Some(c) = resp["capture_subjects"]
+        .as_array()
+        .filter(|c| !c.is_empty())
+    {
+        let c: Vec<&str> = c.iter().filter_map(|v| v.as_str()).collect();
+        println!("  Captures core subjects: {}", c.join(", "));
     }
 
     Ok(())

@@ -56,6 +56,10 @@ pub struct CreateStreamRequest {
     #[serde(default)]
     #[schema(value_type = String, example = "limits")]
     pub retention: RetentionPolicy,
+    /// Subject filters whose core messages (Exspeed or NATS) are also
+    /// appended to this stream.
+    #[serde(default)]
+    pub capture_subjects: Vec<String>,
 }
 
 /// A stream's size, offsets and settings.
@@ -82,6 +86,7 @@ pub struct StreamInfo {
     pub allow_delayed: bool,
     #[schema(value_type = String)]
     pub retention: RetentionPolicy,
+    pub capture_subjects: Vec<String>,
     /// Internal streams start with `__` (consumer state, offsets, ...).
     pub internal: bool,
     /// `healthy`, or `failed`: the partition is fenced read-only after an
@@ -129,6 +134,7 @@ fn stream_info_json(
         msg_ttl_ms: config.msg_ttl_ms,
         allow_delayed: config.allow_delayed,
         retention: config.retention,
+        capture_subjects: config.capture_subjects.clone(),
         internal: name.starts_with(exspeed_common::INTERNAL_STREAM_PREFIX),
     }
 }
@@ -272,6 +278,7 @@ pub async fn create_stream(
         msg_ttl_ms: body.msg_ttl_ms,
         allow_delayed: body.allow_delayed,
         retention: body.retention,
+        capture_subjects: body.capture_subjects.clone(),
     });
 
     // Validate before touching storage.
@@ -465,6 +472,7 @@ pub struct UpdateStreamRequest {
     pub allow_delayed: Option<bool>,
     #[schema(value_type = Option<String>)]
     pub retention: Option<RetentionPolicy>,
+    pub capture_subjects: Option<Vec<String>>,
 }
 
 /// Update retention and dedup settings.
@@ -563,6 +571,9 @@ pub async fn patch_stream(
     }
     if let Some(v) = req.retention {
         cfg.retention = v;
+    }
+    if let Some(v) = req.capture_subjects.clone() {
+        cfg.capture_subjects = v;
     }
 
     // Validate the merged config.

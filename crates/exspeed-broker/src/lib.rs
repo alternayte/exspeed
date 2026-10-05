@@ -1,6 +1,7 @@
 pub mod broker;
 pub mod broker_append;
 pub mod broker_append_snapshot;
+pub mod capture;
 pub mod catalog;
 pub mod cluster;
 pub mod consumer;

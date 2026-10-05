@@ -120,6 +120,21 @@ index; puts run under a per-bucket lock and compare the expected revision
 against the committed log (`latest_committed_for_subject`), then append
 through `Log`.
 
+`crates/exspeed/src/nats/` serves the core NATS protocol on its own
+listener ([nats.md](nats.md)). `proto.rs` parses and encodes the text
+protocol; each connection runs one loop that reads operations, answers
+pings and writes the connection's bus deliveries in batches, deliveries
+first, so a client that publishes faster than its own subscriptions are
+written is slowed by TCP backpressure instead of losing messages. NATS
+`sid`s map to bus subscription ids, so the two protocols share one bus.
+
+`exspeed_broker::capture::Capture` maps subjects to the stream whose
+`capture_subjects` match (a table rebuilt when stream metadata changes).
+Each connection that publishes a captured message gets a pipeline task
+that appends its messages in order, batching consecutive ones for the same
+stream, and publishes a JetStream-style `PubAck` to each message's reply
+subject.
+
 ## Wire protocol
 
 Clients use protocol v2 ([protocol.md](protocol.md)). Every frame has a

@@ -44,6 +44,15 @@ pub struct FileConfig {
     pub exql: ExqlSection,
     #[serde(default)]
     pub log: LogSection,
+    #[serde(default)]
+    pub nats: NatsSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NatsSection {
+    /// Serve the core NATS protocol on this address (off when unset).
+    pub bind: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -183,6 +192,9 @@ pub struct ServeArgs {
     /// Require client certificates signed by this CA (PEM) on the TCP port
     #[arg(long)]
     pub tls_client_ca: Option<PathBuf>,
+    /// Serve the core NATS protocol on this address, e.g. 0.0.0.0:4222 [default: off]
+    #[arg(long)]
+    pub nats_bind: Option<String>,
     /// `sync` (fsync per group commit) or `async` (fsync on a timer) [default: sync]
     #[arg(long, value_enum)]
     pub storage_sync: Option<StorageSyncArg>,
@@ -294,6 +306,7 @@ struct Layer {
     exql_max_event_time_skew_ms: Option<u64>,
     log_format: Option<String>,
     log_level: Option<String>,
+    nats_bind: Option<String>,
 }
 
 fn parse_sync(s: &str) -> Result<StorageSyncArg> {
@@ -358,6 +371,7 @@ impl Layer {
             exql_max_event_time_skew_ms: f.exql.max_event_time_skew_ms,
             log_format: f.log.format,
             log_level: f.log.level,
+            nats_bind: f.nats.bind,
         })
     }
 
@@ -470,6 +484,7 @@ impl Layer {
             )?,
             log_format: s("LOG_FORMAT"),
             log_level: s("RUST_LOG"),
+            nats_bind: s("EXSPEED_NATS_BIND"),
         })
     }
 
@@ -484,6 +499,7 @@ impl Layer {
             tls_cert: a.tls_cert.clone(),
             tls_key: a.tls_key.clone(),
             tls_client_ca: a.tls_client_ca.clone(),
+            nats_bind: a.nats_bind.clone(),
             storage_sync: a.storage_sync,
             flush_window_us: a.storage_flush_window_us,
             flush_threshold_records: a.storage_flush_threshold_records,
@@ -584,6 +600,9 @@ impl Layer {
         }
         if self.log_level.is_some() {
             t.log_level = self.log_level;
+        }
+        if self.nats_bind.is_some() {
+            t.nats_bind = self.nats_bind;
         }
     }
 }
@@ -825,6 +844,9 @@ max_event_time_skew_ms = {xsk}
 [log]
 format = {lf}
 level = {ll}
+
+[nats]
+bind = {nb}
 "#,
         source = a
             .config_file
@@ -884,6 +906,7 @@ level = {ll}
         xsk = a.exql.max_event_time_skew_ms,
         lf = opt(&a.log_format),
         ll = opt(&a.log_level),
+        nb = opt(&a.nats_bind),
     )
 }
 
@@ -960,6 +983,9 @@ max_event_time_skew_ms = 86400000  # TIMESTAMP BY values further than this ahead
 [log]
 format = "text"                  # "text" or "json" (LOG_FORMAT)
 level = "info"                   # tracing filter, e.g. "exspeed=debug,warn" (RUST_LOG)
+
+[nats]
+# bind = "0.0.0.0:4222"          # serve the core NATS protocol here; off when unset (EXSPEED_NATS_BIND, --nats-bind)
 "#;
 
 #[cfg(test)]

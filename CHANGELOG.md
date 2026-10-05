@@ -7,6 +7,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **NATS protocol.** `[nats] bind` (`EXSPEED_NATS_BIND`, `--nats-bind`,
+  off by default) serves the core NATS client protocol, so NATS client
+  libraries and the `nats` CLI connect unchanged: `PUB`/`HPUB`, `SUB`
+  with queue groups, `UNSUB` with a max, request-reply with the
+  `no_responders` 503 status, `echo: false`, verbose mode, server pings,
+  token or client-certificate auth with subject permissions, TLS, and
+  lame-duck `INFO` on shutdown. NATS and Exspeed clients share one core
+  message bus. Standbys close NATS connections after `INFO`; a failover
+  closes them on the old leader. See `docs/nats.md`.
+- **Stream capture.** A stream's `capture_subjects` (HTTP, protocol stream
+  spec, `exspeed create --capture`) stores the core messages published to
+  matching subjects, over NATS or `CorePublish`. A captured publish with a
+  reply subject is acknowledged with a JetStream-style `PubAck`
+  (`{"stream","seq"}`, `seq` = offset + 1), so `js.Publish` /
+  `js.PublishAsync` in NATS clients work; `Nats-Msg-Id` deduplicates.
+  Overlapping capture subjects across streams are refused.
+
+### Changed
+
+- Embedders building `exspeed_broker::pubsub::CoreMessage` set its new
+  `origin` field (the publishing connection; `0` when unknown), and
+  `StreamLimits` is no longer `Copy` (it gained `capture_subjects`).
+
 ## [0.7.0] — 2026-10-04
 
 **TL;DR:** Exspeed 0.7 adds the features people stay on NATS or RabbitMQ

@@ -8,7 +8,10 @@ anything else where a missed message doesn't matter or is retried by the
 sender. Use a stream when a message must not be lost.
 
 Core messages and stream records are separate: publishing to a stream doesn't
-reach core subscribers, and a core publish isn't stored in any stream.
+reach core subscribers, and a core publish is stored only in a stream that
+captures its subject ([stream capture](nats.md#stream-capture)). NATS
+clients take part too: with the [NATS listener](nats.md) on, they publish
+and subscribe on the same bus.
 
 ```mermaid
 sequenceDiagram

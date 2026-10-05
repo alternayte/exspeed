@@ -52,6 +52,8 @@ export interface WireStreamLimits {
   msg_ttl_ms: number;
   allow_delayed: boolean;
   retention: "limits" | "work_queue" | "interest";
+  /** Sent only when non-empty. */
+  capture_subjects?: string[];
 }
 
 /**

@@ -32,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use exspeed_broker::broker_append::{AppendResult, IDEMPOTENCY_HEADER};
+use exspeed_broker::capture::{Capture, CaptureJob};
 use exspeed_broker::consumer::{ConsumerError, SubEvent};
 use exspeed_broker::kv::{BucketConfig, KvEntry, KvError};
 use exspeed_broker::log::LogError;
@@ -76,7 +77,7 @@ pub struct SessionContext {
     pub leader_hint: Arc<dyn Fn() -> Option<String> + Send + Sync>,
 }
 
-fn anonymous_identity() -> Identity {
+pub(crate) fn anonymous_identity() -> Identity {
     Identity {
         name: "anonymous".to_string(),
         permissions: vec![Permission {
@@ -155,6 +156,8 @@ struct ConnState {
     core_subs: Vec<u32>,
     core_tx: Option<mpsc::Sender<CoreEvent>>,
     core_forwarder: Option<tokio::task::JoinHandle<()>>,
+    /// Appends captured core messages in publish order (started on first use).
+    capture_tx: Option<mpsc::Sender<CaptureJob>>,
     ephemeral: Vec<String>,
     /// This connection's publish pipeline (started on the first publish).
     publishes: Option<mpsc::Sender<PublishJob>>,
@@ -332,6 +335,7 @@ where
         core_subs: Vec::new(),
         core_tx: None,
         core_forwarder: None,
+        capture_tx: None,
         ephemeral: Vec::new(),
         publishes: None,
         closed: cancel.child_token(),
@@ -1312,15 +1316,48 @@ async fn dispatch(
             if let Err(e) = broker.log.limits().check(&probe) {
                 return out.send(corr, Response::error(code::BAD_REQUEST, e)).await;
             }
+            if !broker.bus.is_open() {
+                return out.send(corr, not_leader(&ctx)).await;
+            }
+            let captured = match broker.capture.target(&subject).await {
+                Some(stream) => {
+                    if !identity.authorize(Action::Publish, &stream) {
+                        return forbid(&ctx, out, corr, "CorePublish").await;
+                    }
+                    let tx = state.capture_tx.get_or_insert_with(|| {
+                        Capture::pipeline(broker.log.clone(), broker.bus.clone())
+                    });
+                    let job = CaptureJob::new(
+                        stream,
+                        &subject,
+                        reply_to.clone(),
+                        headers.clone(),
+                        value.clone(),
+                    );
+                    if tx.send(job).await.is_err() {
+                        return out
+                            .send(
+                                corr,
+                                Response::error(code::INTERNAL, "capture pipeline stopped"),
+                            )
+                            .await;
+                    }
+                    true
+                }
+                None => false,
+            };
             let msg = CoreMessage {
                 subject,
                 reply_to,
                 headers,
                 value,
+                origin: 0,
             };
             match broker.bus.publish(msg) {
                 Ok(_) => reply_ok(corr).await,
                 Err(BusError::NotLeader) => out.send(corr, not_leader(&ctx)).await,
+                // A captured request is answered by its stream.
+                Err(BusError::NoResponders(_)) if captured => reply_ok(corr).await,
                 Err(e @ BusError::NoResponders(_)) => {
                     out.send(corr, Response::error(code::NOT_FOUND, e.to_string()))
                         .await

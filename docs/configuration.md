@@ -19,7 +19,7 @@ exspeed server -c exspeed.toml
 ```
 
 The file has these sections: `[server]`, `[auth]`, `[tls]`, `[storage]`,
-`[cluster]`, `[connectors]`, `[exql]` and `[log]`. The tables below give each setting
+`[cluster]`, `[connectors]`, `[exql]`, `[log]` and `[nats]`. The tables below give each setting
 as **file key / env var / flag**.
 
 ## Server
@@ -37,8 +37,9 @@ as **file key / env var / flag**.
 | `server.idle_timeout_secs` | `EXSPEED_IDLE_TIMEOUT_SECS` | — | `120` | A TCP connection that sends no frame (clients ping) for this long is closed |
 | `server.stop_timeout_secs` | `EXSPEED_STOP_TIMEOUT_SECS` | — | `30` | Total budget, after the drain, for stopping connectors, continuous queries and consumers (final state) and writing the dedup snapshot. Shutdown takes at most `drain_timeout_secs + stop_timeout_secs`. |
 | `server.metrics_token` | `EXSPEED_METRICS_TOKEN` | — | — | When set, `GET /metrics` requires `Authorization: Bearer <token>` ([security.md](security.md#metrics-token)) |
+| `nats.bind` | `EXSPEED_NATS_BIND` | `--nats-bind` | off | Serve the core NATS protocol on this address, e.g. `0.0.0.0:4222` ([nats.md](nats.md)). It uses the `[tls]` certificate and the same credentials as the client port. |
 
-Both listeners are bound before anything else starts: a port that is already
+Every listener is bound before anything else starts: a port that is already
 in use (or a bad TLS file, or a connector/ExQL catalog that can't be read)
 makes `exspeed server` exit with an error instead of running half-started.
 

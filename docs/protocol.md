@@ -118,7 +118,10 @@ spec is understood by every server version):
 ```
 
 `discard` is `old` or `new`; `retention` is `limits`, `work_queue` or
-`interest`. Missing keys take these defaults. See [queues.md](queues.md).
+`interest`. An optional `capture_subjects` array of subject filters makes
+the stream store core messages published to those subjects
+([nats.md](nats.md#stream-capture)). Missing keys take these defaults. See
+[queues.md](queues.md).
 
 **ConsumerSpec** (JSON, carried as `bytes`):
 

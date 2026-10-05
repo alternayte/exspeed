@@ -450,6 +450,15 @@ describe("stream limits", () => {
       expect(toWireStreamSpec({ name: "s", ...s }).limits).not.toBeNull();
     }
   });
+
+  it("adds capture_subjects only when there are some", () => {
+    expect(toWireStreamSpec({ name: "s", captureSubjects: [] }).limits).toBeNull();
+    const c = toWireStreamSpec({ name: "s", captureSubjects: ["orders.>"] });
+    expect(JSON.stringify(c.limits)).toBe(
+      '{"max_msgs":0,"discard":"old","max_msgs_per_subject":0,"allow_msg_ttl":false,' +
+        '"msg_ttl_ms":0,"allow_delayed":false,"retention":"limits","capture_subjects":["orders.>"]}',
+    );
+  });
 });
 
 describe("publish options", () => {

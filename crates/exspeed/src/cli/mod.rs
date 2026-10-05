@@ -66,6 +66,10 @@ pub struct StreamLimitArgs {
     /// `interest` (removed once every consumer acked)
     #[arg(long, value_parser = ["limits", "work_queue", "interest"])]
     pub retention_policy: Option<String>,
+    /// Append core messages (Exspeed or NATS) published to subjects matching
+    /// this filter; repeatable, comma-separated, or "" to clear
+    #[arg(long, value_delimiter = ',')]
+    pub capture: Option<Vec<String>>,
 }
 
 #[derive(Subcommand)]

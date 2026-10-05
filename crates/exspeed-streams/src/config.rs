@@ -55,6 +55,10 @@ pub struct StreamConfig {
     /// Whether acknowledgements remove records (`work_queue`, `interest`).
     #[serde(default)]
     pub retention: RetentionPolicy,
+    /// Subject filters whose core messages (Exspeed `CorePublish` or NATS
+    /// `PUB`) are also appended to this stream.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capture_subjects: Vec<String>,
 }
 
 fn default_dedup_window_secs() -> u64 {
@@ -83,6 +87,7 @@ impl Default for StreamConfig {
             msg_ttl_ms: 0,
             allow_delayed: false,
             retention: RetentionPolicy::Limits,
+            capture_subjects: Vec::new(),
         }
     }
 }
@@ -174,6 +179,16 @@ impl StreamConfig {
                     .into(),
             );
         }
+        if self.capture_subjects.len() > 64 {
+            return Err("at most 64 capture_subjects".into());
+        }
+        for f in &self.capture_subjects {
+            match exspeed_common::SubjectFilter::parse(f) {
+                Ok(_) if !f.is_empty() => {}
+                Ok(_) => return Err("capture_subjects entries can't be empty".into()),
+                Err(e) => return Err(format!("capture_subjects: {e}")),
+            }
+        }
         Ok(())
     }
 
@@ -187,6 +202,7 @@ impl StreamConfig {
             msg_ttl_ms: self.msg_ttl_ms,
             allow_delayed: self.allow_delayed,
             retention: self.retention,
+            capture_subjects: self.capture_subjects.clone(),
         }
     }
 
@@ -199,6 +215,7 @@ impl StreamConfig {
         self.msg_ttl_ms = l.msg_ttl_ms;
         self.allow_delayed = l.allow_delayed;
         self.retention = l.retention;
+        self.capture_subjects = l.capture_subjects.clone();
         self
     }
 
