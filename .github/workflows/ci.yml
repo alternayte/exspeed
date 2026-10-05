@@ -224,6 +224,30 @@ jobs:
       - run: test -z "$(gofmt -l .)"
       - run: go test -race -count=1 ./...
 
+  sdk-java:
+    name: Java SDK
+    needs: server-bin
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdks/java
+    env:
+      EXSPEED_BIN: ${{ github.workspace }}/bin/exspeed
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: exspeed-bin
+          path: bin
+      - run: chmod +x "$EXSPEED_BIN"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-dependency-path: sdks/java/pom.xml
+      - run: mvn -B verify
+
   helm:
     name: Helm chart
     runs-on: ubuntu-latest
