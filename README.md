@@ -26,6 +26,9 @@ upgrade).
 - **Messaging and key-value too.** Non-persistent pub/sub with queue groups
   and request-reply, and key-value buckets with history, compare-and-set and
   watches.
+- **NATS clients work unchanged.** An optional NATS listener lets any NATS
+  client library publish, subscribe and request on the same bus, and write
+  durable records with JetStream's publish calls.
 - **SQL built in.** Run one-shot queries (on Apache DataFusion), continuous
   queries into new streams, materialized tables, event-time windows and
   stream joins.
@@ -66,9 +69,12 @@ exspeed tail orders --last 5 --no-follow
 exspeed query "SELECT key, subject, payload->>'region' AS region FROM orders"
 ```
 
-Applications connect through the [TypeScript SDK](sdks/typescript/README.md)
-or the Rust [`exspeed-client`](crates/exspeed-client) on TCP port 5933
-([protocol](docs/protocol.md)). The HTTP API is on port 8080.
+Applications connect on TCP port 5933 ([protocol](docs/protocol.md)) with a
+client for [TypeScript](sdks/typescript/README.md),
+[Python](sdks/python/README.md), [Go](sdks/go/README.md),
+[Java](sdks/java/README.md), [.NET](sdks/dotnet/README.md) or
+[Rust](crates/exspeed-client), or with any NATS client when the
+[NATS listener](docs/nats.md) is on. The HTTP API is on port 8080.
 
 ## Features
 
@@ -79,6 +85,8 @@ or the Rust [`exspeed-client`](crates/exspeed-client) on TCP port 5933
 | Queues | Work-queue and interest retention, per-message and stream TTLs, delayed delivery, `max_msgs` with discard old/new, last-N-per-subject, header filters, priority, single active consumers, dead-letter causes ([queues.md](docs/queues.md)) |
 | Core messaging | Non-persistent publish/subscribe, queue groups, request-reply with "no responders" ([messaging.md](docs/messaging.md)) |
 | Key-value | Buckets with history, compare-and-set, TTLs, keys and watch, over TCP and HTTP ([kv.md](docs/kv.md)) |
+| NATS protocol | Core NATS on its own port: pub/sub, queue groups, request-reply, headers, auth and TLS; streams capture subjects with JetStream-style publish acks and `Nats-Msg-Id` dedup ([nats.md](docs/nats.md)) |
+| Clients | TypeScript, Python, Go, Java, .NET and Rust, each with push and pull consumers, core messaging, KV, TLS and reconnection |
 | Idempotent publish | `msg_id` deduplication on every write path, within batches, from startup and across failover ([idempotent-publish.md](docs/idempotent-publish.md)) |
 | ExQL | SQL on Apache DataFusion: bounded queries (joins, aggregates, window functions, subqueries, JSON numerics, offset/time pushdown) and continuous queries (event-time windows, stream-stream and stream-table joins, durable tables, checkpointed state, effectively-once output) ([exql.md](docs/exql.md)) |
 | Connectors | Postgres CDC, outbox and poll; JDBC sink and poll (Postgres, MySQL, SQL Server); SQL Server CDC; RabbitMQ source and sink; S3 sink; HTTP poll, sink and webhook. Supervised, checkpointed, at-least-once or effectively-once, each tested against the real service ([guarantees](docs/connectors.md#delivery-guarantees)) |
@@ -87,8 +95,8 @@ or the Rust [`exspeed-client`](crates/exspeed-client) on TCP port 5933
 
 Each stream is a single partition, so one stream's write rate is bounded by
 one node; spread load across streams and nodes. Clients speak Exspeed's own
-protocol (TypeScript SDK, Rust client) or HTTP; there is no Kafka, AMQP or
-NATS wire compatibility.
+protocol, the core NATS protocol, or HTTP; there is no Kafka or AMQP wire
+compatibility, and the JetStream management API is not implemented.
 
 ## Performance
 
@@ -110,7 +118,7 @@ numbers, the machine details and the exact commands are in
 | | |
 |---|---|
 | **Learn** | [Getting started](docs/getting-started.md) · [Concepts](docs/concepts.md) |
-| **Use** | [Queues](docs/queues.md) · [Core messaging](docs/messaging.md) · [Key-value](docs/kv.md) · [CLI](docs/cli.md) · [HTTP API](docs/http-api.md) · [ExQL](docs/exql.md) · [Connectors](docs/connectors.md) · [Idempotent publish](docs/idempotent-publish.md) · [TypeScript SDK](sdks/typescript/README.md) · [Protocol](docs/protocol.md) |
+| **Use** | [Queues](docs/queues.md) · [Core messaging](docs/messaging.md) · [Key-value](docs/kv.md) · [CLI](docs/cli.md) · [HTTP API](docs/http-api.md) · [ExQL](docs/exql.md) · [Connectors](docs/connectors.md) · [Idempotent publish](docs/idempotent-publish.md) · [NATS](docs/nats.md) · Clients: [TypeScript](sdks/typescript/README.md), [Python](sdks/python/README.md), [Go](sdks/go/README.md), [Java](sdks/java/README.md), [.NET](sdks/dotnet/README.md) · [Protocol](docs/protocol.md) |
 | **Run** | [Configuration](docs/configuration.md) · [Operations](docs/operations.md) · [Security](docs/security.md) · [High availability](docs/high-availability.md) |
 | **Contribute** | [Architecture](docs/architecture.md) · [Development](docs/development.md) · [Benchmarks](BENCHMARKS.md) · [Changelog](CHANGELOG.md) · [2026-10 design review](docs/history/2026-10-review.md) |
 

@@ -127,22 +127,37 @@ jobs:
           --test redis_lease_test
           -- --include-ignored
 
+  server-bin:
+    name: Server binary for the SDK e2e tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p exspeed --bin exspeed
+      - uses: actions/upload-artifact@v4
+        with:
+          name: exspeed-bin
+          path: target/debug/exspeed
+          retention-days: 1
+
   sdk:
     name: TypeScript SDK
+    needs: server-bin
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: sdks/typescript
     env:
       # The end-to-end tests start this server binary.
-      EXSPEED_BIN: ${{ github.workspace }}/target/debug/exspeed
+      EXSPEED_BIN: ${{ github.workspace }}/bin/exspeed
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build the server for the e2e tests
-        run: cargo build -p exspeed --bin exspeed
-        working-directory: .
+      - uses: actions/download-artifact@v4
+        with:
+          name: exspeed-bin
+          path: bin
+      - run: chmod +x "$EXSPEED_BIN"
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -157,6 +172,105 @@ jobs:
           for ex in getting-started order-processing; do
             (cd "../../examples/$ex" && npm install --no-audit --no-fund && npx tsc --noEmit)
           done
+
+  sdk-python:
+    name: Python SDK
+    needs: server-bin
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.13"]
+    defaults:
+      run:
+        working-directory: sdks/python
+    env:
+      EXSPEED_BIN: ${{ github.workspace }}/bin/exspeed
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: exspeed-bin
+          path: bin
+      - run: chmod +x "$EXSPEED_BIN"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -e '.[dev]'
+      - run: ruff check .
+      - run: mypy src
+      - run: pytest
+
+  sdk-go:
+    name: Go SDK
+    needs: server-bin
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdks/go
+    env:
+      EXSPEED_BIN: ${{ github.workspace }}/bin/exspeed
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: exspeed-bin
+          path: bin
+      - run: chmod +x "$EXSPEED_BIN"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: sdks/go/go.mod
+      - run: go vet ./...
+      - run: test -z "$(gofmt -l .)"
+      - run: go test -race -count=1 ./...
+
+  sdk-java:
+    name: Java SDK
+    needs: server-bin
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdks/java
+    env:
+      EXSPEED_BIN: ${{ github.workspace }}/bin/exspeed
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: exspeed-bin
+          path: bin
+      - run: chmod +x "$EXSPEED_BIN"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-dependency-path: sdks/java/pom.xml
+      - run: mvn -B verify
+
+  sdk-dotnet:
+    name: .NET SDK
+    needs: server-bin
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdks/dotnet
+    env:
+      EXSPEED_BIN: ${{ github.workspace }}/bin/exspeed
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: exspeed-bin
+          path: bin
+      - run: chmod +x "$EXSPEED_BIN"
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - run: dotnet build -c Release
+      - run: dotnet format --verify-no-changes
+      - run: dotnet test -c Release --no-build
 
   helm:
     name: Helm chart

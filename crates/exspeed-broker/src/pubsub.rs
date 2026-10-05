@@ -34,6 +34,9 @@ pub struct CoreMessage {
     pub reply_to: Option<String>,
     pub headers: Vec<(String, String)>,
     pub value: Bytes,
+    /// The connection that published it (0 = unknown), so a NATS client
+    /// that connected with `echo: false` can skip its own messages.
+    pub origin: u64,
 }
 
 /// What a connection receives for its core subscriptions.
@@ -187,6 +190,16 @@ impl CoreBus {
         Ok(delivered)
     }
 
+    /// The subject filter of subscription `id`, if it exists.
+    pub fn filter_of(&self, id: u32) -> Option<SubjectFilter> {
+        self.subs
+            .read()
+            .unwrap()
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.filter.clone())
+    }
+
     /// Number of live subscriptions.
     pub fn len(&self) -> usize {
         self.subs.read().unwrap().len()
@@ -207,6 +220,7 @@ mod tests {
             reply_to: None,
             headers: vec![],
             value: Bytes::from_static(b"x"),
+            origin: 0,
         }
     }
 

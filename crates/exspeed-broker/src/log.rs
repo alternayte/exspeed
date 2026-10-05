@@ -394,6 +394,7 @@ impl Log {
     ) -> Result<(), LogError> {
         self.check_writable()?;
         config.check().map_err(LogError::InvalidConfig)?;
+        self.check_capture_overlap(stream, config).await?;
         self.storage.create_stream_with(stream, config).await?;
         self.dedup
             .configure_stream(stream, config.dedup_window_secs, config.dedup_max_entries)
@@ -438,11 +439,49 @@ impl Log {
     ) -> Result<(), LogError> {
         self.check_writable()?;
         config.check().map_err(LogError::InvalidConfig)?;
+        self.check_capture_overlap(stream, config).await?;
         self.storage.update_stream_config(stream, config).await?;
         self.dedup
             .configure_stream(stream, config.dedup_window_secs, config.dedup_max_entries)
             .await;
         self.metadata_changed(MetadataChange::Updated(stream));
+        Ok(())
+    }
+
+    /// No two streams may capture overlapping subjects (each core message
+    /// lands in at most one stream).
+    async fn check_capture_overlap(
+        &self,
+        stream: &StreamName,
+        config: &StreamConfig,
+    ) -> Result<(), LogError> {
+        let mine: Vec<exspeed_common::SubjectFilter> = config
+            .capture_subjects
+            .iter()
+            .filter_map(|f| exspeed_common::SubjectFilter::parse(f).ok())
+            .collect();
+        if mine.is_empty() {
+            return Ok(());
+        }
+        for other in self.storage.list_streams().await? {
+            if &other == stream {
+                continue;
+            }
+            let Ok(cfg) = self.storage.stream_config(&other).await else {
+                continue;
+            };
+            for f in &cfg.capture_subjects {
+                let Ok(theirs) = exspeed_common::SubjectFilter::parse(f) else {
+                    continue;
+                };
+                if let Some(m) = mine.iter().find(|m| m.overlaps(&theirs)) {
+                    return Err(LogError::InvalidConfig(format!(
+                        "capture subject '{}' overlaps '{f}' captured by stream '{other}'",
+                        m.as_pattern()
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 

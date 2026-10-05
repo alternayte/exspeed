@@ -24,6 +24,8 @@ pub struct Broker {
     pub bus: Arc<crate::pubsub::CoreBus>,
     /// Key-value buckets.
     pub kv: Arc<crate::kv::Kv>,
+    /// Streams that capture core-message subjects.
+    pub capture: Arc<crate::capture::Capture>,
     pub data_dir: PathBuf,
     pub lease: Arc<dyn LeaderLease>,
     pub metrics: Arc<Metrics>,
@@ -49,8 +51,10 @@ impl Broker {
         let consumers = ConsumerManager::new(log.clone(), metrics.clone());
         let bus = crate::pubsub::CoreBus::new(metrics.clone());
         let kv = crate::kv::Kv::new(log.clone());
+        let capture = crate::capture::Capture::new(log.clone());
         Self {
             kv,
+            capture,
             storage,
             broker_append,
             log,

@@ -14,6 +14,8 @@ use tokio::task::JoinHandle;
 pub struct TestServer {
     pub addr: String,
     pub api_addr: String,
+    /// The NATS listener's address, when started with [`Builder::nats`].
+    pub nats_addr: Option<String>,
     pub data_dir: PathBuf,
     _tmp: Option<tempfile::TempDir>,
     stop: Option<oneshot::Sender<()>>,
@@ -25,6 +27,7 @@ type Configure = Box<dyn FnOnce(&mut ServerArgs) + Send>;
 pub struct Builder {
     data_dir: Option<PathBuf>,
     configure: Vec<Configure>,
+    nats: bool,
 }
 
 impl Builder {
@@ -52,6 +55,12 @@ impl Builder {
         })
     }
 
+    /// Also serve the NATS protocol (on a random port).
+    pub fn nats(mut self) -> Self {
+        self.nats = true;
+        self
+    }
+
     pub fn with(mut self, f: impl FnOnce(&mut ServerArgs) + Send + 'static) -> Self {
         self.configure.push(Box::new(f));
         self
@@ -77,6 +86,12 @@ impl Builder {
         args.api_bind = api_addr.clone();
         args.tcp_listener = Some(std::sync::Arc::new(tcp));
         args.api_listener = Some(std::sync::Arc::new(api));
+        let nats_addr = self.nats.then(|| {
+            let l = exspeed_testkit::bind_local();
+            let a = l.local_addr().unwrap().to_string();
+            args.nats_listener = Some(std::sync::Arc::new(l));
+            a
+        });
         let tls = {
             for f in self.configure {
                 f(&mut args);
@@ -90,6 +105,7 @@ impl Builder {
         let server = TestServer {
             addr,
             api_addr,
+            nats_addr,
             data_dir,
             _tmp: tmp,
             stop: Some(stop_tx),
@@ -105,6 +121,7 @@ impl TestServer {
         Builder {
             data_dir: None,
             configure: Vec::new(),
+            nats: false,
         }
     }
 

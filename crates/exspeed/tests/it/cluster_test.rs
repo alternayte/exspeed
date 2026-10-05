@@ -1204,3 +1204,54 @@ async fn queues_messaging_and_kv_across_a_failover() {
 
     o.backend().set_partitioned(&node_id(&a), false);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nats_clients_follow_the_leader() {
+    use crate::nats_test::{Nats, Op};
+    use serde_json::json;
+
+    let o = Opts::new();
+    let dirs = Dirs::new(2);
+    let start = |dir: std::path::PathBuf| {
+        let o = o.clone();
+        async move {
+            TestServer::builder()
+                .data_dir(dir)
+                .nats()
+                .with(move |a| o.apply(a))
+                .start()
+                .await
+        }
+    };
+    let a = start(dirs.path(0).to_path_buf()).await;
+    let b = start(dirs.path(1).to_path_buf()).await;
+    assert_eq!(leader_of(&[&a, &b]).await, 0);
+    let (na, nb) = (a.nats_addr.clone().unwrap(), b.nats_addr.clone().unwrap());
+
+    // A standby says INFO and closes: the client moves on to the next server.
+    let (mut standby, _) = Nats::open(&nb).await;
+    assert_eq!(standby.next_timeout(Duration::from_secs(5)).await, None);
+
+    let mut n = Nats::connect(&na, json!({})).await;
+    n.subscribe("events.>", "1").await;
+    n.publish("events.x", "hi").await;
+    assert_eq!(n.next_msg().await.4, "hi");
+
+    // Fail over to b: connections to a are closed, b serves NATS now.
+    o.backend().set_partitioned(&node_id(&a), true);
+    eventually(Duration::from_secs(20), || async {
+        is_leader(&b).await.then_some(())
+    })
+    .await;
+    loop {
+        match n.next_timeout(Duration::from_secs(10)).await {
+            None => break,
+            Some(Op::Ping) => n.send("PONG").await,
+            Some(other) => panic!("expected the old leader to close, got {other:?}"),
+        }
+    }
+    let mut n = Nats::connect(&nb, json!({})).await;
+    n.subscribe("events.>", "1").await;
+    n.publish("events.y", "again").await;
+    assert_eq!(n.next_msg().await.4, "again");
+}

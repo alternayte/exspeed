@@ -113,6 +113,10 @@ permissions = [
   `_INBOX.…` subject, and a client may subscribe to its own inbox
   (`_INBOX.<id>.>` or `_INBOX.<id>.*`). Subscribing to every inbox
   (`_INBOX.>`, `_INBOX.*.…`) is refused unless a permission covers it.
+- The same rules apply to [NATS](nats.md) connections, which authenticate
+  with the same tokens (`auth_token`, or `pass`) and client certificates.
+  Publishing to a subject a stream [captures](nats.md#stream-capture) also
+  needs `publish` on that stream.
 
 **Generate a credential:**
 

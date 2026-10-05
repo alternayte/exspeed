@@ -14,12 +14,17 @@
 | [Queues and message lifetime](queues.md) | TTLs, delayed delivery, `max_msgs`, work-queue and interest retention, header filters, single active consumers, priority, dead-letter causes |
 | [Core messaging](messaging.md) | Non-persistent publish/subscribe, queue groups, request-reply |
 | [Key-value buckets](kv.md) | Get/put/delete, history, compare-and-set, TTLs, watch |
+| [NATS protocol](nats.md) | Connect any NATS client: pub/sub, queue groups, request-reply, stream capture with JetStream publish acks |
 | [CLI reference](cli.md) | Every `exspeed` command and flag |
 | [HTTP API reference](http-api.md) | Every endpoint and the permission it needs |
 | [ExQL](exql.md) | SQL over streams: bounded and continuous queries, windows, joins, materialized tables, external Postgres tables |
 | [Connectors](connectors.md) | Source and sink plugins, config format, delivery guarantees, retry and DLQ |
 | [Idempotent publish](idempotent-publish.md) | `msg_id` dedup semantics, sizing, alerts |
 | [TypeScript SDK](../sdks/typescript/README.md) | `@exspeed/sdk`: publishing, push and pull consumers, reconnection, TLS and auth |
+| [Python client](../sdks/python/README.md) | `exspeed` on PyPI (asyncio) |
+| [Go client](../sdks/go/README.md) | `github.com/alternayte/exspeed/sdks/go` |
+| [.NET client](../sdks/dotnet/README.md) | `Exspeed.Client` on NuGet |
+| [Java client](../sdks/java/README.md) | `io.github.alternayte:exspeed-client` on Maven Central |
 | [Rust client](../crates/exspeed-client) | `exspeed-client` crate |
 | [Client protocol](protocol.md) | Binary protocol v2 reference for SDK authors |
 

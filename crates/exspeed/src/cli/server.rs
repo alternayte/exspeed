@@ -55,6 +55,8 @@ pub struct ServerArgs {
     /// (mutual TLS). A certificate's common name can stand for a
     /// credential (`cert_cn`).
     pub tls_client_ca: Option<PathBuf>,
+    /// Serve the core NATS protocol on this address (`None` = off).
+    pub nats_bind: Option<String>,
     pub storage_sync: StorageSyncArg,
     pub storage_flush_window_us: u64,
     pub storage_flush_threshold_records: usize,
@@ -92,6 +94,9 @@ pub struct ServerArgs {
     /// the listener, so there is no window between picking a free port and
     /// binding it.
     pub tcp_listener: Option<Arc<std::net::TcpListener>>,
+    /// A pre-bound listener for the NATS protocol; used instead of
+    /// `nats_bind` (see `tcp_listener`).
+    pub nats_listener: Option<Arc<std::net::TcpListener>>,
     /// An already-bound HTTP API listener, used instead of binding
     /// `api_bind` (see `tcp_listener`).
     pub api_listener: Option<Arc<std::net::TcpListener>>,
@@ -267,6 +272,7 @@ impl ServerArgs {
             tls_cert: None,
             tls_key: None,
             tls_client_ca: None,
+            nats_bind: None,
             storage_sync: StorageSyncArg::Sync,
             storage_flush_window_us: 500,
             storage_flush_threshold_records: 256,
@@ -287,6 +293,7 @@ impl ServerArgs {
             log_level: None,
             config_file: None,
             tcp_listener: None,
+            nats_listener: None,
             api_listener: None,
         }
     }
@@ -444,6 +451,14 @@ where
     let api_listener = std_listener(args.api_listener.as_ref(), &args.api_bind, "HTTP API")?;
     let tcp_addr = listener.local_addr()?;
     let api_addr = api_listener.local_addr()?;
+    let nats_listener = match (&args.nats_listener, &args.nats_bind) {
+        (None, None) => None,
+        (pre, addr) => Some(TcpListener::from_std(std_listener(
+            pre.as_ref(),
+            addr.as_deref().unwrap_or_default(),
+            "NATS",
+        )?)?),
+    };
 
     // Build storage sync mode from CLI args.
     let storage_sync_mode = match args.storage_sync {
@@ -971,6 +986,17 @@ where
             Arc::new(move || l.leader_hint())
         },
     });
+
+    if let Some(l) = nats_listener {
+        info!("exspeed NATS listening on {}", l.local_addr()?);
+        let nats = Arc::new(crate::nats::NatsServer {
+            ctx: session_ctx.clone(),
+            tls: tls_config.clone(),
+            tls_verify: args.tls_client_ca.is_some() && tls_config.is_some(),
+            conn_sem: conn_sem.clone(),
+        });
+        tokio::spawn(nats.serve(l, cancel_token.clone()));
+    }
 
     loop {
         tokio::select! {

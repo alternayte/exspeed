@@ -1616,6 +1616,7 @@ mod tests {
                 msg_ttl_ms: 5_000,
                 allow_delayed: true,
                 retention: RetentionPolicy::WorkQueue,
+                capture_subjects: vec![],
             },
             ..StreamSpec::default()
         };

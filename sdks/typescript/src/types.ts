@@ -88,6 +88,11 @@ export interface StreamSpec {
    * `"interest"`: a record is removed once every consumer acked it.
    */
   retention?: "limits" | "work_queue" | "interest";
+  /**
+   * Subject filters whose core messages (`publishCore`, or NATS clients)
+   * the stream also stores. No two streams may capture overlapping subjects.
+   */
+  captureSubjects?: string[];
 }
 
 export interface StreamInfo {
@@ -107,6 +112,7 @@ export interface StreamInfo {
     msgTtlMs?: number;
     allowDelayed?: boolean;
     retention?: "limits" | "work_queue" | "interest";
+    captureSubjects?: string[];
     [k: string]: unknown;
   };
   internal: boolean;
@@ -138,6 +144,7 @@ function toWireStreamLimits(s: StreamSpec): WireStreamLimits | null {
     allow_delayed: s.allowDelayed ?? false,
     retention: s.retention ?? "limits",
   };
+  if (s.captureSubjects?.length) limits.capture_subjects = [...s.captureSubjects];
   const isDefault =
     limits.max_msgs === 0 &&
     limits.discard === "old" &&
@@ -145,7 +152,8 @@ function toWireStreamLimits(s: StreamSpec): WireStreamLimits | null {
     !limits.allow_msg_ttl &&
     limits.msg_ttl_ms === 0 &&
     !limits.allow_delayed &&
-    limits.retention === "limits";
+    limits.retention === "limits" &&
+    !limits.capture_subjects;
   return isDefault ? null : limits;
 }
 

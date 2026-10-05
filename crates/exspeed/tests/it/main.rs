@@ -23,6 +23,7 @@ mod jdbc_sink_sqlite_test;
 mod kv_test;
 mod limits_test;
 mod multi_tenant_auth_test;
+mod nats_test;
 mod observability_test;
 mod protocol_test;
 mod pubsub_test;
