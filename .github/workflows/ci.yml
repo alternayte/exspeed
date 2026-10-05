@@ -200,6 +200,30 @@ jobs:
       - run: mypy src
       - run: pytest
 
+  sdk-go:
+    name: Go SDK
+    needs: server-bin
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdks/go
+    env:
+      EXSPEED_BIN: ${{ github.workspace }}/bin/exspeed
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: exspeed-bin
+          path: bin
+      - run: chmod +x "$EXSPEED_BIN"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: sdks/go/go.mod
+      - run: go vet ./...
+      - run: test -z "$(gofmt -l .)"
+      - run: go test -race -count=1 ./...
+
   helm:
     name: Helm chart
     runs-on: ubuntu-latest
