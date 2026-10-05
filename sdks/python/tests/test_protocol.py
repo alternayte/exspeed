@@ -472,6 +472,21 @@ def test_sends_every_limit_serde_style_once_any_one_is_set() -> None:
         StreamSpec("").to_wire()
 
 
+def test_adds_capture_subjects_only_when_there_are_some() -> None:
+    assert StreamSpec("s", capture_subjects=[]).to_wire().limits is None
+    c = StreamSpec("s", capture_subjects=["orders.>"]).to_wire()
+    limits_json = (
+        b'{"max_msgs":0,"discard":"old","max_msgs_per_subject":0,"allow_msg_ttl":false,'
+        b'"msg_ttl_ms":0,"allow_delayed":false,"retention":"limits","capture_subjects":["orders.>"]}'
+    )
+    assert json.dumps(c.limits, separators=(",", ":")).encode() == limits_json
+    # Byte-exact payload: the plain spec, then the limits JSON as `bytes`.
+    payload = encode_request(m.CreateStream(c))
+    expected = hx("0100 73" + " 0000000000000000" * 4 + " 00") + struct.pack("<I", len(limits_json)) + limits_json
+    assert payload == expected
+    assert decode_request(OpCode.CREATE_STREAM, payload) == m.CreateStream(c)
+
+
 # ---------------------------------------------------------------------------
 # Publish options
 # ---------------------------------------------------------------------------

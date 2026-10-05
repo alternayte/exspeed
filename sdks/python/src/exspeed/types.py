@@ -174,6 +174,9 @@ class StreamSpec:
     #: at most one consumer; a record is removed once acked. ``"interest"``: a
     #: record is removed once every consumer acked it.
     retention: Literal["limits", "work_queue", "interest"] = "limits"
+    #: Subject filters: core messages published to a matching subject are also
+    #: appended to this stream. No two streams may capture overlapping subjects.
+    capture_subjects: list[str] = field(default_factory=list)
 
     def to_wire(self) -> WireStreamSpec:
         """The wire form, with the limits trailer only when a limit isn't at its default."""
@@ -188,6 +191,8 @@ class StreamSpec:
             "allow_delayed": self.allow_delayed,
             "retention": self.retention,
         }
+        if self.capture_subjects:
+            limits["capture_subjects"] = [str(x) for x in self.capture_subjects]
         default = (
             self.max_msgs == 0
             and self.discard == "old"
@@ -196,6 +201,7 @@ class StreamSpec:
             and self.msg_ttl_ms == 0
             and not self.allow_delayed
             and self.retention == "limits"
+            and not self.capture_subjects
         )
         return WireStreamSpec(
             name=self.name,
@@ -229,6 +235,8 @@ class StreamConfig:
     msg_ttl_ms: int
     allow_delayed: bool
     retention: str
+    #: Subject filters whose core messages the stream captures.
+    capture_subjects: list[str] = field(default_factory=list)
     #: The JSON object as received (includes settings this client doesn't model).
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -248,6 +256,7 @@ class StreamConfig:
             msg_ttl_ms=_int(d, "msg_ttl_ms"),
             allow_delayed=bool(d.get("allow_delayed", False)),
             retention=str(d.get("retention", "limits")),
+            capture_subjects=[str(x) for x in d.get("capture_subjects") or []],
             raw=dict(d),
         )
 

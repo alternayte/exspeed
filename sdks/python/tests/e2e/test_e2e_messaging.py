@@ -125,6 +125,21 @@ async def test_keeps_max_msgs_per_subject(client: ExspeedClient) -> None:
     assert [r.text() for r in (await client.read(s)).records] == ["2", "3"]
 
 
+async def test_captures_core_messages_into_a_stream(client: ExspeedClient) -> None:
+    s = uniq("cap")
+    await client.create_stream(StreamSpec(s, capture_subjects=["cap.>"]))
+    assert (await client.stream_info(s)).config.capture_subjects == ["cap.>"]
+    await client.publish_core("cap.x", {"n": 1}, headers={"h": "v"})
+    await client.publish_core("other.x", "not captured")
+
+    async def captured() -> object:
+        r = await client.read(s)
+        return r.records or None
+
+    records = await eventually(captured)
+    assert [(r.subject, r.json(), r.header("h")) for r in records] == [("cap.x", {"n": 1}, "v")]  # type: ignore[attr-defined]
+
+
 # ---------------------------------------------------------------------------
 # Consumer routing
 # ---------------------------------------------------------------------------

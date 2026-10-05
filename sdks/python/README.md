@@ -102,13 +102,17 @@ await client.create_stream(StreamSpec(
     msg_ttl_ms=86_400_000,     # default lifetime of every record (0 = none)
     allow_delayed=True,        # accept the `delay` / `deliver_at` publish options
     retention="work_queue",    # "limits" (default) | "work_queue" | "interest"
+    capture_subjects=["jobs.>"],  # also store core messages published to these subjects
 ))
 ```
 
 With `retention="work_queue"` the stream has at most one consumer, and a
 record is removed once that consumer acked it. With `"interest"` a record is
 removed once every consumer of the stream acked it. Expired records are
-never read or delivered. These settings show up in
+never read or delivered. With `capture_subjects`, core messages published
+to a matching subject (with `publish_core`, or by NATS clients) are also
+appended to the stream; no two streams may capture overlapping subjects.
+These settings show up in
 `(await client.stream_info(name)).config`.
 
 ## Publishing
