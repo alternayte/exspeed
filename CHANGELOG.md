@@ -25,6 +25,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`{"stream","seq"}`, `seq` = offset + 1), so `js.Publish` /
   `js.PublishAsync` in NATS clients work; `Nats-Msg-Id` deduplicates.
   Overlapping capture subjects across streams are refused.
+- **Client libraries for Python, Go, Java and .NET**, next to TypeScript
+  and Rust, each covering streams (every limit, retention and capture
+  option), publishing with TTL / delay / priority, reads, push and pull
+  consumers, ExQL, core pub/sub and request-reply, KV buckets, TLS and
+  mTLS, and reconnection: `exspeed` on PyPI (`sdks/python`),
+  `github.com/alternayte/exspeed/sdks/go`, `io.github.alternayte:exspeed-client`
+  (`sdks/java`) and `Exspeed.Client` on NuGet (`sdks/dotnet`).
+- TypeScript SDK: `captureSubjects` on `StreamSpec`.
 
 ### Changed
 

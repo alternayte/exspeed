@@ -2,7 +2,7 @@
 
 ## Build and test
 
-You need Rust 1.94 or newer. Node 18+ is only needed for the TypeScript SDK.
+You need Rust 1.94 or newer. The client SDKs need their own toolchains: Node 18+ (TypeScript), Python 3.10+, Go 1.22+, JDK 17+ with Maven, and the .NET 8 SDK.
 
 ```bash
 cargo build                              # all crates
@@ -47,19 +47,24 @@ These environment variables change what the tests do:
 | `EXSPEED_ENOSPC_DIR` | A small, empty filesystem for the disk-full tests (CI mounts a 16 MiB tmpfs). Skipped when unset. |
 | `EXSPEED_CRASH_ROUNDS` | Rounds of the single-node `kill -9` test (default 5) |
 | `EXSPEED_PROPTEST_CASES` | Cases for the storage property tests (default 16) |
-| `EXSPEED_BIN` | Server binary for the TypeScript SDK's end-to-end tests |
+| `EXSPEED_BIN` | Server binary for the SDKs' end-to-end tests (default `target/debug/exspeed`) |
 
 ## CI
 
 `.github/workflows/ci.yml` runs on every pull request and every push to
-`main`. It has five jobs:
+`main`. Its jobs:
 
 | Job | What it runs |
 |-----|--------------|
 | `lint` | `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` |
 | `test` | Builds the binary, validates every example `connectors.d/*.toml` with `exspeed connector validate`, mounts a 16 MiB tmpfs for the disk-full tests, then `cargo test --workspace` |
 | `test-services` | Postgres (with `wal_level=logical`), Redis, MySQL, RabbitMQ, an S3-compatible store (moto) and SQL Server (with its Agent) in Docker, then the library, binary, `it`, `leadership_test`, `postgres_lease_test` and `redis_lease_test` test targets with `--include-ignored` |
-| `sdk` | Builds the server for the end-to-end tests, then SDK typecheck, test and build |
+| `server-bin` | Builds the server once and uploads it for the SDK jobs' end-to-end tests |
+| `sdk` | TypeScript SDK: typecheck, test, build, and the examples typecheck |
+| `sdk-python` | Python SDK on 3.10 and 3.13: ruff, mypy, pytest |
+| `sdk-go` | Go SDK: `go vet`, `gofmt`, `go test -race` |
+| `sdk-java` | Java SDK: `mvn -B verify` |
+| `sdk-dotnet` | .NET SDK: `dotnet build` and `dotnet test` |
 | `helm` | `helm lint` and rendering of the single-node and multi-pod values |
 
 ## TypeScript SDK
@@ -75,6 +80,21 @@ npm run build       # tsup → ESM + CJS
 
 The end-to-end tests (`test/e2e/`) are skipped when neither binary exists,
 so build the server first (`cargo build -p exspeed --bin exspeed`).
+
+## Other SDKs
+
+```bash
+cd sdks/python && pip install -e '.[dev]' && ruff check . && mypy src && pytest
+cd sdks/go && go vet ./... && test -z "$(gofmt -l .)" && go test -race -count=1 ./...
+cd sdks/java && mvn -B verify
+cd sdks/dotnet && dotnet build -c Release && dotnet test -c Release --no-build
+```
+
+Each SDK has unit tests against a scriptable fake server, codec tests on
+the byte fixtures generated from the Rust encoder (shared with
+`sdks/typescript/test/unit/protocol.test.ts`), and end-to-end tests that
+start `$EXSPEED_BIN` or `target/debug/exspeed` and skip when neither
+exists.
 
 ## Infrastructure for connector tests
 
@@ -183,7 +203,7 @@ Actions tab with the tag `vX.Y.Z` (`dry-run` builds without publishing).
 It creates the tag on `main`, builds the binaries and installers, creates
 the GitHub Release with the matching `CHANGELOG.md` section as its notes,
 and publishes the multi-arch image `ghcr.io/alternayte/exspeed` from those
-binaries. The checklist (version bump, changelog, tag, npm publish) is in
+binaries. The checklist (version bump, changelog, tag, publishing the SDKs) is in
 the "Releasing" section of [CLAUDE.md](../CLAUDE.md).
 
 ## Repository layout
@@ -191,6 +211,10 @@ the "Releasing" section of [CLAUDE.md](../CLAUDE.md).
 ```
 crates/              Rust workspace (see docs/architecture.md)
 sdks/typescript/     @exspeed/sdk
+sdks/python/         exspeed (PyPI)
+sdks/go/             github.com/alternayte/exspeed/sdks/go
+sdks/java/           io.github.alternayte:exspeed-client
+sdks/dotnet/         Exspeed.Client (NuGet)
 deploy/helm/         Helm chart
 examples/            getting-started (Bun) and order-processing demos
 bench/               comparison kit (Kafka, NATS JetStream) and stored results

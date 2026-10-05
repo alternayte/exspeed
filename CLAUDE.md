@@ -29,6 +29,15 @@ npm run typecheck    # tsc --noEmit
 ```
 E2E tests start a real server from `EXSPEED_BIN` or `target/debug/exspeed` (build it first); they are skipped if neither exists.
 
+### Other client SDKs (same e2e convention: `EXSPEED_BIN` or `target/debug/exspeed`)
+```bash
+cd sdks/python && pip install -e '.[dev]' && ruff check . && mypy src && pytest   # asyncio, no runtime deps
+cd sdks/go && go vet ./... && test -z "$(gofmt -l .)" && go test -race -count=1 ./...  # module github.com/alternayte/exspeed/sdks/go
+cd sdks/java && mvn -B verify                                                     # io.github.alternayte:exspeed-client, Java 17+
+cd sdks/dotnet && dotnet build -c Release && dotnet test -c Release --no-build      # Exspeed.Client, net8.0
+```
+Every SDK's codec tests use the byte fixtures generated from the Rust encoder (`sdks/typescript/test/unit/protocol.test.ts`); a wire change updates all of them.
+
 ### Infrastructure (for connector integration tests)
 ```bash
 docker-compose up -d   # Postgres (5432), MySQL, SQL Server, RabbitMQ (5672/15672), S3 via moto (9000)
@@ -47,15 +56,20 @@ Tag `dry-run` builds every artifact without publishing anything. Don't create th
 
 ```bash
 # 1. Version bump: [workspace.package] + every per-crate Cargo.toml version, sdks/typescript/package.json
-#    (+ package-lock via `npm install --package-lock-only`), deploy/helm/exspeed/Chart.yaml appVersion.
+#    (+ package-lock via `npm install --package-lock-only`), sdks/python/pyproject.toml, sdks/java/pom.xml,
+#    sdks/dotnet/src/Exspeed.Client/Exspeed.Client.csproj, deploy/helm/exspeed/Chart.yaml appVersion.
 # 2. CHANGELOG.md: rename [Unreleased] to `## [X.Y.Z] — YYYY-MM-DD`. The section is the release page, so open it
 #    with a short human TL;DR and "What's new" / "Upgrading" in plain language; detail goes below (a <details> block).
 #    Refresh BENCHMARKS.md + README numbers if they changed.
 # 3. Merge to main with CI green, then run the Release workflow. A prerelease tag (vX.Y.Z-rc.1, with that exact
 #    version in Cargo.toml) runs the same pipeline without moving `latest`.
 gh workflow run release.yml --ref main -f tag=vX.Y.Z
-# 4. TS SDK
+# 4. SDKs (manual)
 cd sdks/typescript && npm publish   # prepublishOnly runs typecheck + test + build
+cd sdks/python && python -m build && twine upload dist/*
+git tag sdks/go/vX.Y.Z && git push origin sdks/go/vX.Y.Z   # Go modules in a subdirectory are tagged with its path
+cd sdks/java && mvn -B deploy       # needs Maven Central credentials and signing
+cd sdks/dotnet && dotnet pack -c Release && dotnet nuget push src/Exspeed.Client/bin/Release/*.nupkg
 ```
 
 - A new GHCR package may start private: check `docker pull ghcr.io/alternayte/exspeed:X.Y.Z` without logging in, and if it fails set the package to public under the repository's Packages → exspeed → Package settings.

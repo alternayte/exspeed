@@ -2,8 +2,11 @@
 
 Exspeed clients speak a small binary protocol over TCP (default port 5933,
 optionally TLS). This page is the reference for SDK authors. Applications
-should use an SDK: the Rust crate [`exspeed-client`](../crates/exspeed-client)
-or the [TypeScript SDK](../sdks/typescript/README.md).
+should use a client library: [TypeScript](../sdks/typescript/README.md),
+[Python](../sdks/python/README.md), [Go](../sdks/go/README.md),
+[Java](../sdks/java/README.md), [.NET](../sdks/dotnet/README.md) or the Rust
+crate [`exspeed-client`](../crates/exspeed-client). Their unit tests decode
+the same byte fixtures, generated from the Rust encoder.
 
 The source of truth is `crates/exspeed-protocol/src/client.rs`. Its unit
 tests round-trip every message.
